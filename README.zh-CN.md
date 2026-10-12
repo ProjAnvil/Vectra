@@ -23,6 +23,8 @@ import "github.com/projanvil/vectra"
 g := vectra.New()
 g.AddNode("gateway", "Service", map[string]any{"env": "prod"})
 g.AddEdge("gateway", "auth", "CALLS", nil)
+g.UpsertEdge("gateway", "auth", "CALLS", map[string]any{"weight": 2}) // 同键 (src,dst,label) 替换属性
+g.DeleteNode("ledger")                                               // 删点并级联删边
 g.Seal() // 此后不可变；并发读免锁
 
 // 链式遍历
@@ -57,7 +59,7 @@ cd server && go build -o vectra-server ./cmd/vectra-server
 ./vectra-server -id n2 -data /data/n2 -join http://n1:8080         # 加入集群
 ```
 
-一致性语义：写线性一致（raft 提交即返回）；读有界过期（≤ SealInterval，小图即时）。防脑裂：设了 `Join` 的节点绝不引导。三节点进程内混沌测试（leader 宕机切换、日志回放追平、重发布期间查询零失败）在 `-race` 下进 CI。
+一致性语义：写线性一致（raft 提交即返回）——upsert 加逻辑键删除（删点级联删边）；读有界过期（≤ SealInterval，小图即时）。防脑裂：设了 `Join` 的节点绝不引导。三节点进程内混沌测试（leader 宕机切换、日志回放追平、重发布期间查询零失败）在 `-race` 下进 CI。
 
 ## MCP（AI agent）
 
@@ -81,7 +83,7 @@ claude mcp add vectra -- /path/to/vectra-mcp
 
 本地复现：`make bench [SIZE=medium] [MODE=http]`，数据目录与报告运行结束即删。
 
-正确性按 LDBC 方法验证：与独立参考实现做属性对账、真实数据集外部 ground truth（SNAP email-Eu-core：203 个 SCC / 最大 803，对外发布的数字）、混沌与退化图测试、确定性检查。覆盖率：根包 89.8% · csr/dag 100% · store 84.3% · engine+traverse 94.6% · server 83.5%。
+正确性按 LDBC 方法验证：与独立参考实现做属性对账、真实数据集外部 ground truth（SNAP email-Eu-core：203 个 SCC / 最大 803，对外发布的数字）、混沌与退化图测试、确定性检查。覆盖率：根包 92.1% · csr/dag 100% · store 84.3% · engine+traverse 98.7% · server 83.8% · mcp 80.9%。
 
 ## 仓库布局
 

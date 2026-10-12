@@ -4,6 +4,11 @@
 // "the graph always fits in single-machine memory": bulk import, lock-free
 // concurrent reads after Seal, disk used only for snapshot recovery.
 //
+// Write semantics: AddNode is idempotent, UpsertEdge keeps the (src,dst,
+// label) triple unique (weight-like props update in place), AddEdge is pure
+// append; deletes are recorded as tombstones and compacted at Seal/export
+// time — node and edge IDs may be renumbered by compaction.
+//
 // Layout: this package is the public API facade (writes, options, type
 // translation); sealed state lives in internal/engine, query algorithms in
 // internal/traverse, encode/decode in internal/store.

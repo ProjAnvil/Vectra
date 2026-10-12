@@ -23,6 +23,8 @@ import "github.com/projanvil/vectra"
 g := vectra.New()
 g.AddNode("gateway", "Service", map[string]any{"env": "prod"})
 g.AddEdge("gateway", "auth", "CALLS", nil)
+g.UpsertEdge("gateway", "auth", "CALLS", map[string]any{"weight": 2}) // replace props on the same (src,dst,label)
+g.DeleteNode("ledger")                                               // cascade-deletes incident edges
 g.Seal() // immutable from here; concurrent reads are lock-free
 
 // chained traversal
@@ -57,7 +59,7 @@ cd server && go build -o vectra-server ./cmd/vectra-server
 ./vectra-server -id n2 -data /data/n2 -join http://n1:8080              # join
 ```
 
-Semantics: writes are linearizable (raft commit), reads are bounded-stale (≤ SealInterval, immediate for small graphs). Anti-split-brain: nodes with `Join` set never bootstrap. The 3-node in-process chaos suite (leader failover, log replay catch-up, zero query failures during republish) runs under `-race` in CI.
+Semantics: writes are linearizable (raft commit) — upserts plus logical-key deletes (node deletes cascade incident edges); reads are bounded-stale (≤ SealInterval, immediate for small graphs). Anti-split-brain: nodes with `Join` set never bootstrap. The 3-node in-process chaos suite (leader failover, log replay catch-up, zero query failures during republish) runs under `-race` in CI.
 
 ## MCP (agents)
 
@@ -81,7 +83,7 @@ See [mcp/README.md](mcp/README.md) for all transports and host configurations.
 
 Reproduce locally: `make bench [SIZE=medium] [MODE=http]` — data and report are deleted when the run ends.
 
-Correctness is validated the LDBC way: property tests against independent reference implementations, real-dataset ground truth (SNAP email-Eu-core: 203 SCCs / largest 803, externally published numbers), chaos and degenerate-graph suites, determinism checks. Coverage: root 89.8% · csr/dag 100% · store 84.3% · engine+traverse 94.6% · server 83.5%.
+Correctness is validated the LDBC way: property tests against independent reference implementations, real-dataset ground truth (SNAP email-Eu-core: 203 SCCs / largest 803, externally published numbers), chaos and degenerate-graph suites, determinism checks. Coverage: root 92.1% · csr/dag 100% · store 84.3% · engine+traverse 98.7% · server 83.8% · mcp 80.9%.
 
 ## Repository layout
 

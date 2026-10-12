@@ -67,3 +67,18 @@ func ExampleGraph_Cycles() {
 	// Output:
 	// cycle: [pay risk]
 }
+
+// ExampleGraph_UpsertEdge demonstrates replace-by-key writes and cascade
+// deletes: UpsertEdge updates weight-like props in place (the (src,dst,label)
+// triple stays unique), DeleteNode removes a node together with its edges.
+func ExampleGraph_UpsertEdge() {
+	g := vectra.New()
+	g.AddNode("a", "Agent", nil)
+	g.AddNode("b", "Agent", nil)
+	g.AddEdge("a", "b", "MENTIONS", map[string]any{"weight": 1})
+	g.UpsertEdge("a", "b", "MENTIONS", map[string]any{"weight": 2}) // same-key replace: weight update
+	g.DeleteNode("b")                                               // cascades the MENTIONS edge away
+	g.Seal()
+	fmt.Println(g.EdgeCount())
+	// Output: 0
+}
