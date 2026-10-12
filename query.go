@@ -52,19 +52,22 @@ func (g *Graph) NeighborsOf(key string, dir Direction, labels ...string) ([]Node
 	if !g.sealed {
 		return nil, ErrNotSealed
 	}
-	adj := g.view(dir)
+	adj := g.snap.AdjacencyF()
+	if dir == DirIn {
+		adj = g.snap.AdjacencyR()
+	}
 	mask := g.labelMask(labels)
-	seen := make([]bool, len(g.nodes))
+	seen := make([]bool, g.snap.NodeCount())
 	var out []Node
-	lo, hi := adj.row(uint32(n.ID))
-	for s := lo; s < hi; s++ {
-		if mask != nil && !mask[adj.label(s)] {
+	tg, _, lb := adj.Row(uint32(n.ID))
+	for i, v := range tg {
+		if mask != nil && !mask[lb[i]] {
 			continue
 		}
-		v := adj.target(s)
 		if !seen[v] {
 			seen[v] = true
-			out = append(out, g.nodes[v])
+			node, _ := g.NodeByID(NodeID(v))
+			out = append(out, node)
 		}
 	}
 	return out, nil

@@ -1,15 +1,18 @@
 // Package vectra 是嵌入式内存图引擎：全内存无指针 CSR 邻接 + 写入侧
 // SCC 压缩 + 层同步并行 BFS。面向"图永远小于单机内存"的企业依赖图谱
 // 场景：批量导入、Seal 后并发只读、磁盘仅作快照恢复。
+//
+// 布局：本包是公共 API 门面（写入、选项、类型翻译）；密封状态在
+// internal/engine，查询算法在 internal/traverse，编解码在 internal/store。
 package vectra
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"os"
 
-	"vectra/internal/csr"
-	"vectra/internal/dag"
+	"vectra/internal/engine"
 	"vectra/internal/store"
 )
 
@@ -55,25 +58,16 @@ type edgeRec struct {
 }
 
 // Graph 是一张 Vectra 图。写入期单写者；Seal 后不可变，并发读免锁。
+// Seal 后写态内存迁移进快照并释放。
 type Graph struct {
-	nodes  []Node
-	byKey  map[string]NodeID
-	edges  []edgeRec
-	labels []string // labelID -> name
-	labIDs map[string]uint32
-	sealed bool
-
-	// Seal 产物（不可变，并发读免锁）
-	csrF       csr.Adjacency // 正向邻接
-	csrR       csr.Adjacency // 反向邻接
-	sccOf      []uint32      // 节点 -> 分量 ID
-	sccCount   uint32
-	cond       dag.Condensed // 正向凝聚 DAG
-	condR      dag.Condensed // 反向凝聚 DAG
-	sccLevel   []uint32      // 分量 -> 最长路径拓扑层级
-	sccNodeOff []uint32      // 分量 -> 成员区间 [off, off+1)
-	sccNodes   []uint32      // 按分量分组的成员（组内 NodeID 升序）
-	selfLoop   []bool
+	nodes     []Node
+	byKey     map[string]NodeID
+	edges     []edgeRec
+	labels    []string // labelID -> name
+	labIDs    map[string]uint32
+	indexKeys []string // Seal 期要建索引的属性键
+	sealed    bool
+	snap      *engine.Snapshot
 }
 
 func New() *Graph {
@@ -102,6 +96,10 @@ func copyProps(props map[string]any) map[string]any {
 }
 
 // AddNode 幂等写入节点：key 已存在时更新 label/props 并返回原 ID。
+//
+// Props 共享契约：本方法对传入 map 做了拷贝；但 Seal 后通过 Node/Edge
+// 暴露的 map 是内部引用——更新必须整体替换（再次 AddNode/AddEdge），
+// 禁止就地修改。
 func (g *Graph) AddNode(key, label string, props map[string]any) (NodeID, error) {
 	if g.sealed {
 		return 0, ErrSealed
@@ -140,10 +138,17 @@ func (g *Graph) NodeByKey(key string) (Node, bool) {
 	if !ok {
 		return Node{}, false
 	}
-	return g.nodes[id], true
+	return g.NodeByID(id)
 }
 
 func (g *Graph) NodeByID(id NodeID) (Node, bool) {
+	if g.sealed {
+		rec, ok := g.snap.NodeInfo(uint32(id))
+		if !ok {
+			return Node{}, false
+		}
+		return Node{ID: id, Key: rec.Key, Label: rec.Label, Props: rec.Props}, true
+	}
 	if int(id) >= len(g.nodes) {
 		return Node{}, false
 	}
@@ -151,91 +156,77 @@ func (g *Graph) NodeByID(id NodeID) (Node, bool) {
 }
 
 func (g *Graph) EdgeByID(id EdgeID) (Edge, bool) {
-	if int(id) >= len(g.edges) {
+	if !g.sealed {
+		if int(id) >= len(g.edges) {
+			return Edge{}, false
+		}
+		e := g.edges[id]
+		return Edge{ID: id, Src: e.src, Dst: e.dst, Label: g.labels[e.label], Props: e.props}, true
+	}
+	src, dst, label, props, ok := g.snap.EdgeInfo(uint32(id))
+	if !ok {
 		return Edge{}, false
 	}
-	e := g.edges[id]
-	return Edge{ID: id, Src: e.src, Dst: e.dst, Label: g.labels[e.label], Props: e.props}, true
+	return Edge{ID: id, Src: NodeID(src), Dst: NodeID(dst), Label: label, Props: props}, true
 }
 
-func (g *Graph) NodeCount() int { return len(g.nodes) }
-func (g *Graph) EdgeCount() int { return len(g.edges) }
-func (g *Graph) Sealed() bool   { return g.sealed }
+// NodeCount/EdgeCount 在两种状态下给出真实规模（Seal 后写态已迁移
+// 进快照并释放，从快照读取）。
+func (g *Graph) NodeCount() int {
+	if g.sealed {
+		return g.snap.NodeCount()
+	}
+	return len(g.nodes)
+}
+
+func (g *Graph) EdgeCount() int {
+	if g.sealed {
+		return g.snap.EdgeCount()
+	}
+	return len(g.edges)
+}
+
+func (g *Graph) Sealed() bool { return g.sealed }
 
 func (g *Graph) Stats() Stats {
-	st := Stats{Nodes: len(g.nodes), Edges: len(g.edges)}
-	if !g.sealed {
+	if g.sealed {
+		st := Stats{
+			Nodes: g.snap.NodeCount(),
+			Edges: g.snap.EdgeCount(),
+			SCCs:  int(g.snap.SCCCount()),
+		}
+		for c := uint32(0); c < g.snap.SCCCount(); c++ {
+			if size := len(g.snap.SCCMembers(c)); size > 1 {
+				st.CyclicNodes += size
+			}
+		}
 		return st
 	}
-	st.SCCs = int(g.sccCount)
-	for s := uint32(0); s < g.sccCount; s++ {
-		if size := g.sccNodeOff[s+1] - g.sccNodeOff[s]; size > 1 {
-			st.CyclicNodes += int(size)
-		}
-	}
+	st := Stats{Nodes: len(g.nodes), Edges: len(g.edges)}
 	return st
 }
 
-// Seal 构建查询所需的全部不可变结构：正/反向 CSR、SCC 分量、
-// 正/反向凝聚 DAG、拓扑层级、分量成员表。此后图只读、并发读免锁。
+// Seal 构建查询所需的全部不可变结构（正/反向 CSR、Tarjan SCC、正/反向
+// 凝聚 DAG、成员表、自环标记、属性索引），此后图只读、并发读免锁。
 func (g *Graph) Seal() error {
 	if g.sealed {
 		return nil
 	}
-	n := uint32(len(g.nodes))
-	e := len(g.edges)
-	src := make([]uint32, e)
-	dst := make([]uint32, e)
-	eids := make([]uint32, e)
-	lids := make([]uint32, e)
-	for i, er := range g.edges {
-		src[i] = uint32(er.src)
-		dst[i] = uint32(er.dst)
-		eids[i] = uint32(i)
-		lids[i] = er.label
+	nodes := make([]engine.NodeRec, len(g.nodes))
+	for i, n := range g.nodes {
+		nodes[i] = engine.NodeRec{Key: n.Key, Label: n.Label, Props: n.Props}
 	}
-	g.csrF = csr.BuildPayloads(n, src, dst, eids, lids)
-	g.csrR = csr.BuildPayloads(n, dst, src, eids, lids)
-
-	adjF := func(u uint32) []uint32 { return g.csrF.Neighbors(u) }
-	labF := func(u uint32) []uint32 {
-		return g.csrF.Labels[g.csrF.Offsets[u]:g.csrF.Offsets[u+1]]
+	edges := make([]engine.EdgeRec, len(g.edges))
+	for i, e := range g.edges {
+		edges[i] = engine.EdgeRec{Src: uint32(e.src), Dst: uint32(e.dst), LabelID: e.label, Props: e.props}
 	}
-	adjR := func(u uint32) []uint32 { return g.csrR.Neighbors(u) }
-	labR := func(u uint32) []uint32 {
-		return g.csrR.Labels[g.csrR.Offsets[u]:g.csrR.Offsets[u+1]]
+	snap, err := engine.Seal(nodes, edges, g.labels, nil)
+	if err != nil {
+		return err
 	}
-
-	g.sccOf, g.sccCount = dag.Tarjan(n, adjF)
-	g.cond = dag.Condense(n, g.sccOf, g.sccCount, adjF, labF)
-	g.condR = dag.Condense(n, g.sccOf, g.sccCount, adjR, labR)
-	g.sccLevel = dag.Levels(g.cond)
-
-	// 分量成员表：按 sccOf 计数排序分组；u 升序遍历保证组内 NodeID 升序。
-	g.sccNodeOff = make([]uint32, g.sccCount+1)
-	for _, s := range g.sccOf {
-		g.sccNodeOff[s+1]++
-	}
-	for i := uint32(1); i <= g.sccCount; i++ {
-		g.sccNodeOff[i] += g.sccNodeOff[i-1]
-	}
-	g.sccNodes = make([]uint32, n)
-	cursor := make([]uint32, g.sccCount)
-	copy(cursor, g.sccNodeOff[:g.sccCount])
-	for u := uint32(0); u < n; u++ {
-		s := g.sccOf[u]
-		g.sccNodes[cursor[s]] = u
-		cursor[s]++
-	}
-
-	g.selfLoop = make([]bool, n)
-	for _, er := range g.edges {
-		if er.src == er.dst {
-			g.selfLoop[er.src] = true
-		}
-	}
-
+	g.snap = snap
 	g.sealed = true
+	g.nodes, g.edges = nil, nil // 写态已迁移进快照，释放
 	return nil
 }
 
@@ -244,34 +235,71 @@ func (g *Graph) Save(w io.Writer) error {
 	if !g.sealed {
 		return ErrNotSealed
 	}
-	nodes := make([]store.Node, len(g.nodes))
-	for i, n := range g.nodes {
+	snapNodes := g.snap.ExportNodes()
+	snapEdges := g.snap.ExportEdges()
+	nodes := make([]store.Node, len(snapNodes))
+	for i, n := range snapNodes {
 		nodes[i] = store.Node{Key: n.Key, Label: n.Label, Props: n.Props}
 	}
-	edges := make([]store.Edge, len(g.edges))
-	for i, e := range g.edges {
-		edges[i] = store.Edge{
-			SrcKey: g.nodes[e.src].Key,
-			DstKey: g.nodes[e.dst].Key,
-			Label:  g.labels[e.label],
-			Props:  e.props,
-		}
+	edges := make([]store.Edge, 0, len(snapEdges))
+	for _, e := range snapEdges {
+		src, _ := g.snap.NodeInfo(e.Src)
+		dst, _ := g.snap.NodeInfo(e.Dst)
+		edges = append(edges, store.Edge{
+			SrcKey: src.Key,
+			DstKey: dst.Key,
+			Label:  g.snap.LabelName(e.LabelID),
+			Props:  e.Props,
+		})
 	}
 	return store.Encode(w, nodes, edges)
 }
 
-// SaveFile 保存到路径。
+// SaveFile 保存到路径：临时文件 + fsync + 原子 rename，避免半写文件。
 func (g *Graph) SaveFile(path string) error {
-	f, err := os.Create(path)
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	return g.Save(f)
+	if err := g.Save(f); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func (g *Graph) saveBytes() ([]byte, error) {
+	var buf bytes.Buffer
+	if err := g.Save(&buf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // Load 从快照恢复图并自动 Seal。
 func Load(r io.Reader) (*Graph, error) {
+	g, err := loadGraph(r)
+	if err != nil {
+		return nil, err
+	}
+	if err := g.Seal(); err != nil {
+		return nil, err
+	}
+	return g, nil
+}
+
+func loadGraph(r io.Reader) (*Graph, error) {
 	nodes, edges, err := store.Decode(r)
 	if err != nil {
 		return nil, err
@@ -286,9 +314,6 @@ func Load(r io.Reader) (*Graph, error) {
 		if _, err := g.AddEdge(e.SrcKey, e.DstKey, e.Label, e.Props); err != nil {
 			return nil, err
 		}
-	}
-	if err := g.Seal(); err != nil {
-		return nil, err
 	}
 	return g, nil
 }
