@@ -37,14 +37,15 @@ g2, _ := vectra.LoadFile("deps.vg")
 - 可达性走超节点路径，visited 每位对应一个分量，零环检测；
 - "循环依赖阻断"的防御机制变成 `Cycles()` 诊断能力——SCC 成员表就是循环依赖清单。
 
-## 基准（M1 Pro，18 核，1M 节点 / 10M 边随机图）
+## 基准（M1 Pro，18 核，1M 节点 / 10M 边随机图，10 轮均值）
 
-| 查询 | 耗时 | vs 朴素 map 邻接 BFS (104ms) |
+| 查询 | 耗时 | vs 朴素 map 邻接 BFS (145ms) |
 |---|---|---|
-| 全图 BFS（串行 CSR） | 57ms | 1.8x |
-| 全图 BFS（并行 CSR） | 41ms | 2.6x |
-| 全图可达性（SCC 超节点） | 14ms | 7.3x |
+| 全图 BFS（串行 CSR） | 102ms | 1.4x |
+| 全图 BFS（并行 CSR） | 44ms | 3.3x |
+| 全图可达性（SCC 超节点） | 15ms | 9.7x |
 | 双向最短路径（单对，64 对均值） | ~0.42ms | — |
+| Seal（建图 + CSR + Tarjan + 凝聚） | 4.6s | — |
 
 ```
 go test -bench 1M -benchtime 5x ./
