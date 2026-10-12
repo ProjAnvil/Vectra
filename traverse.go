@@ -149,21 +149,24 @@ func (g *Graph) expandLayerSerial(adj adjacencyView, mask []bool, visited []uint
 	return next
 }
 
-// adjacencyView 把 CSR 的三个平行数组压成一个可拷贝的值类型，
+// adjacencyView 把 CSR 的四个平行数组压成一个可拷贝的值类型，
 // 避免 traverse 层持有内部包类型的指针。
 type adjacencyView struct {
-	off, tgt, lab []uint32
+	off, tgt, lab, eid []uint32
 }
 
 func (a adjacencyView) row(u uint32) (uint32, uint32) { return a.off[u], a.off[u+1] }
 func (a adjacencyView) target(s uint32) uint32        { return a.tgt[s] }
 func (a adjacencyView) label(s uint32) uint32         { return a.lab[s] }
+func (a adjacencyView) edge(s uint32) uint32          { return a.eid[s] }
 
 func (g *Graph) view(dir Direction) adjacencyView {
 	if dir == DirIn {
-		return adjacencyView{off: g.csrR.Offsets, tgt: g.csrR.Targets, lab: g.csrR.Labels}
+		a := g.csrR
+		return adjacencyView{off: a.Offsets, tgt: a.Targets, lab: a.Labels, eid: a.EdgeIDs}
 	}
-	return adjacencyView{off: g.csrF.Offsets, tgt: g.csrF.Targets, lab: g.csrF.Labels}
+	a := g.csrF
+	return adjacencyView{off: a.Offsets, tgt: a.Targets, lab: a.Labels, eid: a.EdgeIDs}
 }
 
 const (
@@ -355,4 +358,136 @@ func (g *Graph) Reachable(startKey string, opts ...ReachOption) ([]string, error
 		out = append(out, g.nodes[id].Key)
 	}
 	return out, nil
+}
+
+// Path 是一条节点-边交替的具体路径：Nodes[i] --Edges[i]--> Nodes[i+1]。
+type Path struct {
+	Nodes []NodeID
+	Edges []EdgeID
+}
+
+// Len 返回跳数（边数）。
+func (p Path) Len() int { return len(p.Edges) }
+
+const noParent = ^uint32(0)
+
+// ShortestPathIDs 双向 BFS 最短路径：始终整层展开较小一侧的前沿，
+// 标记时检测对侧 visited，首个相遇点的距离即最优（两侧距离均为
+// 精确 BFS 距离，且相遇前无更短路径存在的状态可达）。
+func (g *Graph) ShortestPathIDs(from, to NodeID) (Path, bool, error) {
+	if !g.sealed {
+		return Path{}, false, ErrNotSealed
+	}
+	n := uint32(len(g.nodes))
+	if uint32(from) >= n || uint32(to) >= n {
+		return Path{}, false, ErrNodeNotFound
+	}
+	if from == to {
+		return Path{Nodes: []NodeID{from}}, true, nil
+	}
+	nInt := int(n)
+	fVis := visitedPool.acquire(wordsFor(nInt))
+	bVis := visitedPool.acquire(wordsFor(nInt))
+	defer visitedPool.release(fVis)
+	defer visitedPool.release(bVis)
+	fParent := make([]uint32, nInt)
+	bParent := make([]uint32, nInt)
+	for i := range fParent {
+		fParent[i], bParent[i] = noParent, noParent
+	}
+
+	fAdj, bAdj := g.view(DirOut), g.view(DirIn)
+	fFront := []NodeID{from}
+	bFront := []NodeID{to}
+	fVis[from>>5] |= 1 << (from & 31)
+	bVis[to>>5] |= 1 << (to & 31)
+
+	for len(fFront) > 0 && len(bFront) > 0 {
+		if len(fFront) <= len(bFront) {
+			next, meet, ok := expandMeeting(fFront, fAdj, fVis, bVis, fParent)
+			if ok {
+				return g.reconstruct(meet, fParent, bParent), true, nil
+			}
+			fFront = next
+		} else {
+			next, meet, ok := expandMeeting(bFront, bAdj, bVis, fVis, bParent)
+			if ok {
+				return g.reconstruct(meet, fParent, bParent), true, nil
+			}
+			bFront = next
+		}
+	}
+	return Path{}, false, nil
+}
+
+// ShortestPath 是 ShortestPathIDs 的字符串 key 便捷版。
+func (g *Graph) ShortestPath(fromKey, toKey string) (Path, bool, error) {
+	fn, ok := g.NodeByKey(fromKey)
+	if !ok {
+		return Path{}, false, ErrNodeNotFound
+	}
+	tn, ok := g.NodeByKey(toKey)
+	if !ok {
+		return Path{}, false, ErrNodeNotFound
+	}
+	return g.ShortestPathIDs(fn.ID, tn.ID)
+}
+
+// expandMeeting 完整展开一层并返回新前沿；标记时检测对侧 visited，
+// 新标记 v 已在对侧集合中即为相遇点。
+func expandMeeting(frontier []NodeID, adj adjacencyView, mine, theirs []uint32, parent []uint32) (next []NodeID, meet uint32, found bool) {
+	for _, u := range frontier {
+		lo, hi := adj.row(uint32(u))
+		for s := lo; s < hi; s++ {
+			v := adj.target(s)
+			w := &mine[v>>5]
+			bit := uint32(1) << (v & 31)
+			if *w&bit != 0 {
+				continue
+			}
+			*w |= bit
+			parent[v] = uint32(u)
+			next = append(next, NodeID(v))
+			if !found && theirs[v>>5]&bit != 0 {
+				meet = v
+				found = true
+			}
+		}
+	}
+	return next, meet, found
+}
+
+// reconstruct 从相遇点向两侧回溯父指针拼接路径。
+// bParent 在反向图上的语义：bParent[v]=u 对应原图边 v->u，
+// 因此从 bParent[meet] 起步逐步回溯即得 meet->to 的正向节点序列。
+func (g *Graph) reconstruct(meet uint32, fParent, bParent []uint32) Path {
+	fwd := []NodeID{NodeID(meet)} // meet -> from，逆序
+	for v := fParent[meet]; v != noParent; v = fParent[v] {
+		fwd = append(fwd, NodeID(v))
+	}
+	// 反转得 from -> meet
+	for i, j := 0, len(fwd)-1; i < j; i, j = i+1, j-1 {
+		fwd[i], fwd[j] = fwd[j], fwd[i]
+	}
+	var bwd []NodeID // meet -> to
+	for v := bParent[meet]; v != noParent; v = bParent[v] {
+		bwd = append(bwd, NodeID(v))
+	}
+	nodes := append(fwd, bwd...)
+	edges := make([]EdgeID, 0, len(nodes)-1)
+	for i := 0; i+1 < len(nodes); i++ {
+		edges = append(edges, g.anyEdge(nodes[i], nodes[i+1]))
+	}
+	return Path{Nodes: nodes, Edges: edges}
+}
+
+// anyEdge 返回 u->v 的任意一条边（多边时任取首条）。
+func (g *Graph) anyEdge(u, v NodeID) EdgeID {
+	lo, hi := g.csrF.Offsets[u], g.csrF.Offsets[u+1]
+	for s := lo; s < hi; s++ {
+		if g.csrF.Targets[s] == uint32(v) {
+			return EdgeID(g.csrF.EdgeIDs[s])
+		}
+	}
+	return 0 // 路径保证连续，正常不可达
 }

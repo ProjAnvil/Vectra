@@ -453,3 +453,114 @@ func TestReachableLabelFilteredMatchesBFS(t *testing.T) {
 		}
 	}
 }
+
+func TestShortestPathBasic(t *testing.T) {
+	g := buildDAG(t)
+	p, found, err := g.ShortestPath("gateway", "kafka")
+	if err != nil || !found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+	wantNodes := []string{"gateway", "auth", "db", "kafka"}
+	if p.Len() != 3 {
+		t.Errorf("Len = %d, want 3", p.Len())
+	}
+	got := keysOf(t, g, p.Nodes)
+	if !slices.Equal(got, wantNodes) {
+		t.Errorf("path = %v, want %v", got, wantNodes)
+	}
+	wantLabels := []string{"CALLS", "QUERY", "EVENT"}
+	for i, e := range p.Edges {
+		edge, _ := g.EdgeByID(e)
+		if edge.Label != wantLabels[i] {
+			t.Errorf("edge[%d] label = %s, want %s", i, edge.Label, wantLabels[i])
+		}
+	}
+}
+
+func TestShortestPathSameNode(t *testing.T) {
+	g := buildDAG(t)
+	p, found, err := g.ShortestPath("db", "db")
+	if err != nil || !found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+	if len(p.Nodes) != 1 || p.Len() != 0 {
+		t.Errorf("self path = %v, want single node", p.Nodes)
+	}
+}
+
+func TestShortestPathNotFound(t *testing.T) {
+	g := buildDAG(t)
+	_, found, err := g.ShortestPath("kafka", "gateway")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Error("kafka->gateway should not be reachable (DAG)")
+	}
+}
+
+func TestShortestPathThroughCycle(t *testing.T) {
+	g := buildCyclic(t)
+	// c 所在分量 {a,b,c,d}；c->d->b：c 到 b 最短 2 跳
+	p, found, err := g.ShortestPath("c", "b")
+	if err != nil || !found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+	if p.Len() != 2 {
+		t.Errorf("Len = %d, want 2", p.Len())
+	}
+	got := keysOf(t, g, p.Nodes)
+	if !slices.Equal(got, []string{"c", "d", "b"}) {
+		t.Errorf("path = %v, want [c d b]", got)
+	}
+}
+
+func TestShortestPathUnknownKeys(t *testing.T) {
+	g := buildDAG(t)
+	if _, _, err := g.ShortestPath("nope", "db"); !errors.Is(err, vectra.ErrNodeNotFound) {
+		t.Errorf("err = %v, want ErrNodeNotFound", err)
+	}
+	if _, _, err := g.ShortestPath("db", "nope"); !errors.Is(err, vectra.ErrNodeNotFound) {
+		t.Errorf("err = %v, want ErrNodeNotFound", err)
+	}
+}
+
+// TestShortestPathBidirectionalMatchesBFS 属性测试：200 对随机点，
+// 双向路径长度必须等于单向 BFS 距离，且路径连续、边真实存在。
+func TestShortestPathBidirectionalMatchesBFS(t *testing.T) {
+	g := randGraph(t, 5000, 50000)
+	rng := rand.New(rand.NewSource(7))
+	for i := 0; i < 200; i++ {
+		from, to := vectra.NodeID(rng.Intn(5000)), vectra.NodeID(rng.Intn(5000))
+		p, found, err := g.ShortestPathIDs(from, to)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bfs, err := g.BFS([]vectra.NodeID{from})
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, ok := bfs.Depths[to]
+		if !ok {
+			if found {
+				t.Fatalf("pair %d->%d: bidir found but BFS did not reach", from, to)
+			}
+			continue
+		}
+		if !found {
+			t.Fatalf("pair %d->%d: BFS depth=%d but bidir not found", from, to, d)
+		}
+		if p.Len() != int(d) {
+			t.Fatalf("pair %d->%d: bidir len=%d BFS depth=%d", from, to, p.Len(), d)
+		}
+		if p.Nodes[0] != from || p.Nodes[len(p.Nodes)-1] != to {
+			t.Fatalf("path endpoints wrong: %v", p.Nodes)
+		}
+		for j, e := range p.Edges {
+			edge, ok := g.EdgeByID(e)
+			if !ok || edge.Src != p.Nodes[j] || edge.Dst != p.Nodes[j+1] {
+				t.Fatalf("edge %d mismatch on path %v", j, p.Nodes)
+			}
+		}
+	}
+}
