@@ -88,15 +88,25 @@ type edgeIn struct {
 	Props  map[string]any `json:"props,omitempty"`
 }
 
+type edgeDeleteIn struct {
+	SrcKey string `json:"srcKey" jsonschema:"source node key"`
+	DstKey string `json:"dstKey" jsonschema:"destination node key"`
+	Label  string `json:"label,omitempty"`
+}
+
 type injectIn struct {
-	Nodes []nodeIn `json:"nodes,omitempty"`
-	Edges []edgeIn `json:"edges,omitempty"`
+	Nodes       []nodeIn       `json:"nodes,omitempty"`
+	Edges       []edgeIn       `json:"edges,omitempty"`
+	DeleteEdges []edgeDeleteIn `json:"deleteEdges,omitempty" jsonschema:"delete edges by (srcKey,dstKey,label)"`
+	DeleteNodes []string       `json:"deleteNodes,omitempty" jsonschema:"delete nodes (cascades incident edges)"`
 }
 
 type countsOut struct {
 	NodesApplied int `json:"nodesApplied"`
 	EdgesApplied int `json:"edgesApplied"`
 	EdgesSkipped int `json:"edgesSkipped"`
+	EdgesDeleted int `json:"edgesDeleted"`
+	NodesDeleted int `json:"nodesDeleted"`
 }
 
 type statsOut struct {
@@ -169,7 +179,8 @@ type lookupIn struct {
 func registerTools(s *mcp.Server, svc *service) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "inject_batch",
-		Description: "Batch-write nodes and edges (upsert: same key updates props). " +
+		Description: "Batch-write and delete nodes/edges (writes are upserts: same key updates props; " +
+			"deleteEdges removes by (srcKey,dstKey,label), deleteNodes removes nodes and cascades their edges). " +
 			"Call seal after writing, before querying.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false},
 	}, svc.injectBatch)
@@ -245,6 +256,17 @@ func (svc *service) injectBatch(_ context.Context, _ *mcp.CallToolRequest, in in
 		}
 		for k := range e.Props {
 			svc.propKeys[k] = true
+		}
+	}
+	for _, d := range in.DeleteEdges {
+		if n, err := svc.live.DeleteEdge(d.SrcKey, d.DstKey, d.Label); err == nil {
+			out.EdgesDeleted += n
+		}
+	}
+	for _, k := range in.DeleteNodes {
+		if n, err := svc.live.DeleteNode(k); err == nil {
+			out.NodesDeleted++
+			out.EdgesDeleted += n
 		}
 	}
 	return nil, out, nil

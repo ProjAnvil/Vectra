@@ -217,3 +217,29 @@ func TestLookupProperty(t *testing.T) {
 		t.Fatalf("lookup_property: %+v", nodes.Nodes)
 	}
 }
+
+func TestInjectDeleteSeal(t *testing.T) {
+	cs := newTestSession(t)
+	call[struct{}](t, cs, "inject_batch", map[string]any{
+		"nodes": []map[string]any{{"key": "a"}, {"key": "b"}},
+		"edges": []map[string]any{{"srcKey": "a", "dstKey": "b", "label": "E"}},
+	})
+	out := call[struct {
+		EdgesDeleted int `json:"edgesDeleted"`
+		NodesDeleted int `json:"nodesDeleted"`
+	}](t, cs, "inject_batch", map[string]any{
+		"deleteEdges": []map[string]any{{"srcKey": "a", "dstKey": "b", "label": "E"}},
+		"deleteNodes": []string{"b"},
+	})
+	if out.EdgesDeleted != 1 || out.NodesDeleted != 1 {
+		t.Fatalf("out = %+v", out)
+	}
+	call[struct{}](t, cs, "seal", map[string]any{})
+	st := call[struct {
+		Nodes int `json:"nodes"`
+		Edges int `json:"edges"`
+	}](t, cs, "stats", map[string]any{})
+	if st.Nodes != 1 || st.Edges != 0 {
+		t.Fatalf("stats = %+v, want 1/0", st)
+	}
+}
