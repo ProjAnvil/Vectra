@@ -96,23 +96,58 @@ go test -bench 1M -benchtime 5x ./
 **4. 工作负载基准**（对标 SNB Interactive + parameter curation）。真实图上预固定查询参数（高扇出起点、已验证可达对）：2/3 跳邻域 17/36µs、点对最短路 2.3µs、可达性 6.6µs、16 源批量 BFS 122µs、快照冷加载 172 MB/s。
 
 ```
-go test ./...                     # 全部测试
+go test ./...                     # 引擎全部测试
 go test -race ./...               # 并发声明验证
 go test -short ./...              # 跳过百万节点压力项
 go test -bench 'SNB|1M' ./...     # 工作负载 + 微基准
+cd server && go test -race ./...  # 三节点混沌集群（选主/宕机/日志回放/查询不中断）
 ```
+
+## 服务模式（可选模块 `vectra/server`）
+
+竞品调研的规律：所有嵌入式图产品（Kuzu/CozoDB/SQLite）都没有内置复制，Raft 只活在 server 产品里。Vectra 沿用 rqlite/DQLite 先例——**复制包在引擎外面**：
+
+```
+写入: 客户端 →POST /v1/batch→ leader ─raft 复制→ 多数派提交
+                                        ↓ FSM.Apply（确定性回放到 live 可写图）
+      发布器（每节点本地）: RLock 克隆 → 锁外 Seal → atomic.Pointer 交换
+查询: GET /v1/* → 本地 published 快照（免锁并发读，永不中断）
+```
+
+```go
+// 节点 1（首个，自动引导）
+n, _ := server.New(server.Config{NodeID: "n1", HTTPAddr: ":8080",
+    RaftAddr: ":9000", DataDir: "/data/vectra"})
+http.ListenAndServe(":8080", n.Handler())
+
+// 节点 2/3（Join 指向任一既有节点的 HTTP 地址）
+n, _ = server.New(server.Config{NodeID: "n2", ..., Join: "http://n1:8080"})
+```
+
+**一致性语义**：写线性一致（raft 提交即返回）；读有界过期（本地快照，新鲜度 ≤ SealInterval，默认 2s；小图每 batch 立即发布）。**就绪门**：重启恢复期间（日志回放 + 首次发布完成前）查询返回 503 NOT_READY。
+
+**运维约束（防脑裂）**：`Join` 非空的节点绝不 bootstrap；两个空 Join 的新数据目录各自引导会形成两个独立集群——与 etcd initial-cluster 同类的运维错误，扩容永远走 Join。缩容（成员移除）v2 不支持，走重建集群。`{DataDir}/meta.json` 锁定节点身份，目录复用会报 `ErrDirMismatch`。
+
+**API**：`POST /v1/batch`（写）、`POST /v1/join`、`GET /v1/{health,stats,nodes/{key},neighbors,reachable,path,cycles}`、`POST /v1/query`、`GET /debug/vars`（expvar：applied/seals/leader_changes 等指标）。错误体 `{"error":{"code","message"}}`；非 leader 写入 503 + `Retry-After` + `X-Vectra-Leader` 提示。
+
+**依赖声明**：核心模块零第三方依赖（go.sum 不存在）；server 模块引入 hashicorp/raft v1.8.0 + raft-boltdb/v2 v2.4.2（传递依赖含已归档的 boltdb/bolt v1.3.1——Consul/Nomad 生产同款路径，可接受并在此记录）。
 
 ## 布局
 
 ```
-vectra.go      Graph：写入、Seal、查找、快照入口
-traverse.go    BFS（串行/并行）、Reachable、ShortestPath、Cycles
-query.go       链式查询构造器
-pool.go        visited 位图缓冲池
-internal/csr   CSR 邻接（无指针 uint32 平坦数组）
-internal/dag   Tarjan SCC、凝聚图、拓扑层级
-internal/store 二进制快照编解码
-testdata/     真实数据集夹具（SNAP email-Eu-core，84KB，含引用与统计推导）
+vectra.go            门面：Graph 写入、Seal、快照、属性索引
+traverse.go          门面：BFS/可达性/最短路/Cycles 的选项与类型翻译
+query.go             链式查询构造器（From/Out/In/MaxDepth/Where）
+internal/csr         CSR 邻接（无指针 uint32 平坦数组）
+internal/dag         Tarjan SCC、凝聚图、拓扑层级
+internal/engine      密封快照 + 访问器 + Seal 流水线 + 属性索引
+internal/traverse    算法：层同步 BFS、超节点可达性、双向最短路、Cycles
+internal/store       快照编解码（v2：CRC32 尾校验，v1 读兼容）
+server/              独立 module：raft 复制 + HTTP API + 热替换发布
+testdata/           真实数据集夹具（SNAP email-Eu-core，84KB，含引用与统计推导）
+docs/specs/         v2 spec（含竞品与 Raft 选型调研结论、子代理审计记录）
 ```
+
+**覆盖率**（`go test -cover`）：根包 88.8% · csr 100% · dag 100% · store 86.4% · engine+traverse 94.6%（跨包）· server 86.1%。
 
 测试含三组等价性/属性验证：并行 BFS ≡ 串行 BFS（20k 节点随机图 + race 检测）、超节点可达性 ≡ 节点级 BFS、双向最短路径 ≡ 单向 BFS 距离（200 对随机点，含路径连续性与边存在性）。
