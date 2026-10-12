@@ -23,9 +23,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"vectra"
-	"vectra/server"
-	"vectra/server/internal/bench"
+	"github.com/projanvil/vectra"
+	"github.com/projanvil/vectra/server"
+	"github.com/projanvil/vectra/server/internal/bench"
 )
 
 type sizeSpec struct {

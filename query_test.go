@@ -4,7 +4,7 @@ import (
 	"slices"
 	"testing"
 
-	"vectra"
+	"github.com/projanvil/vectra"
 )
 
 func TestQueryChainOut(t *testing.T) {

@@ -3,7 +3,7 @@ package bench
 import (
 	"math/rand"
 
-	"vectra"
+	"github.com/projanvil/vectra"
 )
 
 // QueryParams 是预固定的查询参数集（LDBC parameter curation）：

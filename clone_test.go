@@ -7,7 +7,7 @@ import (
 	"slices"
 	"testing"
 
-	"vectra"
+	"github.com/projanvil/vectra"
 )
 
 func TestClonePreSealIndependentEvolution(t *testing.T) {

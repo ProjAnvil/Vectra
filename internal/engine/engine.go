@@ -9,8 +9,8 @@ import (
 	"cmp"
 	"slices"
 
-	"vectra/internal/csr"
-	"vectra/internal/dag"
+	"github.com/projanvil/vectra/internal/csr"
+	"github.com/projanvil/vectra/internal/dag"
 )
 
 // NodeRec / EdgeRec 是图的原料记录。ID 是切片下标；LabelID 由根包的

@@ -13,7 +13,7 @@ import (
 
 	"github.com/hashicorp/raft"
 
-	"vectra"
+	"github.com/projanvil/vectra"
 )
 
 func TestNewValidationErrors(t *testing.T) {

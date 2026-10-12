@@ -1,0 +1,112 @@
+# Vectra
+
+[English](README.md) | **简体中文**
+
+面向**企业依赖图谱**（服务调用图、数据血缘、权限继承，10 万～1000 万边）的 Go 嵌入式内存图引擎。在这个量级，大图数据库背负的机制（buffer manager、磁盘页缓存、WAL 事务）全是纯成本。Vectra 押注相反的方向：图永远装得进内存，读免锁，整张图就是一份原子文件。
+
+v0.2 起，同一引擎可升级为**多副本基础服务**：独立的 `server` 模块用 hashicorp/raft（leader 选举、写复制）加 HTTP API 包住引擎——rqlite 模式的图版。并且原生说 **MCP**（Go / Python / TypeScript 三语实现），AI agent 可以直接查询你的依赖图谱。
+
+## 四个赌注
+
+| 赌注 | 收益 |
+|---|---|
+| 全内存 + 无指针 CSR（`[]uint32` 平坦数组） | GC 成本与边数无关；`Seal()` 后并发读免锁 |
+| 层同步并行 BFS（morsel 驱动 + 原子 Or 位图去重） | 1000 万边上比朴素 map 邻接快 3.3 倍 |
+| 写入侧 SCC 压缩（Tarjan）——查询面对 DAG | 可达性每位图一比特；`Cycles()` 免费诊断循环依赖 |
+| 单文件快照 + CRC32（v2 格式） | 原子发布/备份；服务模式蓝绿热替换 |
+
+## 快速上手（嵌入式）
+
+```go
+import "github.com/projanvil/vectra"
+
+g := vectra.New()
+g.AddNode("gateway", "Service", map[string]any{"env": "prod"})
+g.AddEdge("gateway", "auth", "CALLS", nil)
+g.Seal() // 此后不可变；并发读免锁
+
+// 链式遍历
+res, _ := g.Query().From("gateway").Out("CALLS").MaxDepth(3).Run()
+
+// 可达性（SCC 压缩快路径）
+reach, _ := g.Reachable("gateway")
+
+// 双向 BFS 最短路径
+path, found, _ := g.ShortestPath("gateway", "kafka")
+
+// 循环依赖发现
+for _, c := range g.Cycles() { ... }
+
+// 原子单文件快照
+g.SaveFile("deps.vg")
+```
+
+## 服务模式（可选模块）
+
+所有嵌入式图产品（Kuzu、CozoDB、SQLite）都不带复制；所有 Raft 产品都是 server。Vectra 沿用 rqlite 先例——复制包在引擎外，不进核心：
+
+```
+写入: 客户端 →POST /v1/batch→ leader ─raft→ 多数派提交 → FSM 确定性回放
+发布器（每节点）: RLock 克隆 → 锁外 Seal → 原子指针交换
+查询: GET /v1/* → 本地 published 快照（免锁，永不中断）
+```
+
+```bash
+cd server && go build -o vectra-server ./cmd/vectra-server
+./vectra-server -id n1 -data /data/n1 -http :8080 -raft :9000     # 首节点
+./vectra-server -id n2 -data /data/n2 -join http://n1:8080         # 加入集群
+```
+
+一致性语义：写线性一致（raft 提交即返回）；读有界过期（≤ SealInterval，小图即时）。防脑裂：设了 `Join` 的节点绝不引导。三节点进程内混沌测试（leader 宕机切换、日志回放追平、重发布期间查询零失败）在 `-race` 下进 CI。
+
+## MCP（AI agent）
+
+三个一等实现——[Go（嵌入引擎）](mcp)、[Python（FastMCP）](mcp/python)、[TypeScript](mcp/ts)——把一跳/多跳/最短路/可达性/循环依赖暴露为 MCP 工具：
+
+```bash
+claude mcp add vectra -- /path/to/vectra-mcp
+```
+
+全部传输方式与宿主配置见 [mcp/README.md](mcp/README.md)。
+
+## 基准（M1 Pro，幂律图，完整报告见 [docs/benchmarks](docs/benchmarks)）
+
+| 负载 | 1千/1万 | 10万/100万 | 100万/1000万（设计上界） |
+|---|---|---|---|
+| 一跳 p50 | 0.5µs | 4.4µs | 36µs |
+| 3 跳 p50 | 7.7µs | 763µs | 7.1ms |
+| 全图 BFS p50 | 16µs | 3.8ms | 70ms |
+| 最短路径 p50 | 3.2µs | 101µs | 1.1ms |
+| 注入（引擎 / raft+HTTP） | — | 950 万 / 140 万边每秒 | 940 万 / 130 万边每秒 |
+
+正确性按 LDBC 方法验证：与独立参考实现做属性对账、真实数据集外部 ground truth（SNAP email-Eu-core：203 个 SCC / 最大 803，对外发布的数字）、混沌与退化图测试、确定性检查。覆盖率：根包 89.8% · csr/dag 100% · store 84.3% · engine+traverse 94.6% · server 83.5%。
+
+## 仓库布局
+
+```
+vectra.go            门面：写入、Seal、快照、属性索引
+internal/csr         CSR 邻接（无指针 uint32 数组）
+internal/dag         Tarjan SCC、凝聚图、拓扑层级
+internal/engine      密封快照 + 访问器 + Seal 流水线
+internal/traverse    算法：层同步 BFS、可达性、双向最短路、循环发现
+internal/store       快照编解码（v2：CRC32 尾校验，v1 读兼容）
+server/              独立模块：raft 复制 + HTTP API + 热替换发布器
+                     ├─ cmd/vectra-server   服务二进制
+                     ├─ cmd/vectra-bench    压测工具
+mcp/                 独立模块：MCP 服务
+                     ├─ cmd/vectra-mcp      Go（嵌入引擎，stdio + HTTP）
+                     ├─ python/             FastMCP（包装 HTTP API）
+                     └─ ts/                 TypeScript（包装 HTTP API）
+testdata/            真实数据集夹具（SNAP email-Eu-core，含引用）
+docs/benchmarks/     压测设计与结果
+```
+
+核心模块**零第三方依赖**（无 go.sum）。`server` 模块引入 hashicorp/raft v1.8.0 + raft-boltdb/v2；`mcp` 模块引入 MCP 官方 Go SDK。部署什么引入什么。
+
+## 明确不做
+
+在线写 / delta-CSR（会推翻两个核心赌注）、超 1000 万边的磁盘溢出、核心内置完整 GQL 解析器、分片。路线图：k-hop 预计算、极简查询 DSL、属性类型化索引。
+
+## 许可证
+
+[MIT](LICENSE)

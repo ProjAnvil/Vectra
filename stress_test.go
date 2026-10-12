@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"vectra"
+	"github.com/projanvil/vectra"
 )
 
 // ============================================================

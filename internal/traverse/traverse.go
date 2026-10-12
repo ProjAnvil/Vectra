@@ -9,8 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"vectra/internal/csr"
-	"vectra/internal/dag"
+	"github.com/projanvil/vectra/internal/csr"
+	"github.com/projanvil/vectra/internal/dag"
 )
 
 // engineSnapshot 是 traverse 对密封快照的最小依赖面：engine.Snapshot

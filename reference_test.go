@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"vectra"
+	"github.com/projanvil/vectra"
 )
 
 // ============================================================

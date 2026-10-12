@@ -1,0 +1,17 @@
+[project]
+name = "vectra-mcp-python"
+version = "0.1.0"
+description = "MCP server for the Vectra dependency-graph engine (wraps the Vectra HTTP API)"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = ["fastmcp>=2.0", "httpx>=0.27"]
+
+[project.scripts]
+vectra-mcp-python = "vectra_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["vectra_mcp"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

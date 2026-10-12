@@ -12,7 +12,7 @@ import (
 
 	"github.com/hashicorp/raft"
 
-	"vectra"
+	"github.com/projanvil/vectra"
 )
 
 // ============================================================

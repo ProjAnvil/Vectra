@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"testing"
 
-	"vectra"
+	"github.com/projanvil/vectra"
 )
 
 // ============================================================

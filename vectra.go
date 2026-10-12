@@ -14,8 +14,8 @@ import (
 	"os"
 	"slices"
 
-	"vectra/internal/engine"
-	"vectra/internal/store"
+	"github.com/projanvil/vectra/internal/engine"
+	"github.com/projanvil/vectra/internal/store"
 )
 
 // NodeID / EdgeID 是图内整数标识。Seal 后所有查询结构以 NodeID 寻址，
@@ -30,18 +30,18 @@ var (
 )
 
 type Node struct {
-	ID    NodeID
-	Key   string
-	Label string
-	Props map[string]any
+	ID    NodeID         `json:"id"`
+	Key   string         `json:"key"`
+	Label string         `json:"label"`
+	Props map[string]any `json:"props,omitempty"`
 }
 
 type Edge struct {
-	ID    EdgeID
-	Src   NodeID
-	Dst   NodeID
-	Label string
-	Props map[string]any
+	ID    EdgeID         `json:"id"`
+	Src   NodeID         `json:"src"`
+	Dst   NodeID         `json:"dst"`
+	Label string         `json:"label"`
+	Props map[string]any `json:"props,omitempty"`
 }
 
 // Stats 汇报图的规模与压环结果。CyclicNodes 是属于大小>1 的 SCC 的

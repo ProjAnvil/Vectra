@@ -3,7 +3,7 @@ package bench
 import (
 	"testing"
 
-	"vectra"
+	"github.com/projanvil/vectra"
 )
 
 func buildSealed(t *testing.T, spec Spec) (*vectra.Graph, *Graph) {

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"vectra/internal/store"
+	"github.com/projanvil/vectra/internal/store"
 )
 
 func TestEncodeDecodeRoundtrip(t *testing.T) {

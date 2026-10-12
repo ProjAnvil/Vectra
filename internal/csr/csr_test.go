@@ -3,7 +3,7 @@ package csr_test
 import (
 	"testing"
 
-	"vectra/internal/csr"
+	"github.com/projanvil/vectra/internal/csr"
 )
 
 func TestBuildDegreesAndNeighbors(t *testing.T) {

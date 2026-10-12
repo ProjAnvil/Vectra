@@ -24,7 +24,7 @@ import (
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 
-	"vectra"
+	"github.com/projanvil/vectra"
 )
 
 // DefaultSealInterval 是大图发布的默认节流间隔；小于 smallGraphLimit

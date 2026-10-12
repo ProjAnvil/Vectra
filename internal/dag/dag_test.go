@@ -3,7 +3,7 @@ package dag_test
 import (
 	"testing"
 
-	"vectra/internal/dag"
+	"github.com/projanvil/vectra/internal/dag"
 )
 
 func graph(n uint32, edges [][2]uint32) func(uint32) []uint32 {

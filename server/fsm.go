@@ -11,7 +11,7 @@ import (
 
 	"github.com/hashicorp/raft"
 
-	"vectra"
+	"github.com/projanvil/vectra"
 )
 
 // defaultSmallGraphLimit：live 图规模低于此值时发布不做节流（每 batch

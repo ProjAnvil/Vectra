@@ -5,7 +5,7 @@ import (
 	"os"
 	"slices"
 
-	"vectra"
+	"github.com/projanvil/vectra"
 )
 
 // Example_quickstart 演示完整生命周期：建图 → Seal → 查询 → 快照。

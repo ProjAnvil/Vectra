@@ -1,7 +1,7 @@
 package vectra
 
 import (
-	tr "vectra/internal/traverse"
+	tr "github.com/projanvil/vectra/internal/traverse"
 )
 
 type Direction uint8

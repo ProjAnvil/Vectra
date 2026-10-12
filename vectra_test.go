@@ -7,7 +7,7 @@ import (
 	"slices"
 	"testing"
 
-	"vectra"
+	"github.com/projanvil/vectra"
 )
 
 func mustBuild(t *testing.T) *vectra.Graph {

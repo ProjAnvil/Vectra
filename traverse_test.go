@@ -7,7 +7,7 @@ import (
 	"slices"
 	"testing"
 
-	"vectra"
+	"github.com/projanvil/vectra"
 )
 
 // buildDAG 构建固定测试图（无环）:

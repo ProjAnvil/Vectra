@@ -5,7 +5,7 @@ import (
 	"math/rand"
 	"testing"
 
-	"vectra"
+	"github.com/projanvil/vectra"
 )
 
 // 基准规模：1M 节点 / 10M 边（设计目标量级上界的一次全景验证）。

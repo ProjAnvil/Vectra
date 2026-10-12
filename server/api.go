@@ -14,7 +14,7 @@ import (
 
 	"github.com/hashicorp/raft"
 
-	"vectra"
+	"github.com/projanvil/vectra"
 )
 
 func httpPost(url string, body []byte, timeout time.Duration) (*http.Response, error) {
