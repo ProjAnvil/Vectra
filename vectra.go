@@ -343,29 +343,60 @@ func (g *Graph) Stats() Stats {
 	return st
 }
 
-// Seal builds every immutable structure queries need (forward/reverse CSR,
-// Tarjan SCC, forward/reverse condensation DAG, member tables, self-loop
-// marks, property indexes); afterwards the graph is read-only with
-// lock-free concurrent reads.
+// compact returns the tombstone-free raw records: tombstoned nodes/edges are
+// skipped, edges whose endpoints were dropped are discarded too (defensive
+// for import paths), and node/edge IDs are renumbered densely. remap maps
+// old node ID -> new node ID (^NodeID(0) for dropped nodes). Shared by Seal
+// and ExportSnapshot.
+func (g *Graph) compact() (nodes []engine.NodeRec, edges []engine.EdgeRec, remap []NodeID) {
+	remap = make([]NodeID, len(g.nodes))
+	nodes = make([]engine.NodeRec, 0, len(g.nodes)-g.deadN)
+	for i, n := range g.nodes {
+		if g.tombN[i] {
+			remap[i] = ^NodeID(0)
+			continue
+		}
+		remap[i] = NodeID(len(nodes))
+		nodes = append(nodes, engine.NodeRec{Key: n.Key, Label: n.Label, Props: n.Props})
+	}
+	edges = make([]engine.EdgeRec, 0, len(g.edges)-g.deadE)
+	for i, e := range g.edges {
+		if g.tombE[i] || remap[e.src] == ^NodeID(0) || remap[e.dst] == ^NodeID(0) {
+			continue
+		}
+		edges = append(edges, engine.EdgeRec{
+			Src: uint32(remap[e.src]), Dst: uint32(remap[e.dst]),
+			LabelID: e.label, Props: e.props,
+		})
+	}
+	return nodes, edges, remap
+}
+
+// Seal compacts tombstones first (node and edge IDs may be renumbered), then
+// builds every immutable structure queries need (forward/reverse CSR, Tarjan
+// SCC, forward/reverse condensation DAG, member tables, self-loop marks,
+// property indexes); afterwards the graph is read-only with lock-free
+// concurrent reads.
 func (g *Graph) Seal() error {
 	if g.sealed {
 		return nil
 	}
-	nodes := make([]engine.NodeRec, len(g.nodes))
-	for i, n := range g.nodes {
-		nodes[i] = engine.NodeRec{Key: n.Key, Label: n.Label, Props: n.Props}
-	}
-	edges := make([]engine.EdgeRec, len(g.edges))
-	for i, e := range g.edges {
-		edges[i] = engine.EdgeRec{Src: uint32(e.src), Dst: uint32(e.dst), LabelID: e.label, Props: e.props}
-	}
+	nodes, edges, remap := g.compact()
 	snap, err := engine.Seal(nodes, edges, g.labels, g.indexKeys)
 	if err != nil {
 		return err
 	}
+	for i, n := range g.nodes { // byKey re-points at compacted IDs
+		if remap[i] != ^NodeID(0) {
+			g.byKey[n.Key] = remap[i]
+		} else {
+			delete(g.byKey, n.Key)
+		}
+	}
 	g.snap = snap
 	g.sealed = true
 	g.nodes, g.edges = nil, nil // write state migrated into snapshot, release
+	g.edgeIdx, g.tombE, g.tombN = nil, nil, nil
 	return nil
 }
 
@@ -543,17 +574,18 @@ func (g *Graph) ExportSnapshot() ([]byte, error) {
 		}
 		return buf.Bytes(), nil
 	}
-	nodes := make([]store.Node, len(g.nodes))
-	for i, n := range g.nodes {
+	nodesC, edgesC, _ := g.compact()
+	nodes := make([]store.Node, len(nodesC))
+	for i, n := range nodesC {
 		nodes[i] = store.Node{Key: n.Key, Label: n.Label, Props: n.Props}
 	}
-	edges := make([]store.Edge, 0, len(g.edges))
-	for _, e := range g.edges {
+	edges := make([]store.Edge, 0, len(edgesC))
+	for _, e := range edgesC {
 		edges = append(edges, store.Edge{
-			SrcKey: g.nodes[e.src].Key,
-			DstKey: g.nodes[e.dst].Key,
-			Label:  g.labels[e.label],
-			Props:  e.props,
+			SrcKey: nodesC[e.Src].Key,
+			DstKey: nodesC[e.Dst].Key,
+			Label:  g.labels[e.LabelID],
+			Props:  e.Props,
 		})
 	}
 	var buf bytes.Buffer

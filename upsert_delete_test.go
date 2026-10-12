@@ -132,3 +132,83 @@ func TestMutationAfterSealRejected(t *testing.T) {
 		t.Errorf("DeleteNode after seal: %v", err)
 	}
 }
+
+func TestSealCompactionRenumbersAndRebuildsKeyIndex(t *testing.T) {
+	g := vectra.New()
+	for _, k := range []string{"a", "b", "c"} {
+		if _, err := g.AddNode(k, "Svc", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, e := range [][3]string{{"a", "b", "E"}, {"b", "c", "E"}} {
+		if _, err := g.AddEdge(e[0], e[1], e[2], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := g.DeleteNode("b"); err != nil { // cascades both edges away
+		t.Fatal(err)
+	}
+	if err := g.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	st := g.Stats()
+	if st.Nodes != 2 || st.Edges != 0 {
+		t.Fatalf("Stats = %+v, want 2/0", st)
+	}
+	n, ok := g.NodeByKey("c") // original ID 2 -> 1 after compaction
+	if !ok || n.ID != 1 {
+		t.Errorf("NodeByKey(c) = %+v, want id 1", n)
+	}
+	if _, ok := g.NodeByKey("b"); ok {
+		t.Error("deleted key still present after seal")
+	}
+}
+
+func TestExportSnapshotCompactsTombstones(t *testing.T) {
+	g := mustBuild(t)
+	if _, err := g.DeleteEdge("gateway", "auth", "CALLS"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := g.ExportSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	g2, err := vectra.ImportSnapshot(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g2.NodeCount() != 4 || g2.EdgeCount() != 3 {
+		t.Fatalf("imported = %d/%d, want 4/3", g2.NodeCount(), g2.EdgeCount())
+	}
+	if err := g2.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	ns, err := g2.NeighborsOf("gateway", vectra.DirOut, "CALLS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ns) != 1 || ns[0].Key != "ledger" {
+		t.Errorf("neighbors = %+v, want only ledger", ns)
+	}
+}
+
+func TestClonePreservesTombstoneState(t *testing.T) {
+	g := mustBuild(t)
+	if _, err := g.DeleteNode("gateway"); err != nil {
+		t.Fatal(err)
+	}
+	c := g.Clone()
+	if c.NodeCount() != 3 || c.EdgeCount() != 2 {
+		t.Fatalf("clone counts = %d/%d, want 3/2", c.NodeCount(), c.EdgeCount())
+	}
+	if _, err := c.DeleteNode("auth"); err != nil {
+		t.Fatal(err) // deletes keep working on the clone (cascades auth->db)
+	}
+	if err := c.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	st := c.Stats()
+	if st.Nodes != 2 || st.Edges != 1 { // ledger->db survives
+		t.Errorf("clone stats = %+v, want 2/1", st)
+	}
+}
