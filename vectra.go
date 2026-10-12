@@ -64,6 +64,14 @@ type edgeRec struct {
 	props    map[string]any
 }
 
+// edgeKey is the logical identity of an edge for UpsertEdge/DeleteEdge:
+// the (src, dst, label) triple. EdgeID cannot serve as identity because
+// Seal-time compaction renumbers IDs.
+type edgeKey struct {
+	src, dst NodeID
+	label    uint32
+}
+
 // Graph is a Vectra graph. Single writer during the write phase; immutable
 // after Seal with lock-free concurrent reads. On Seal the write-state memory
 // migrates into the snapshot and is released.
@@ -76,10 +84,16 @@ type Graph struct {
 	indexKeys []string // property keys to index at Seal time
 	sealed    bool
 	snap      *engine.Snapshot
+
+	edgeIdx map[edgeKey][]EdgeID // (src,dst,label) -> live edge IDs (append order)
+	tombE   []bool               // parallel to edges: true = deleted (compacted at Seal)
+	tombN   []bool               // parallel to nodes: true = deleted (revivable via AddNode)
+	deadE   int                  // true-count in tombE (visible edges = len(edges)-deadE)
+	deadN   int                  // true-count in tombN
 }
 
 func New() *Graph {
-	return &Graph{byKey: map[string]NodeID{}, labIDs: map[string]uint32{}}
+	return &Graph{byKey: map[string]NodeID{}, labIDs: map[string]uint32{}, edgeIdx: map[edgeKey][]EdgeID{}}
 }
 
 func (g *Graph) internLabel(name string) uint32 {
@@ -104,7 +118,8 @@ func copyProps(props map[string]any) map[string]any {
 }
 
 // AddNode idempotently writes a node: if the key already exists it updates
-// label/props and returns the original ID.
+// label/props and returns the original ID. Re-adding a deleted (tombstoned)
+// key revives the node, reusing its ID.
 //
 // Props sharing contract: this method copies the passed-in map; but the maps
 // exposed via Node/Edge after Seal are internal references — updates must
@@ -115,12 +130,17 @@ func (g *Graph) AddNode(key, label string, props map[string]any) (NodeID, error)
 		return 0, ErrSealed
 	}
 	if id, ok := g.byKey[key]; ok {
+		if g.tombN[id] { // deleted then re-added: revive, reusing the ID
+			g.tombN[id] = false
+			g.deadN--
+		}
 		g.nodes[id].Label = label
 		g.nodes[id].Props = copyProps(props)
 		return id, nil
 	}
 	id := NodeID(len(g.nodes))
 	g.nodes = append(g.nodes, Node{ID: id, Key: key, Label: label, Props: copyProps(props)})
+	g.tombN = append(g.tombN, false)
 	g.byKey[key] = id
 	return id, nil
 }
@@ -130,17 +150,65 @@ func (g *Graph) AddEdge(srcKey, dstKey, label string, props map[string]any) (Edg
 	if g.sealed {
 		return 0, ErrSealed
 	}
+	src, dst, lid, err := g.resolveEdge(srcKey, dstKey, label)
+	if err != nil {
+		return 0, err
+	}
+	return g.appendEdge(src, dst, lid, props), nil
+}
+
+// UpsertEdge replaces-by-key: if live edges with the same (src, dst, label)
+// exist, their Props are replaced on the most recent one (edge ID kept;
+// extra parallel edges deleted); otherwise a new edge is appended. Unlike
+// AddEdge (pure append, multigraph semantics) this method guarantees the
+// triple is unique — it is the entry point for updating weight-like props
+// (relation strength, event counts).
+func (g *Graph) UpsertEdge(srcKey, dstKey, label string, props map[string]any) (EdgeID, error) {
+	if g.sealed {
+		return 0, ErrSealed
+	}
+	src, dst, lid, err := g.resolveEdge(srcKey, dstKey, label)
+	if err != nil {
+		return 0, err
+	}
+	k := edgeKey{src: src, dst: dst, label: lid}
+	ids := g.edgeIdx[k]
+	if len(ids) == 0 {
+		return g.appendEdge(src, dst, lid, props), nil
+	}
+	for _, id := range ids[:len(ids)-1] { // drop extra parallels, keep the most recent
+		g.tombE[id] = true
+		g.deadE++
+	}
+	keep := ids[len(ids)-1]
+	g.edges[keep].props = copyProps(props) // wholesale replacement (same contract as AddNode)
+	g.edgeIdx[k] = []EdgeID{keep}
+	return keep, nil
+}
+
+// resolveEdge looks up edge endpoints and label; deleted (tombstoned) nodes
+// count as nonexistent.
+func (g *Graph) resolveEdge(srcKey, dstKey, label string) (NodeID, NodeID, uint32, error) {
 	src, ok := g.byKey[srcKey]
-	if !ok {
-		return 0, ErrNodeNotFound
+	if !ok || g.tombN[src] {
+		return 0, 0, 0, ErrNodeNotFound
 	}
 	dst, ok := g.byKey[dstKey]
-	if !ok {
-		return 0, ErrNodeNotFound
+	if !ok || g.tombN[dst] {
+		return 0, 0, 0, ErrNodeNotFound
 	}
-	lid := g.internLabel(label)
+	return src, dst, g.internLabel(label), nil
+}
+
+// appendEdge is the shared tail of AddEdge/UpsertEdge: appends the edge
+// record and registers it in the key index.
+func (g *Graph) appendEdge(src, dst NodeID, lid uint32, props map[string]any) EdgeID {
 	g.edges = append(g.edges, edgeRec{src: src, dst: dst, label: lid, props: copyProps(props)})
-	return EdgeID(len(g.edges) - 1), nil
+	g.tombE = append(g.tombE, false)
+	id := EdgeID(len(g.edges) - 1)
+	k := edgeKey{src: src, dst: dst, label: lid}
+	g.edgeIdx[k] = append(g.edgeIdx[k], id)
+	return id
 }
 
 func (g *Graph) NodeByKey(key string) (Node, bool) {
@@ -180,21 +248,21 @@ func (g *Graph) EdgeByID(id EdgeID) (Edge, bool) {
 	return Edge{ID: id, Src: NodeID(src), Dst: NodeID(dst), Label: label, Props: props}, true
 }
 
-// NodeCount/EdgeCount report the true size in both states (after Seal the
-// write state has already migrated into the snapshot and been released;
-// reads come from the snapshot).
+// NodeCount/EdgeCount report the visible size in both states: before Seal
+// tombstoned records are subtracted; after Seal the write state has already
+// migrated into the snapshot and been released, reads come from the snapshot.
 func (g *Graph) NodeCount() int {
 	if g.sealed {
 		return g.snap.NodeCount()
 	}
-	return len(g.nodes)
+	return len(g.nodes) - g.deadN
 }
 
 func (g *Graph) EdgeCount() int {
 	if g.sealed {
 		return g.snap.EdgeCount()
 	}
-	return len(g.edges)
+	return len(g.edges) - g.deadE
 }
 
 func (g *Graph) Sealed() bool { return g.sealed }
@@ -377,6 +445,13 @@ func (g *Graph) Clone() *Graph {
 	c.labels = slices.Clone(g.labels)
 	c.labIDs = maps.Clone(g.labIDs)
 	c.indexKeys = slices.Clone(g.indexKeys)
+	c.tombE = slices.Clone(g.tombE)
+	c.tombN = slices.Clone(g.tombN)
+	c.deadE, c.deadN = g.deadE, g.deadN
+	c.edgeIdx = make(map[edgeKey][]EdgeID, len(g.edgeIdx))
+	for k, ids := range g.edgeIdx {
+		c.edgeIdx[k] = slices.Clone(ids)
+	}
 	return c
 }
 
