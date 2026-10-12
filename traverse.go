@@ -2,6 +2,7 @@ package vectra
 
 import (
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 )
@@ -490,4 +491,45 @@ func (g *Graph) anyEdge(u, v NodeID) EdgeID {
 		}
 	}
 	return 0 // 路径保证连续，正常不可达
+}
+
+// Cycle 是一个循环依赖：大小>1 的强连通分量的成员列表，
+// 或一个自环节点。
+type Cycle struct {
+	Nodes []NodeID
+}
+
+// Len 返回环上节点数。
+func (c Cycle) Len() int { return len(c.Nodes) }
+
+// Cycles 返回图中所有循环依赖，按成员数降序、再按最小成员 ID 升序。
+// 这是写入侧 SCC 压缩的副产品："循环依赖阻断"的防御性机制
+// 变成"循环依赖发现"的诊断性能力。
+func (g *Graph) Cycles() []Cycle {
+	if !g.sealed {
+		return nil
+	}
+	var cycles []Cycle
+	for s := uint32(0); s < g.sccCount; s++ {
+		if size := g.sccNodeOff[s+1] - g.sccNodeOff[s]; size > 1 {
+			mem := g.sccNodes[g.sccNodeOff[s]:g.sccNodeOff[s+1]]
+			ids := make([]NodeID, size)
+			for i, v := range mem {
+				ids[i] = NodeID(v)
+			}
+			cycles = append(cycles, Cycle{Nodes: ids})
+		}
+	}
+	for u, self := range g.selfLoop {
+		if self {
+			cycles = append(cycles, Cycle{Nodes: []NodeID{NodeID(u)}})
+		}
+	}
+	slices.SortFunc(cycles, func(a, b Cycle) int {
+		if a.Len() != b.Len() {
+			return b.Len() - a.Len()
+		}
+		return int(a.Nodes[0]) - int(b.Nodes[0])
+	})
+	return cycles
 }

@@ -564,3 +564,50 @@ func TestShortestPathBidirectionalMatchesBFS(t *testing.T) {
 		}
 	}
 }
+
+func TestCyclesFindsSCCAndSelfLoop(t *testing.T) {
+	g := vectra.New()
+	for _, k := range []string{"a", "b", "c", "d", "solo"} {
+		if _, err := g.AddNode(k, "Svc", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, e := range []struct{ s, d string }{
+		{"a", "b"}, {"b", "c"}, {"c", "a"}, // SCC {a,b,c}
+		{"c", "d"},                          // d 不在环
+		{"solo", "solo"},                    // 自环
+	} {
+		if _, err := g.AddEdge(e.s, e.d, "CALLS", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := g.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	cycles := g.Cycles()
+	if len(cycles) != 2 {
+		t.Fatalf("cycles = %d, want 2 (SCC{a,b,c} + self-loop solo)", len(cycles))
+	}
+	first := keysOf(t, g, cycles[0].Nodes)
+	slices.Sort(first)
+	if !slices.Equal(first, []string{"a", "b", "c"}) {
+		t.Errorf("first cycle = %v, want [a b c]", first)
+	}
+	if second := keysOf(t, g, cycles[1].Nodes); !slices.Equal(second, []string{"solo"}) {
+		t.Errorf("second cycle = %v, want [solo]", second)
+	}
+}
+
+func TestCyclesEmptyOnDAG(t *testing.T) {
+	g := buildDAG(t)
+	if cs := g.Cycles(); len(cs) != 0 {
+		t.Errorf("Cycles() = %d, want 0", len(cs))
+	}
+}
+
+func TestCyclesRequiresSealed(t *testing.T) {
+	g := vectra.New()
+	if cs := g.Cycles(); cs != nil {
+		t.Errorf("Cycles() before Seal = %v, want nil", cs)
+	}
+}
