@@ -220,3 +220,139 @@ func (g *Graph) expandLayerParallel(adj adjacencyView, mask []bool, visited []ui
 	}
 	return next
 }
+
+type reachConfig struct {
+	labelNames []string
+	direction  Direction
+}
+
+type ReachOption func(*reachConfig)
+
+func ReachWithLabels(names ...string) ReachOption {
+	return func(c *reachConfig) { c.labelNames = names }
+}
+func ReachWithDirection(d Direction) ReachOption {
+	return func(c *reachConfig) { c.direction = d }
+}
+
+// ReachableIDs 返回从 start 出发（含自身）可达的全部节点，按 NodeID 升序。
+// 在 SCC 凝聚 DAG 上做超节点 BFS：查询面对的图无环，visited 位图每位对应
+// 一个分量——这是写入侧压环换来的查询侧红利（环内互达由分量成员表
+// 一次性展开，无需节点级环检测）。
+func (g *Graph) ReachableIDs(start NodeID, opts ...ReachOption) ([]NodeID, error) {
+	if !g.sealed {
+		return nil, ErrNotSealed
+	}
+	if uint32(start) >= uint32(len(g.nodes)) {
+		return nil, ErrNodeNotFound
+	}
+	cfg := reachConfig{direction: DirOut}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	mask := g.labelMask(cfg.labelNames)
+
+	// 无标签过滤：超节点快路径——进入分量即互达（分量成员经任意边
+	// 互达），visited 位图每位对应一个分量。
+	// 有标签过滤：分量成员间可能只有被过滤的边（进入 a 不代表经
+	// DATA 边能到同分量的 b），退回节点级遍历保证严格语义。
+	if mask == nil {
+		return g.reachableSupernode(start, g.condensedView(cfg.direction)), nil
+	}
+	return g.reachableNodeLevel(start, cfg.direction, mask), nil
+}
+
+func (g *Graph) reachableSupernode(start NodeID, cond dagCondensed) []NodeID {
+	seen := make([]bool, g.sccCount)
+	startSCC := g.sccOf[start]
+	seen[startSCC] = true
+	frontier := []uint32{startSCC}
+	for len(frontier) > 0 {
+		var next []uint32
+		for _, s := range frontier {
+			for _, d := range cond.targets(s) {
+				if !seen[d] {
+					seen[d] = true
+					next = append(next, d)
+				}
+			}
+		}
+		frontier = next
+	}
+	out := make([]NodeID, 0, len(g.sccNodes))
+	for s := uint32(0); s < g.sccCount; s++ {
+		if !seen[s] {
+			continue
+		}
+		for _, v := range g.sccNodes[g.sccNodeOff[s]:g.sccNodeOff[s+1]] {
+			out = append(out, NodeID(v))
+		}
+	}
+	return out // sccNodes 组内 NodeID 升序、分量间按 ID 升序 → 整体升序
+}
+
+// reachableNodeLevel 是标签过滤时的严格可达性：节点级遍历，
+// 每条边都要命中掩码。结果按 NodeID 升序。
+func (g *Graph) reachableNodeLevel(start NodeID, dir Direction, mask []bool) []NodeID {
+	adj := g.view(dir)
+	n := uint32(len(g.nodes))
+	visited := visitedPool.acquire(wordsFor(int(n)))
+	defer visitedPool.release(visited)
+	testAndSet(visited, uint32(start))
+	frontier := []NodeID{start}
+	for len(frontier) > 0 {
+		var next []NodeID
+		for _, u := range frontier {
+			lo, hi := adj.row(uint32(u))
+			for s := lo; s < hi; s++ {
+				if !mask[adj.label(s)] {
+					continue
+				}
+				v := adj.target(s)
+				if !testAndSet(visited, v) {
+					next = append(next, NodeID(v))
+				}
+			}
+		}
+		frontier = next
+	}
+	out := make([]NodeID, 0, 64)
+	for v := uint32(0); v < n; v++ {
+		if visited[v>>5]&(1<<(v&31)) != 0 {
+			out = append(out, NodeID(v))
+		}
+	}
+	return out
+}
+
+// dagCondensed 是凝聚 DAG 的值类型视图（不依赖内部包类型导出）。
+type dagCondensed struct {
+	off, tgt []uint32
+}
+
+func (c dagCondensed) targets(s uint32) []uint32 { return c.tgt[c.off[s]:c.off[s+1]] }
+
+func (g *Graph) condensedView(dir Direction) dagCondensed {
+	c := g.cond
+	if dir == DirIn {
+		c = g.condR
+	}
+	return dagCondensed{off: c.Offsets, tgt: c.Targets}
+}
+
+// Reachable 是 ReachableIDs 的字符串 key 便捷版。
+func (g *Graph) Reachable(startKey string, opts ...ReachOption) ([]string, error) {
+	node, ok := g.NodeByKey(startKey)
+	if !ok {
+		return nil, ErrNodeNotFound
+	}
+	ids, err := g.ReachableIDs(node.ID, opts...)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, g.nodes[id].Key)
+	}
+	return out, nil
+}

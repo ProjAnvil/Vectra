@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"slices"
 	"testing"
 
 	"vectra"
@@ -338,6 +339,117 @@ func TestParallelBFSDirectionInEquivalence(t *testing.T) {
 	for id, d := range ser.Depths {
 		if par.Depths[id] != d {
 			t.Fatalf("node %d depth diverged", id)
+		}
+	}
+}
+
+func TestReachableThroughCycles(t *testing.T) {
+	g := buildCyclic(t)
+	res, err := g.ReachableIDs(ids(t, g, "a")[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := keysOf(t, g, res)
+	want := []string{"a", "b", "c", "d"}
+	if !slices.Equal(got, want) {
+		t.Errorf("Reachable(a) = %v, want %v (sorted, excludes e)", got, want)
+	}
+}
+
+func TestReachableLabels(t *testing.T) {
+	g := buildCyclic(t)
+	// e 的出边是 DATA；只走 CALLS 时仅剩起点自身
+	res, err := g.ReachableIDs(ids(t, g, "e")[0], vectra.ReachWithLabels("CALLS"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := keysOf(t, g, res); !slices.Equal(got, []string{"e"}) {
+		t.Errorf("Reachable(e, CALLS) = %v, want [e]", got)
+	}
+	// e -DATA-> a 之后进入 CALLS 域 {a,b,c,d}
+	res, err = g.ReachableIDs(ids(t, g, "e")[0], vectra.ReachWithLabels("DATA"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := keysOf(t, g, res); !slices.Equal(got, []string{"a", "e"}) {
+		t.Errorf("Reachable(e, DATA) = %v, want [a e] (e 经 DATA 到 a，a 无 DATA 出边)", got)
+	}
+}
+
+func TestReachableDirectionIn(t *testing.T) {
+	g := buildCyclic(t)
+	res, err := g.ReachableIDs(ids(t, g, "c")[0], vectra.ReachWithDirection(vectra.DirIn))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := keysOf(t, g, res)
+	if !slices.Equal(got, []string{"a", "b", "c", "d", "e"}) {
+		t.Errorf("Reachable(c, In) = %v, want [a b c d e]", got)
+	}
+}
+
+func TestReachableMatchesBFSOnRandomGraph(t *testing.T) {
+	g := randGraph(t, 20000, 200000)
+	for _, start := range []vectra.NodeID{0, 1, 42, 19999} {
+		bfs, err := g.BFS([]vectra.NodeID{start}, vectra.WithParallelThreshold(1<<30))
+		if err != nil {
+			t.Fatal(err)
+		}
+		reach, err := g.ReachableIDs(start)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bfs.Count() != len(reach) {
+			t.Fatalf("start %d: BFS=%d Reachable=%d", start, bfs.Count(), len(reach))
+		}
+		bm := map[vectra.NodeID]bool{}
+		for _, n := range bfs.Nodes() {
+			bm[n] = true
+		}
+		for _, n := range reach {
+			if !bm[n] {
+				t.Fatalf("start %d: node %d in Reachable but not BFS", start, n)
+			}
+		}
+	}
+}
+
+func TestReachableByStringKey(t *testing.T) {
+	g := buildCyclic(t)
+	res, err := g.Reachable("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(res, []string{"a", "b", "c", "d"}) {
+		t.Errorf("Reachable(a) = %v", res)
+	}
+	if _, err := g.Reachable("nope"); !errors.Is(err, vectra.ErrNodeNotFound) {
+		t.Errorf("err = %v, want ErrNodeNotFound", err)
+	}
+}
+
+func TestReachableLabelFilteredMatchesBFS(t *testing.T) {
+	g := randGraph(t, 20000, 200000)
+	for _, start := range []vectra.NodeID{0, 5, 777} {
+		bfs, err := g.BFS([]vectra.NodeID{start}, vectra.WithLabels("CALLS"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		reach, err := g.ReachableIDs(start, vectra.ReachWithLabels("CALLS"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bfs.Count() != len(reach) {
+			t.Fatalf("start %d: BFS=%d Reachable=%d", start, bfs.Count(), len(reach))
+		}
+		bm := map[vectra.NodeID]bool{}
+		for _, n := range bfs.Nodes() {
+			bm[n] = true
+		}
+		for _, n := range reach {
+			if !bm[n] {
+				t.Fatalf("start %d: node %d in Reachable but not label-BFS", start, n)
+			}
 		}
 	}
 }
