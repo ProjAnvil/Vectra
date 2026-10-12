@@ -1,0 +1,369 @@
+package server
+
+import (
+	"bytes"
+	"encoding/json"
+	"expvar"
+	"io"
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/hashicorp/raft"
+
+	"vectra"
+)
+
+func httpPost(url string, body []byte, timeout time.Duration) (*http.Response, error) {
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// API 错误模型：{"error":{"code":"...","message":"..."}}。
+type apiError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeErr(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]any{"error": apiError{Code: code, Message: msg}})
+}
+
+// queryRequest 是 POST /v1/query 的请求体。
+type queryRequest struct {
+	From      []string `json:"from"`
+	Labels    []string `json:"labels"`
+	Direction string   `json:"direction"` // "out"（默认）/"in"
+	MaxDepth  uint32   `json:"maxDepth"`
+}
+
+// Handler 返回该节点的 HTTP API（挂到任意 mux/httptest）。
+func (n *Node) Handler() http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("POST /v1/batch", n.handleBatch)
+	mux.HandleFunc("POST /v1/join", n.handleJoin)
+	mux.HandleFunc("GET /v1/health", n.handleHealth)
+	mux.HandleFunc("GET /v1/stats", n.handleStats)
+	mux.HandleFunc("GET /v1/nodes/{key}", n.handleNode)
+	mux.HandleFunc("GET /v1/neighbors", n.handleNeighbors)
+	mux.HandleFunc("POST /v1/query", n.handleQuery)
+	mux.HandleFunc("GET /v1/reachable", n.handleReachable)
+	mux.HandleFunc("GET /v1/path", n.handlePath)
+	mux.HandleFunc("GET /v1/cycles", n.handleCycles)
+	mux.Handle("/debug/vars", expvar.Handler())
+	n.registerExpvar()
+
+	return mux
+}
+
+var expvarOnce sync.Once
+
+func (n *Node) registerExpvar() {
+	expvarOnce.Do(func() {
+		m := n.fsm.metrics
+		expvar.Publish("vectra_applied_batches", expvar.Func(func() any { return m.AppliedBatches.Load() }))
+		expvar.Publish("vectra_applied_nodes", expvar.Func(func() any { return m.AppliedNodes.Load() }))
+		expvar.Publish("vectra_applied_edges", expvar.Func(func() any { return m.AppliedEdges.Load() }))
+		expvar.Publish("vectra_skipped_edges", expvar.Func(func() any { return m.SkippedEdges.Load() }))
+		expvar.Publish("vectra_seals", expvar.Func(func() any { return m.Seals.Load() }))
+		expvar.Publish("vectra_restores", expvar.Func(func() any { return m.Restores.Load() }))
+		expvar.Publish("vectra_queries", expvar.Func(func() any { return n.queryCount.Load() }))
+		expvar.Publish("vectra_leader_changes", expvar.Func(func() any { return m.LeaderChanges.Load() }))
+	})
+}
+
+// gateReady 是查询类端点的就绪门：首次发布前 503 NOT_READY。
+func (n *Node) gateReady(w http.ResponseWriter) bool {
+	select {
+	case <-n.fsm.Ready():
+		return true
+	default:
+		writeErr(w, http.StatusServiceUnavailable, "NOT_READY", "首次发布未完成（恢复中）")
+		return false
+	}
+}
+
+func (n *Node) graph(w http.ResponseWriter) *vectra.Graph {
+	if !n.gateReady(w) {
+		return nil
+	}
+	g := n.fsm.Published()
+	if g == nil {
+		writeErr(w, http.StatusServiceUnavailable, "NOT_READY", "快照尚未发布")
+		return nil
+	}
+	return g
+}
+
+func (n *Node) handleBatch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Nodes []NodeUpsert `json:"nodes"`
+		Edges []EdgeUpsert `json:"edges"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "坏请求体: "+err.Error())
+		return
+	}
+	res, err := n.Apply(r.Context(), Batch{Version: batchVersion, Nodes: req.Nodes, Edges: req.Edges})
+	if err != nil {
+		if err == ErrNotLeader {
+			if hint := n.LeaderHint(); hint != "" {
+				w.Header().Set("X-Vectra-Leader", hint)
+			}
+			w.Header().Set("Retry-After", "1")
+			writeErr(w, http.StatusServiceUnavailable, "NOT_LEADER", "写入请发往 leader")
+			return
+		}
+		writeErr(w, http.StatusGatewayTimeout, "TIMEOUT", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"nodesApplied": res.NodesApplied,
+		"edgesApplied": res.EdgesApplied,
+		"edgesSkipped": res.EdgesSkipped,
+	})
+}
+
+func (n *Node) handleJoin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		NodeID   string `json:"nodeID"`
+		RaftAddr string `json:"raftAddr"`
+		HTTPAddr string `json:"httpAddr"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil ||
+		req.NodeID == "" || req.RaftAddr == "" || req.HTTPAddr == "" {
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "需要 nodeID/raftAddr/httpAddr")
+		return
+	}
+	if !n.IsLeader() {
+		if hint := n.LeaderHint(); hint != "" {
+			w.Header().Set("X-Vectra-Leader", hint)
+		}
+		w.Header().Set("Retry-After", "1")
+		writeErr(w, http.StatusServiceUnavailable, "NOT_LEADER", "join 请发往 leader")
+		return
+	}
+	fut := n.r.AddVoter(raft.ServerID(req.NodeID), raft.ServerAddress(req.RaftAddr), 0, 15*time.Second)
+	if err := fut.Error(); err != nil {
+		// 已是成员视为幂等成功
+		writeErr(w, http.StatusConflict, "VALIDATION", "AddVoter: "+err.Error())
+		return
+	}
+	n.mergeRegistry(map[string]string{req.RaftAddr: req.HTTPAddr})
+	n.regMu.Lock()
+	regCopy := make(map[string]string, len(n.registry))
+	for k, v := range n.registry {
+		regCopy[k] = v
+	}
+	n.regMu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"registry": regCopy})
+}
+
+func (n *Node) handleHealth(w http.ResponseWriter, r *http.Request) {
+	select {
+	case <-n.fsm.Ready():
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":   "ok",
+			"isLeader": n.IsLeader(),
+			"term":     n.term(),
+		})
+	default:
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "starting"})
+	}
+}
+
+func (n *Node) term() uint64 {
+	if n.r == nil {
+		return 0
+	}
+	v, _ := strconv.ParseUint(n.r.Stats()["term"], 10, 64)
+	return v
+}
+
+func (n *Node) handleStats(w http.ResponseWriter, r *http.Request) {
+	g := n.graph(w)
+	if g == nil {
+		return
+	}
+	n.queryCount.Add(1)
+	st := g.Stats()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"nodes":       st.Nodes,
+		"edges":       st.Edges,
+		"sccs":        st.SCCs,
+		"cyclicNodes": st.CyclicNodes,
+		"isLeader":    n.IsLeader(),
+		"term":        n.term(),
+		"publishedAt": n.fsm.lastSealNanos.Load() / int64(time.Millisecond),
+	})
+}
+
+func (n *Node) handleNode(w http.ResponseWriter, r *http.Request) {
+	g := n.graph(w)
+	if g == nil {
+		return
+	}
+	n.queryCount.Add(1)
+	node, ok := g.NodeByKey(r.PathValue("key"))
+	if !ok {
+		writeErr(w, http.StatusNotFound, "NODE_NOT_FOUND", "节点不存在")
+		return
+	}
+	writeJSON(w, http.StatusOK, node)
+}
+
+func (n *Node) handleNeighbors(w http.ResponseWriter, r *http.Request) {
+	g := n.graph(w)
+	if g == nil {
+		return
+	}
+	n.queryCount.Add(1)
+	key := r.URL.Query().Get("key")
+	dir := parseDirection(r.URL.Query().Get("dir"))
+	label := r.URL.Query().Get("label")
+	var labels []string
+	if label != "" {
+		labels = []string{label}
+	}
+	ns, err := g.NeighborsOf(key, dir, labels...)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "NODE_NOT_FOUND", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"nodes": ns})
+}
+
+func (n *Node) handleQuery(w http.ResponseWriter, r *http.Request) {
+	var req queryRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 16<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "坏请求体: "+err.Error())
+		return
+	}
+	if len(req.From) == 0 {
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "缺少 from")
+		return
+	}
+	g := n.graph(w)
+	if g == nil {
+		return
+	}
+	n.queryCount.Add(1)
+	// API 语义：maxDepth 缺省/0 = 不限跳数
+	opts := []vectra.BFSOption{vectra.WithDirection(parseDirection(req.Direction))}
+	if req.MaxDepth > 0 {
+		opts = append(opts, vectra.WithMaxDepth(req.MaxDepth))
+	}
+	if len(req.Labels) > 0 {
+		opts = append(opts, vectra.WithLabels(req.Labels...))
+	}
+	starts := make([]vectra.NodeID, 0, len(req.From))
+	for _, k := range req.From {
+		node, ok := g.NodeByKey(k)
+		if !ok {
+			writeErr(w, http.StatusBadRequest, "NODE_NOT_FOUND", "起点不存在: "+k)
+			return
+		}
+		starts = append(starts, node.ID)
+	}
+	res, err := g.BFS(starts, opts...)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "INTERNAL", err.Error())
+		return
+	}
+	type nodeDepth struct {
+		Key   string `json:"key"`
+		Depth uint32 `json:"depth"`
+	}
+	out := make([]nodeDepth, 0, res.Count())
+	for _, id := range res.Nodes() {
+		node, _ := g.NodeByID(id)
+		out = append(out, nodeDepth{Key: node.Key, Depth: res.Depth(id)})
+	}
+	layers := make([][]string, len(res.Layers))
+	for i, l := range res.Layers {
+		layers[i] = make([]string, len(l))
+		for j, id := range l {
+			node, _ := g.NodeByID(id)
+			layers[i][j] = node.Key
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"count": res.Count(), "nodes": out, "layers": layers})
+}
+
+func (n *Node) handleReachable(w http.ResponseWriter, r *http.Request) {
+	g := n.graph(w)
+	if g == nil {
+		return
+	}
+	n.queryCount.Add(1)
+	from := r.URL.Query().Get("from")
+	reach, err := g.Reachable(from)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "NODE_NOT_FOUND", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"nodes": reach})
+}
+
+func (n *Node) handlePath(w http.ResponseWriter, r *http.Request) {
+	g := n.graph(w)
+	if g == nil {
+		return
+	}
+	n.queryCount.Add(1)
+	p, found, err := g.ShortestPath(r.URL.Query().Get("from"), r.URL.Query().Get("to"))
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "NODE_NOT_FOUND", err.Error())
+		return
+	}
+	if !found {
+		writeJSON(w, http.StatusOK, map[string]any{"found": false, "hops": 0})
+		return
+	}
+	keys := make([]string, len(p.Nodes))
+	for i, id := range p.Nodes {
+		node, _ := g.NodeByID(id)
+		keys[i] = node.Key
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"found": true, "hops": p.Len(), "nodes": keys})
+}
+
+func (n *Node) handleCycles(w http.ResponseWriter, r *http.Request) {
+	g := n.graph(w)
+	if g == nil {
+		return
+	}
+	n.queryCount.Add(1)
+	cycles := g.Cycles()
+	type cycleOut struct {
+		Nodes []string `json:"nodes"`
+	}
+	out := make([]cycleOut, len(cycles))
+	for i, c := range cycles {
+		out[i] = cycleOut{Nodes: make([]string, len(c.Nodes))}
+		for j, id := range c.Nodes {
+			node, _ := g.NodeByID(id)
+			out[i].Nodes[j] = node.Key
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"cycles": out})
+}
+
+func parseDirection(s string) vectra.Direction {
+	if s == "in" {
+		return vectra.DirIn
+	}
+	return vectra.DirOut
+}

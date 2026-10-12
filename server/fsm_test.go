@@ -226,8 +226,8 @@ func waitPublished(t *testing.T, f *fsm, nodes, edges int, within time.Duration)
 
 // memSink 是 raft.SnapshotSink 的内存实现（测试用）。
 type memSink struct {
-	buf     *bytes.Buffer
-	closed  bool
+	buf      *bytes.Buffer
+	closed   bool
 	canceled bool
 }
 

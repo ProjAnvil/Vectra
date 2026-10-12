@@ -17,7 +17,6 @@ import (
 // 远低于该值。
 const defaultSmallGraphLimit = 100_000
 
-
 // ApplyResult 是 FSM.Apply 的返回值（经 ApplyFuture.Response 传回）。
 type ApplyResult struct {
 	NodesApplied int
@@ -33,6 +32,7 @@ type Metrics struct {
 	SkippedEdges   atomic.Int64
 	Seals          atomic.Int64
 	Restores       atomic.Int64
+	LeaderChanges  atomic.Int64
 }
 
 // fsm 实现 raft.FSM：live 可写图 + 热替换发布器。
@@ -43,13 +43,13 @@ type Metrics struct {
 //   - Snapshot/Persist：克隆 live 直接序列化（无需 Seal）；
 //   - Restore：字节流重建 live 并立即首发布。
 type fsm struct {
-	mu       sync.RWMutex
-	live     *vectra.Graph
-	dirty    bool
-	version  int64 // 单调递增，发布器用它判断克隆后是否有新写入
+	mu        sync.RWMutex
+	live      *vectra.Graph
+	dirty     bool
+	version   int64 // 单调递增，发布器用它判断克隆后是否有新写入
 	published atomic.Pointer[vectra.Graph]
 
-	sealInterval   time.Duration
+	sealInterval    time.Duration
 	smallGraphLimit int
 
 	lastSealNanos atomic.Int64
