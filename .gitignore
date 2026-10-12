@@ -1,0 +1,4 @@
+# 压测/基准的本地数据目录（生成即弃，结果只进 docs/benchmarks/）
+benchdata/
+*.snap
+*.tmp
