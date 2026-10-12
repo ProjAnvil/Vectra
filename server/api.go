@@ -116,14 +116,22 @@ func (n *Node) graph(w http.ResponseWriter) *vectra.Graph {
 
 func (n *Node) handleBatch(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Nodes []NodeUpsert `json:"nodes"`
-		Edges []EdgeUpsert `json:"edges"`
+		Nodes       []NodeUpsert `json:"nodes"`
+		Edges       []EdgeUpsert `json:"edges"`
+		EdgeDeletes []EdgeDelete `json:"edgeDeletes"`
+		NodeDeletes []string     `json:"nodeDeletes"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<20)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "VALIDATION", "bad request body: "+err.Error())
 		return
 	}
-	res, err := n.Apply(r.Context(), Batch{Version: batchVersion, Nodes: req.Nodes, Edges: req.Edges})
+	res, err := n.Apply(r.Context(), Batch{
+		Version:     batchVersion,
+		Nodes:       req.Nodes,
+		Edges:       req.Edges,
+		EdgeDeletes: req.EdgeDeletes,
+		NodeDeletes: req.NodeDeletes,
+	})
 	if err != nil {
 		if err == ErrNotLeader {
 			if hint := n.LeaderHint(); hint != "" {
@@ -144,6 +152,9 @@ func (n *Node) handleBatch(w http.ResponseWriter, r *http.Request) {
 		"nodesApplied": res.NodesApplied,
 		"edgesApplied": res.EdgesApplied,
 		"edgesSkipped": res.EdgesSkipped,
+		"edgesDeleted": res.EdgesDeleted,
+		"nodesDeleted": res.NodesDeleted,
+		"nodesSkipped": res.NodesSkipped,
 	})
 }
 

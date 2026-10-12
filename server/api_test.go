@@ -426,3 +426,32 @@ func TestNodePublishedIsSealedGraph(t *testing.T) {
 	}
 	var _ *vectra.Graph = p
 }
+
+func TestAPIBatchDeletes(t *testing.T) {
+	tc := newTestCluster(t, 1)
+	leader := tc.leaderWithin(10 * time.Second)
+	postJSON(t, leader.URL()+"/v1/batch", map[string]any{
+		"nodes": []map[string]any{
+			{"key": "a", "label": "Svc"}, {"key": "b", "label": "Svc"},
+		},
+		"edges": []map[string]any{{"srcKey": "a", "dstKey": "b", "label": "E"}},
+	})
+	resp, out := postJSON(t, leader.URL()+"/v1/batch", map[string]any{
+		"edgeDeletes": []map[string]any{{"srcKey": "a", "dstKey": "b", "label": "E"}},
+		"nodeDeletes": []string{"b"},
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if out["edgesDeleted"] != float64(1) || out["nodesDeleted"] != float64(1) {
+		t.Errorf("out = %v", out)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if p := leader.node.Published(); p != nil && p.NodeCount() == 1 && p.EdgeCount() == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("published graph never reached 1/0")
+}
