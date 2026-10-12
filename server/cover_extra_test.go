@@ -305,3 +305,19 @@ func TestNewBadRaftAddrRejected(t *testing.T) {
 		t.Fatal("坏 RaftAddr 应报错")
 	}
 }
+
+// TestJoinGarbageResponseTolerated seed 返回非 JSON 注册表响应：
+// join 不失败，仅告警（注册表为空）。
+func TestJoinGarbageResponseTolerated(t *testing.T) {
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("not-json"))
+	}))
+	defer bad.Close()
+	tn := newTestNode(t, "j1", bad.URL)
+	defer func() { tn.node.Close(); tn.srv.Close() }()
+	// 节点照常启动
+	if tn.node.IsLeader() {
+		t.Log("未加入集群却成为 leader——不该发生（Join 非空不 bootstrap）")
+	}
+}

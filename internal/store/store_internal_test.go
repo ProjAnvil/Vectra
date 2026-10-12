@@ -3,7 +3,9 @@ package store
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"strings"
 	"testing"
 )
@@ -119,5 +121,18 @@ func TestDecodeV1PartialEdgeFields(t *testing.T) {
 	ok := append(numEdges(1), 1, 0, 0, 0, 'a', 1, 0, 0, 0, 'b', 1, 0, 0, 0, 'E', 0, 0, 0, 0)
 	if _, _, err := Decode(bytes.NewReader(base(append(node, ok...)))); err != nil {
 		t.Errorf("完整边不应失败: %v", err)
+	}
+}
+
+// TestDecodeHugeCountsRejectedWithValidCRC 攻击者可自算 CRC——
+// 计数下界校验必须独立于 CRC 生效。
+func TestDecodeHugeCountsRejectedWithValidCRC(t *testing.T) {
+	body := []byte{'V', 'C', 'T', 'R', 2, 0}    // magic + v2
+	body = append(body, 0xFF, 0xFF, 0x00, 0x00) // numNodes = 65535（声明巨大）
+	body = append(body, 0, 0, 0, 0)             // numEdges = 0
+	crc := crc32.ChecksumIEEE(body)
+	body = binary.LittleEndian.AppendUint32(body, crc)
+	if _, _, err := Decode(bytes.NewReader(body)); err == nil {
+		t.Fatal("合法 CRC + 伪造计数应被下界校验拒绝")
 	}
 }

@@ -148,6 +148,6 @@ testdata/           真实数据集夹具（SNAP email-Eu-core，84KB，含引�
 docs/specs/         v2 spec（含竞品与 Raft 选型调研结论、子代理审计记录）
 ```
 
-**覆盖率**（`go test -cover`）：根包 88.8% · csr 100% · dag 100% · store 86.4% · engine+traverse 94.6%（跨包）· server 86.1%。
+**覆盖率**（`go test -cover`）：根包 89.8% · csr 100% · dag 100% · store 84.3% · engine+traverse 94.6%（跨包）· server 83.5%。store/server 的剩余缺口集中在需要故障注入基建的防御分支（权限瞬态错误、发布单调守卫的丢弃路径等），属有意取舍。
 
 测试含三组等价性/属性验证：并行 BFS ≡ 串行 BFS（20k 节点随机图 + race 检测）、超节点可达性 ≡ 节点级 BFS、双向最短路径 ≡ 单向 BFS 距离（200 对随机点，含路径连续性与边存在性）。
