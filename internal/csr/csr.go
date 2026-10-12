@@ -65,7 +65,15 @@ func (a Adjacency) Neighbors(n uint32) []uint32 {
 }
 
 // Row 返回节点 n 的整行：邻居、边 ID、标签三段平行视图。
+// 未携带 payload 的数组返回 nil。
 func (a Adjacency) Row(n uint32) (targets, edgeIDs, labels []uint32) {
 	lo, hi := a.Offsets[n], a.Offsets[n+1]
-	return a.Targets[lo:hi], a.EdgeIDs[lo:hi], a.Labels[lo:hi]
+	targets = a.Targets[lo:hi]
+	if a.EdgeIDs != nil {
+		edgeIDs = a.EdgeIDs[lo:hi]
+	}
+	if a.Labels != nil {
+		labels = a.Labels[lo:hi]
+	}
+	return targets, edgeIDs, labels
 }
