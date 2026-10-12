@@ -5,9 +5,12 @@ package vectra
 
 import (
 	"errors"
+	"io"
+	"os"
 
 	"vectra/internal/csr"
 	"vectra/internal/dag"
+	"vectra/internal/store"
 )
 
 // NodeID / EdgeID 是图内整数标识。Seal 后所有查询结构以 NodeID 寻址，
@@ -234,4 +237,68 @@ func (g *Graph) Seal() error {
 
 	g.sealed = true
 	return nil
+}
+
+// Save 把整图写入 w。要求已 Seal（保证导出一致状态）。
+func (g *Graph) Save(w io.Writer) error {
+	if !g.sealed {
+		return ErrNotSealed
+	}
+	nodes := make([]store.Node, len(g.nodes))
+	for i, n := range g.nodes {
+		nodes[i] = store.Node{Key: n.Key, Label: n.Label, Props: n.Props}
+	}
+	edges := make([]store.Edge, len(g.edges))
+	for i, e := range g.edges {
+		edges[i] = store.Edge{
+			SrcKey: g.nodes[e.src].Key,
+			DstKey: g.nodes[e.dst].Key,
+			Label:  g.labels[e.label],
+			Props:  e.props,
+		}
+	}
+	return store.Encode(w, nodes, edges)
+}
+
+// SaveFile 保存到路径。
+func (g *Graph) SaveFile(path string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return g.Save(f)
+}
+
+// Load 从快照恢复图并自动 Seal。
+func Load(r io.Reader) (*Graph, error) {
+	nodes, edges, err := store.Decode(r)
+	if err != nil {
+		return nil, err
+	}
+	g := New()
+	for _, n := range nodes {
+		if _, err := g.AddNode(n.Key, n.Label, n.Props); err != nil {
+			return nil, err
+		}
+	}
+	for _, e := range edges {
+		if _, err := g.AddEdge(e.SrcKey, e.DstKey, e.Label, e.Props); err != nil {
+			return nil, err
+		}
+	}
+	if err := g.Seal(); err != nil {
+		return nil, err
+	}
+	return g, nil
+}
+
+// LoadFile 从路径恢复图。
+func LoadFile(path string) (*Graph, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return Load(f)
 }

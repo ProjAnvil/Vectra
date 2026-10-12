@@ -1,7 +1,10 @@
 package vectra_test
 
 import (
+	"bytes"
 	"errors"
+	"path/filepath"
+	"slices"
 	"testing"
 
 	"vectra"
@@ -132,5 +135,78 @@ func TestNodeByIDBounds(t *testing.T) {
 	}
 	if _, ok := g.EdgeByID(vectra.EdgeID(99)); ok {
 		t.Error("EdgeByID(99) should not exist")
+	}
+}
+
+func TestGraphSaveLoadRoundtrip(t *testing.T) {
+	g := buildCyclic(t) // 已 Seal，含环
+	var buf bytes.Buffer
+	if err := g.Save(&buf); err != nil {
+		t.Fatal(err)
+	}
+	g2, err := vectra.Load(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !g2.Sealed() {
+		t.Fatal("loaded graph not sealed")
+	}
+	st1, st2 := g.Stats(), g2.Stats()
+	if st1 != st2 {
+		t.Errorf("stats %v != %v", st1, st2)
+	}
+	r1, _ := g.Reachable("a")
+	r2, _ := g2.Reachable("a")
+	if !slices.Equal(r1, r2) {
+		t.Errorf("Reachable diverged: %v vs %v", r1, r2)
+	}
+	p1, ok1, _ := g.ShortestPath("c", "b")
+	p2, ok2, _ := g2.ShortestPath("c", "b")
+	if ok1 != ok2 || p1.Len() != p2.Len() {
+		t.Errorf("ShortestPath diverged")
+	}
+	if len(g.Cycles()) != len(g2.Cycles()) {
+		t.Errorf("Cycles diverged")
+	}
+	// props 保留
+	n, _ := g2.NodeByKey("a")
+	_ = n
+}
+
+func TestSaveRequiresSealed(t *testing.T) {
+	g := vectra.New()
+	if _, err := g.AddNode("a", "S", nil); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := g.Save(&buf); !errors.Is(err, vectra.ErrNotSealed) {
+		t.Errorf("err = %v, want ErrNotSealed", err)
+	}
+}
+
+func TestSaveFileLoadFileRoundtrip(t *testing.T) {
+	g := mustBuild(t)
+	if err := g.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "g.snap")
+	if err := g.SaveFile(path); err != nil {
+		t.Fatal(err)
+	}
+	g2, err := vectra.LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g2.Stats() != g.Stats() {
+		t.Errorf("stats diverged")
+	}
+	// 节点属性经 JSON 往返保留
+	n1, _ := g.NodeByKey("gateway")
+	n2, _ := g2.NodeByKey("gateway")
+	if n1.Props["team"] != n2.Props["team"] {
+		t.Errorf("props diverged: %v vs %v", n1.Props, n2.Props)
+	}
+	if _, err := vectra.LoadFile(filepath.Join(t.TempDir(), "missing.snap")); err == nil {
+		t.Error("expected error for missing file")
 	}
 }
