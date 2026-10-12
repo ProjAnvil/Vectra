@@ -211,6 +211,64 @@ func (g *Graph) appendEdge(src, dst NodeID, lid uint32, props map[string]any) Ed
 	return id
 }
 
+// DeleteEdge removes every live parallel edge with the given (src, dst,
+// label) triple (idempotent: deleting a triple that never existed succeeds
+// with 0). Returns the number of edges actually deleted.
+func (g *Graph) DeleteEdge(srcKey, dstKey, label string) (int, error) {
+	if g.sealed {
+		return 0, ErrSealed
+	}
+	src, ok := g.byKey[srcKey]
+	if !ok || g.tombN[src] {
+		return 0, ErrNodeNotFound
+	}
+	dst, ok := g.byKey[dstKey]
+	if !ok || g.tombN[dst] {
+		return 0, ErrNodeNotFound
+	}
+	lid, ok := g.labIDs[label]
+	if !ok {
+		return 0, nil // label never interned: no match possible, idempotent success
+	}
+	k := edgeKey{src: src, dst: dst, label: lid}
+	for _, id := range g.edgeIdx[k] {
+		g.tombE[id] = true
+	}
+	n := len(g.edgeIdx[k])
+	g.deadE += n
+	delete(g.edgeIdx, k)
+	return n, nil
+}
+
+// DeleteNode removes a node and cascade-deletes all its incident edges
+// (DETACH DELETE semantics). Cost is O(live edge keys) — a scan of the key
+// index. Re-adding the same key via AddNode revives the node (ID reused).
+// Returns the number of cascaded edge deletions.
+func (g *Graph) DeleteNode(key string) (int, error) {
+	if g.sealed {
+		return 0, ErrSealed
+	}
+	id, ok := g.byKey[key]
+	if !ok || g.tombN[id] {
+		return 0, ErrNodeNotFound
+	}
+	removed := 0
+	for k, ids := range g.edgeIdx { // deleting during range is safe in Go
+		if k.src != id && k.dst != id {
+			continue
+		}
+		for _, eid := range ids {
+			g.tombE[eid] = true
+		}
+		g.deadE += len(ids)
+		removed += len(ids)
+		delete(g.edgeIdx, k)
+	}
+	g.tombN[id] = true
+	g.deadN++
+	return removed, nil
+}
+
 func (g *Graph) NodeByKey(key string) (Node, bool) {
 	id, ok := g.byKey[key]
 	if !ok {
@@ -227,7 +285,7 @@ func (g *Graph) NodeByID(id NodeID) (Node, bool) {
 		}
 		return Node{ID: id, Key: rec.Key, Label: rec.Label, Props: rec.Props}, true
 	}
-	if int(id) >= len(g.nodes) {
+	if int(id) >= len(g.nodes) || g.tombN[id] {
 		return Node{}, false
 	}
 	return g.nodes[id], true
@@ -235,7 +293,7 @@ func (g *Graph) NodeByID(id NodeID) (Node, bool) {
 
 func (g *Graph) EdgeByID(id EdgeID) (Edge, bool) {
 	if !g.sealed {
-		if int(id) >= len(g.edges) {
+		if int(id) >= len(g.edges) || g.tombE[id] {
 			return Edge{}, false
 		}
 		e := g.edges[id]
@@ -281,7 +339,7 @@ func (g *Graph) Stats() Stats {
 		}
 		return st
 	}
-	st := Stats{Nodes: len(g.nodes), Edges: len(g.edges)}
+	st := Stats{Nodes: g.NodeCount(), Edges: g.EdgeCount()}
 	return st
 }
 

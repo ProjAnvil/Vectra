@@ -69,3 +69,66 @@ func TestUpsertEdgeUnknownNode(t *testing.T) {
 		t.Errorf("err = %v, want ErrNodeNotFound", err)
 	}
 }
+
+func TestDeleteEdgeIdempotent(t *testing.T) {
+	g := mustBuild(t)
+	n, err := g.DeleteEdge("gateway", "auth", "CALLS")
+	if err != nil || n != 1 {
+		t.Fatalf("DeleteEdge = %d, %v; want 1, nil", n, err)
+	}
+	if g.EdgeCount() != 3 {
+		t.Errorf("EdgeCount = %d, want 3", g.EdgeCount())
+	}
+	if e, ok := g.EdgeByID(0); ok {
+		t.Errorf("deleted edge still visible: %+v", e)
+	}
+	if n, err := g.DeleteEdge("gateway", "auth", "CALLS"); err != nil || n != 0 {
+		t.Errorf("re-delete = %d, %v; want 0, nil", n, err)
+	}
+	if _, err := g.DeleteEdge("x", "auth", "CALLS"); !errors.Is(err, vectra.ErrNodeNotFound) {
+		t.Errorf("missing node err = %v, want ErrNodeNotFound", err)
+	}
+}
+
+func TestDeleteNodeCascadesAndResurrects(t *testing.T) {
+	g := mustBuild(t)
+	n, err := g.DeleteNode("gateway")
+	if err != nil || n != 2 {
+		t.Fatalf("DeleteNode = %d, %v; want 2 cascaded edges", n, err)
+	}
+	if g.NodeCount() != 3 || g.EdgeCount() != 2 {
+		t.Fatalf("counts = %d/%d, want 3/2", g.NodeCount(), g.EdgeCount())
+	}
+	if _, ok := g.NodeByKey("gateway"); ok {
+		t.Error("deleted node still visible")
+	}
+	if _, err := g.AddEdge("gateway", "auth", "CALLS", nil); !errors.Is(err, vectra.ErrNodeNotFound) {
+		t.Errorf("AddEdge on deleted node: %v, want ErrNodeNotFound", err)
+	}
+	id, err := g.AddNode("gateway", "Service", nil) // revive
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != 0 {
+		t.Errorf("resurrected id = %d, want 0", id)
+	}
+	if g.NodeCount() != 4 {
+		t.Errorf("NodeCount = %d, want 4", g.NodeCount())
+	}
+}
+
+func TestMutationAfterSealRejected(t *testing.T) {
+	g := mustBuild(t)
+	if err := g.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.UpsertEdge("gateway", "auth", "CALLS", nil); !errors.Is(err, vectra.ErrSealed) {
+		t.Errorf("UpsertEdge after seal: %v", err)
+	}
+	if _, err := g.DeleteEdge("gateway", "auth", "CALLS"); !errors.Is(err, vectra.ErrSealed) {
+		t.Errorf("DeleteEdge after seal: %v", err)
+	}
+	if _, err := g.DeleteNode("gateway"); !errors.Is(err, vectra.ErrSealed) {
+		t.Errorf("DeleteNode after seal: %v", err)
+	}
+}
