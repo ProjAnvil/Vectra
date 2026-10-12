@@ -281,3 +281,9 @@ func (g *Graph) Cycles() []Cycle {
 	}
 	return out
 }
+
+// WithNodeFilter 对到达节点施加谓词（标记新节点时求值；起点恒入选，
+// 谓词不满足的节点不进入结果也不被展开）。
+func WithNodeFilter(pred func(Node) bool) BFSOption {
+	return func(c *bfsConfig) { c.nodeFilter = pred }
+}

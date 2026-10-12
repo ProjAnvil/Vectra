@@ -220,7 +220,7 @@ func (g *Graph) Seal() error {
 	for i, e := range g.edges {
 		edges[i] = engine.EdgeRec{Src: uint32(e.src), Dst: uint32(e.dst), LabelID: e.label, Props: e.props}
 	}
-	snap, err := engine.Seal(nodes, edges, g.labels, nil)
+	snap, err := engine.Seal(nodes, edges, g.labels, g.indexKeys)
 	if err != nil {
 		return err
 	}
@@ -326,4 +326,106 @@ func LoadFile(path string) (*Graph, error) {
 	}
 	defer f.Close()
 	return Load(f)
+}
+
+// IndexProperty 注册一个 Seal 期构建索引的字符串属性键（幂等，
+// Seal 后调用为空操作）。未注册的键在 LookupByProperty 中 ok=false。
+func (g *Graph) IndexProperty(key string) *Graph {
+	if g.sealed {
+		return g
+	}
+	for _, k := range g.indexKeys {
+		if k == key {
+			return g
+		}
+	}
+	g.indexKeys = append(g.indexKeys, key)
+	return g
+}
+
+// Clone 深拷贝一张可继续写入的图（结果恒为未密封态）。
+// Props map 按共享契约共享引用（依赖"替换不修改"纪律）。
+// server 模块的热替换发布器用它克隆 live 图。
+func (g *Graph) Clone() *Graph {
+	c := New()
+	if g.sealed {
+		for _, n := range g.snap.ExportNodes() {
+			_, _ = c.AddNode(n.Key, n.Label, n.Props)
+		}
+		for _, e := range g.snap.ExportEdges() {
+			src, _ := g.snap.NodeInfo(e.Src)
+			dst, _ := g.snap.NodeInfo(e.Dst)
+			_, _ = c.AddEdge(src.Key, dst.Key, g.snap.LabelName(e.LabelID), e.Props)
+		}
+		return c
+	}
+	for _, n := range g.nodes {
+		c.nodes = append(c.nodes, Node{ID: NodeID(len(c.nodes)), Key: n.Key, Label: n.Label, Props: n.Props})
+		c.byKey[n.Key] = n.ID
+	}
+	c.edges = append(c.edges, g.edges...)
+	c.labels = append(c.labels, g.labels...)
+	for k, v := range g.labIDs {
+		c.labIDs[k] = v
+	}
+	c.indexKeys = append(c.indexKeys, g.indexKeys...)
+	return c
+}
+
+// LookupByProperty 在 Seal 期索引上按字符串属性值查节点（升序 ID）。
+// key 未注册索引返回 ok=false；注册过则返回命中集（可为空）。
+func (g *Graph) LookupByProperty(key, value string) ([]Node, bool) {
+	if !g.sealed {
+		return nil, false
+	}
+	ids, ok := g.snap.LookupIndex(key, value)
+	if !ok {
+		return nil, false
+	}
+	out := make([]Node, 0, len(ids))
+	for _, id := range ids {
+		n, _ := g.NodeByID(NodeID(id))
+		out = append(out, n)
+	}
+	return out, true
+}
+
+// ExportSnapshot 序列化当前写态或密封态（未 Seal 也可导出——server
+// 模块的 FSM 快照对 live 图使用）。格式与 Save 相同（含 CRC）。
+func (g *Graph) ExportSnapshot() ([]byte, error) {
+	if g.sealed {
+		var buf bytes.Buffer
+		if err := g.Save(&buf); err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	}
+	nodes := make([]store.Node, len(g.nodes))
+	for i, n := range g.nodes {
+		nodes[i] = store.Node{Key: n.Key, Label: n.Label, Props: n.Props}
+	}
+	edges := make([]store.Edge, 0, len(g.edges))
+	for _, e := range g.edges {
+		edges = append(edges, store.Edge{
+			SrcKey: g.nodes[e.src].Key,
+			DstKey: g.nodes[e.dst].Key,
+			Label:  g.labels[e.label],
+			Props:  e.props,
+		})
+	}
+	var buf bytes.Buffer
+	if err := store.Encode(&buf, nodes, edges); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// ImportSnapshot 从快照字节构建未密封图（可继续写入）。Seal 时机由
+// 调用方决定——server FSM 的 Restore 路径用它重建 live 图。
+func ImportSnapshot(data []byte) (*Graph, error) {
+	g, err := loadGraph(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	return g, nil
 }
