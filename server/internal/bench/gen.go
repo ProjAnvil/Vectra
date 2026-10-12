@@ -1,5 +1,6 @@
-// Package bench 提供 Vectra 压测的图生成、参数固定化、延迟统计与
-// 负载执行。设计文档见 docs/benchmarks/DESIGN.md。
+// Package bench provides graph generation, parameter curation, latency stats,
+// and workload execution for Vectra stress tests. See docs/benchmarks/DESIGN.md
+// for the design document.
 package bench
 
 import (
@@ -7,16 +8,18 @@ import (
 	"math/rand"
 )
 
-// Spec 描述一次生成的图：幂律度分布（BA 优先连接，新节点连老节点），
-// cycleRate 比例的边反向制造环（真实依赖图存在少量循环依赖）。
+// Spec describes a graph to generate: power-law degree distribution (BA
+// preferential attachment, new nodes attach to old nodes), with a cycleRate
+// fraction of edges reversed to create cycles (real dependency graphs have
+// a few circular dependencies).
 type Spec struct {
 	Nodes     int
 	Edges     int
 	Seed      int64
-	CycleRate float64 // 0~1，默认 0.05
+	CycleRate float64 // 0~1, default 0.05
 }
 
-// Node / Edge 是生成产物（与 server.Batch 的 upsert 结构对齐）。
+// Node / Edge are generation artifacts (aligned with server.Batch's upsert structs).
 type Node struct {
 	Key   string
 	Label string
@@ -29,7 +32,7 @@ type Edge struct {
 	Label string
 }
 
-// Graph 是确定性生成结果。
+// Graph is the deterministic generation result.
 type Graph struct {
 	Nodes []Node
 	Edges []Edge
@@ -37,8 +40,9 @@ type Graph struct {
 
 var edgeLabels = []string{"CALLS", "DATA", "EVENT"}
 
-// Generate 按 BA 模型生成幂律图：节点带 tier 属性，边按序取标签。
-// 新→老方向为主（时间箭头），CycleRate 比例反向造环。
+// Generate produces a power-law graph per the BA model: nodes carry a tier
+// prop, edges take labels in order. New→old is the dominant direction (time
+// arrow); a CycleRate fraction reverses to create cycles.
 func Generate(spec Spec) *Graph {
 	if spec.CycleRate == 0 {
 		spec.CycleRate = 0.05
@@ -46,11 +50,12 @@ func Generate(spec Spec) *Graph {
 	rng := rand.New(rand.NewSource(spec.Seed))
 	g := &Graph{Nodes: make([]Node, 0, spec.Nodes)}
 
-	m := spec.Edges / spec.Nodes // 每新节点附带的边数（平均入度）
+	m := spec.Edges / spec.Nodes // Edges attached per new node (average in-degree)
 	if m < 1 {
 		m = 1
 	}
-	// 重复目标表：节点每获得一个度就在表中出现一次——按度比例抽样的经典实现
+	// Repeated-target table: a node appears once per degree gained — the classic
+	// degree-proportional sampling implementation
 	targets := make([]int, 0, spec.Edges*2)
 
 	addNode := func() int {
@@ -68,7 +73,7 @@ func Generate(spec Spec) *Graph {
 		return id
 	}
 
-	// 种子团（BA 的初始完全图）
+	// Seed cluster (BA's initial complete graph)
 	const seedCluster = 4
 	for i := 0; i < seedCluster && len(g.Nodes) < spec.Nodes; i++ {
 		u := addNode()
@@ -91,20 +96,21 @@ func Generate(spec Spec) *Graph {
 			if v == u {
 				continue
 			}
-			src, dst := u, v // 新 -> 老
+			src, dst := u, v // New -> old
 			if rng.Float64() < spec.CycleRate {
-				// 回边造环：两端都是"老节点获胜"，都积累选择权重
+				// Back edge creates a cycle: both endpoints are "old-node winners" and both gain selection weight
 				src, dst = v, u
 				targets = append(targets, src, dst)
 			} else {
-				// 前向边只给被选中的老节点加权（经典 BA：rich-get-richer
-				// 只作用于既有节点，新节点初始权重为 1，避免分布被压平）
+				// Forward edge only adds weight to the chosen old node (classic BA:
+				// rich-get-richer applies only to existing nodes; new nodes start
+				// with weight 1 to avoid flattening the distribution)
 				targets = append(targets, dst)
 			}
 			g.Edges = append(g.Edges, Edge{Src: src, Dst: dst, Label: edgeLabels[len(g.Edges)%len(edgeLabels)]})
 		}
 	}
-	// 补足边数（节点先用尽的场景）：随机节点对
+	// Top up the edge count (when nodes run out first): random node pairs
 	for len(g.Edges) < spec.Edges {
 		u := rng.Intn(len(g.Nodes))
 		v := rng.Intn(len(g.Nodes))

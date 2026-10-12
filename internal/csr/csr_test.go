@@ -7,7 +7,7 @@ import (
 )
 
 func TestBuildDegreesAndNeighbors(t *testing.T) {
-	// 边按插入序: 0->1, 0->2, 2->0, 3->3(自环)
+	// Edges in insertion order: 0->1, 0->2, 2->0, 3->3 (self-loop)
 	src := []uint32{0, 0, 2, 3}
 	dst := []uint32{1, 2, 0, 3}
 	a := csr.Build(4, src, dst)
@@ -50,13 +50,13 @@ func TestBuildPayloadsKeepsSlotPairing(t *testing.T) {
 	if lbs[0] != 5 || lbs[1] != 6 {
 		t.Errorf("row labels = %v, want [5 6]", lbs)
 	}
-	// 反向构建：payload 依然与 target 配对
+	// Reverse build: payloads still pair with targets
 	r := csr.BuildPayloads(3, dst, src, edgeIDs, labels)
 	if got := r.Neighbors(2); len(got) != 2 {
 		t.Fatalf("reverse Neighbors(2) len = %d, want 2", len(got))
 	}
 	rt, re, rl := r.Row(2)
-	// 插入序: 边20 (0->2) 先于 边30 (1->2)
+	// Insertion order: edge 20 (0->2) comes before edge 30 (1->2)
 	if rt[0] != 0 || rt[1] != 1 || re[0] != 20 || re[1] != 30 || rl[0] != 6 || rl[1] != 7 {
 		t.Errorf("reverse row = %v %v %v, want [0 1] [20 30] [6 7]", rt, re, rl)
 	}

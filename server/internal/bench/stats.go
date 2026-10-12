@@ -6,21 +6,21 @@ import (
 	"time"
 )
 
-// Percentile 就近排名法（nearest-rank）计算分位数，不修改输入。
-// 空样本返回 0。
+// Percentile computes a percentile via the nearest-rank method, without
+// modifying the input. Empty samples return 0.
 func Percentile(durs []time.Duration, p float64) time.Duration {
 	if len(durs) == 0 {
 		return 0
 	}
 	sorted := append([]time.Duration(nil), durs...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-	// 就近排名：第 ceil(p*N) 个样本（1 基）
+	// Nearest rank: the ceil(p*N)-th sample (1-based)
 	idx := int(math.Ceil(p*float64(len(sorted)))) - 1
 	idx = min(max(idx, 0), len(sorted)-1)
 	return sorted[idx]
 }
 
-// Summary 是一组延迟样本的统计量。
+// Summary holds the statistics of a set of latency samples.
 type Summary struct {
 	N    int
 	P50  time.Duration

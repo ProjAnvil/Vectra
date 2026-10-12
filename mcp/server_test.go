@@ -11,14 +11,14 @@ import (
 	"github.com/projanvil/vectra"
 )
 
-// newTestSession 起一个进程内 server 并用 MCP 客户端连接（真实协议路径）。
+// newTestSession starts an in-process server and connects an MCP client to it (real protocol path).
 func newTestSession(t *testing.T) *mcp.ClientSession {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	s := New(vectra.New(), Options{})
 	ct, st := mcp.NewInMemoryTransports()
 	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
-	go func() { _ = s.Run(ctx, st) }() // 服务端先就位，握手才能完成
+	go func() { _ = s.Run(ctx, st) }() // server must be up first so the handshake can complete
 	cs, err := client.Connect(ctx, ct, nil)
 	if err != nil {
 		cancel()
@@ -41,13 +41,13 @@ func call[Out any](t *testing.T, cs *mcp.ClientSession, tool string, args map[st
 		t.Fatalf("CallTool(%s): %v", tool, err)
 	}
 	if res.IsError {
-		t.Fatalf("CallTool(%s) 返回工具错误: %+v", tool, res.Content)
+		t.Fatalf("CallTool(%s) returned tool error: %+v", tool, res.Content)
 	}
-	// 结构化输出在 res.StructuredContent / res.RawOutput
+	// structured output is in res.StructuredContent / res.RawOutput
 	raw, _ := json.Marshal(res.StructuredContent)
 	var out Out
 	if err := json.Unmarshal(raw, &out); err != nil {
-		t.Fatalf("结构化输出解码: %v (%s)", err, raw)
+		t.Fatalf("decode structured output: %v (%s)", err, raw)
 	}
 	return out
 }
@@ -111,7 +111,7 @@ func TestNeighborsAndBFS(t *testing.T) {
 		t.Fatalf("neighbors: %+v", nb)
 	}
 
-	// 2 跳：a->b->c；限标签 CALLS 则 d（DATA）不可达
+	// 2 hops: a->b->c; with labels restricted to CALLS, d (DATA) is unreachable
 	bfs := call[struct {
 		Count int      `json:"count"`
 		Nodes []string `json:"nodes"`
@@ -124,7 +124,7 @@ func TestNeighborsAndBFS(t *testing.T) {
 		t.Fatalf("bfs count = %d: %+v", bfs.Count, bfs.Nodes)
 	}
 
-	// 结果封顶：limit=2 只返回 2 个但 total 反映真实数
+	// result capping: limit=2 returns only 2 nodes but total reflects the true count
 	lim := call[struct {
 		Count int      `json:"count"`
 		Total int      `json:"total"`
@@ -142,7 +142,7 @@ func TestShortestPathReachableCycles(t *testing.T) {
 		"edges": []map[string]any{
 			{"srcKey": "x", "dstKey": "y"},
 			{"srcKey": "y", "dstKey": "z"},
-			{"srcKey": "z", "dstKey": "y"}, // 环 y<->z
+			{"srcKey": "z", "dstKey": "y"}, // cycle y<->z
 			{"srcKey": "w", "dstKey": "x"},
 		},
 	})
@@ -185,9 +185,9 @@ func TestQueryBeforeSealIsHelpfulError(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !res.IsError {
-		t.Fatal("未 seal 的查询应返回工具错误")
+		t.Fatal("query before seal should return a tool error")
 	}
-	// 错误信息应提示 seal
+	// the error message should hint at seal
 	hint := ""
 	if len(res.Content) > 0 {
 		if tc, ok := res.Content[0].(*mcp.TextContent); ok {
@@ -195,7 +195,7 @@ func TestQueryBeforeSealIsHelpfulError(t *testing.T) {
 		}
 	}
 	if !strings.Contains(hint, "seal") {
-		t.Errorf("错误提示应包含 seal: %q", hint)
+		t.Errorf("error hint should contain seal: %q", hint)
 	}
 }
 
@@ -212,7 +212,7 @@ func TestLookupProperty(t *testing.T) {
 	nodes := call[struct {
 		Nodes []string `json:"nodes"`
 	}](t, cs, "lookup_property", map[string]any{"propKey": "env", "value": "prod"})
-	// MCP 服务在 seal 时自动注册注入期出现过的属性键
+	// the MCP service auto-registers property keys seen during injection when sealing
 	if len(nodes.Nodes) != 1 || nodes.Nodes[0] != "a" {
 		t.Fatalf("lookup_property: %+v", nodes.Nodes)
 	}

@@ -8,8 +8,9 @@ import (
 	"github.com/projanvil/vectra"
 )
 
-// 基准规模：1M 节点 / 10M 边（设计目标量级上界的一次全景验证）。
-// 用较小规模快速验证：go test -bench . -benchtime=1x
+// Benchmark size: 1M nodes / 10M edges (a full-scale run at the design
+// target's upper bound). For a quick check at smaller scale:
+// go test -bench . -benchtime=1x
 const benchNodes = 1_000_000
 const benchEdges = 10_000_000
 
@@ -31,7 +32,7 @@ func benchGraph(b *testing.B, nodes, edges int) *vectra.Graph {
 	return g
 }
 
-// map 邻接基线：朴素 Go 写法（map[int32][]int32 + slice visited）。
+// Map adjacency baseline: naive Go (map[int32][]int32 + slice visited).
 func bfsMap(adj map[int32][]int32, start int32, maxNodes int32) int {
 	visited := make([]bool, maxNodes)
 	frontier := []int32{start}
@@ -122,8 +123,9 @@ func BenchmarkReachable1M(b *testing.B) {
 	}
 }
 
-// BenchmarkShortestPathBiDirVsUni 双向 BFS vs 全图单向 BFS 距离查询。
-// 随机图中两点距离很短，双向的收益在路径展开量上。
+// BenchmarkShortestPathBiDirVsUni: bidirectional BFS vs whole-graph
+// unidirectional BFS distance queries. In random graphs node pairs are
+// close; bidirectional wins on path expansion volume.
 func BenchmarkShortestPathBiDir(b *testing.B) {
 	g := benchGraph(b, benchNodes, benchEdges)
 	pairs := make([][2]vectra.NodeID, 64)
@@ -156,7 +158,7 @@ func BenchmarkShortestPathUniBFS(b *testing.B) {
 				b.Fatal(err)
 			}
 			if !res.Reached(p[1]) {
-				_ = res // 不可达也算完成一次距离判定
+				_ = res // unreachable also counts as one distance determination
 			}
 		}
 	}

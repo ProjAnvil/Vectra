@@ -139,7 +139,7 @@ func TestNodeByIDBounds(t *testing.T) {
 }
 
 func TestGraphSaveLoadRoundtrip(t *testing.T) {
-	g := buildCyclic(t) // 已 Seal，含环
+	g := buildCyclic(t) // already Sealed, contains cycles
 	var buf bytes.Buffer
 	if err := g.Save(&buf); err != nil {
 		t.Fatal(err)
@@ -168,7 +168,7 @@ func TestGraphSaveLoadRoundtrip(t *testing.T) {
 	if len(g.Cycles()) != len(g2.Cycles()) {
 		t.Errorf("Cycles diverged")
 	}
-	// props 保留
+	// props preserved
 	n, _ := g2.NodeByKey("a")
 	_ = n
 }
@@ -200,7 +200,7 @@ func TestSaveFileLoadFileRoundtrip(t *testing.T) {
 	if g2.Stats() != g.Stats() {
 		t.Errorf("stats diverged")
 	}
-	// 节点属性经 JSON 往返保留
+	// node props preserved across the JSON round-trip
 	n1, _ := g.NodeByKey("gateway")
 	n2, _ := g2.NodeByKey("gateway")
 	if n1.Props["team"] != n2.Props["team"] {

@@ -26,7 +26,7 @@ func httpPost(url string, body []byte, timeout time.Duration) (*http.Response, e
 	return resp, nil
 }
 
-// API 错误模型：{"error":{"code":"...","message":"..."}}。
+// API error model: {"error":{"code":"...","message":"..."}}.
 type apiError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
@@ -42,15 +42,15 @@ func writeErr(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, map[string]any{"error": apiError{Code: code, Message: msg}})
 }
 
-// queryRequest 是 POST /v1/query 的请求体。
+// queryRequest is the request body of POST /v1/query.
 type queryRequest struct {
 	From      []string `json:"from"`
 	Labels    []string `json:"labels"`
-	Direction string   `json:"direction"` // "out"（默认）/"in"
+	Direction string   `json:"direction"` // "out" (default)/"in"
 	MaxDepth  uint32   `json:"maxDepth"`
 }
 
-// Handler 返回该节点的 HTTP API（挂到任意 mux/httptest）。
+// Handler returns this node's HTTP API (mountable on any mux/httptest).
 func (n *Node) Handler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -70,8 +70,9 @@ func (n *Node) Handler() http.Handler {
 	return mux
 }
 
-// expvarOnce 是进程级单例：同进程多节点（如测试集群）只有首个节点的
-// vitra_* 指标可见。单机生产部署无影响。
+// expvarOnce is a process-level singleton: with multiple nodes in one process
+// (e.g. a test cluster), only the first node's vitra_* metrics are visible.
+// No impact on single-node production deployments.
 var expvarOnce sync.Once
 
 func (n *Node) registerExpvar() {
@@ -88,13 +89,13 @@ func (n *Node) registerExpvar() {
 	})
 }
 
-// gateReady 是查询类端点的就绪门：首次发布前 503 NOT_READY。
+// gateReady is the readiness gate for query endpoints: 503 NOT_READY before the first publish.
 func (n *Node) gateReady(w http.ResponseWriter) bool {
 	select {
 	case <-n.fsm.Ready():
 		return true
 	default:
-		writeErr(w, http.StatusServiceUnavailable, "NOT_READY", "首次发布未完成（恢复中）")
+		writeErr(w, http.StatusServiceUnavailable, "NOT_READY", "first publish not completed (recovering)")
 		return false
 	}
 }
@@ -105,7 +106,7 @@ func (n *Node) graph(w http.ResponseWriter) *vectra.Graph {
 	}
 	g := n.fsm.Published()
 	if g == nil {
-		writeErr(w, http.StatusServiceUnavailable, "NOT_READY", "快照尚未发布")
+		writeErr(w, http.StatusServiceUnavailable, "NOT_READY", "snapshot not yet published")
 		return nil
 	}
 	return g
@@ -117,7 +118,7 @@ func (n *Node) handleBatch(w http.ResponseWriter, r *http.Request) {
 		Edges []EdgeUpsert `json:"edges"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<20)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "VALIDATION", "坏请求体: "+err.Error())
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "bad request body: "+err.Error())
 		return
 	}
 	res, err := n.Apply(r.Context(), Batch{Version: batchVersion, Nodes: req.Nodes, Edges: req.Edges})
@@ -127,7 +128,7 @@ func (n *Node) handleBatch(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("X-Vectra-Leader", hint)
 			}
 			w.Header().Set("Retry-After", "1")
-			writeErr(w, http.StatusServiceUnavailable, "NOT_LEADER", "写入请发往 leader")
+			writeErr(w, http.StatusServiceUnavailable, "NOT_LEADER", "send writes to the leader")
 			return
 		}
 		if errors.Is(err, ErrTimeout) {
@@ -152,7 +153,7 @@ func (n *Node) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil ||
 		req.NodeID == "" || req.RaftAddr == "" || req.HTTPAddr == "" {
-		writeErr(w, http.StatusBadRequest, "VALIDATION", "需要 nodeID/raftAddr/httpAddr")
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "nodeID/raftAddr/httpAddr required")
 		return
 	}
 	if !n.IsLeader() {
@@ -160,12 +161,12 @@ func (n *Node) handleJoin(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("X-Vectra-Leader", hint)
 		}
 		w.Header().Set("Retry-After", "1")
-		writeErr(w, http.StatusServiceUnavailable, "NOT_LEADER", "join 请发往 leader")
+		writeErr(w, http.StatusServiceUnavailable, "NOT_LEADER", "send join to the leader")
 		return
 	}
 	fut := n.r.AddVoter(raft.ServerID(req.NodeID), raft.ServerAddress(req.RaftAddr), 0, 15*time.Second)
 	if err := fut.Error(); err != nil {
-		// 重复 join（节点已在配置中）是正常运维动作，幂等成功
+		// Duplicate join (node already in the configuration) is a normal ops action, idempotent success
 		if n.alreadyMember(req.NodeID, req.RaftAddr) {
 			n.mergeRegistry(map[string]string{req.RaftAddr: req.HTTPAddr})
 			writeJSON(w, http.StatusOK, map[string]any{"registry": maps.Clone(safeRegistry(n))})
@@ -225,7 +226,7 @@ func (n *Node) handleNode(w http.ResponseWriter, r *http.Request) {
 	n.queryCount.Add(1)
 	node, ok := g.NodeByKey(r.PathValue("key"))
 	if !ok {
-		writeErr(w, http.StatusNotFound, "NODE_NOT_FOUND", "节点不存在")
+		writeErr(w, http.StatusNotFound, "NODE_NOT_FOUND", "node not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, node)
@@ -255,11 +256,11 @@ func (n *Node) handleNeighbors(w http.ResponseWriter, r *http.Request) {
 func (n *Node) handleQuery(w http.ResponseWriter, r *http.Request) {
 	var req queryRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 16<<20)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "VALIDATION", "坏请求体: "+err.Error())
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "bad request body: "+err.Error())
 		return
 	}
 	if len(req.From) == 0 {
-		writeErr(w, http.StatusBadRequest, "VALIDATION", "缺少 from")
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "missing from")
 		return
 	}
 	g := n.graph(w)
@@ -267,7 +268,7 @@ func (n *Node) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n.queryCount.Add(1)
-	// API 语义：maxDepth 缺省/0 = 不限跳数
+	// API semantics: maxDepth omitted/0 = unlimited hops
 	opts := []vectra.BFSOption{vectra.WithDirection(parseDirection(req.Direction))}
 	if req.MaxDepth > 0 {
 		opts = append(opts, vectra.WithMaxDepth(req.MaxDepth))
@@ -279,7 +280,7 @@ func (n *Node) handleQuery(w http.ResponseWriter, r *http.Request) {
 	for _, k := range req.From {
 		node, ok := g.NodeByKey(k)
 		if !ok {
-			writeErr(w, http.StatusBadRequest, "NODE_NOT_FOUND", "起点不存在: "+k)
+			writeErr(w, http.StatusBadRequest, "NODE_NOT_FOUND", "start node not found: "+k)
 			return
 		}
 		starts = append(starts, node.ID)
@@ -368,7 +369,7 @@ func (n *Node) handleCycles(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"cycles": out})
 }
 
-// alreadyMember 检查 nodeID 是否已在集群配置中（幂等 join 判定）。
+// alreadyMember checks whether nodeID is already in the cluster configuration (idempotent join check).
 func (n *Node) alreadyMember(nodeID, raftAddr string) bool {
 	cfgf := n.r.GetConfiguration()
 	if cfgf.Error() != nil {

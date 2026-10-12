@@ -8,10 +8,11 @@ import (
 	"time"
 )
 
-// Op 是一次负载操作。实现方负责参数轮换（闭包内原子计数）。
+// Op is a single workload operation. The implementer is responsible for
+// parameter rotation (atomic counter inside a closure).
 type Op func() error
 
-// LoadResult 是一个负载的完整压测结果。
+// LoadResult is the complete stress result of one workload.
 type LoadResult struct {
 	Name   string
 	Ops    int
@@ -20,8 +21,9 @@ type LoadResult struct {
 	QPS float64
 }
 
-// RunWorkload 并发执行 op：workers 个 goroutine 跑满 duration。
-// 延迟样本按 worker 本地缓冲记录、事后合并——避免共享锁污染测量。
+// RunWorkload executes op concurrently: workers goroutines run flat out for duration.
+// Latency samples are recorded in per-worker local buffers and merged afterwards —
+// avoiding shared-lock contamination of measurements.
 func RunWorkload(name string, op Op, workers int, duration time.Duration) LoadResult {
 	if workers < 1 {
 		workers = 1
@@ -48,7 +50,7 @@ func RunWorkload(name string, op Op, workers int, duration time.Duration) LoadRe
 			locs[w] = local
 		}(w)
 	}
-	// 到点后停（duration 已由 deadline 判定，此处保证退出）
+	// Stop at the deadline (duration already judged via deadline; this guarantees exit)
 	time.AfterFunc(duration, func() { stop.Store(true) })
 	wg.Wait()
 
@@ -63,7 +65,7 @@ func RunWorkload(name string, op Op, workers int, duration time.Duration) LoadRe
 	return res
 }
 
-// MarkdownTable 渲染对齐的 markdown 表（压测报告用）。
+// MarkdownTable renders an aligned markdown table (for stress reports).
 func MarkdownTable(header []string, rows [][]string) string {
 	var b strings.Builder
 	b.WriteString("| ")
@@ -81,7 +83,7 @@ func MarkdownTable(header []string, rows [][]string) string {
 	return b.String()
 }
 
-// FormatDur 把延迟渲染成人类可读的 µs/ms。
+// FormatDur renders a latency as human-readable µs/ms.
 func FormatDur(d time.Duration) string {
 	switch {
 	case d >= time.Millisecond:

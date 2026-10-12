@@ -1,8 +1,11 @@
-// Package engine 持有 Vectra 的密封图状态：Seal 产物（CSR、SCC、凝聚
-// DAG、成员表、属性索引）与原料（节点/边记录）。包只做状态与构建，
-// 不做查询算法——算法在 internal/traverse，两者都只被根包门面使用。
+// Package engine holds Vectra's sealed graph state: Seal outputs (CSR, SCC,
+// condensation DAG, member tables, property indexes) and raw records
+// (node/edge records). The package does state and construction only, no query
+// algorithms — those live in internal/traverse; both are used only by the
+// root package facade.
 //
-// Snapshot 构建后不可变，可被多 goroutine 免锁并发读。
+// Once built, a Snapshot is immutable and can be read concurrently by
+// multiple goroutines without locks.
 package engine
 
 import (
@@ -13,9 +16,11 @@ import (
 	"github.com/projanvil/vectra/internal/dag"
 )
 
-// NodeRec / EdgeRec 是图的原料记录。ID 是切片下标；LabelID 由根包的
-// 标签注册表分配。Props map 与调用方共享引用——本包与所有消费者的
-// 契约是"更新必须替换整个 map，禁止就地修改"。
+// NodeRec / EdgeRec are the graph's raw records. ID is the slice index;
+// LabelID is assigned by the root package's label registry. The Props map is
+// shared by reference with callers — the contract of this package and all
+// consumers is "updates must replace the whole map; in-place mutation is
+// forbidden".
 type NodeRec struct {
 	Key   string
 	Label string
@@ -29,34 +34,36 @@ type EdgeRec struct {
 	Props   map[string]any
 }
 
-// indexEntry 是属性索引项：值与节点 ID 联合排序，二分查找。
+// indexEntry is a property index entry: sorted jointly by value and node ID,
+// searched by binary search.
 type indexEntry struct {
 	val string
 	id  uint32
 }
 
-// Snapshot 是 Seal 之后的全部查询状态。
+// Snapshot is all query state after Seal.
 type Snapshot struct {
 	nodes  []NodeRec
 	edges  []EdgeRec
 	labels []string // labelID -> name
 
-	csrF csr.Adjacency // 正向邻接
-	csrR csr.Adjacency // 反向邻接
+	csrF csr.Adjacency // forward adjacency
+	csrR csr.Adjacency // reverse adjacency
 
-	sccOf      []uint32      // 节点 -> 分量
-	sccCount   uint32        // 分量总数
-	cond       dag.Condensed // 正向凝聚 DAG
-	condR      dag.Condensed // 反向凝聚 DAG
-	sccNodeOff []uint32      // 分量 -> 成员区间 [off, off+1)
-	sccNodes   []uint32      // 按分量分组的成员（组内升序）
+	sccOf      []uint32      // node -> component
+	sccCount   uint32        // component count
+	cond       dag.Condensed // forward condensation DAG
+	condR      dag.Condensed // reverse condensation DAG
+	sccNodeOff []uint32      // component -> member range [off, off+1)
+	sccNodes   []uint32      // members grouped by component (ascending within group)
 	selfLoop   []bool
 
-	indexes map[string][]indexEntry // 属性键 -> 有序索引（Seal 期构建）
+	indexes map[string][]indexEntry // property key -> sorted index (built at Seal time)
 }
 
-// Seal 从原料构建不可变快照：正/反向 CSR、Tarjan SCC、正/反向凝聚
-// DAG、分量成员表、自环标记、字符串属性索引。
+// Seal builds an immutable snapshot from raw records: forward/reverse CSR,
+// Tarjan SCC, forward/reverse condensation DAG, component member tables,
+// self-loop flags, and string property indexes.
 func Seal(nodes []NodeRec, edges []EdgeRec, labels []string, indexKeys []string) (*Snapshot, error) {
 	s := &Snapshot{nodes: nodes, edges: edges, labels: labels}
 	n := uint32(len(nodes))
@@ -88,7 +95,8 @@ func Seal(nodes []NodeRec, edges []EdgeRec, labels []string, indexKeys []string)
 	s.cond = dag.Condense(n, s.sccOf, s.sccCount, adjF, labF)
 	s.condR = dag.Condense(n, s.sccOf, s.sccCount, adjR, labR)
 
-	// 分量成员表：计数排序按 sccOf 分组；u 升序遍历保证组内升序。
+	// Component member table: counting sort groups by sccOf; ascending u
+	// iteration keeps members ascending within each group.
 	s.sccNodeOff = make([]uint32, s.sccCount+1)
 	for _, c := range s.sccOf {
 		s.sccNodeOff[c+1]++
@@ -133,27 +141,27 @@ func Seal(nodes []NodeRec, edges []EdgeRec, labels []string, indexKeys []string)
 	return s, nil
 }
 
-// ---- 只读访问器（traverse 与根包门面的全部依赖面） ----
+// ---- read-only accessors (the full dependency surface of traverse and the root facade) ----
 
-// AdjacencyF 返回正向 CSR。
+// AdjacencyF returns the forward CSR.
 func (s *Snapshot) AdjacencyF() csr.Adjacency { return s.csrF }
 
-// AdjacencyR 返回反向 CSR。
+// AdjacencyR returns the reverse CSR.
 func (s *Snapshot) AdjacencyR() csr.Adjacency { return s.csrR }
 
-// CondensedF 返回正向凝聚 DAG。
+// CondensedF returns the forward condensation DAG.
 func (s *Snapshot) CondensedF() dag.Condensed { return s.cond }
 
-// CondensedR 返回反向凝聚 DAG。
+// CondensedR returns the reverse condensation DAG.
 func (s *Snapshot) CondensedR() dag.Condensed { return s.condR }
 
-// NodeCount 返回节点总数。
+// NodeCount returns the total number of nodes.
 func (s *Snapshot) NodeCount() int { return len(s.nodes) }
 
-// EdgeCount 返回边总数。
+// EdgeCount returns the total number of edges.
 func (s *Snapshot) EdgeCount() int { return len(s.edges) }
 
-// NodeInfo 返回节点原料；越界返回 ok=false。
+// NodeInfo returns the node record; out of range returns ok=false.
 func (s *Snapshot) NodeInfo(id uint32) (NodeRec, bool) {
 	if int(id) >= len(s.nodes) {
 		return NodeRec{}, false
@@ -161,7 +169,8 @@ func (s *Snapshot) NodeInfo(id uint32) (NodeRec, bool) {
 	return s.nodes[id], true
 }
 
-// EdgeInfo 返回边原料（含标签名）；越界返回 ok=false。
+// EdgeInfo returns the edge record (label name included); out of range
+// returns ok=false.
 func (s *Snapshot) EdgeInfo(id uint32) (src, dst uint32, label string, props map[string]any, ok bool) {
 	if int(id) >= len(s.edges) {
 		return 0, 0, "", nil, false
@@ -170,25 +179,25 @@ func (s *Snapshot) EdgeInfo(id uint32) (src, dst uint32, label string, props map
 	return e.Src, e.Dst, s.labels[e.LabelID], e.Props, true
 }
 
-// LabelName 返回标签 ID 对应名称。
+// LabelName returns the name for a label ID.
 func (s *Snapshot) LabelName(id uint32) string { return s.labels[id] }
 
-// SCCOf 返回节点所属分量 ID。
+// SCCOf returns the component ID a node belongs to.
 func (s *Snapshot) SCCOf(v uint32) uint32 { return s.sccOf[v] }
 
-// SCCCount 返回分量总数。
+// SCCCount returns the total number of components.
 func (s *Snapshot) SCCCount() uint32 { return s.sccCount }
 
-// SCCMembers 返回分量 scc 的成员（升序）。
+// SCCMembers returns the members of component scc (ascending).
 func (s *Snapshot) SCCMembers(scc uint32) []uint32 {
 	return s.sccNodes[s.sccNodeOff[scc]:s.sccNodeOff[scc+1]]
 }
 
-// SelfLoop 报告节点是否有自环。
+// SelfLoop reports whether the node has a self-loop.
 func (s *Snapshot) SelfLoop(v uint32) bool { return s.selfLoop[v] }
 
-// LookupIndex 在 Seal 期构建的字符串属性索引上二分查找；
-// key 未注册返回 ok=false。
+// LookupIndex binary-searches the string property index built at Seal time;
+// an unregistered key returns ok=false.
 func (s *Snapshot) LookupIndex(key, value string) ([]uint32, bool) {
 	entries, ok := s.indexes[key]
 	if !ok {
@@ -210,6 +219,7 @@ func (s *Snapshot) LookupIndex(key, value string) ([]uint32, bool) {
 	return out, true
 }
 
-// ExportNodes / ExportEdges 返回原料切片（共享引用，只读契约）。
+// ExportNodes / ExportEdges return the raw record slices (shared references,
+// read-only contract).
 func (s *Snapshot) ExportNodes() []NodeRec { return s.nodes }
 func (s *Snapshot) ExportEdges() []EdgeRec { return s.edges }

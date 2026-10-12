@@ -1,11 +1,13 @@
-// Package server 是 Vectra 的可选服务模块：hashicorp/raft 复制 +
-// HTTP JSON API + 热替换发布。核心引擎模块保持零第三方依赖；
-// 本模块的依赖树只影响选择服务形态的用户（README 有完整声明）。
+// Package server is Vectra's optional server module: hashicorp/raft replication +
+// HTTP JSON API + hot-swap publishing. The core engine module stays free of
+// third-party dependencies; this module's dependency tree only affects users
+// choosing the server form (full disclosure in the README).
 //
-// 一致性语义：写线性一致（raft 提交即返回）；读有界过期
-// （本地 published 快照，新鲜度 ≤ SealInterval + 发布耗时）。
-// 防脑裂约束：Join 非空的节点绝不 bootstrap；两个空 Join 的新目录
-// 各自引导属于运维错误（与 etcd initial-cluster 同类）。
+// Consistency semantics: writes are linearizable (returns once raft commits);
+// reads are bounded-stale (local published snapshot, freshness ≤ SealInterval +
+// publish time). Anti-split-brain constraint: a node with non-empty Join never
+// bootstraps; two fresh directories with empty Join each bootstrapping is an
+// ops error (same class as etcd initial-cluster).
 package server
 
 import (
@@ -27,8 +29,8 @@ import (
 	"github.com/projanvil/vectra"
 )
 
-// DefaultSealInterval 是大图发布的默认节流间隔；小于 smallGraphLimit
-// 的图每 batch 立即发布。
+// DefaultSealInterval is the default publish throttle interval for large graphs;
+// graphs smaller than smallGraphLimit publish immediately per batch.
 const DefaultSealInterval = 2 * time.Second
 
 var (
@@ -37,15 +39,16 @@ var (
 	ErrDirMismatch = errors.New("server: data dir belongs to a different node")
 )
 
-// Config 组装一个服务节点。LogStore/StableStore/SnapshotStore/Transport
-// 为 nil 时使用生产默认（BoltDB + FileSnapshotStore + TCP）；
-// 注入 Inmem 系列可做进程内集群测试。RaftConfig 为 nil 时用默认参数。
+// Config assembles a server node. LogStore/StableStore/SnapshotStore/Transport
+// use production defaults when nil (BoltDB + FileSnapshotStore + TCP);
+// injecting the Inmem variants enables in-process cluster testing. RaftConfig
+// nil means default parameters.
 type Config struct {
 	NodeID        string
-	HTTPAddr      string // 对外 HTTP 监听（:0 可用）
-	RaftAddr      string // raft 对等地址
-	DataDir       string // 持久化目录（raft.db / snapshots / meta.json）
-	Join          string // seed 节点的 HTTP 地址；空 = 单节点引导
+	HTTPAddr      string // External HTTP listen address (:0 allowed)
+	RaftAddr      string // raft peer address
+	DataDir       string // Persistence directory (raft.db / snapshots / meta.json)
+	Join          string // Seed node's HTTP address; empty = single-node bootstrap
 	SealInterval  time.Duration
 	LogStore      raft.LogStore
 	StableStore   raft.StableStore
@@ -60,17 +63,17 @@ type nodeMeta struct {
 	RaftAddr string `json:"raftAddr"`
 }
 
-// Node 是一个 Vectra 服务节点：raft 复制 + FSM 发布 + HTTP API。
+// Node is a Vectra server node: raft replication + FSM publishing + HTTP API.
 type Node struct {
 	cfg Config
 	fsm *fsm
 	r   *raft.Raft
 
-	bolt  *raftboltdb.BoltStore // 生产模式持有；测试模式为 nil
+	bolt  *raftboltdb.BoltStore // Held in production mode; nil in test mode
 	trans raft.Transport
 
 	regMu    sync.Mutex
-	registry map[string]string // raftAddr -> httpAddr（尽力而为的提示表）
+	registry map[string]string // raftAddr -> httpAddr (best-effort hint table)
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -78,11 +81,11 @@ type Node struct {
 	leaderObs *raft.Observer
 	leaderChg chan raft.Observation
 
-	queryCount atomic.Int64 // api.go 使用
+	queryCount atomic.Int64 // Used by api.go
 }
 
-// New 打开（或创建）一个节点：恢复 raft 状态 → 组装 FSM →
-// 按需引导/加入。Join 为空且无既有状态时单节点引导。
+// New opens (or creates) a node: restore raft state → assemble FSM →
+// bootstrap/join as needed. Empty Join with no existing state = single-node bootstrap.
 func New(cfg Config) (*Node, error) {
 	if cfg.NodeID == "" {
 		return nil, fmt.Errorf("server: NodeID required")
@@ -107,7 +110,7 @@ func New(cfg Config) (*Node, error) {
 		closed:   make(chan struct{}),
 	}
 
-	// 持久化与传输
+	// Persistence and transport
 	if cfg.LogStore == nil || cfg.StableStore == nil {
 		bolt, err := raftboltdb.NewBoltStore(filepath.Join(cfg.DataDir, "raft.db"))
 		if err != nil {
@@ -136,12 +139,12 @@ func New(cfg Config) (*Node, error) {
 		}
 	}
 	n.trans = cfg.Transport
-	n.cfg = cfg // 注入默认值已填充完毕后再挂载
+	n.cfg = cfg // Attach only after injected defaults are fully populated
 
-	// FSM（发布器随之启动）
+	// FSM (publisher starts with it)
 	n.fsm = newFSM(cfg.SealInterval)
 
-	// 引导决策：有既有状态 → 不动；Join 空 → 单节点引导；Join 非空 → 等 seed 收编
+	// Bootstrap decision: existing state → leave alone; empty Join → single-node bootstrap; non-empty Join → wait for the seed to absorb us
 	hasState, err := raft.HasExistingState(cfg.LogStore, cfg.StableStore, cfg.SnapshotStore)
 	if err != nil {
 		n.Close()
@@ -169,7 +172,7 @@ func New(cfg Config) (*Node, error) {
 	}
 	n.r = r
 
-	// leader 变更观察（指标）
+	// Leader change observer (metrics)
 	n.leaderChg = make(chan raft.Observation, 16)
 	n.leaderObs = raft.NewObserver(n.leaderChg, false, func(o *raft.Observation) bool {
 		_, ok := o.Data.(raft.LeaderObservation)
@@ -178,11 +181,11 @@ func New(cfg Config) (*Node, error) {
 	r.RegisterObserver(n.leaderObs)
 	go n.watchLeader()
 
-	// 加入既有集群（注册表随 join 响应扩散）
+	// Join an existing cluster (registry propagates via the join response)
 	if cfg.Join != "" {
 		if err := n.Join(cfg.Join); err != nil {
-			// 不致命：节点保持候选状态，运维可重试 join
-			fmt.Fprintf(os.Stderr, "vectra/server: join %s 失败: %v\n", cfg.Join, err)
+			// Not fatal: the node stays candidate; ops can retry join
+			fmt.Fprintf(os.Stderr, "vectra/server: join %s failed: %v\n", cfg.Join, err)
 		}
 	}
 	return n, nil
@@ -202,7 +205,7 @@ func loadOrCreateMeta(cfg Config) (nodeMeta, error) {
 	var m nodeMeta
 	if data, err := os.ReadFile(path); err == nil {
 		if err := json.Unmarshal(data, &m); err != nil {
-			return m, fmt.Errorf("server: 坏 meta.json: %w", err)
+			return m, fmt.Errorf("server: bad meta.json: %w", err)
 		}
 		if m.NodeID != cfg.NodeID {
 			return m, fmt.Errorf("%w: dir=%s node=%s cfg=%s", ErrDirMismatch, cfg.DataDir, m.NodeID, cfg.NodeID)
@@ -210,9 +213,9 @@ func loadOrCreateMeta(cfg Config) (nodeMeta, error) {
 	} else if errors.Is(err, os.ErrNotExist) {
 		m = nodeMeta{NodeID: cfg.NodeID}
 	} else {
-		return m, fmt.Errorf("server: 读 meta.json: %w", err) // 权限类瞬态错误不绕过身份防线
+		return m, fmt.Errorf("server: read meta.json: %w", err) // Transient permission-class errors must not bypass the identity guard
 	}
-	// 地址允许漂移（重启换端口），ID 不允许
+	// Addresses may drift (restart with new ports); IDs may not
 	m.HTTPAddr, m.RaftAddr = cfg.HTTPAddr, cfg.RaftAddr
 	data, _ := json.MarshalIndent(m, "", "  ")
 	if err := os.WriteFile(path, data, 0o644); err != nil {
@@ -221,7 +224,7 @@ func loadOrCreateMeta(cfg Config) (nodeMeta, error) {
 	return m, nil
 }
 
-// Join 向 seed 节点登记自己（seed 侧执行 AddVoter 并回传注册表）。
+// Join registers this node with the seed (the seed side runs AddVoter and returns the registry).
 func (n *Node) Join(seedHTTP string) error {
 	body := map[string]string{
 		"nodeID":   n.cfg.NodeID,
@@ -242,13 +245,13 @@ func (n *Node) Join(seedHTTP string) error {
 		Registry map[string]string `json:"registry"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
-		fmt.Fprintf(os.Stderr, "vectra/server: join 响应解析失败（注册表未同步）: %v\n", err)
+		fmt.Fprintf(os.Stderr, "vectra/server: failed to parse join response (registry not synced): %v\n", err)
 	}
 	n.mergeRegistry(out.Registry)
 	return nil
 }
 
-// announceAddr 把 :0 之类的占位换成可广播形式（尽力而为）。
+// announceAddr replaces placeholders like :0 with an announcable form (best effort).
 func announceAddr(addr string) string {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -260,7 +263,7 @@ func announceAddr(addr string) string {
 	return net.JoinHostPort(host, port)
 }
 
-// Apply 把变更集经 raft 复制后提交到 FSM。非 leader 返回 ErrNotLeader。
+// Apply replicates a changeset through raft and commits it to the FSM. Returns ErrNotLeader when not the leader.
 func (n *Node) Apply(ctx context.Context, b Batch) (ApplyResult, error) {
 	data, err := encodeBatch(b)
 	if err != nil {
@@ -298,10 +301,10 @@ func (n *Node) Apply(ctx context.Context, b Batch) (ApplyResult, error) {
 	}
 }
 
-// IsLeader 报告当前节点是否为 leader。
+// IsLeader reports whether this node is currently the leader.
 func (n *Node) IsLeader() bool { return n.r != nil && n.r.State() == raft.Leader }
 
-// LeaderHint 返回已知 leader 的 HTTP 地址（尽力而为，可能为空）。
+// LeaderHint returns the known leader's HTTP address (best effort, may be empty).
 func (n *Node) LeaderHint() string {
 	if n.r == nil {
 		return ""
@@ -326,13 +329,13 @@ func (n *Node) mergeRegistry(m map[string]string) {
 	}
 }
 
-// Published 返回本地最近密封发布的图（nil = 尚未发布）。
+// Published returns the most recently sealed-and-published local graph (nil = not yet published).
 func (n *Node) Published() *vectra.Graph { return n.fsm.Published() }
 
-// Ready 在首次发布完成后可读（重启恢复的读就绪门）。
+// Ready becomes readable once the first publish completes (read readiness gate for restart recovery).
 func (n *Node) Ready() <-chan struct{} { return n.fsm.Ready() }
 
-// Close 幂等停机：停发布器 → raft.Shutdown → 关持久化。
+// Close shuts down idempotently: stop publisher → raft.Shutdown → close persistence.
 func (n *Node) Close() {
 	n.closeOnce.Do(func() {
 		close(n.closed)

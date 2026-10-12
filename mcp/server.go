@@ -1,9 +1,11 @@
-// Package mcpserver 用官方 Go SDK（modelcontextprotocol/go-sdk）把
-// Vectra 引擎暴露为 MCP 服务：直接嵌入引擎（单二进制，stdio 即可用，
-// 无需网络），供 Claude Desktop / Claude Code 等 MCP 宿主调用。
+// Package mcpserver uses the official Go SDK (modelcontextprotocol/go-sdk)
+// to expose the Vectra engine as an MCP service: the engine is embedded
+// directly (single binary, usable over stdio, no network), for MCP hosts
+// like Claude Desktop / Claude Code.
 //
-// 工具面遵循数据库 MCP 的最佳实践：小而全的 10 个工具、读写注解
-// 分离、结果默认封顶（limit，防上下文窗口爆炸）。
+// The tool surface follows database-MCP best practices: 10 small but
+// complete tools, separated read/write annotations, and results capped
+// by default (limit, to prevent context-window blowup).
 package mcpserver
 
 import (
@@ -17,69 +19,71 @@ import (
 	"github.com/projanvil/vectra"
 )
 
-// Version 是 MCP 服务宣告的实现版本。
+// Version is the implementation version advertised by the MCP service.
 const Version = "0.1.0"
 
-// defaultLimit 是 bfs/reachable 默认返回的节点数上限（结果封顶，
-// total 字段仍反映真实规模——数据库 MCP 的安全默认实践）。
+// defaultLimit is the default cap on nodes returned by bfs/reachable
+// (results are capped; the total field still reflects the true size,
+// a safe default practice for database MCPs).
 const defaultLimit = 1000
 
-// Options 配置 MCP 服务。
+// Options configures the MCP service.
 type Options struct {
-	// SnapshotPath 非空时：启动加载、每次 seal 后保存（单文件快照）。
+	// SnapshotPath, when non-empty: loaded at startup, saved after each seal (single-file snapshot).
 	SnapshotPath string
 }
 
-// service 持有嵌入的引擎状态。写入累积在 live 图；seal 后查询走
-// 密封视图。MCP 会话可并发调用工具——写入工具互斥，查询免锁。
+// service holds the embedded engine state. Writes accumulate in the live
+// graph; after seal, queries go through the sealed view. MCP sessions may
+// call tools concurrently: write tools are mutually exclusive, queries are lock-free.
 type service struct {
 	mu   sync.Mutex
 	live *vectra.Graph
-	view *vectra.Graph // 密封视图（nil = 未 seal）
+	view *vectra.Graph // sealed view (nil = not sealed)
 
-	propKeys map[string]bool // 注入期见过的属性键，seal 时自动建索引
+	propKeys map[string]bool // property keys seen during injection, auto-indexed at seal
 	opts     Options
 }
 
-// New 创建 MCP server（嵌入一个新图；有 SnapshotPath 则加载）。
+// New creates an MCP server (embedding the given graph; loads it if SnapshotPath is set).
 func New(g *vectra.Graph, opts Options) *mcp.Server {
 	svc := &service{live: g, propKeys: map[string]bool{}, opts: opts}
 	if opts.SnapshotPath != "" {
 		if loaded, err := vectra.LoadFile(opts.SnapshotPath); err == nil {
-			svc.view = loaded // Load 自动 Seal
+			svc.view = loaded // Load seals automatically
 		}
 	}
 	s := mcp.NewServer(
 		&mcp.Implementation{Name: "github.com/projanvil/vectra", Version: Version},
 		&mcp.ServerOptions{
-			Instructions: "Vectra 内存图引擎（依赖图谱）。写入用 inject_batch，" +
-				"写入后必须调用 seal 才能查询；查询工具：neighbors（一跳）、" +
-				"bfs（多跳）、shortest_path、reachable（影响面）、cycles（循环依赖）、" +
-				"stats、get_node、lookup_property。",
+			Instructions: "Vectra in-memory graph engine (dependency graphs). Write with inject_batch, " +
+				"then call seal before querying; query tools: neighbors (one hop), " +
+				"bfs (multi-hop), shortest_path, reachable (impact set), cycles (dependency cycles), " +
+				"stats, get_node, lookup_property.",
 		},
 	)
 	registerTools(s, svc)
 	return s
 }
 
-// Handler 返回 Streamable HTTP 传输的 http.Handler（挂载到 /mcp）。
+// Handler returns an http.Handler for the Streamable HTTP transport (mounted at /mcp).
 func Handler(g *vectra.Graph, opts Options) *mcp.StreamableHTTPHandler {
 	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
-		return New(g, opts) // 每连接一个 server 实例（无状态传输模式）
+		return New(g, opts) // one server instance per connection (stateless transport mode)
 	}, nil)
 }
 
-// ---- 输入/输出类型（JSON Schema 自动生成） ----
+// ---- input/output types (JSON Schema auto-generated) ----
 
 type nodeIn struct {
-	Key   string         `json:"key" jsonschema:"节点唯一键"`
+	Key   string         `json:"key" jsonschema:"unique node key"`
 	Label string         `json:"label,omitempty"`
 	Props map[string]any `json:"props,omitempty"`
 }
 
 type edgeIn struct {
-	SrcKey string         `json:"srcKey" jsonschema:"起点 key"`
-	DstKey string         `json:"dstKey" jsonschema:"终点 key"`
+	SrcKey string         `json:"srcKey" jsonschema:"source node key"`
+	DstKey string         `json:"dstKey" jsonschema:"destination node key"`
 	Label  string         `json:"label,omitempty"`
 	Props  map[string]any `json:"props,omitempty"`
 }
@@ -111,27 +115,27 @@ type nodeOut struct {
 
 type neighborsIn struct {
 	Key       string `json:"key"`
-	Direction string `json:"direction,omitempty" jsonschema:"out（默认）或 in"`
+	Direction string `json:"direction,omitempty" jsonschema:"out (default) or in"`
 	Label     string `json:"label,omitempty"`
 }
 
 type bfsIn struct {
-	From      []string `json:"from" jsonschema:"一个或多个起点 key"`
-	MaxDepth  uint32   `json:"maxDepth,omitempty" jsonschema:"缺省表示不限跳数"`
+	From      []string `json:"from" jsonschema:"one or more source node keys"`
+	MaxDepth  uint32   `json:"maxDepth,omitempty" jsonschema:"omitted means unlimited hops"`
 	Labels    []string `json:"labels,omitempty"`
 	Direction string   `json:"direction,omitempty"`
-	Limit     int      `json:"limit,omitempty" jsonschema:"返回节点数上限，默认 1000"`
+	Limit     int      `json:"limit,omitempty" jsonschema:"max nodes returned, default 1000"`
 }
 
 type listOut struct {
-	Count int      `json:"count" jsonschema:"本次返回数"`
-	Total int      `json:"total" jsonschema:"真实总数（可能被 limit 截断）"`
+	Count int      `json:"count" jsonschema:"number returned in this call"`
+	Total int      `json:"total" jsonschema:"true total (may be truncated by limit)"`
 	Nodes []string `json:"nodes"`
 }
 
 type depthOut struct {
 	listOut
-	Depths map[string]uint32 `json:"depths,omitempty" jsonschema:"key->跳数"`
+	Depths map[string]uint32 `json:"depths,omitempty" jsonschema:"key->hop count"`
 }
 
 type pathIn struct {
@@ -151,7 +155,7 @@ type reachIn struct {
 }
 
 type cyclesOut struct {
-	Cycles [][]string `json:"cycles" jsonschema:"每个循环依赖的成员 key 列表，按规模降序"`
+	Cycles [][]string `json:"cycles" jsonschema:"member key list of each dependency cycle, sorted by size descending"`
 }
 
 type lookupIn struct {
@@ -160,66 +164,66 @@ type lookupIn struct {
 	Limit   int    `json:"limit,omitempty"`
 }
 
-// ---- 工具注册 ----
+// ---- tool registration ----
 
 func registerTools(s *mcp.Server, svc *service) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "inject_batch",
-		Description: "批量写入节点与边（upsert：同 key 更新属性）。" +
-			"写入后需调用 seal 才能查询。",
+		Description: "Batch-write nodes and edges (upsert: same key updates props). " +
+			"Call seal after writing, before querying.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false},
 	}, svc.injectBatch)
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "seal",
-		Description: "密封图：构建查询索引后图变为只读可查询（写前需重新注入）。返回图统计。",
+		Description: "Seal the graph: builds query indexes and makes the graph read-only and queryable (re-inject to write again). Returns graph stats.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false},
 	}, svc.seal)
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "stats", Description: "图统计：节点/边/强连通分量/环上节点数。",
+		Name: "stats", Description: "Graph stats: nodes/edges/strongly connected components/nodes on cycles.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.stats)
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "get_node", Description: "按 key 查节点（标签与属性）。",
+		Name: "get_node", Description: "Get a node by key (label and props).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.getNode)
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "neighbors", Description: "一跳邻居（direction: out/in，可按边标签过滤）。",
+		Name: "neighbors", Description: "One-hop neighbors (direction: out/in, filterable by edge label).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.neighbors)
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "bfs",
-		Description: "多跳遍历（1..maxDepth 跳邻域）：maxDepth=2 即朋友的朋友；" +
-			"0=不限。返回每节点跳数。结果默认封顶 1000，total 为真实总数。",
+		Description: "Multi-hop traversal (1..maxDepth hop neighborhood): maxDepth=2 means friends of friends; " +
+			"0=unlimited. Returns per-node hop counts. Results are capped at 1000 by default; total is the true total.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.bfs)
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "shortest_path", Description: "两节点间最短路径（双向 BFS）。",
+		Name: "shortest_path", Description: "Shortest path between two nodes (bidirectional BFS).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.shortestPath)
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "reachable", Description: "从起点可达的全部节点（依赖影响面/爆炸半径）。",
+		Name: "reachable", Description: "All nodes reachable from a source (dependency impact set / blast radius).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.reachable)
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "cycles", Description: "全部循环依赖（强连通分量成员列表，按规模降序）。",
+		Name: "cycles", Description: "All dependency cycles (strongly connected component member lists, sorted by size descending).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.cycles)
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "lookup_property", Description: "按字符串属性值查节点（env/team/tier 等标签类属性）。",
+		Name: "lookup_property", Description: "Look up nodes by string property value (label-like props such as env/team/tier).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.lookupProperty)
 }
 
-// ---- 工具实现 ----
+// ---- tool implementations ----
 
 func (svc *service) injectBatch(_ context.Context, _ *mcp.CallToolRequest, in injectIn) (*mcp.CallToolResult, countsOut, error) {
 	svc.mu.Lock()
@@ -250,7 +254,7 @@ func (svc *service) seal(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) 
 	svc.mu.Lock()
 	defer svc.mu.Unlock()
 	for k := range svc.propKeys {
-		svc.live.IndexProperty(k) // 注入期见过的属性键自动建索引
+		svc.live.IndexProperty(k) // auto-index property keys seen during injection
 	}
 	if err := svc.live.Seal(); err != nil {
 		return nil, statsOut{}, err
@@ -258,7 +262,7 @@ func (svc *service) seal(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) 
 	svc.view = svc.live
 	if svc.opts.SnapshotPath != "" {
 		if err := svc.view.SaveFile(svc.opts.SnapshotPath); err != nil {
-			return nil, statsOut{}, fmt.Errorf("快照保存失败: %w", err)
+			return nil, statsOut{}, fmt.Errorf("snapshot save failed: %w", err)
 		}
 	}
 	st := svc.view.Stats()
@@ -268,12 +272,12 @@ func (svc *service) seal(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) 
 	}, nil
 }
 
-// view 返回密封视图；未密封时给出可操作的错误提示。
+// view returns the sealed view; gives an actionable error when not sealed.
 func (svc *service) viewOrSealHint() (*vectra.Graph, error) {
 	if v := svc.view; v != nil {
 		return v, nil
 	}
-	return nil, fmt.Errorf("图尚未密封：先调用 inject_batch 写入，再调用 seal 后查询")
+	return nil, fmt.Errorf("graph is not sealed: call inject_batch to write, then seal before querying")
 }
 
 func (svc *service) stats(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, statsOut, error) {
@@ -297,7 +301,7 @@ func (svc *service) getNode(_ context.Context, _ *mcp.CallToolRequest, in struct
 	}
 	n, ok := v.NodeByKey(in.Key)
 	if !ok {
-		return nil, nodeOut{}, fmt.Errorf("节点 %q 不存在", in.Key)
+		return nil, nodeOut{}, fmt.Errorf("node %q does not exist", in.Key)
 	}
 	return nil, nodeOut{Key: n.Key, Label: n.Label, Props: n.Props}, nil
 }
@@ -343,7 +347,7 @@ func (svc *service) bfs(_ context.Context, _ *mcp.CallToolRequest, in bfsIn) (*m
 	for _, k := range in.From {
 		n, ok := v.NodeByKey(k)
 		if !ok {
-			return nil, depthOut{}, fmt.Errorf("起点 %q 不存在", k)
+			return nil, depthOut{}, fmt.Errorf("source node %q does not exist", k)
 		}
 		starts = append(starts, n.ID)
 	}
@@ -446,7 +450,7 @@ func (svc *service) lookupProperty(_ context.Context, _ *mcp.CallToolRequest, in
 	}
 	nodes, ok := v.LookupByProperty(in.PropKey, in.Value)
 	if !ok {
-		return nil, listOut{}, fmt.Errorf("属性 %q 未建索引（需在注入数据中出现后重新 seal）", in.PropKey)
+		return nil, listOut{}, fmt.Errorf("property %q is not indexed (re-seal after it appears in injected data)", in.PropKey)
 	}
 	out := listOut{Total: len(nodes)}
 	for i, n := range nodes {

@@ -16,8 +16,8 @@ import (
 )
 
 // ============================================================
-// 进程内测试集群（InmemTransport + httptest）——T4 API 测试与
-// T5 混沌测试共用。
+// In-process test cluster (InmemTransport + httptest) — shared by
+// T4 API tests and T5 chaos tests.
 // ============================================================
 
 type testNode struct {
@@ -36,9 +36,10 @@ type testCluster struct {
 	nodes []*testNode
 }
 
-// newTestCluster 建集群：n1 空目录自动引导并当选，其余节点带 Join
-// 创建（New 内走真实 /v1/join 协议）。transport 在 New 之前互联，
-// 保证 AddVoter 能等到多数派提交。
+// newTestCluster builds a cluster: n1 bootstraps from an empty dir and gets
+// elected; the other nodes are created with Join (New runs the real /v1/join
+// protocol). Transports are interconnected before New so AddVoter can wait
+// for a majority commit.
 func newTestCluster(t *testing.T, n int) *testCluster {
 	t.Helper()
 	tc := &testCluster{t: t}
@@ -49,7 +50,7 @@ func newTestCluster(t *testing.T, n int) *testCluster {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if !first.node.IsLeader() {
-		t.Fatal("n1 未当选 leader")
+		t.Fatal("n1 not elected leader")
 	}
 	for i := 2; i <= n; i++ {
 		tn := newTestNode(t, fmt.Sprintf("n%d", i), first.URL(), tc.nodes...)
@@ -65,7 +66,7 @@ func newTestNode(t *testing.T, id, join string, existing ...*testNode) *testNode
 	stable := raft.NewInmemStore()
 	snaps := raft.NewInmemSnapshotStore()
 
-	// 先与既有节点互联（join 的 AddVoter 需要可达的多数派）
+	// Interconnect with existing nodes first (join's AddVoter needs a reachable majority)
 	for _, ex := range existing {
 		trans.Connect(raft.ServerAddress(ex.node.cfg.RaftAddr), ex.trans)
 		ex.trans.Connect(raft.ServerAddress(string(transAddr)), trans)
@@ -97,7 +98,7 @@ func newTestNode(t *testing.T, id, join string, existing ...*testNode) *testNode
 	return tn
 }
 
-// testRaftConfig 混沌测试专用：tick 20ms、ElectionTick 12、HeartbeatTick 2。
+// testRaftConfig for chaos tests: tick 20ms, ElectionTick 12, HeartbeatTick 2.
 func testRaftConfig(id string) *raft.Config {
 	c := raft.DefaultConfig()
 	c.LocalID = raft.ServerID(id)
@@ -122,7 +123,7 @@ func (tc *testCluster) leaderWithin(within time.Duration) *testNode {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	tc.t.Fatal("没有节点在期限内成为 leader")
+	tc.t.Fatal("no node became leader within the deadline")
 	return nil
 }
 
@@ -148,11 +149,11 @@ func (tc *testCluster) waitAllPublished(nodes, edges int, within time.Duration) 
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	tc.t.Fatalf("集群未在期限内全部发布 %d/%d", nodes, edges)
+	tc.t.Fatalf("cluster did not fully publish %d/%d within the deadline", nodes, edges)
 }
 
 // ============================================================
-// HTTP API 契约测试
+// HTTP API contract tests
 // ============================================================
 
 func postJSON(t *testing.T, url string, body any) (*http.Response, map[string]any) {
@@ -199,22 +200,22 @@ func TestAPIBatchWriteAndQuery(t *testing.T) {
 		},
 	})
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("batch 写入: %d %v", resp.StatusCode, out)
+		t.Fatalf("batch write: %d %v", resp.StatusCode, out)
 	}
 	if out["nodesApplied"] != float64(3) || out["edgesApplied"] != float64(2) || out["edgesSkipped"] != float64(1) {
-		t.Fatalf("applied 结果错误: %v", out)
+		t.Fatalf("applied result wrong: %v", out)
 	}
 
 	tc.waitAllPublished(3, 2, 10*time.Second)
 
-	// 查询端点（leader 上）
+	// Query endpoints (on the leader)
 	resp, out = getJSON(t, leader.URL()+"/v1/reachable?from=gateway")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("reachable: %d", resp.StatusCode)
 	}
 	nodes, _ := out["nodes"].([]any)
 	if len(nodes) != 3 {
-		t.Fatalf("reachable nodes = %v, want 3 个", nodes)
+		t.Fatalf("reachable nodes = %v, want 3", nodes)
 	}
 
 	resp, out = getJSON(t, leader.URL()+"/v1/path?from=gateway&to=db")
@@ -230,7 +231,7 @@ func TestAPIBatchWriteAndQuery(t *testing.T) {
 		t.Fatalf("stats.isLeader = %v", out["isLeader"])
 	}
 
-	// follower 上的读（最终一致）：也能查到
+	// Reads on a follower (eventually consistent): also served
 	var follower *testNode
 	for _, tn := range tc.nodes {
 		if tn != leader {
@@ -258,17 +259,17 @@ func TestAPINonLeaderWriteRedirectHint(t *testing.T) {
 		"nodes": []map[string]any{{"key": "x", "label": "S"}},
 	})
 	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("非 leader 写入应 503: %d %v", resp.StatusCode, out)
+		t.Fatalf("non-leader write should be 503: %d %v", resp.StatusCode, out)
 	}
 	if errBody, ok := out["error"].(map[string]any); !ok || errBody["code"] != "NOT_LEADER" {
-		t.Fatalf("错误码: %v", out)
+		t.Fatalf("error code: %v", out)
 	}
 	if resp.Header.Get("Retry-After") == "" {
-		t.Error("缺 Retry-After 头")
+		t.Error("missing Retry-After header")
 	}
-	// leader 提示头可选（注册表尽力而为），不强制；但给了就必须可解析
+	// Leader hint header is optional (registry is best effort), not enforced; but if present it must be resolvable
 	if h := resp.Header.Get("X-Vectra-Leader"); h != "" && h == follower.URL() {
-		t.Error("leader 提示指向了自己")
+		t.Error("leader hint points to itself")
 	}
 }
 
@@ -281,24 +282,24 @@ func TestAPIQueryValidation(t *testing.T) {
 	})
 	tc.waitAllPublished(2, 1, 5*time.Second)
 
-	// 缺 from
+	// Missing from
 	resp, out := postJSON(t, leader.URL()+"/v1/query", map[string]any{"maxDepth": 2})
 	if resp.StatusCode != http.StatusBadRequest || out["error"].(map[string]any)["code"] != "VALIDATION" {
-		t.Fatalf("缺 from: %d %v", resp.StatusCode, out)
+		t.Fatalf("missing from: %d %v", resp.StatusCode, out)
 	}
-	// 不存在的节点
+	// Nonexistent node
 	resp, out = getJSON(t, leader.URL()+"/v1/nodes/missing")
 	if resp.StatusCode != http.StatusNotFound || out["error"].(map[string]any)["code"] != "NODE_NOT_FOUND" {
-		t.Fatalf("缺节点: %d %v", resp.StatusCode, out)
+		t.Fatalf("missing node: %d %v", resp.StatusCode, out)
 	}
-	// 坏 JSON
+	// Bad JSON
 	resp2, err := http.Post(leader.URL()+"/v1/query", "application/json", bytes.NewReader([]byte("{")))
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp2.Body.Close()
 	if resp2.StatusCode != http.StatusBadRequest {
-		t.Fatalf("坏 JSON: %d", resp2.StatusCode)
+		t.Fatalf("bad JSON: %d", resp2.StatusCode)
 	}
 }
 
@@ -342,14 +343,14 @@ func TestAPIQueryEndpoint(t *testing.T) {
 func TestAPIHealthAndReadyGate(t *testing.T) {
 	tc := newTestCluster(t, 1)
 	leader := tc.leaderWithin(10 * time.Second)
-	// 未写入 → 未就绪（空图未发布）→ 503
+	// No writes → not ready (empty graph unpublished) → 503
 	resp, _ := getJSON(t, leader.URL()+"/v1/health")
 	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("未就绪 health: %d", resp.StatusCode)
+		t.Fatalf("not-ready health: %d", resp.StatusCode)
 	}
 	resp, _ = getJSON(t, leader.URL()+"/v1/stats")
 	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("未就绪 stats: %d", resp.StatusCode)
+		t.Fatalf("not-ready stats: %d", resp.StatusCode)
 	}
 	postJSON(t, leader.URL()+"/v1/batch", map[string]any{
 		"nodes": []map[string]any{{"key": "a", "label": "S"}},
@@ -357,7 +358,7 @@ func TestAPIHealthAndReadyGate(t *testing.T) {
 	tc.waitAllPublished(1, 0, 5*time.Second)
 	resp, out := getJSON(t, leader.URL()+"/v1/health")
 	if resp.StatusCode != http.StatusOK || out["status"] != "ok" {
-		t.Fatalf("就绪后 health: %d %v", resp.StatusCode, out)
+		t.Fatalf("ready health: %d %v", resp.StatusCode, out)
 	}
 }
 
@@ -391,19 +392,19 @@ func TestAPINeighborsAndCycles(t *testing.T) {
 }
 
 func TestAPIJoinEndpoint(t *testing.T) {
-	tc := newTestCluster(t, 2) // join 已在 helper 里走通，这里验证协议细节
+	tc := newTestCluster(t, 2) // join already exercised in the helper; here we verify protocol details
 	leader := tc.leaderWithin(10 * time.Second)
-	// 重复 join 同一节点（幂等场景由 raft AddVoter 处理，不视为错误路径）
+	// Duplicate join of the same node (idempotent case handled by raft AddVoter, not treated as an error path)
 	resp, out := postJSON(t, leader.URL()+"/v1/join", map[string]any{
 		"nodeID":   "n2",
 		"raftAddr": tc.nodes[1].node.cfg.RaftAddr,
 		"httpAddr": tc.nodes[1].URL(),
 	})
 	if resp.StatusCode == http.StatusOK {
-		return // 幂等成功，可接受
+		return // Idempotent success, acceptable
 	}
 	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("join 重复请求: %d %v", resp.StatusCode, out)
+		t.Fatalf("join duplicate request: %d %v", resp.StatusCode, out)
 	}
 }
 
@@ -417,11 +418,11 @@ func TestNodePublishedIsSealedGraph(t *testing.T) {
 	tc.waitAllPublished(2, 1, 5*time.Second)
 	p := leader.node.Published()
 	if p == nil || !p.Sealed() {
-		t.Fatal("Published 应返回密封图")
+		t.Fatal("Published should return a sealed graph")
 	}
 	r, err := p.Reachable("a")
 	if err != nil || len(r) != 2 {
-		t.Fatalf("Published 图查询: %v %v", r, err)
+		t.Fatalf("Published graph query: %v %v", r, err)
 	}
 	var _ *vectra.Graph = p
 }

@@ -70,7 +70,8 @@ func TestTarjanDAGAllSingletons(t *testing.T) {
 }
 
 func TestTarjanSelfLoopIsSingleton(t *testing.T) {
-	// 自环不构成多于 1 个成员的 SCC；Vectra 在上层单独标记自环为环。
+	// A self-loop does not form an SCC with more than 1 member; Vectra marks
+	// self-loops as cycles separately at a higher layer.
 	adj := graph(1, [][2]uint32{{0, 0}})
 	sccOf, count := dag.Tarjan(1, adj)
 	if count != 1 || sccOf[0] != 0 {
@@ -79,7 +80,7 @@ func TestTarjanSelfLoopIsSingleton(t *testing.T) {
 }
 
 func TestTarjanNestedAndDisjoint(t *testing.T) {
-	// 两个独立环 {0,1,2} 和 {3,4}，5->0 指入第一个环
+	// Two disjoint cycles {0,1,2} and {3,4}; 5->0 points into the first cycle
 	adj := graph(6, [][2]uint32{
 		{0, 1}, {1, 2}, {2, 0},
 		{3, 4}, {4, 3},
@@ -105,9 +106,9 @@ func membersOf(m map[uint32][]uint32, want ...uint32) bool {
 }
 
 func TestCondenseDedupAndLabel(t *testing.T) {
-	// 0<->1 环, 1->2, 0->2, 2->3。凝聚后跨 SCC 边按 (s,d,label) 去重。
+	// Cycle 0<->1, 1->2, 0->2, 2->3. After condensation, cross-SCC edges dedup by (s,d,label).
 	adj := graph(4, [][2]uint32{{0, 1}, {1, 0}, {1, 2}, {0, 2}, {2, 3}})
-	// 边序: e0:0->1(L0) e1:1->0(L0) e2:1->2(L1) e3:0->2(L2) e4:2->3(L3)
+	// Edge order: e0:0->1(L0) e1:1->0(L0) e2:1->2(L1) e3:0->2(L2) e4:2->3(L3)
 	lab := func(u uint32) []uint32 {
 		switch u {
 		case 0:
@@ -124,7 +125,7 @@ func TestCondenseDedupAndLabel(t *testing.T) {
 		t.Fatalf("count = %d, want 3", count)
 	}
 	cond := dag.Condense(4, sccOf, count, adj, lab)
-	// scc: A={0,1} B={2} C={3}; 跨 SCC 边: e2:A->B(L1), e3:A->B(L2), e4:B->C(L3)
+	// scc: A={0,1} B={2} C={3}; cross-SCC edges: e2:A->B(L1), e3:A->B(L2), e4:B->C(L3)
 	total := 0
 	for s := uint32(0); s < count; s++ {
 		tg, lb := cond.Row(s)
@@ -134,12 +135,12 @@ func TestCondenseDedupAndLabel(t *testing.T) {
 		}
 	}
 	if total != 3 {
-		t.Errorf("condensed edges = %d, want 3 (三元组去重后)", total)
+		t.Errorf("condensed edges = %d, want 3 (after triple dedup)", total)
 	}
 }
 
 func TestLevelsLongestPath(t *testing.T) {
-	// DAG: 0->1, 0->2, 1->3, 2->3, 3->4; 每点单 SCC
+	// DAG: 0->1, 0->2, 1->3, 2->3, 3->4; each node its own SCC
 	adj := graph(5, [][2]uint32{{0, 1}, {0, 2}, {1, 3}, {2, 3}, {3, 4}})
 	sccOf, count := dag.Tarjan(5, adj)
 	cond := dag.Condense(5, sccOf, count, adj, nil)
@@ -149,7 +150,7 @@ func TestLevelsLongestPath(t *testing.T) {
 			t.Errorf("level[%d] = %d, want %d", tc.node, got, tc.want)
 		}
 	}
-	// 所有凝聚边严格升层
+	// All condensed edges rise strictly in level
 	for s := uint32(0); s < count; s++ {
 		tg, _ := cond.Row(s)
 		for _, d := range tg {

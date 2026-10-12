@@ -9,11 +9,11 @@ func TestGenerateDeterministic(t *testing.T) {
 	a := Generate(Spec{Nodes: 500, Edges: 5000, Seed: 7})
 	b := Generate(Spec{Nodes: 500, Edges: 5000, Seed: 7})
 	if len(a.Edges) != len(b.Edges) || len(a.Nodes) != len(b.Nodes) {
-		t.Fatalf("规模不一致: %d/%d vs %d/%d", len(a.Nodes), len(a.Edges), len(b.Nodes), len(b.Edges))
+		t.Fatalf("size mismatch: %d/%d vs %d/%d", len(a.Nodes), len(a.Edges), len(b.Nodes), len(b.Edges))
 	}
 	for i := range a.Edges {
 		if a.Edges[i] != b.Edges[i] {
-			t.Fatalf("第 %d 条边不一致: %v vs %v", i, a.Edges[i], b.Edges[i])
+			t.Fatalf("edge %d mismatch: %v vs %v", i, a.Edges[i], b.Edges[i])
 		}
 	}
 }
@@ -21,12 +21,13 @@ func TestGenerateDeterministic(t *testing.T) {
 func TestGenerateShape(t *testing.T) {
 	g := Generate(Spec{Nodes: 2000, Edges: 20000, Seed: 42})
 	if len(g.Nodes) != 2000 {
-		t.Fatalf("节点数 = %d", len(g.Nodes))
+		t.Fatalf("node count = %d", len(g.Nodes))
 	}
 	if len(g.Edges) != 20000 {
-		t.Fatalf("边数 = %d", len(g.Edges))
+		t.Fatalf("edge count = %d", len(g.Edges))
 	}
-	// 幂律度分布：前 1% 节点（按总度）应占 >= 15% 的边端点
+	// Power-law degree distribution: the top 1% of nodes (by total degree) should
+	// account for >= 15% of edge endpoints
 	outDeg := make([]int, len(g.Nodes))
 	inDeg := make([]int, len(g.Nodes))
 	for _, e := range g.Edges {
@@ -41,7 +42,7 @@ func TestGenerateShape(t *testing.T) {
 		all = append(all, kv{i, d})
 		total += d
 	}
-	// 简单排序取 top 1%
+	// Simple sort to take the top 1%
 	for i := 1; i < len(all); i++ {
 		for j := i; j > 0 && all[j].deg > all[j-1].deg; j-- {
 			all[j], all[j-1] = all[j-1], all[j]
@@ -56,35 +57,36 @@ func TestGenerateShape(t *testing.T) {
 		topSum += k.deg
 	}
 	if float64(topSum)/float64(total) < 0.15 {
-		t.Errorf("幂律性不足: top1%% 节点只占 %.1f%% 度", 100*float64(topSum)/float64(total))
+		t.Errorf("insufficient power-law: top 1%% nodes hold only %.1f%% of degrees", 100*float64(topSum)/float64(total))
 	}
-	// 边标签来自固定集合
+	// Edge labels come from a fixed set
 	for _, e := range g.Edges {
 		switch e.Label {
 		case "CALLS", "DATA", "EVENT":
 		default:
-			t.Fatalf("非法标签 %q", e.Label)
+			t.Fatalf("illegal label %q", e.Label)
 		}
 	}
-	// 节点属性存在且带 env
+	// Node props exist and include env
 	for i, n := range g.Nodes {
 		if n.Key == "" || n.Props["tier"] == nil {
-			t.Fatalf("节点 %d 属性不完整: %+v", i, n)
+			t.Fatalf("node %d props incomplete: %+v", i, n)
 		}
 	}
 }
 
 func TestGenerateCyclesExist(t *testing.T) {
-	// cycleRate 造环：默认参数下应有 SCC>1 的环存在（幂律图 + 回边）
+	// cycleRate creates cycles: with default parameters, cycles with SCC>1 should
+	// exist (power-law graph + back edges)
 	g := Generate(Spec{Nodes: 3000, Edges: 30000, Seed: 11})
-	back := 0 // 老节点 -> 新节点方向的边（近似回边）
+	back := 0 // Edges in the old -> new direction (approximate back edges)
 	for _, e := range g.Edges {
 		if e.Dst > e.Src {
 			back++
 		}
 	}
 	if back == 0 {
-		t.Error("没有任何回边——cycleRate 未生效")
+		t.Error("no back edges at all — cycleRate not in effect")
 	}
 	_ = fmt.Sprint(back)
 }

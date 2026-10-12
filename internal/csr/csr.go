@@ -1,10 +1,10 @@
-// Package csr 实现压缩稀疏行邻接结构：节点 n 的邻居存放在
-// Targets[Offsets[n]:Offsets[n+1]]。全部为 uint32 平坦数组，无指针，
-// GC 扫描成本与边数无关。
+// Package csr implements compressed sparse row adjacency: neighbors of node n
+// live at Targets[Offsets[n]:Offsets[n+1]]. Flat uint32 arrays throughout, no
+// pointers, so GC scan cost is independent of edge count.
 package csr
 
-// Adjacency 是一份 CSR 邻接。EdgeIDs 与 Labels 与 Targets 平行，
-// 可为 nil（Build 不带 payload 时）。
+// Adjacency is a CSR adjacency. EdgeIDs and Labels run parallel to Targets
+// and may be nil (when built without payloads).
 type Adjacency struct {
 	Offsets []uint32 // len == numNodes+1
 	Targets []uint32
@@ -12,12 +12,13 @@ type Adjacency struct {
 	Labels  []uint32
 }
 
-// Build 用计数排序从边表构建 CSR，同节点邻居保持插入序。
+// Build builds a CSR from an edge list via counting sort; neighbors of the
+// same node keep insertion order.
 func Build(numNodes uint32, src, dst []uint32) Adjacency {
 	return build(numNodes, src, dst, nil, nil)
 }
 
-// BuildPayloads 同 Build，且每个槽位携带对应的边 ID 与标签 ID。
+// BuildPayloads is like Build, with each slot carrying its edge ID and label ID.
 func BuildPayloads(numNodes uint32, src, dst, edgeIDs, labels []uint32) Adjacency {
 	return build(numNodes, src, dst, edgeIDs, labels)
 }
@@ -54,18 +55,19 @@ func build(numNodes uint32, src, dst, edgeIDs, labels []uint32) Adjacency {
 	return a
 }
 
-// Degree 返回节点 n 的出度。
+// Degree returns the out-degree of node n.
 func (a Adjacency) Degree(n uint32) uint32 {
 	return a.Offsets[n+1] - a.Offsets[n]
 }
 
-// Neighbors 返回节点 n 的邻居视图（底层数组切片，调用方不得修改）。
+// Neighbors returns node n's neighbor view (a slice of the underlying array;
+// callers must not modify it).
 func (a Adjacency) Neighbors(n uint32) []uint32 {
 	return a.Targets[a.Offsets[n]:a.Offsets[n+1]]
 }
 
-// Row 返回节点 n 的整行：邻居、边 ID、标签三段平行视图。
-// 未携带 payload 的数组返回 nil。
+// Row returns node n's full row: three parallel views of neighbors, edge IDs,
+// and labels. Arrays without payloads return nil.
 func (a Adjacency) Row(n uint32) (targets, edgeIDs, labels []uint32) {
 	lo, hi := a.Offsets[n], a.Offsets[n+1]
 	targets = a.Targets[lo:hi]

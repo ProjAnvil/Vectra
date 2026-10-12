@@ -1,10 +1,11 @@
-// Package store 实现 Vectra 单文件二进制快照。小图全内存假设下磁盘
-// 只做崩溃恢复：整图重写、加载后重建 CSR/SCC，无需增量 WAL。
-// 格式 v2（小端）："VCTR" | u16 版本(2) | u32 节点数 | u32 边数 |
-// 节点{ key 字符串, label 字符串, props JSON }* | 边{ srcKey, dstKey, label, props }*
-// | u32 CRC32(IEEE，覆盖此前全部字节)。
-// 字符串 = u32 长度 + 字节；props = u32 JSON 长度 + JSON（0 = nil）。
-// v1（无 CRC 尾）仍可读，按头部版本号分派。
+// Package store implements Vectra's single-file binary snapshot. Under the
+// small-graph all-in-memory assumption the disk only serves crash recovery:
+// whole-graph rewrite, rebuild CSR/SCC on load, no incremental WAL.
+// Format v2 (little-endian): "VCTR" | u16 version(2) | u32 node count | u32 edge count |
+// node{ key string, label string, props JSON }* | edge{ srcKey, dstKey, label, props }*
+// | u32 CRC32(IEEE, covering all preceding bytes).
+// string = u32 length + bytes; props = u32 JSON length + JSON (0 = nil).
+// v1 (no CRC trailer) remains readable; dispatched by header version.
 package store
 
 import (
@@ -19,12 +20,13 @@ import (
 const (
 	magic         = "VCTR"
 	versionV2     = 2
-	versionLegacy = 1 // 无 CRC 尾，仅读兼容
-	headerSize    = 6 // magic(4) + version(2)，计数字段从这之后开始
+	versionLegacy = 1 // no CRC trailer, read compatibility only
+	headerSize    = 6 // magic(4) + version(2); count fields start after this
 )
 
-// Node / Edge 用字符串 key 而非内部 NodeID：快照与 ID 分配顺序解耦，
-// 加载时重建。props 序列化为 JSON（数字经往返变 float64，v1 已知限制）。
+// Node / Edge use string keys rather than internal NodeIDs: the snapshot is
+// decoupled from ID assignment order and rebuilt on load. props serialize to
+// JSON (numbers become float64 on roundtrip, a known v1 limitation).
 type Node struct {
 	Key   string
 	Label string
@@ -38,7 +40,8 @@ type Edge struct {
 	Props  map[string]any
 }
 
-// crcWriter 聚合写入字节流的 CRC（尾插，覆盖此前全部字节）。
+// crcWriter aggregates the CRC of the written byte stream (appended as a
+// trailer, covering all preceding bytes).
 type crcWriter struct {
 	bw  *bufio.Writer
 	crc uint32
@@ -91,7 +94,7 @@ func writeProps(w io.Writer, props map[string]any) error {
 	return err
 }
 
-// Encode 把整图以 v2 格式写入 w（尾部 CRC32）。
+// Encode writes the whole graph to w in v2 format (CRC32 trailer).
 func Encode(w io.Writer, nodes []Node, edges []Edge) error {
 	cw := &crcWriter{bw: bufio.NewWriter(w)}
 	var head [4]byte
@@ -136,8 +139,9 @@ func Encode(w io.Writer, nodes []Node, edges []Edge) error {
 	return cw.finish()
 }
 
-// reader 直接消费字节切片：一切长度字段都对着剩余字节做边界检查，
-// 坏输入不可能触发超长分配。
+// reader consumes a byte slice directly: every length field is bounds-checked
+// against the remaining bytes, so bad input can never trigger oversized
+// allocations.
 type reader struct {
 	b []byte
 	i int
@@ -193,7 +197,8 @@ func (rd *reader) props() (map[string]any, error) {
 	return m, nil
 }
 
-// Decode 从快照恢复节点与边数据。先整体读入，v2 校验 CRC，v1 兼容。
+// Decode restores node and edge data from a snapshot. Reads fully first;
+// v2 verifies the CRC, v1 is accepted for compatibility.
 func Decode(r io.Reader) ([]Node, []Edge, error) {
 	raw, err := io.ReadAll(r)
 	if err != nil {
@@ -215,12 +220,12 @@ func Decode(r io.Reader) ([]Node, []Edge, error) {
 			return nil, nil, errors.New("store: CRC mismatch")
 		}
 	case versionLegacy:
-		// v1 无 CRC 尾
+		// v1 has no CRC trailer
 	default:
 		return nil, nil, errors.New("store: unsupported version")
 	}
 
-	rd := &reader{b: body[headerSize:]} // 头部已预解析
+	rd := &reader{b: body[headerSize:]} // header already pre-parsed
 	nn, err := rd.u32()
 	if err != nil {
 		return nil, nil, err
@@ -229,8 +234,9 @@ func Decode(r io.Reader) ([]Node, []Edge, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	// 计数下界：每节点至少 12 字节、每边至少 16 字节的定长字段，
-	// 防伪造计数触发超长预分配（v2 的 CRC 攻击者可自算）。
+	// Count lower bound: at least 12 fixed-size bytes per node and 16 per
+	// edge, preventing forged counts from triggering oversized preallocation
+	// (a v2 attacker can compute the CRC themselves).
 	if int64(nn)*12+int64(ne)*16 > int64(len(rd.b)) {
 		return nil, nil, errTruncated
 	}

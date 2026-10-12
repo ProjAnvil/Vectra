@@ -1,9 +1,12 @@
-// Package vectra 是嵌入式内存图引擎：全内存无指针 CSR 邻接 + 写入侧
-// SCC 压缩 + 层同步并行 BFS。面向"图永远小于单机内存"的企业依赖图谱
-// 场景：批量导入、Seal 后并发只读、磁盘仅作快照恢复。
+// Package vectra is an embedded in-memory graph engine: all-memory
+// pointer-free CSR adjacency + write-side SCC compression + level-synchronous
+// parallel BFS. It targets enterprise dependency-graph scenarios where
+// "the graph always fits in single-machine memory": bulk import, lock-free
+// concurrent reads after Seal, disk used only for snapshot recovery.
 //
-// 布局：本包是公共 API 门面（写入、选项、类型翻译）；密封状态在
-// internal/engine，查询算法在 internal/traverse，编解码在 internal/store。
+// Layout: this package is the public API facade (writes, options, type
+// translation); sealed state lives in internal/engine, query algorithms in
+// internal/traverse, encode/decode in internal/store.
 package vectra
 
 import (
@@ -18,8 +21,9 @@ import (
 	"github.com/projanvil/vectra/internal/store"
 )
 
-// NodeID / EdgeID 是图内整数标识。Seal 后所有查询结构以 NodeID 寻址，
-// 字符串 key 只在 API 边界转换一次。
+// NodeID / EdgeID are integer identifiers within the graph. After Seal all
+// query structures are addressed by NodeID; string keys are converted once
+// at the API boundary.
 type NodeID uint32
 type EdgeID uint32
 
@@ -44,8 +48,9 @@ type Edge struct {
 	Props map[string]any `json:"props,omitempty"`
 }
 
-// Stats 汇报图的规模与压环结果。CyclicNodes 是属于大小>1 的 SCC 的
-// 节点数（自环不计入，由 Cycles() 单独报告）。
+// Stats reports graph size and cycle-compression results. CyclicNodes is
+// the node count of SCCs with size>1 (self-loops excluded, reported
+// separately by Cycles()).
 type Stats struct {
 	Nodes       int
 	Edges       int
@@ -59,15 +64,16 @@ type edgeRec struct {
 	props    map[string]any
 }
 
-// Graph 是一张 Vectra 图。写入期单写者；Seal 后不可变，并发读免锁。
-// Seal 后写态内存迁移进快照并释放。
+// Graph is a Vectra graph. Single writer during the write phase; immutable
+// after Seal with lock-free concurrent reads. On Seal the write-state memory
+// migrates into the snapshot and is released.
 type Graph struct {
 	nodes     []Node
 	byKey     map[string]NodeID
 	edges     []edgeRec
 	labels    []string // labelID -> name
 	labIDs    map[string]uint32
-	indexKeys []string // Seal 期要建索引的属性键
+	indexKeys []string // property keys to index at Seal time
 	sealed    bool
 	snap      *engine.Snapshot
 }
@@ -97,11 +103,13 @@ func copyProps(props map[string]any) map[string]any {
 	return m
 }
 
-// AddNode 幂等写入节点：key 已存在时更新 label/props 并返回原 ID。
+// AddNode idempotently writes a node: if the key already exists it updates
+// label/props and returns the original ID.
 //
-// Props 共享契约：本方法对传入 map 做了拷贝；但 Seal 后通过 Node/Edge
-// 暴露的 map 是内部引用——更新必须整体替换（再次 AddNode/AddEdge），
-// 禁止就地修改。
+// Props sharing contract: this method copies the passed-in map; but the maps
+// exposed via Node/Edge after Seal are internal references — updates must
+// replace them wholesale (AddNode/AddEdge again); in-place mutation is
+// forbidden.
 func (g *Graph) AddNode(key, label string, props map[string]any) (NodeID, error) {
 	if g.sealed {
 		return 0, ErrSealed
@@ -117,7 +125,7 @@ func (g *Graph) AddNode(key, label string, props map[string]any) (NodeID, error)
 	return id, nil
 }
 
-// AddEdge 追加一条有向边（多边/自环均允许）。
+// AddEdge appends a directed edge (multi-edges/self-loops both allowed).
 func (g *Graph) AddEdge(srcKey, dstKey, label string, props map[string]any) (EdgeID, error) {
 	if g.sealed {
 		return 0, ErrSealed
@@ -172,8 +180,9 @@ func (g *Graph) EdgeByID(id EdgeID) (Edge, bool) {
 	return Edge{ID: id, Src: NodeID(src), Dst: NodeID(dst), Label: label, Props: props}, true
 }
 
-// NodeCount/EdgeCount 在两种状态下给出真实规模（Seal 后写态已迁移
-// 进快照并释放，从快照读取）。
+// NodeCount/EdgeCount report the true size in both states (after Seal the
+// write state has already migrated into the snapshot and been released;
+// reads come from the snapshot).
 func (g *Graph) NodeCount() int {
 	if g.sealed {
 		return g.snap.NodeCount()
@@ -208,8 +217,10 @@ func (g *Graph) Stats() Stats {
 	return st
 }
 
-// Seal 构建查询所需的全部不可变结构（正/反向 CSR、Tarjan SCC、正/反向
-// 凝聚 DAG、成员表、自环标记、属性索引），此后图只读、并发读免锁。
+// Seal builds every immutable structure queries need (forward/reverse CSR,
+// Tarjan SCC, forward/reverse condensation DAG, member tables, self-loop
+// marks, property indexes); afterwards the graph is read-only with
+// lock-free concurrent reads.
 func (g *Graph) Seal() error {
 	if g.sealed {
 		return nil
@@ -228,11 +239,12 @@ func (g *Graph) Seal() error {
 	}
 	g.snap = snap
 	g.sealed = true
-	g.nodes, g.edges = nil, nil // 写态已迁移进快照，释放
+	g.nodes, g.edges = nil, nil // write state migrated into snapshot, release
 	return nil
 }
 
-// Save 把整图写入 w。要求已 Seal（保证导出一致状态）。
+// Save writes the whole graph to w. Requires Seal first (guarantees a
+// consistent exported state).
 func (g *Graph) Save(w io.Writer) error {
 	if !g.sealed {
 		return ErrNotSealed
@@ -257,7 +269,8 @@ func (g *Graph) Save(w io.Writer) error {
 	return store.Encode(w, nodes, edges)
 }
 
-// SaveFile 保存到路径：临时文件 + fsync + 原子 rename，避免半写文件。
+// SaveFile saves to a path: temp file + fsync + atomic rename, avoiding
+// half-written files.
 func (g *Graph) SaveFile(path string) error {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
@@ -281,7 +294,7 @@ func (g *Graph) SaveFile(path string) error {
 	return os.Rename(tmp, path)
 }
 
-// Load 从快照恢复图并自动 Seal。
+// Load restores a graph from a snapshot and Seals it automatically.
 func Load(r io.Reader) (*Graph, error) {
 	g, err := loadGraph(r)
 	if err != nil {
@@ -312,7 +325,7 @@ func loadGraph(r io.Reader) (*Graph, error) {
 	return g, nil
 }
 
-// LoadFile 从路径恢复图。
+// LoadFile restores a graph from a path.
 func LoadFile(path string) (*Graph, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -322,8 +335,9 @@ func LoadFile(path string) (*Graph, error) {
 	return Load(f)
 }
 
-// IndexProperty 注册一个 Seal 期构建索引的字符串属性键（幂等，
-// Seal 后调用为空操作）。未注册的键在 LookupByProperty 中 ok=false。
+// IndexProperty registers a string property key to index at Seal time
+// (idempotent; a no-op after Seal). Unregistered keys yield ok=false in
+// LookupByProperty.
 func (g *Graph) IndexProperty(key string) *Graph {
 	if g.sealed {
 		return g
@@ -337,9 +351,10 @@ func (g *Graph) IndexProperty(key string) *Graph {
 	return g
 }
 
-// Clone 深拷贝一张可继续写入的图（结果恒为未密封态）。
-// Props map 按共享契约共享引用（依赖"替换不修改"纪律）。
-// server 模块的热替换发布器用它克隆 live 图。
+// Clone deep-copies into a graph that can keep taking writes (the result is
+// always unsealed). Props maps share references per the sharing contract
+// (relies on "replace, don't mutate" discipline). The server module's
+// hot-swap publisher uses it to clone the live graph.
 func (g *Graph) Clone() *Graph {
 	c := New()
 	if g.sealed {
@@ -351,7 +366,7 @@ func (g *Graph) Clone() *Graph {
 			dst, _ := g.snap.NodeInfo(e.Dst)
 			_, _ = c.AddEdge(src.Key, dst.Key, g.snap.LabelName(e.LabelID), e.Props)
 		}
-		c.indexKeys = slices.Clone(g.indexKeys) // 索引声明随克隆迁移
+		c.indexKeys = slices.Clone(g.indexKeys) // index declarations carry over to the clone
 		return c
 	}
 	for _, n := range g.nodes {
@@ -365,8 +380,9 @@ func (g *Graph) Clone() *Graph {
 	return c
 }
 
-// LookupByProperty 在 Seal 期索引上按字符串属性值查节点（升序 ID）。
-// key 未注册索引返回 ok=false；注册过则返回命中集（可为空）。
+// LookupByProperty finds nodes by string property value on the Seal-time
+// index (ascending IDs). An unregistered key returns ok=false; a registered
+// one returns the hit set (possibly empty).
 func (g *Graph) LookupByProperty(key, value string) ([]Node, bool) {
 	if !g.sealed {
 		return nil, false
@@ -383,8 +399,9 @@ func (g *Graph) LookupByProperty(key, value string) ([]Node, bool) {
 	return out, true
 }
 
-// ExportSnapshot 序列化当前写态或密封态（未 Seal 也可导出——server
-// 模块的 FSM 快照对 live 图使用）。格式与 Save 相同（含 CRC）。
+// ExportSnapshot serializes the current write state or sealed state (export
+// works before Seal too — the server module's FSM snapshot uses it on the
+// live graph). The format matches Save (CRC included).
 func (g *Graph) ExportSnapshot() ([]byte, error) {
 	if g.sealed {
 		var buf bytes.Buffer
@@ -413,8 +430,9 @@ func (g *Graph) ExportSnapshot() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// ImportSnapshot 从快照字节构建未密封图（可继续写入）。Seal 时机由
-// 调用方决定——server FSM 的 Restore 路径用它重建 live 图。
+// ImportSnapshot builds an unsealed graph from snapshot bytes (writable
+// again). The caller decides when to Seal — the server FSM's Restore path
+// uses it to rebuild the live graph.
 func ImportSnapshot(data []byte) (*Graph, error) {
 	g, err := loadGraph(bytes.NewReader(data))
 	if err != nil {

@@ -5,11 +5,11 @@ import (
 	"encoding/gob"
 )
 
-// batchVersion 是变更集格式版本。演进规则：只加字段（gob 兼容）。
+// batchVersion is the changeset format version. Evolution rule: add fields only (gob compatible).
 const batchVersion = 1
 
-// NodeUpsert / EdgeUpsert 是变更集的原子项。v2 语义只有 upsert：
-// 节点 key 已存在则更新属性；边追加（多边允许）。删除不在 v2 范围。
+// NodeUpsert / EdgeUpsert are the atomic items of a changeset. v2 semantics are upsert-only:
+// an existing node key updates its props; edges append (multi-edges allowed). Deletes are out of scope for v2.
 type NodeUpsert struct {
 	Key   string
 	Label string
@@ -23,7 +23,7 @@ type EdgeUpsert struct {
 	Props  map[string]any
 }
 
-// Batch 是一条 raft 日志承载的变更集。
+// Batch is a changeset carried by one raft log.
 type Batch struct {
 	Version int
 	Nodes   []NodeUpsert

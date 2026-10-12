@@ -1,11 +1,12 @@
-// vectra-mcp 是 Vectra 的 MCP 服务二进制：直接嵌入引擎（无网络依赖）。
+// vectra-mcp is the Vectra MCP server binary: embeds the engine directly
+// (no network dependency).
 //
-// 传输模式：
+// Transport modes:
 //
-//	vectra-mcp                      # stdio（Claude Desktop / Claude Code 本地挂载）
-//	vectra-mcp -http :8080          # Streamable HTTP（/mcp 路径，远程共享）
+//	vectra-mcp                      # stdio (local mount for Claude Desktop / Claude Code)
+//	vectra-mcp -http :8080          # Streamable HTTP (/mcp path, remote sharing)
 //
-// 持久化：-snapshot path.vg 启动加载、每次 seal 后保存。
+// Persistence: -snapshot path.vg loads at startup and saves after each seal.
 package main
 
 import (
@@ -22,15 +23,15 @@ import (
 )
 
 func main() {
-	httpAddr := flag.String("http", "", "HTTP 监听地址（空 = stdio 模式）")
-	snapshot := flag.String("snapshot", "", "快照文件路径（启动加载、seal 后保存）")
+	httpAddr := flag.String("http", "", "HTTP listen address (empty = stdio mode)")
+	snapshot := flag.String("snapshot", "", "snapshot file path (loaded at startup, saved after seal)")
 	flag.Parse()
 
 	opts := mcpserver.Options{SnapshotPath: *snapshot}
 	g := vectra.New()
 	if *snapshot != "" {
 		if loaded, err := vectra.LoadFile(*snapshot); err == nil {
-			g = loaded.Clone() // 恢复为可写继续演进
+			g = loaded.Clone() // restore to writable for further evolution
 		}
 	}
 

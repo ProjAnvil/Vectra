@@ -34,16 +34,16 @@ func TestCurateDeterministic(t *testing.T) {
 	a := Curate(g, bg, 32, 99)
 	b := Curate(g, bg, 32, 99)
 	if len(a.Starts) != 32 || len(a.Pairs) != 32 {
-		t.Fatalf("采样数: %d/%d", len(a.Starts), len(a.Pairs))
+		t.Fatalf("sample counts: %d/%d", len(a.Starts), len(a.Pairs))
 	}
 	for i := range a.Starts {
 		if a.Starts[i] != b.Starts[i] {
-			t.Fatalf("起点[%d] 不确定", i)
+			t.Fatalf("start[%d] nondeterministic", i)
 		}
 	}
 	for i := range a.Pairs {
 		if a.Pairs[i] != b.Pairs[i] {
-			t.Fatalf("点对[%d] 不确定", i)
+			t.Fatalf("pair[%d] nondeterministic", i)
 		}
 	}
 }
@@ -55,21 +55,21 @@ func TestCurateStartsDegreeWeighted(t *testing.T) {
 	for _, e := range bg.Edges {
 		outDeg[bg.Nodes[e.Src].Key]++
 	}
-	// 高扇出节点（top 1% 出度）应显著过采样
+	// High-fanout nodes (top 1% out-degree) should be significantly oversampled
 	hits := map[string]bool{}
 	for _, s := range p.Starts {
 		hits[s] = true
 	}
 	top := 0
 	for _, d := range outDeg {
-		if d >= 20 { // 该规格下的高扇出阈值
+		if d >= 20 { // High-fanout threshold for this spec
 			top++
 		}
 	}
 	if top == 0 {
-		t.Fatal("没有高扇出节点")
+		t.Fatal("no high-fanout nodes")
 	}
-	// 至少命中一个高扇出节点（度加权下概率极高）
+	// At least one high-fanout node hit (extremely likely under degree weighting)
 	hitHigh := false
 	for s := range hits {
 		if outDeg[s] >= 20 {
@@ -77,7 +77,7 @@ func TestCurateStartsDegreeWeighted(t *testing.T) {
 		}
 	}
 	if !hitHigh {
-		t.Error("度加权采样未命中任何高扇出节点")
+		t.Error("degree-weighted sampling hit no high-fanout node")
 	}
 }
 
@@ -86,19 +86,19 @@ func TestCuratePairsReachable(t *testing.T) {
 	p := Curate(g, bg, 64, 13)
 	for _, pair := range p.Pairs {
 		if pair[0] == pair[1] {
-			t.Fatalf("自环点对: %v", pair)
+			t.Fatalf("self-loop pair: %v", pair)
 		}
 		path, found, err := g.ShortestPath(pair[0], pair[1])
 		if err != nil {
-			// 起点或终点不存在
-			t.Fatalf("点对引用不存在的节点: %v %v", pair, err)
+			// Start or end node does not exist
+			t.Fatalf("pair references nonexistent node: %v %v", pair, err)
 		}
 		if !found {
-			t.Fatalf("点对不可达（curation 失职）: %v", pair)
+			t.Fatalf("pair unreachable (curation failure): %v", pair)
 		}
 		if path.Len() < 2 {
-			// 允许少量 1 跳，但多数应 ≥2
-			t.Logf("短路径点对: %v hops=%d", pair, path.Len())
+			// A few 1-hop pairs are allowed, but most should be ≥2
+			t.Logf("short-path pair: %v hops=%d", pair, path.Len())
 		}
 	}
 }

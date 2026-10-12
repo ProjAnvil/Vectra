@@ -14,19 +14,20 @@ import (
 	"github.com/projanvil/vectra"
 )
 
-// defaultSmallGraphLimit：live 图规模低于此值时发布不做节流（每 batch
-// 立即 Seal 发布）；之上按 SealInterval 节流。依赖图场景绝大多数
-// 远低于该值。
+// defaultSmallGraphLimit: when the live graph size is below this value, publishing
+// is not throttled (each batch seals and publishes immediately); above it,
+// publishing is throttled by SealInterval. Dependency-graph workloads are almost
+// always far below this value.
 const defaultSmallGraphLimit = 100_000
 
-// ApplyResult 是 FSM.Apply 的返回值（经 ApplyFuture.Response 传回）。
+// ApplyResult is the return value of FSM.Apply (passed back via ApplyFuture.Response).
 type ApplyResult struct {
 	NodesApplied int
 	EdgesApplied int
-	EdgesSkipped int // 引用不存在节点的边被确定性跳过（计数进指标）
+	EdgesSkipped int // Edges referencing nonexistent nodes are deterministically skipped (counted in metrics)
 }
 
-// Metrics 是 server 的原子计数器（expvar 在 api.go 挂载）。
+// Metrics is the server's atomic counters (expvar is mounted in api.go).
 type Metrics struct {
 	AppliedBatches atomic.Int64
 	AppliedNodes   atomic.Int64
@@ -37,26 +38,26 @@ type Metrics struct {
 	LeaderChanges  atomic.Int64
 }
 
-// fsm 实现 raft.FSM：live 可写图 + 热替换发布器。
+// fsm implements raft.FSM: a live writable graph + a hot-swap publisher.
 //
-//   - Apply：确定性回放 batch 到 live（RLock 内短临界区）；
-//   - 发布器：克隆 live（RLock 下 O(V+E) 拷贝）→ 锁外 Seal →
-//     atomic.Pointer 交换 → 查询永不中断、免锁并发读；
-//   - Snapshot/Persist：克隆 live 直接序列化（无需 Seal）；
-//   - Restore：字节流重建 live 并立即首发布。
+//   - Apply: deterministically replays a batch into live (short critical section under RLock);
+//   - publisher: clone live (O(V+E) copy under RLock) → Seal outside the lock →
+//     atomic.Pointer swap → queries never interrupted, lock-free concurrent reads;
+//   - Snapshot/Persist: clone live and serialize directly (no Seal needed);
+//   - Restore: rebuild live from the byte stream and immediately do the first publish.
 type fsm struct {
 	mu        sync.RWMutex
 	live      *vectra.Graph
 	dirty     bool
-	version   int64 // 单调递增，发布器用它判断克隆后是否有新写入
+	version   int64 // Monotonically increasing; the publisher uses it to detect writes after cloning
 	published atomic.Pointer[vectra.Graph]
 
 	sealInterval    time.Duration
 	smallGraphLimit int
 
 	lastSealNanos atomic.Int64
-	pubMu         sync.Mutex // 发布临界区：保证 published 按版本单调前进
-	publishedVer  int64      // pubMu 保护；防旧克隆晚到覆盖新快照
+	pubMu         sync.Mutex // Publish critical section: keeps published monotonically advancing by version
+	publishedVer  int64      // Guarded by pubMu; prevents a late old clone from overwriting a newer snapshot
 
 	ready     chan struct{}
 	readyOnce sync.Once
@@ -77,13 +78,13 @@ func newFSM(sealInterval time.Duration) *fsm {
 		wake:            make(chan struct{}, 1),
 		metrics:         &Metrics{},
 	}
-	// 节流间隔从进程启动起算，避免零值纪元（Since=59 年）触发即时发布
+	// Throttle interval counts from process start to avoid the zero-value epoch (Since = 59 years) triggering an immediate publish
 	f.lastSealNanos.Store(time.Now().UnixNano())
 	go f.publishLoop()
 	return f
 }
 
-// Apply 是 raft 提交后的确定性回放入口。返回 ApplyResult 或 error。
+// Apply is the deterministic replay entry point after a raft commit. Returns ApplyResult or error.
 func (f *fsm) Apply(l *raft.Log) interface{} {
 	b, err := decodeBatch(l.Data)
 	if err != nil {
@@ -100,7 +101,7 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 		if _, err := f.live.AddEdge(e.SrcKey, e.DstKey, e.Label, e.Props); err == nil {
 			res.EdgesApplied++
 		} else if errors.Is(err, vectra.ErrNodeNotFound) {
-			res.EdgesSkipped++ // 权威校验：回放端跳过无效项，不分叉
+			res.EdgesSkipped++ // Authoritative validation: replay skips invalid items, no divergence
 		}
 	}
 	f.dirty = true
@@ -118,13 +119,13 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	return res
 }
 
-// Published 返回最近一次密封发布的图（不可变，免锁并发读）。
-// 首次发布前返回 nil。
+// Published returns the most recently sealed-and-published graph (immutable, lock-free concurrent reads).
+// Returns nil before the first publish.
 func (f *fsm) Published() *vectra.Graph {
 	return f.published.Load()
 }
 
-// Ready 在首次发布完成后关闭（重启恢复的读就绪门）。
+// Ready closes once the first publish completes (read readiness gate for restart recovery).
 func (f *fsm) Ready() <-chan struct{} { return f.ready }
 
 func (f *fsm) wakePublisher() {
@@ -134,8 +135,8 @@ func (f *fsm) wakePublisher() {
 	}
 }
 
-// publishInterval 决定本次发布等待：小图立即（wake 已触发则不等），
-// 大图按 SealInterval 节流。
+// publishInterval determines this publish's wait: small graphs publish immediately
+// (no wait if wake already fired), large graphs throttle by SealInterval.
 func (f *fsm) publishLoop() {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -146,8 +147,8 @@ func (f *fsm) publishLoop() {
 		case <-f.wake:
 			f.publishOnce()
 		case <-ticker.C:
-			// 大图按 SealInterval 节流；小图（< smallGraphLimit）
-			// 每 tick 检查即可（Apply 已即时 wake）。
+			// Large graphs throttle by SealInterval; small graphs (< smallGraphLimit)
+			// just need the per-tick check (Apply already wakes immediately).
 			f.mu.RLock()
 			dirty := f.dirty
 			small := f.live.NodeCount()+f.live.EdgeCount() < f.smallGraphLimit
@@ -159,7 +160,7 @@ func (f *fsm) publishLoop() {
 	}
 }
 
-// sealNow 立即发布一次（测试与大图周期到期共用）。
+// sealNow publishes immediately (shared by tests and large-graph interval expiry).
 func (f *fsm) sealNow() { f.publishOnce() }
 
 func (f *fsm) publishOnce() {
@@ -173,11 +174,11 @@ func (f *fsm) publishOnce() {
 	f.mu.RUnlock()
 
 	if err := clone.Seal(); err != nil {
-		fmt.Fprintf(os.Stderr, "vectra/server: 发布失败（Seal）: %v\n", err)
+		fmt.Fprintf(os.Stderr, "vectra/server: publish failed (Seal): %v\n", err)
 		return
 	}
 	f.pubMu.Lock()
-	if version > f.publishedVer { // Restore/发布器并发时只允许新版本落地
+	if version > f.publishedVer { // With Restore/publisher racing, only newer versions may land
 		f.publishedVer = version
 		f.published.Store(clone)
 		f.metrics.Seals.Add(1)
@@ -186,7 +187,7 @@ func (f *fsm) publishOnce() {
 	f.pubMu.Unlock()
 
 	f.mu.Lock()
-	if f.version == version { // 克隆之后没有新写入才清 dirty
+	if f.version == version { // Clear dirty only if no new writes happened after cloning
 		f.dirty = false
 	}
 	f.mu.Unlock()
@@ -194,7 +195,7 @@ func (f *fsm) publishOnce() {
 	f.readyOnce.Do(func() { close(f.ready) })
 }
 
-// Snapshot 实现 raft.FSM：返回 live 的克隆视图（快照在锁外序列化）。
+// Snapshot implements raft.FSM: returns a cloned view of live (snapshot serialized outside the lock).
 func (f *fsm) Snapshot() (raft.FSMSnapshot, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -205,8 +206,8 @@ type graphSnapshot struct {
 	clone *vectra.Graph
 }
 
-// Persist 把克隆的 live 图序列化写入 sink（未密封态可直接导出，
-// 无需先 Seal——省一次大图密封）。
+// Persist serializes the cloned live graph into the sink (the unsealed state can
+// be exported directly, no Seal required — saves sealing a large graph once).
 func (s *graphSnapshot) Persist(sink raft.SnapshotSink) error {
 	data, err := s.clone.ExportSnapshot()
 	if err != nil {
@@ -220,7 +221,7 @@ func (s *graphSnapshot) Persist(sink raft.SnapshotSink) error {
 
 func (s *graphSnapshot) Release() {}
 
-// Restore 从快照字节重建 live 并立即首发布（就绪门由此打开）。
+// Restore rebuilds live from snapshot bytes and immediately does the first publish (readiness gate opens here).
 func (f *fsm) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
 	data, err := io.ReadAll(rc)
@@ -241,7 +242,7 @@ func (f *fsm) Restore(rc io.ReadCloser) error {
 	return nil
 }
 
-// Close 停止发布器（幂等）。
+// Close stops the publisher (idempotent).
 func (f *fsm) Close() {
 	f.stopOnce.Do(func() { close(f.stop) })
 }

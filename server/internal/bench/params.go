@@ -6,20 +6,22 @@ import (
 	"github.com/projanvil/vectra"
 )
 
-// QueryParams 是预固定的查询参数集（LDBC parameter curation）：
-// 起点按出度加权（模拟"网关/核心服务"被高频查询），点对只保留
-// 可达对且路径长度 ≥2，避免大量无意义的 1 跳/不可达样本。
+// QueryParams is the pre-curated query parameter set (LDBC parameter curation):
+// start nodes are weighted by out-degree (simulating "gateway/core services"
+// being queried at high frequency), node pairs keep only reachable pairs with
+// path length ≥2, avoiding many meaningless 1-hop/unreachable samples.
 type QueryParams struct {
 	Starts []string
 	Pairs  [][2]string
 }
 
-// Curate 从密封图与生成产物采样 n 个起点与 n 个可达点对。确定性种子。
+// Curate samples n start nodes and n reachable node pairs from the sealed graph
+// and generation artifacts. Deterministic seed.
 func Curate(g *vectra.Graph, bg *Graph, n int, seed int64) QueryParams {
 	rng := rand.New(rand.NewSource(seed))
 	keyOf := func(id int) string { return bg.Nodes[id].Key }
 
-	// 出度加权起点池：每条出边给源节点一票
+	// Out-degree weighted start-node pool: each out-edge gives the source node one vote
 	pool := make([]int, 0, len(bg.Edges))
 	outDeg := make([]int, len(bg.Nodes))
 	for _, e := range bg.Edges {
@@ -28,7 +30,7 @@ func Curate(g *vectra.Graph, bg *Graph, n int, seed int64) QueryParams {
 	}
 	p := QueryParams{}
 	if len(pool) == 0 {
-		// 无边图：均匀采样
+		// Edgeless graph: uniform sampling
 		for i := 0; i < n && i < len(bg.Nodes); i++ {
 			p.Starts = append(p.Starts, keyOf(i))
 		}
@@ -44,7 +46,7 @@ func Curate(g *vectra.Graph, bg *Graph, n int, seed int64) QueryParams {
 		p.Starts = append(p.Starts, keyOf(id))
 	}
 
-	// 可达点对：从采样起点 BFS，取深度 ≥2 的到达节点
+	// Reachable node pairs: BFS from sampled start nodes, take nodes reached at depth ≥2
 	for _, startKey := range p.Starts {
 		node, ok := g.NodeByKey(startKey)
 		if !ok {

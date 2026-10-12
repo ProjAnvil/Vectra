@@ -10,7 +10,7 @@ import (
 	"github.com/projanvil/vectra"
 )
 
-// buildDAG 构建固定测试图（无环）:
+// buildDAG builds the fixed test graph (acyclic):
 // gateway -CALLS-> auth -QUERY-> db; gateway -CALLS-> ledger -QUERY-> db; db -EVENT-> kafka
 func buildDAG(t *testing.T) *vectra.Graph {
 	t.Helper()
@@ -59,7 +59,7 @@ func keysOf(t *testing.T, g *vectra.Graph, ids []vectra.NodeID) []string {
 	return out
 }
 
-// randGraph 生成固定种子随机图（含环）。
+// randGraph generates a fixed-seed random graph (with cycles).
 func randGraph(t *testing.T, nodes, edges int) *vectra.Graph {
 	t.Helper()
 	rng := rand.New(rand.NewSource(42))
@@ -129,11 +129,11 @@ func TestBFSLabelFilter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 从 gateway 出发只有 QUERY 边：gateway 的出边都是 CALLS，无可达
+	// from gateway there are no QUERY edges: gateway's out-edges are all CALLS, nothing reachable
 	if res.Count() != 1 {
-		t.Errorf("Count = %d, want 1 (仅起点)", res.Count())
+		t.Errorf("Count = %d, want 1 (start node only)", res.Count())
 	}
-	// 从 auth 出发: auth->db(QUERY) 可达，db->kafka 是 EVENT 被过滤
+	// from auth: auth->db(QUERY) reachable; db->kafka is EVENT, filtered out
 	auth := ids(t, g, "auth")[0]
 	res, _ = g.BFS([]vectra.NodeID{auth}, vectra.WithLabels("QUERY"))
 	if res.Count() != 2 {
@@ -149,7 +149,7 @@ func TestBFSLabelFilterUnknownLabel(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res.Count() != 1 {
-		t.Errorf("Count = %d, want 1 (未知标签全过滤)", res.Count())
+		t.Errorf("Count = %d, want 1 (unknown label filters everything)", res.Count())
 	}
 }
 
@@ -173,7 +173,7 @@ func TestBFSMultiSource(t *testing.T) {
 
 func TestBFSMultiSourceDedup(t *testing.T) {
 	g := buildDAG(t)
-	// 同一起点重复传入只计一次
+	// a duplicated start node passed twice counts once
 	res, err := g.BFS(ids(t, g, "gateway", "gateway"))
 	if err != nil {
 		t.Fatal(err)
@@ -257,8 +257,8 @@ func TestBFSEmptyStarts(t *testing.T) {
 	}
 }
 
-// buildCyclic 供后续 Reachable/ShortestPath/Cycles 测试复用：
-// 环 a<->b, b->c, c->d, d->b (b,c,d 成环), e -DATA-> a
+// buildCyclic is reused by later Reachable/ShortestPath/Cycles tests:
+// cycle a<->b, b->c, c->d, d->b (b,c,d form a cycle), e -DATA-> a
 func buildCyclic(t *testing.T) *vectra.Graph {
 	t.Helper()
 	g := vectra.New()
@@ -284,11 +284,11 @@ func buildCyclic(t *testing.T) *vectra.Graph {
 
 func TestParallelBFSEquivalentToSerial(t *testing.T) {
 	g := randGraph(t, 20000, 200000)
-	serial, err := g.BFS([]vectra.NodeID{0}, vectra.WithParallelThreshold(1<<30)) // 永远串行
+	serial, err := g.BFS([]vectra.NodeID{0}, vectra.WithParallelThreshold(1<<30)) // always serial
 	if err != nil {
 		t.Fatal(err)
 	}
-	parallel, err := g.BFS([]vectra.NodeID{0}, vectra.WithParallelThreshold(0)) // 永远并行
+	parallel, err := g.BFS([]vectra.NodeID{0}, vectra.WithParallelThreshold(0)) // always parallel
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,7 +360,7 @@ func TestReachableThroughCycles(t *testing.T) {
 
 func TestReachableLabels(t *testing.T) {
 	g := buildCyclic(t)
-	// e 的出边是 DATA；只走 CALLS 时仅剩起点自身
+	// e's out-edge is DATA; walking CALLS only leaves just the start itself
 	res, err := g.ReachableIDs(ids(t, g, "e")[0], vectra.ReachWithLabels("CALLS"))
 	if err != nil {
 		t.Fatal(err)
@@ -368,13 +368,13 @@ func TestReachableLabels(t *testing.T) {
 	if got := keysOf(t, g, res); !slices.Equal(got, []string{"e"}) {
 		t.Errorf("Reachable(e, CALLS) = %v, want [e]", got)
 	}
-	// e -DATA-> a 之后进入 CALLS 域 {a,b,c,d}
+	// e -DATA-> a, then enters the CALLS domain {a,b,c,d}
 	res, err = g.ReachableIDs(ids(t, g, "e")[0], vectra.ReachWithLabels("DATA"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := keysOf(t, g, res); !slices.Equal(got, []string{"a", "e"}) {
-		t.Errorf("Reachable(e, DATA) = %v, want [a e] (e 经 DATA 到 a，a 无 DATA 出边)", got)
+		t.Errorf("Reachable(e, DATA) = %v, want [a e] (e reaches a via DATA; a has no DATA out-edge)", got)
 	}
 }
 
@@ -503,7 +503,7 @@ func TestShortestPathNotFound(t *testing.T) {
 
 func TestShortestPathThroughCycle(t *testing.T) {
 	g := buildCyclic(t)
-	// c 所在分量 {a,b,c,d}；c->d->b：c 到 b 最短 2 跳
+	// c's component is {a,b,c,d}; c->d->b: shortest c-to-b is 2 hops
 	p, found, err := g.ShortestPath("c", "b")
 	if err != nil || !found {
 		t.Fatalf("found=%v err=%v", found, err)
@@ -527,8 +527,9 @@ func TestShortestPathUnknownKeys(t *testing.T) {
 	}
 }
 
-// TestShortestPathBidirectionalMatchesBFS 属性测试：200 对随机点，
-// 双向路径长度必须等于单向 BFS 距离，且路径连续、边真实存在。
+// TestShortestPathBidirectionalMatchesBFS: property test — 200 random
+// node pairs; bidirectional path length must equal unidirectional BFS
+// distance, with a contiguous path of real edges.
 func TestShortestPathBidirectionalMatchesBFS(t *testing.T) {
 	g := randGraph(t, 5000, 50000)
 	rng := rand.New(rand.NewSource(7))
@@ -576,8 +577,8 @@ func TestCyclesFindsSCCAndSelfLoop(t *testing.T) {
 	}
 	for _, e := range []struct{ s, d string }{
 		{"a", "b"}, {"b", "c"}, {"c", "a"}, // SCC {a,b,c}
-		{"c", "d"},       // d 不在环
-		{"solo", "solo"}, // 自环
+		{"c", "d"},       // d not on a cycle
+		{"solo", "solo"}, // self-loop
 	} {
 		if _, err := g.AddEdge(e.s, e.d, "CALLS", nil); err != nil {
 			t.Fatal(err)

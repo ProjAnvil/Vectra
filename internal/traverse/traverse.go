@@ -1,6 +1,8 @@
-// Package traverse 实现图的查询算法：多源层同步 BFS（串行+并行）、
-// SCC 超节点可达性、双向最短路径、循环发现。算法只依赖 engine.Snapshot
-// 的只读访问器与调用方传入的配置（标签掩码、节点谓词），不含写入语义。
+// Package traverse implements the graph query algorithms: multi-source
+// level-synchronous BFS (serial + parallel), SCC-supernode reachability,
+// bidirectional shortest path, and cycle discovery. Algorithms depend only on
+// engine.Snapshot's read-only accessors and caller-supplied config (label
+// mask, node predicate); no write semantics.
 package traverse
 
 import (
@@ -13,9 +15,10 @@ import (
 	"github.com/projanvil/vectra/internal/dag"
 )
 
-// engineSnapshot 是 traverse 对密封快照的最小依赖面：engine.Snapshot
-// 的导出访问器天然满足此接口——traverse 不 import engine，层级保持
-// csr/dag（叶）→ engine（状态）与 traverse（算法）平行。
+// engineSnapshot is traverse's minimal dependency surface on the sealed
+// snapshot: engine.Snapshot's exported accessors satisfy it naturally —
+// traverse does not import engine, keeping the layering csr/dag (leaves) ->
+// engine (state), with traverse (algorithms) parallel to it.
 type engineSnapshot interface {
 	AdjacencyF() csr.Adjacency
 	AdjacencyR() csr.Adjacency
@@ -36,15 +39,17 @@ const (
 )
 
 const (
-	// DefaultParallelThreshold 是 frontier 达到该规模时切换并行展开。
+	// DefaultParallelThreshold is the frontier size at which expansion
+	// switches to parallel.
 	DefaultParallelThreshold = 1024
 	parallelChunk            = 256
 	noDepth                  = ^uint32(0)
 	noParent                 = ^uint32(0)
 )
 
-// Config 是一次遍历的全部可调项。LabelMask 由调用方按其标签注册表
-// 构建（nil = 不过滤）；NodeFilter 在标记新节点时求值（起点恒入选）。
+// Config holds all tunables of a traversal. LabelMask is built by the caller
+// from its label registry (nil = no filtering); NodeFilter is evaluated when a
+// new node is marked (start nodes always pass).
 type Config struct {
 	MaxDepth          uint32
 	LabelMask         []bool
@@ -53,17 +58,21 @@ type Config struct {
 	NodeFilter        func(uint32) bool
 }
 
-// Result 是 BFS 结果：按层成员 + 深度数组（noDepth = 未到达）。
+// Result is the BFS result: per-layer members + depth array (noDepth =
+// unreached).
 type Result struct {
 	Layers [][]uint32
 	depth  []uint32
 }
 
-// DepthRaw 返回深度数组本体（门面复用，避免整图拷贝；只读契约）。
+// DepthRaw returns the depth array itself (reused by the facade to avoid a
+// whole-graph copy; read-only contract).
 func (r *Result) DepthRaw() []uint32 { return r.depth }
 
-// BFS 多源层同步广度优先：起点深度 0，每层整体展开；frontier 达到
-// 阈值时切块交给多 goroutine，去重用原子 Or 位图。
+// BFS is a multi-source level-synchronous breadth-first search: starts at
+// depth 0, each layer expanded as a whole; once the frontier reaches the
+// threshold, chunks go to multiple goroutines, deduplicated via an atomic-Or
+// bitmap.
 func BFS(s engineSnapshot, starts []uint32, cfg Config) *Result {
 	n := uint32(s.NodeCount())
 	for _, st := range starts {
@@ -72,7 +81,7 @@ func BFS(s engineSnapshot, starts []uint32, cfg Config) *Result {
 		}
 	}
 	if cfg.ParallelThreshold == 0 {
-		cfg.ParallelThreshold = 1 // 0 视为强制并行：任何非空层都并行
+		cfg.ParallelThreshold = 1 // 0 means force parallel: any non-empty layer goes parallel
 	}
 	adj := s.AdjacencyF()
 	if cfg.Direction == DirIn {
@@ -174,7 +183,7 @@ func expandLayerParallel(adj csr.Adjacency, cfg Config, visited []uint32, fronti
 					word := &visited[v>>5]
 					bit := uint32(1) << (v & 31)
 					if atomic.OrUint32(word, bit)&bit != 0 {
-						continue // 已被其他 worker 标记
+						continue // already marked by another worker
 					}
 					local = append(local, v)
 				}
@@ -190,11 +199,13 @@ func expandLayerParallel(adj csr.Adjacency, cfg Config, visited []uint32, fronti
 	return next
 }
 
-// Reachable 返回从 start 出发（含自身）可达的全部节点，按 ID 升序。
-// 无标签过滤时走 SCC 超节点快路径（查询面对 DAG，零环检测）；
-// 有过滤时分量成员间可能只有被过滤的边，退回严格节点级遍历。
-// 注意：超节点快路径不支持 NodeFilter（谓词与分量语义冲突），
-// 调用方不得在带 NodeFilter 的 Config 上走快路径。
+// Reachable returns all nodes reachable from start (including itself),
+// ascending by ID. Without a label filter it takes the SCC-supernode fast
+// path (queries face a DAG, zero cycle detection); with a filter, members of
+// a component may be joined only by filtered-out edges, so it falls back to
+// strict node-level traversal. Note: the supernode fast path does not support
+// NodeFilter (the predicate conflicts with component semantics); callers must
+// not take the fast path with a Config carrying a NodeFilter.
 func Reachable(s engineSnapshot, start uint32, cfg Config) []uint32 {
 	adj := s.AdjacencyF()
 	if cfg.Direction == DirIn {
@@ -265,8 +276,9 @@ func reachableSupernode(s engineSnapshot, start uint32, dir Direction) []uint32 
 	return out
 }
 
-// ShortestPath 双向 BFS：小前沿一侧优先整层展开，标记时检测对侧
-// visited，首个相遇点即最优。返回节点与边序列。
+// ShortestPath is a bidirectional BFS: the smaller frontier side expands a
+// full layer first, checking the opposite side's visited bitmap when marking;
+// the first meeting point is optimal. Returns node and edge sequences.
 func ShortestPath(s engineSnapshot, from, to uint32) (nodes, edges []uint32, found bool) {
 	if from == to {
 		return []uint32{from}, nil, true
@@ -308,7 +320,8 @@ func ShortestPath(s engineSnapshot, from, to uint32) (nodes, edges []uint32, fou
 	return nil, nil, false
 }
 
-// expandMeeting 完整展开一层并返回新前沿；标记时检测对侧 visited。
+// expandMeeting expands one full layer and returns the new frontier; checks
+// the opposite side's visited bitmap when marking.
 func expandMeeting(frontier []uint32, adj csr.Adjacency, mine, theirs []uint32, parent []uint32) (next []uint32, meet uint32, found bool) {
 	for _, u := range frontier {
 		for _, v := range adj.Neighbors(u) {
@@ -330,7 +343,7 @@ func expandMeeting(frontier []uint32, adj csr.Adjacency, mine, theirs []uint32, 
 }
 
 func reconstruct(s engineSnapshot, meet uint32, fParent, bParent []uint32) ([]uint32, []uint32) {
-	fwd := []uint32{meet} // meet -> from，逆序
+	fwd := []uint32{meet} // meet -> from, reversed afterwards
 	for v := fParent[meet]; v != noParent; v = fParent[v] {
 		fwd = append(fwd, v)
 	}
@@ -356,17 +369,19 @@ func anyEdge(s engineSnapshot, u, v uint32) uint32 {
 			return eids[i]
 		}
 	}
-	return 0 // 路径保证连续，正常不可达
+	return 0 // path is contiguous by construction; unreachable in practice
 }
 
-// Cycle 是一个循环依赖：多节点 SCC 的成员列表，或一个自环节点。
+// Cycle is one circular dependency: the member list of a multi-node SCC, or
+// a single self-loop node.
 type Cycle struct {
 	Nodes []uint32
 }
 
 func (c Cycle) Len() int { return len(c.Nodes) }
 
-// Cycles 返回全部循环依赖，按成员数降序、再按最小成员 ID 升序。
+// Cycles returns all circular dependencies, descending by member count, then
+// ascending by smallest member ID.
 func Cycles(s engineSnapshot) []Cycle {
 	var cycles []Cycle
 	for c := uint32(0); c < s.SCCCount(); c++ {
@@ -389,7 +404,7 @@ func Cycles(s engineSnapshot) []Cycle {
 	return cycles
 }
 
-// ---- visited 位图缓冲池 ----
+// ---- visited bitmap buffer pool ----
 
 type bitmapPool struct {
 	p sync.Pool

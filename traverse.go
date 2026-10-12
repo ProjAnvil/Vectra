@@ -11,15 +11,17 @@ const (
 	DirIn
 )
 
-// BFSResult 是一次 BFS 的完整结果：按层分组的成员 + 每节点深度。
-// 深度用平坦 uint32 数组而非 map——百万级结果集上 map 插入成本
-// 会吞掉 CSR 的访存优势（基准验证过），数组的 GC 成本也趋近于零。
+// BFSResult is the complete result of one BFS: members grouped by layer +
+// per-node depth. Depth uses a flat uint32 array instead of a map — on
+// million-scale result sets map insertion cost would swallow the CSR's
+// memory-access advantage (verified by benchmarks), and the array's GC cost
+// is near zero.
 type BFSResult struct {
 	Layers [][]NodeID
 	depth  []uint32
 }
 
-// Nodes 返回全部到达节点（按层拼接）。
+// Nodes returns all reached nodes (layers concatenated).
 func (r *BFSResult) Nodes() []NodeID {
 	total := 0
 	for _, l := range r.Layers {
@@ -32,7 +34,7 @@ func (r *BFSResult) Nodes() []NodeID {
 	return out
 }
 
-// Count 返回到达节点总数（含起点）。
+// Count returns the total number of reached nodes (start nodes included).
 func (r *BFSResult) Count() int {
 	total := 0
 	for _, l := range r.Layers {
@@ -41,14 +43,14 @@ func (r *BFSResult) Count() int {
 	return total
 }
 
-// Depth 返回节点深度；未到达返回 math.MaxUint32。
+// Depth returns the node depth; unreached nodes return math.MaxUint32.
 func (r *BFSResult) Depth(id NodeID) uint32 { return r.depth[id] }
 
-// Reached 报告节点是否到达。
+// Reached reports whether the node was reached.
 func (r *BFSResult) Reached(id NodeID) bool { return r.depth[id] != ^uint32(0) }
 
-// DepthsMap 按需构建"节点->深度"映射（小结果集的便捷接口；
-// 大结果集请用 Depth/Reached/Nodes）。
+// DepthsMap builds a "node->depth" map on demand (a convenience for small
+// result sets; prefer Depth/Reached/Nodes for large ones).
 func (r *BFSResult) DepthsMap() map[NodeID]uint32 {
 	m := make(map[NodeID]uint32, r.Count())
 	for d, l := range r.Layers {
@@ -73,14 +75,16 @@ func WithMaxDepth(d uint32) BFSOption       { return func(c *bfsConfig) { c.maxD
 func WithDirection(d Direction) BFSOption   { return func(c *bfsConfig) { c.direction = d } }
 func WithParallelThreshold(n int) BFSOption { return func(c *bfsConfig) { c.parallelThr = n } }
 
-// WithLabels 只沿给定标签的边遍历。空列表 = 不过滤；标签不存在时
-// 结果只剩起点。
+// WithLabels traverses only edges with the given labels. Empty list = no
+// filtering; if no label exists the result is just the start nodes.
 func WithLabels(names ...string) BFSOption {
 	return func(c *bfsConfig) { c.labelNames = names }
 }
 
-// BFS 多源层同步广度优先：起点深度 0，每层整体展开。层同步是并行化
-// 的基础——frontier 是扁平数组，达到阈值时切块交给多个 goroutine。
+// BFS is multi-source level-synchronous breadth-first search: start nodes
+// at depth 0, each layer expanded wholesale. Level synchronization is the
+// basis for parallelism — the frontier is a flat array, chunked across
+// goroutines once it crosses a threshold.
 func (g *Graph) BFS(starts []NodeID, opts ...BFSOption) (*BFSResult, error) {
 	if !g.sealed {
 		return nil, ErrNotSealed
@@ -118,8 +122,8 @@ func (g *Graph) traverseConfig(opts ...BFSOption) tr.Config {
 	return tc
 }
 
-// labelMask 把标签名集合转成按 labelID 索引的布尔掩码；
-// names 为空返回 nil（不过滤）。
+// labelMask turns a set of label names into a boolean mask indexed by
+// labelID; empty names returns nil (no filtering).
 func (g *Graph) labelMask(names []string) []bool {
 	if len(names) == 0 {
 		return nil
@@ -166,9 +170,11 @@ func ReachWithDirection(d Direction) ReachOption {
 	return func(c *reachConfig) { c.direction = d }
 }
 
-// ReachableIDs 返回从 start 出发（含自身）可达的全部节点，按 NodeID 升序。
-// 无标签过滤时在 SCC 凝聚 DAG 上做超节点 BFS（查询面对的图无环，
-// visited 每位对应一个分量）；有过滤时退回严格节点级遍历。
+// ReachableIDs returns all nodes reachable from start (itself included),
+// ascending by NodeID. With no label filter it runs supernode BFS on the
+// SCC condensation DAG (the query-facing graph is acyclic; each visited bit
+// corresponds to one component); with a filter it falls back to strict
+// node-level traversal.
 func (g *Graph) ReachableIDs(start NodeID, opts ...ReachOption) ([]NodeID, error) {
 	if !g.sealed {
 		return nil, ErrNotSealed
@@ -192,7 +198,7 @@ func (g *Graph) ReachableIDs(start NodeID, opts ...ReachOption) ([]NodeID, error
 	return out, nil
 }
 
-// Reachable 是 ReachableIDs 的字符串 key 便捷版。
+// Reachable is the string-key convenience version of ReachableIDs.
 func (g *Graph) Reachable(startKey string, opts ...ReachOption) ([]string, error) {
 	node, ok := g.NodeByKey(startKey)
 	if !ok {
@@ -210,17 +216,18 @@ func (g *Graph) Reachable(startKey string, opts ...ReachOption) ([]string, error
 	return out, nil
 }
 
-// Path 是一条节点-边交替的具体路径：Nodes[i] --Edges[i]--> Nodes[i+1]。
+// Path is one concrete node-edge alternating path: Nodes[i] --Edges[i]--> Nodes[i+1].
 type Path struct {
 	Nodes []NodeID
 	Edges []EdgeID
 }
 
-// Len 返回跳数（边数）。
+// Len returns the hop count (number of edges).
 func (p Path) Len() int { return len(p.Edges) }
 
-// ShortestPathIDs 双向 BFS 最短路径：始终整层展开较小一侧的前沿，
-// 标记时检测对侧 visited，首个相遇点的距离即最优。
+// ShortestPathIDs is bidirectional BFS shortest path: always expands the
+// whole layer of the smaller side's frontier, checks the opposite side's
+// visited when marking; the first meeting point yields the optimal distance.
 func (g *Graph) ShortestPathIDs(from, to NodeID) (Path, bool, error) {
 	if !g.sealed {
 		return Path{}, false, ErrNotSealed
@@ -242,7 +249,7 @@ func (g *Graph) ShortestPathIDs(from, to NodeID) (Path, bool, error) {
 	return p, true, nil
 }
 
-// ShortestPath 是 ShortestPathIDs 的字符串 key 便捷版。
+// ShortestPath is the string-key convenience version of ShortestPathIDs.
 func (g *Graph) ShortestPath(fromKey, toKey string) (Path, bool, error) {
 	fn, ok := g.NodeByKey(fromKey)
 	if !ok {
@@ -255,18 +262,19 @@ func (g *Graph) ShortestPath(fromKey, toKey string) (Path, bool, error) {
 	return g.ShortestPathIDs(fn.ID, tn.ID)
 }
 
-// Cycle 是一个循环依赖：大小>1 的强连通分量的成员列表，
-// 或一个自环节点。
+// Cycle is one circular dependency: the member list of a strongly connected
+// component of size>1, or a single self-loop node.
 type Cycle struct {
 	Nodes []NodeID
 }
 
-// Len 返回环上节点数。
+// Len returns the number of nodes on the cycle.
 func (c Cycle) Len() int { return len(c.Nodes) }
 
-// Cycles 返回图中所有循环依赖，按成员数降序、再按最小成员 ID 升序。
-// 这是写入侧 SCC 压缩的副产品："循环依赖阻断"的防御性机制
-// 变成"循环依赖发现"的诊断性能力。
+// Cycles returns all circular dependencies in the graph, sorted by member
+// count descending, then by smallest member ID ascending. It is a byproduct
+// of write-side SCC compression: the defensive "cycle blocking" mechanism
+// becomes the diagnostic "cycle discovery" capability.
 func (g *Graph) Cycles() []Cycle {
 	if !g.sealed {
 		return nil
@@ -282,8 +290,9 @@ func (g *Graph) Cycles() []Cycle {
 	return out
 }
 
-// WithNodeFilter 对到达节点施加谓词（标记新节点时求值；起点恒入选，
-// 谓词不满足的节点不进入结果也不被展开）。
+// WithNodeFilter applies a predicate to reached nodes (evaluated when a new
+// node is marked; start nodes are always included; nodes failing the
+// predicate enter neither the result nor the expansion).
 func WithNodeFilter(pred func(Node) bool) BFSOption {
 	return func(c *bfsConfig) { c.nodeFilter = pred }
 }

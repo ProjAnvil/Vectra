@@ -12,16 +12,18 @@ import (
 )
 
 // ============================================================
-// 鲁棒性维度（对应 LDBC Graphalytics 的 robustness 轴）
+// Robustness dimension (the robustness axis of LDBC Graphalytics)
 // ============================================================
 
-// TestConcurrentReadersMixedQueries 验证核心声明："Seal 后不可变，
-// 并发读免锁"。8 个 goroutine 混跑全部只读 API（含并行 BFS、快照导出），
-// 在 -race 下无数据竞争即通过。任何一个查询结果与其他 goroutine
-// 的查询交错后仍必须自洽（与单线程基准值比对）。
+// TestConcurrentReadersMixedQueries verifies the core claim: "immutable
+// after Seal, lock-free concurrent reads". 8 goroutines mix all read-only
+// APIs (including parallel BFS and snapshot export); passing under -race
+// means no data races. Any query result must remain self-consistent when
+// interleaved with other goroutines' queries (compared against
+// single-threaded baseline values).
 func TestConcurrentReadersMixedQueries(t *testing.T) {
 	g := randGraph(t, 5000, 50000)
-	// 单线程基准值
+	// single-threaded baseline values
 	baseReach, err := g.ReachableIDs(0)
 	if err != nil {
 		t.Fatal(err)
@@ -45,37 +47,37 @@ func TestConcurrentReadersMixedQueries(t *testing.T) {
 			for i := 0; i < 30; i++ {
 				var err error
 				switch rng.Intn(5) {
-				case 0: // 并行 BFS
+				case 0: // parallel BFS
 					res, e := g.BFS([]vectra.NodeID{0}, vectra.WithParallelThreshold(0))
 					if e != nil {
 						err = e
 					} else if res.Count() != baseBFS.Count() {
-						err = fmt.Errorf("并发 BFS count=%d 基准=%d", res.Count(), baseBFS.Count())
+						err = fmt.Errorf("concurrent BFS count=%d baseline=%d", res.Count(), baseBFS.Count())
 					}
-				case 1: // 可达性
+				case 1: // reachability
 					r, e := g.ReachableIDs(0)
 					if e != nil {
 						err = e
 					} else if len(r) != len(baseReach) {
-						err = fmt.Errorf("并发 Reachable=%d 基准=%d", len(r), len(baseReach))
+						err = fmt.Errorf("concurrent Reachable=%d baseline=%d", len(r), len(baseReach))
 					}
-				case 2: // 最短路径
+				case 2: // shortest path
 					p, found, e := g.ShortestPathIDs(0, 4999)
 					if e != nil {
 						err = e
 					} else if !found || p.Len() != basePath.Len() {
-						err = fmt.Errorf("并发最短路 len=%d 基准=%d", p.Len(), basePath.Len())
+						err = fmt.Errorf("concurrent shortest path len=%d baseline=%d", p.Len(), basePath.Len())
 					}
-				case 3: // 环清单
+				case 3: // cycle list
 					if cs := g.Cycles(); cs == nil && g.Stats().CyclicNodes > 0 {
-						err = fmt.Errorf("Cycles() 为空但 CyclicNodes>0")
+						err = fmt.Errorf("Cycles() empty but CyclicNodes>0")
 					}
-				case 4: // 快照导出到各自缓冲
+				case 4: // snapshot export to per-goroutine buffer
 					var buf bytes.Buffer
 					if e := g.Save(&buf); e != nil {
 						err = e
 					} else if buf.Len() == 0 {
-						err = fmt.Errorf("空快照")
+						err = fmt.Errorf("empty snapshot")
 					}
 				}
 				if err != nil {
@@ -92,8 +94,10 @@ func TestConcurrentReadersMixedQueries(t *testing.T) {
 	}
 }
 
-// TestDegenerateGraphs 退化形态表驱动：每种形态 Seal 后全部查询
-// 必须给出结构正确的答案（空图、孤立点、稠密团、链、星、多边、自环海）。
+// TestDegenerateGraphs: table-driven degenerate shapes — after Seal every
+// query must give structurally correct answers for each shape (empty
+// graph, isolated node, dense clique, chain, star, multi-edges, a sea of
+// self-loops).
 func TestDegenerateGraphs(t *testing.T) {
 	t.Run("Empty", func(t *testing.T) {
 		g := vectra.New()
@@ -101,21 +105,21 @@ func TestDegenerateGraphs(t *testing.T) {
 			t.Fatal(err)
 		}
 		if st := g.Stats(); st.Nodes != 0 || st.Edges != 0 || st.SCCs != 0 {
-			t.Errorf("空图 stats = %+v", st)
+			t.Errorf("empty graph stats = %+v", st)
 		}
 		if cs := g.Cycles(); len(cs) != 0 {
-			t.Errorf("空图 Cycles = %d", len(cs))
+			t.Errorf("empty graph Cycles = %d", len(cs))
 		}
 		res, err := g.BFS(nil)
 		if err != nil || res.Count() != 0 {
-			t.Errorf("空图 BFS = %d err=%v", res.Count(), err)
+			t.Errorf("empty graph BFS = %d err=%v", res.Count(), err)
 		}
 		var buf bytes.Buffer
 		if err := g.Save(&buf); err != nil {
 			t.Fatal(err)
 		}
 		if g2, err := vectra.Load(&buf); err != nil || g2.Stats() != g.Stats() {
-			t.Errorf("空图快照往返失败: %v", err)
+			t.Errorf("empty graph snapshot round-trip failed: %v", err)
 		}
 	})
 	t.Run("SingleIsolatedNode", func(t *testing.T) {
@@ -147,7 +151,7 @@ func TestDegenerateGraphs(t *testing.T) {
 		}
 		cs := g.Cycles()
 		if len(cs) != 1 || cs[0].Len() != 1 {
-			t.Errorf("自环 Cycles = %v", cs)
+			t.Errorf("self-loop Cycles = %v", cs)
 		}
 	})
 	t.Run("ParallelMultiEdges", func(t *testing.T) {
@@ -166,19 +170,19 @@ func TestDegenerateGraphs(t *testing.T) {
 			t.Fatal(err)
 		}
 		if g.EdgeCount() != 5 {
-			t.Errorf("多边保留失败: %d", g.EdgeCount())
+			t.Errorf("multi-edge preservation failed: %d", g.EdgeCount())
 		}
 		res, err := g.BFS([]vectra.NodeID{0})
 		if err != nil || res.Count() != 2 {
-			t.Errorf("多边 BFS count = %d err=%v", res.Count(), err)
+			t.Errorf("multi-edge BFS count = %d err=%v", res.Count(), err)
 		}
 		p, found, err := g.ShortestPathIDs(0, 1)
 		if err != nil || !found || p.Len() != 1 {
-			t.Errorf("多边最短路 = %v found=%v", p, found)
+			t.Errorf("multi-edge shortest path = %v found=%v", p, found)
 		}
 		ns, _ := g.NeighborsOf("a", vectra.DirOut)
 		if len(ns) != 1 {
-			t.Errorf("一跳邻居应去重: %d", len(ns))
+			t.Errorf("one-hop neighbors should be deduplicated: %d", len(ns))
 		}
 	})
 	t.Run("Clique50", func(t *testing.T) {
@@ -199,11 +203,11 @@ func TestDegenerateGraphs(t *testing.T) {
 		}
 		st := g.Stats()
 		if st.SCCs != 1 || st.CyclicNodes != n {
-			t.Errorf("完全图应为单一 SCC: %+v", st)
+			t.Errorf("complete graph should be a single SCC: %+v", st)
 		}
 		p, found, _ := g.ShortestPathIDs(0, vectra.NodeID(n-1))
 		if !found || p.Len() != 1 {
-			t.Errorf("完全图任意两点应 1 跳: %v", p)
+			t.Errorf("any two nodes in a complete graph should be 1 hop: %v", p)
 		}
 	})
 	t.Run("Star1000", func(t *testing.T) {
@@ -216,12 +220,12 @@ func TestDegenerateGraphs(t *testing.T) {
 		if err := g.Seal(); err != nil {
 			t.Fatal(err)
 		}
-		res, err := g.BFS([]vectra.NodeID{0}, vectra.WithParallelThreshold(0)) // 中心 ID=0，强制并行
+		res, err := g.BFS([]vectra.NodeID{0}, vectra.WithParallelThreshold(0)) // center ID=0, forced parallel
 		if err != nil || res.Count() != 1001 {
-			t.Errorf("星形 BFS = %d err=%v", res.Count(), err)
+			t.Errorf("star BFS = %d err=%v", res.Count(), err)
 		}
 		if st := g.Stats(); st.SCCs != 1001 || st.CyclicNodes != 0 {
-			t.Errorf("星形应无环: %+v", st)
+			t.Errorf("star should be acyclic: %+v", st)
 		}
 	})
 	t.Run("AllSelfLoops", func(t *testing.T) {
@@ -235,20 +239,21 @@ func TestDegenerateGraphs(t *testing.T) {
 			t.Fatal(err)
 		}
 		if cs := g.Cycles(); len(cs) != 100 {
-			t.Errorf("全自环 Cycles = %d, want 100", len(cs))
+			t.Errorf("all-self-loops Cycles = %d, want 100", len(cs))
 		}
 		if st := g.Stats(); st.SCCs != 100 || st.CyclicNodes != 0 {
-			t.Errorf("自环不计入 CyclicNodes: %+v", st)
+			t.Errorf("self-loops must not count toward CyclicNodes: %+v", st)
 		}
 	})
 }
 
-// TestDeepChain1M 百万节点链：迭代 Tarjan 的调用栈压力
-// （递归实现会在此类深图上膨胀栈）+ 全链 BFS 深度正确性 + 双向搜索。
-// 耗时约数秒，-short 模式跳过。
+// TestDeepChain1M: million-node chain — call-stack pressure on iterative
+// Tarjan (a recursive implementation would balloon the stack on such deep
+// graphs) + whole-chain BFS depth correctness + bidirectional search.
+// Takes a few seconds; skipped in -short mode.
 func TestDeepChain1M(t *testing.T) {
 	if testing.Short() {
-		t.Skip("short 模式跳过百万节点压力测试")
+		t.Skip("skipping million-node stress test in short mode")
 	}
 	const n = 1_000_000
 	g := vectra.New()
@@ -264,41 +269,42 @@ func TestDeepChain1M(t *testing.T) {
 		t.Fatal(err)
 	}
 	if st := g.Stats(); st.Nodes != n || st.SCCs != n {
-		t.Errorf("链 stats = %+v", st)
+		t.Errorf("chain stats = %+v", st)
 	}
 	ser, err := g.BFS([]vectra.NodeID{0}, vectra.WithParallelThreshold(1<<30))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if ser.Count() != n {
-		t.Errorf("链 BFS count = %d, want %d", ser.Count(), n)
+		t.Errorf("chain BFS count = %d, want %d", ser.Count(), n)
 	}
 	if d := ser.Depth(vectra.NodeID(n - 1)); d != n-1 {
-		t.Errorf("链尾深度 = %d, want %d", d, n-1)
+		t.Errorf("chain tail depth = %d, want %d", d, n-1)
 	}
 	par, err := g.BFS([]vectra.NodeID{0}, vectra.WithParallelThreshold(0))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if par.Count() != ser.Count() || par.Depth(vectra.NodeID(n-1)) != ser.Depth(vectra.NodeID(n-1)) {
-		t.Error("深链上并行与串行结果不一致")
+		t.Error("parallel and serial results differ on the deep chain")
 	}
-	// 双向搜索在最长链上：1M 跳路径，长度精确等于中点距离
+	// bidirectional search on the longest chain: a 1M-hop path whose length exactly equals the midpoint distance
 	p, found, err := g.ShortestPathIDs(0, vectra.NodeID(n-1))
 	if err != nil || !found {
-		t.Fatalf("链最短路: found=%v err=%v", found, err)
+		t.Fatalf("chain shortest path: found=%v err=%v", found, err)
 	}
 	if p.Len() != n-1 {
-		t.Errorf("链最短路 = %d, want %d", p.Len(), n-1)
+		t.Errorf("chain shortest path = %d, want %d", p.Len(), n-1)
 	}
 	r, err := g.ReachableIDs(0)
 	if err != nil || len(r) != n {
-		t.Errorf("链 Reachable = %d err=%v", len(r), err)
+		t.Errorf("chain Reachable = %d err=%v", len(r), err)
 	}
 }
 
-// TestDeterminismSameSeedSameResults 同种子构建两次，全部查询结果
-// 逐位一致（LDBC 基准的 validate 模式要求可重复性）。
+// TestDeterminismSameSeedSameResults: build twice with the same seed, all
+// query results bit-for-bit identical (LDBC benchmark validate mode
+// requires repeatability).
 func TestDeterminismSameSeedSameResults(t *testing.T) {
 	build := func() *vectra.Graph {
 		g := vectra.New()
@@ -316,16 +322,16 @@ func TestDeterminismSameSeedSameResults(t *testing.T) {
 	}
 	g1, g2 := build(), build()
 	if g1.Stats() != g2.Stats() {
-		t.Fatalf("stats 不一致: %+v vs %+v", g1.Stats(), g2.Stats())
+		t.Fatalf("stats mismatch: %+v vs %+v", g1.Stats(), g2.Stats())
 	}
 	c1, c2 := g1.Cycles(), g2.Cycles()
 	if len(c1) != len(c2) {
-		t.Fatalf("Cycles 数不一致")
+		t.Fatalf("Cycles count mismatch")
 	}
 	for i := range c1 {
 		for j := range c1[i].Nodes {
 			if c1[i].Nodes[j] != c2[i].Nodes[j] {
-				t.Fatalf("Cycles[%d] 成员不一致", i)
+				t.Fatalf("Cycles[%d] members mismatch", i)
 			}
 		}
 	}
@@ -333,17 +339,17 @@ func TestDeterminismSameSeedSameResults(t *testing.T) {
 	r2, _ := g2.ReachableIDs(7)
 	for i := range r1 {
 		if r1[i] != r2[i] {
-			t.Fatalf("Reachable 结果在第 %d 位不一致", i)
+			t.Fatalf("Reachable results differ at position %d", i)
 		}
 	}
 	p1, ok1, _ := g1.ShortestPathIDs(3, 1997)
 	p2, ok2, _ := g2.ShortestPathIDs(3, 1997)
 	if ok1 != ok2 {
-		t.Fatal("可达性判定不一致")
+		t.Fatal("reachability determination mismatch")
 	}
 	for i := range p1.Nodes {
 		if p1.Nodes[i] != p2.Nodes[i] {
-			t.Fatalf("最短路径在第 %d 跳不一致", i)
+			t.Fatalf("shortest paths differ at hop %d", i)
 		}
 	}
 }

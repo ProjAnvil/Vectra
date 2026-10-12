@@ -26,10 +26,10 @@ func TestPercentileNearestRank(t *testing.T) {
 
 func TestPercentileEmptyAndSingle(t *testing.T) {
 	if got := Percentile(nil, 0.5); got != 0 {
-		t.Errorf("空样本 = %v, want 0", got)
+		t.Errorf("empty samples = %v, want 0", got)
 	}
 	if got := Percentile([]time.Duration{7 * time.Millisecond}, 0.99); got != 7*time.Millisecond {
-		t.Errorf("单样本 = %v, want 7ms", got)
+		t.Errorf("single sample = %v, want 7ms", got)
 	}
 }
 
@@ -37,7 +37,7 @@ func TestPercentileDoesNotMutateInput(t *testing.T) {
 	durs := []time.Duration{3 * time.Millisecond, 1 * time.Millisecond, 2 * time.Millisecond}
 	_ = Percentile(durs, 0.5)
 	if durs[0] != 3*time.Millisecond || durs[1] != 1*time.Millisecond || durs[2] != 2*time.Millisecond {
-		t.Error("Percentile 不应修改输入切片")
+		t.Error("Percentile should not modify the input slice")
 	}
 }
 

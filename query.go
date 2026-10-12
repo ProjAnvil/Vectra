@@ -1,12 +1,14 @@
 package vectra
 
-// Query 是链式遍历构造器：
+// Query is the chained traversal builder:
 //
 //	g.Query().From("gateway").Out("CALLS").MaxDepth(3).Run()
 //
-// From 支持多起点（批量多源 BFS）；Out/In 指定方向并可选按标签过滤；
-// MaxDepth 限制跳数（默认不限）。Where 对到达节点施加谓词。
-// Run 执行层同步 BFS（前沿达到阈值自动并行）。
+// From supports multiple start nodes (batched multi-source BFS); Out/In
+// pick the direction with optional label filtering; MaxDepth caps hops
+// (unbounded by default). Where applies a predicate to reached nodes.
+// Run executes a level-synchronous BFS (goes parallel automatically once
+// the frontier crosses a threshold).
 type Query struct {
 	g        *Graph
 	fromKeys []string
@@ -25,7 +27,8 @@ func (q *Query) Out(labels ...string) *Query { q.labels, q.dir = labels, DirOut;
 func (q *Query) In(labels ...string) *Query  { q.labels, q.dir = labels, DirIn; return q }
 func (q *Query) MaxDepth(d uint32) *Query    { q.maxDepth = d; return q }
 
-// Where 对到达节点施加谓词（等价 WithNodeFilter；起点不受限）。
+// Where applies a predicate to reached nodes (equivalent to WithNodeFilter;
+// start nodes are exempt).
 func (q *Query) Where(pred func(Node) bool) *Query { q.nodePred = pred; return q }
 
 func (q *Query) Run() (*BFSResult, error) {
@@ -50,7 +53,8 @@ func (q *Query) Run() (*BFSResult, error) {
 	return q.g.BFS(starts, opts...)
 }
 
-// NeighborsOf 返回 key 节点的一跳邻居（按标签过滤，空 = 全部，去重）。
+// NeighborsOf returns the one-hop neighbors of the node key (label-filtered,
+// empty = all, deduplicated).
 func (g *Graph) NeighborsOf(key string, dir Direction, labels ...string) ([]Node, error) {
 	n, ok := g.NodeByKey(key)
 	if !ok {

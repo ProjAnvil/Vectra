@@ -1,11 +1,13 @@
-// vectra-bench 是 Vectra 的压测工具：生成幂律依赖图 → 注入（引擎直写
-// 或经 HTTP/raft）→ 参数固定化 → 并发压测单跳/多跳/路径/可达负载 →
-// 输出 markdown 报告。数据落本地临时目录，运行后删除（--keep 保留）。
+// vectra-bench is Vectra's stress tool: generate a power-law dependency graph →
+// inject (direct engine writes or via HTTP/raft) → parameter curation →
+// concurrent stress of neighbors/multi-hop/path/reachability workloads →
+// emit a markdown report. Data goes to a local temp directory, deleted after
+// the run (--keep retains it).
 //
-// 用法：
+// Usage:
 //
-//	vectra-bench -size small                      # 引擎模式，千级图
-//	vectra-bench -size medium -mode http          # 服务模式（HTTP+raft）
+//	vectra-bench -size small                      # engine mode, thousand-scale graph
+//	vectra-bench -size medium -mode http          # server mode (HTTP+raft)
 //	vectra-bench -size large -duration 10s -workers 16
 package main
 
@@ -40,27 +42,27 @@ var sizes = map[string]sizeSpec{
 }
 
 const (
-	nodeChunk = 20_000  // HTTP 注入的节点分批
-	edgeChunk = 100_000 // HTTP 注入的边分批
+	nodeChunk = 20_000  // Node chunk size for HTTP injection
+	edgeChunk = 100_000 // Edge chunk size for HTTP injection
 )
 
 func main() {
 	size := flag.String("size", "small", "small|medium|large")
 	mode := flag.String("mode", "engine", "engine|http")
-	workers := flag.Int("workers", 8, "并发 worker 数")
-	duration := flag.Duration("duration", 5*time.Second, "每负载压测时长")
-	warmup := flag.Duration("warmup", 500*time.Millisecond, "每负载预热时长（丢弃）")
-	seed := flag.Int64("seed", 42, "图与参数种子")
-	datadir := flag.String("datadir", "", "数据目录（默认系统临时目录，结束删除）")
-	keep := flag.Bool("keep", false, "保留数据目录（调试）")
-	out := flag.String("out", "", "结果写入文件（默认 stdout）")
-	sealInterval := flag.Duration("seal-interval", 2*time.Second, "http 模式发布节流间隔")
-	workloads := flag.String("workloads", "", "逗号分隔的负载子集（默认全部）: neighbors,bfs2,bfs3,bfsall,path,reach")
+	workers := flag.Int("workers", 8, "number of concurrent workers")
+	duration := flag.Duration("duration", 5*time.Second, "stress duration per workload")
+	warmup := flag.Duration("warmup", 500*time.Millisecond, "warmup duration per workload (discarded)")
+	seed := flag.Int64("seed", 42, "seed for graph and parameters")
+	datadir := flag.String("datadir", "", "data directory (system temp dir by default, deleted at the end)")
+	keep := flag.Bool("keep", false, "keep the data directory (debugging)")
+	out := flag.String("out", "", "write results to file (stdout by default)")
+	sealInterval := flag.Duration("seal-interval", 2*time.Second, "publish throttle interval in http mode")
+	workloads := flag.String("workloads", "", "comma-separated workload subset (all by default): neighbors,bfs2,bfs3,bfsall,path,reach")
 	flag.Parse()
 
 	spec, ok := sizes[*size]
 	if !ok {
-		fmt.Fprintf(os.Stderr, "未知 size: %s（small|medium|large）\n", *size)
+		fmt.Fprintf(os.Stderr, "unknown size: %s (small|medium|large)\n", *size)
 		os.Exit(2)
 	}
 
@@ -83,18 +85,18 @@ func main() {
 		if cleanup {
 			os.RemoveAll(dir)
 		} else {
-			fmt.Fprintf(os.Stderr, "数据目录保留: %s\n", dir)
+			fmt.Fprintf(os.Stderr, "data directory kept: %s\n", dir)
 		}
 	}()
 
 	rep := newReport(spec, *mode, *workers, *duration, *seed)
 
-	// 1. 生成
+	// 1. Generate
 	t0 := time.Now()
 	bg := bench.Generate(bench.Spec{Nodes: spec.nodes, Edges: spec.edges, Seed: *seed})
 	rep.GenTime = time.Since(t0)
 
-	// 2. 注入
+	// 2. Inject
 	var queryGraph *vectra.Graph
 	var baseURL string
 	var httpc *http.Client
@@ -107,16 +109,16 @@ func main() {
 		defer node.Close()
 		queryGraph = waitPublished(node, spec)
 	default:
-		fmt.Fprintf(os.Stderr, "未知 mode: %s\n", *mode)
+		fmt.Fprintf(os.Stderr, "unknown mode: %s\n", *mode)
 		os.Exit(2)
 	}
 
-	// 3. 参数固定化
+	// 3. Parameter curation
 	t0 = time.Now()
 	params := bench.Curate(queryGraph, bg, 64, *seed+1)
 	rep.CurateTime = time.Since(t0)
 
-	// 4. 负载
+	// 4. Workloads
 	ops := buildWorkloads(*mode, queryGraph, baseURL, httpc, params)
 	selected := ops
 	if *workloads != "" {
@@ -132,27 +134,27 @@ func main() {
 		}
 	}
 	for _, w := range selected {
-		bench.RunWorkload(w.name, w.op, 1, *warmup) // 预热丢弃
+		bench.RunWorkload(w.name, w.op, 1, *warmup) // Warmup discarded
 		res := bench.RunWorkload(w.name, w.op, *workers, *duration)
 		fmt.Fprintf(os.Stderr, "  %-10s ops=%-7d p50=%-9s p99=%s\n",
 			res.Name, res.Ops, bench.FormatDur(res.P50), bench.FormatDur(res.P99))
 		rep.Results = append(rep.Results, res)
 	}
 
-	// 5. 输出
+	// 5. Output
 	md := rep.markdown()
 	if *out != "" {
 		if err := os.WriteFile(*out, []byte(md), 0o644); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		fmt.Fprintf(os.Stderr, "结果已写入 %s\n", *out)
+		fmt.Fprintf(os.Stderr, "results written to %s\n", *out)
 	} else {
 		fmt.Print(md)
 	}
 }
 
-// ---- 注入 ----
+// ---- Injection ----
 
 func injectEngine(rep *report, bg *bench.Graph) *vectra.Graph {
 	g := vectra.New()
@@ -176,7 +178,7 @@ func injectEngine(rep *report, bg *bench.Graph) *vectra.Graph {
 }
 
 func injectHTTP(rep *report, bg *bench.Graph, dir string, sealInterval time.Duration, keep bool) (string, *http.Client, *server.Node) {
-	// 探测空闲端口后释放，交给 server.New 的 TCP transport 绑定
+	// Probe a free port and release it for server.New's TCP transport to bind
 	probe, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -213,7 +215,7 @@ func injectHTTP(rep *report, bg *bench.Graph, dir string, sealInterval time.Dura
 	}
 	base := "http://" + httpLn.Addr().String()
 
-	// 节点分批注入
+	// Chunked node injection
 	t0 := time.Now()
 	for i := 0; i < len(bg.Nodes); i += nodeChunk {
 		end := min(i+nodeChunk, len(bg.Nodes))
@@ -223,7 +225,7 @@ func injectHTTP(rep *report, bg *bench.Graph, dir string, sealInterval time.Dura
 	}
 	rep.InjectNodesPerS = rate(len(bg.Nodes), time.Since(t0))
 
-	// 边分批注入
+	// Chunked edge injection
 	t0 = time.Now()
 	chunk := make([]bench.Edge, 0, edgeChunk)
 	flush := func() {
@@ -275,7 +277,7 @@ func postJSONAndWait(c *http.Client, url string, body any) {
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintf(os.Stderr, "注入失败: %s\n", resp.Status)
+		fmt.Fprintf(os.Stderr, "injection failed: %s\n", resp.Status)
 		os.Exit(1)
 	}
 }
@@ -288,12 +290,12 @@ func waitLeader(n *server.Node) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	fmt.Fprintln(os.Stderr, "单节点未在期限内当选 leader")
+	fmt.Fprintln(os.Stderr, "single node not elected leader within the deadline")
 	os.Exit(1)
 }
 
 func waitPublished(n *server.Node, spec sizeSpec) *vectra.Graph {
-	fmt.Fprintf(os.Stderr, "等待发布（含大图 Seal）...\n")
+	fmt.Fprintf(os.Stderr, "waiting for publish (including large-graph Seal)...\n")
 	deadline := time.Now().Add(5 * time.Minute)
 	last := time.Now()
 	for time.Now().Before(deadline) {
@@ -303,13 +305,13 @@ func waitPublished(n *server.Node, spec sizeSpec) *vectra.Graph {
 				return p
 			}
 			if time.Since(last) > 10*time.Second {
-				fmt.Fprintf(os.Stderr, "  已发布 %d/%d（等待注入数据全部发布）...\n", st.Nodes, st.Edges)
+				fmt.Fprintf(os.Stderr, "  published %d/%d (waiting for all injected data to be published)...\n", st.Nodes, st.Edges)
 				last = time.Now()
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	fmt.Fprintln(os.Stderr, "发布超时")
+	fmt.Fprintln(os.Stderr, "publish timeout")
 	os.Exit(1)
 	return nil
 }
@@ -321,7 +323,7 @@ func rate(n int, d time.Duration) float64 {
 	return float64(n) / d.Seconds()
 }
 
-// ---- 负载定义 ----
+// ---- Workload definitions ----
 
 type workload struct {
 	name string
@@ -418,7 +420,7 @@ func httpWorkloads(base string, c *http.Client, p bench.QueryParams) []workload 
 	}
 }
 
-// ---- 报告 ----
+// ---- Report ----
 
 type report struct {
 	Size    sizeSpec
@@ -441,11 +443,11 @@ func newReport(s sizeSpec, mode string, workers int, dur time.Duration, seed int
 
 func (r *report) markdown() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "## vectra-bench %s（%s 模式，%d workers × %s，seed=%d）\n\n",
+	fmt.Fprintf(&b, "## vectra-bench %s (%s mode, %d workers × %s, seed=%d)\n\n",
 		r.Size.name, r.Mode, r.Workers, r.Dur, r.Seed)
-	fmt.Fprintf(&b, "- 图：%s 节点 / %s 边（幂律 BA + 5%% 回边）\n",
+	fmt.Fprintf(&b, "- Graph: %s nodes / %s edges (power-law BA + 5%% back edges)\n",
 		intComma(r.Size.nodes), intComma(r.Size.edges))
-	fmt.Fprintf(&b, "- 生成：%s；注入：%.0f 节点/s、%.0f 边/s；Seal：%s；参数固定化：%s\n\n",
+	fmt.Fprintf(&b, "- Generate: %s; inject: %.0f nodes/s, %.0f edges/s; Seal: %s; parameter curation: %s\n\n",
 		bench.FormatDur(r.GenTime), r.InjectNodesPerS, r.InjectEdgesPerS,
 		bench.FormatDur(r.SealTime), bench.FormatDur(r.CurateTime))
 	rows := make([][]string, 0, len(r.Results))
@@ -457,7 +459,7 @@ func (r *report) markdown() string {
 		})
 	}
 	b.WriteString(bench.MarkdownTable(
-		[]string{"负载", "ops", "QPS", "p50", "p90", "p99", "max", "err"},
+		[]string{"workload", "ops", "QPS", "p50", "p90", "p99", "max", "err"},
 		rows,
 	))
 	return b.String()
@@ -473,7 +475,7 @@ func intComma(n int) string {
 	return strings.Join(append([]string{s}, parts...), ",")
 }
 
-// rotators 返回参数轮换闭包（原子计数取模）。
+// rotators returns parameter rotation closures (atomic counter modulo).
 func rotators(p bench.QueryParams) (func() string, func() [2]string) {
 	var i, j atomic.Int64
 	nextStart := func() string { return p.Starts[i.Add(1)%int64(len(p.Starts))] }

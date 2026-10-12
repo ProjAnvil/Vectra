@@ -71,7 +71,7 @@ func TestNeighborsOf(t *testing.T) {
 	if !slices.Equal(got, []string{"auth", "ledger"}) {
 		t.Errorf("neighbors = %v", got)
 	}
-	// 反向 + 无过滤
+	// reverse direction + no filtering
 	ns, err = g.NeighborsOf("db", vectra.DirIn)
 	if err != nil {
 		t.Fatal(err)

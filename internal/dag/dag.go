@@ -1,5 +1,7 @@
-// Package dag 提供强连通分量（Tarjan 迭代版）、凝聚图构建与拓扑层级。
-// 查询侧的"写入时压环"由本包支撑：Seal 时压缩 SCC，之后查询面对 DAG。
+// Package dag provides strongly connected components (iterative Tarjan),
+// condensation construction, and topological levels. It backs the query side's
+// "collapse cycles at write time": Seal compresses SCCs, after which queries
+// face a DAG.
 package dag
 
 import "slices"
@@ -9,8 +11,9 @@ type frame struct {
 	ei uint32
 }
 
-// Tarjan 计算强连通分量。返回 sccOf（节点->分量 ID）与分量总数。
-// 迭代实现：显式调用栈，深度不受 goroutine 栈限制。
+// Tarjan computes strongly connected components. Returns sccOf (node -> SCC
+// ID) and the component count. Iterative implementation: explicit call stack,
+// so depth is not bounded by the goroutine stack.
 func Tarjan(numNodes uint32, adj func(uint32) []uint32) (sccOf []uint32, count uint32) {
 	const unvisited = ^uint32(0)
 	index := make([]uint32, numNodes)
@@ -52,7 +55,7 @@ func Tarjan(numNodes uint32, adj func(uint32) []uint32) (sccOf []uint32, count u
 				}
 				continue
 			}
-			// 节点 f.v 的所有邻居处理完毕
+			// all neighbors of node f.v processed
 			if low[f.v] == index[f.v] {
 				for {
 					w := tarjanStack[len(tarjanStack)-1]
@@ -77,8 +80,9 @@ func Tarjan(numNodes uint32, adj func(uint32) []uint32) (sccOf []uint32, count u
 	return sccOf, count
 }
 
-// Condensed 是凝聚图的 CSR 表示。Labels 平行于 Targets：该凝聚边继承的
-// 原边标签（跨 SCC 且同标签的平行边去重后保留一条）。
+// Condensed is the CSR representation of the condensation. Labels run parallel
+// to Targets: the original edge label inherited by that condensed edge
+// (parallel cross-SCC edges with the same label dedup to one).
 type Condensed struct {
 	Offsets []uint32 // len == sccCount+1
 	Targets []uint32
@@ -97,8 +101,9 @@ type condEdge struct {
 	src, dst, label uint32
 }
 
-// Condense 构建凝聚图。labelOf 返回与 adj(u) 平行的每条出边标签，
-// 为 nil 时凝聚边不带标签。跨 SCC 边按 (src, dst, label) 三元组去重。
+// Condense builds the condensation. labelOf returns per-out-edge labels
+// parallel to adj(u); when nil, condensed edges carry no label. Cross-SCC
+// edges are deduped by the (src, dst, label) triple.
 func Condense(numNodes uint32, sccOf []uint32, count uint32, adj func(uint32) []uint32, labelOf func(uint32) []uint32) Condensed {
 	var edges []condEdge
 	for u := uint32(0); u < numNodes; u++ {
@@ -149,8 +154,9 @@ func Condense(numNodes uint32, sccOf []uint32, count uint32, adj func(uint32) []
 	return c
 }
 
-// Levels 用 Kahn 拓扑排序计算凝聚图最长路径层级：入度 0 为 0 层，
-// 其余为 1 + max(前驱层级)。DAG 上所有边严格升层。
+// Levels computes longest-path levels on the condensation via Kahn's
+// topological sort: in-degree 0 is level 0, others are 1 + max(predecessor
+// level). All edges in the DAG rise strictly in level.
 func Levels(c Condensed) []uint32 {
 	n := uint32(len(c.Offsets) - 1)
 	level := make([]uint32, n)

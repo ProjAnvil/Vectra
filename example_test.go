@@ -8,7 +8,7 @@ import (
 	"github.com/projanvil/vectra"
 )
 
-// Example_quickstart 演示完整生命周期：建图 → Seal → 查询 → 快照。
+// Example_quickstart demonstrates the full lifecycle: build → Seal → query → snapshot.
 func Example_quickstart() {
 	g := vectra.New()
 	for _, n := range []string{"gateway", "auth", "ledger", "db", "kafka"} {
@@ -45,7 +45,7 @@ func Example_quickstart() {
 	// cycles: 0
 }
 
-// ExampleGraph_Cycles 演示循环依赖发现。
+// ExampleGraph_Cycles demonstrates circular-dependency discovery.
 func ExampleGraph_Cycles() {
 	g := vectra.New()
 	for _, k := range []string{"order", "pay", "risk", "notify"} {

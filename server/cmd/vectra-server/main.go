@@ -1,7 +1,7 @@
-// vectra-server 启动一个 Vectra 服务节点（raft 复制 + HTTP API）。
+// vectra-server starts a Vectra server node (raft replication + HTTP API).
 //
-// 首节点：  vectra-server -id n1 -http :8080 -raft :9000 -data /data/n1
-// 加入集群：vectra-server -id n2 -http :8081 -raft :9001 -data /data/n2 -join http://n1:8080
+// First node:  vectra-server -id n1 -http :8080 -raft :9000 -data /data/n1
+// Join cluster: vectra-server -id n2 -http :8081 -raft :9001 -data /data/n2 -join http://n1:8080
 package main
 
 import (
@@ -14,16 +14,16 @@ import (
 )
 
 func main() {
-	id := flag.String("id", "", "节点 ID（必填，与数据目录绑定）")
-	httpAddr := flag.String("http", ":8080", "HTTP API 监听地址")
-	raftAddr := flag.String("raft", ":9000", "raft 对等地址")
-	dataDir := flag.String("data", "", "数据目录（必填：raft.db/snapshots/meta.json）")
-	join := flag.String("join", "", "seed 节点 HTTP 地址（空 = 单节点引导；防脑裂：Join 非空绝不引导）")
-	sealInterval := flag.Duration("seal-interval", server.DefaultSealInterval, "大图发布节流间隔")
+	id := flag.String("id", "", "node ID (required, bound to the data directory)")
+	httpAddr := flag.String("http", ":8080", "HTTP API listen address")
+	raftAddr := flag.String("raft", ":9000", "raft peer address")
+	dataDir := flag.String("data", "", "data directory (required: raft.db/snapshots/meta.json)")
+	join := flag.String("join", "", "seed node HTTP address (empty = single-node bootstrap; anti-split-brain: non-empty Join never bootstraps)")
+	sealInterval := flag.Duration("seal-interval", server.DefaultSealInterval, "publish throttle interval for large graphs")
 	flag.Parse()
 
 	if *id == "" || *dataDir == "" {
-		fmt.Fprintln(os.Stderr, "用法: vectra-server -id n1 -data /data/n1 [-http :8080 -raft :9000 -join SEED]")
+		fmt.Fprintln(os.Stderr, "usage: vectra-server -id n1 -data /data/n1 [-http :8080 -raft :9000 -join SEED]")
 		os.Exit(2)
 	}
 

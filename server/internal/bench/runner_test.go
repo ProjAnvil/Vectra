@@ -17,14 +17,14 @@ func TestRunWorkloadCountsAndLatency(t *testing.T) {
 		time.Sleep(200 * time.Microsecond)
 		return nil
 	}, 4, 300*time.Millisecond)
-	if res.Ops < 4 { // 4 worker × 至少几十次
-		t.Fatalf("ops = %d 过少", res.Ops)
+	if res.Ops < 4 { // 4 workers × at least a few dozen ops
+		t.Fatalf("ops = %d too few", res.Ops)
 	}
 	if res.Errors == 0 {
-		t.Error("错误未被计数")
+		t.Error("errors not counted")
 	}
 	if res.P50 < 100*time.Microsecond || res.P50 > 10*time.Millisecond {
-		t.Errorf("p50 = %v 异常", res.P50)
+		t.Errorf("p50 = %v abnormal", res.P50)
 	}
 	if res.QPS <= 0 {
 		t.Errorf("QPS = %f", res.QPS)

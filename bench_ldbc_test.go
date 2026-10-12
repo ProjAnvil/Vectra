@@ -10,18 +10,21 @@ import (
 )
 
 // ============================================================
-// LDBC SNB Interactive 风格工作负载基准
+// LDBC SNB Interactive-style workload benchmarks
 //
-// 模拟 SNB 的复杂读查询形态（从一到两个起点做 2-3 跳邻域、点对路径），
-// 并采用其 parameter curation 方法：查询参数（起点/终点）在基准外
-// 预先固定成代表性集合（高扇出节点、已验证可达对），而不是每次迭代
-// 随机重抽——保证迭代间工作负载一致、数字可比。
-// 数据集：SNAP email-Eu-core 真实邮件图（1005 节点 / 25571 边）。
+// Mimics SNB's complex-read query shapes (2-3 hop neighborhoods and
+// node-pair paths from one or two start nodes) and adopts its parameter
+// curation method: query parameters (start/end nodes) are fixed into a
+// representative set outside the benchmark (high fan-out nodes,
+// verified-reachable pairs) rather than re-drawn at random each iteration —
+// keeping the workload consistent across iterations and the numbers
+// comparable.
+// Dataset: SNAP email-Eu-core real email graph (1005 nodes / 25571 edges).
 // ============================================================
 
-// curateSNBParameters 预先固定基准参数：
-// - kHopSources: 出度前 16 的节点（对应 SNB 的"活跃用户"起点）
-// - pathPairs: 64 对已验证可达的节点（对应 CR14 路径查询参数）
+// curateSNBParameters fixes benchmark parameters in advance:
+// - kHopSources: top-16 nodes by out-degree (SNB's "active user" start nodes)
+// - pathPairs: 64 verified-reachable node pairs (CR14 path query parameters)
 func curateSNBParameters(t testing.TB, g *vectra.Graph, el edgeList) (kHopSources []vectra.NodeID, pathPairs [][2]vectra.NodeID) {
 	t.Helper()
 	outDeg := make([]int, el.n)
@@ -32,7 +35,7 @@ func curateSNBParameters(t testing.TB, g *vectra.Graph, el edgeList) (kHopSource
 	for i := range idx {
 		idx[i] = i
 	}
-	// 出度降序取前 16
+	// top 16 by out-degree, descending
 	for i := 0; i < len(idx); i++ {
 		for j := i + 1; j < len(idx); j++ {
 			if outDeg[idx[j]] > outDeg[idx[i]] {
@@ -43,7 +46,7 @@ func curateSNBParameters(t testing.TB, g *vectra.Graph, el edgeList) (kHopSource
 	for i := 0; i < 16 && i < el.n; i++ {
 		kHopSources = append(kHopSources, vectra.NodeID(idx[i]))
 	}
-	// 固定种子抽 64 对，只保留可达对（参数筛选 = curation）
+	// draw 64 pairs with a fixed seed, keeping only reachable ones (parameter screening = curation)
 	rng := rand.New(rand.NewSource(31))
 	for len(pathPairs) < 64 {
 		u, v := vectra.NodeID(rng.Intn(el.n)), vectra.NodeID(rng.Intn(el.n))
@@ -64,7 +67,7 @@ func benchSNB(b *testing.B) (*vectra.Graph, []vectra.NodeID, [][2]vectra.NodeID)
 	return g, srcs, pairs
 }
 
-// bytesBuffer 是可重复 Read 的内存缓冲（bytes.Buffer 读后不可复用）。
+// bytesBuffer is a re-Readable in-memory buffer (a bytes.Buffer cannot be re-read).
 type bytesBuffer struct {
 	data []byte
 	off  int
@@ -84,8 +87,9 @@ func (b *bytesBuffer) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// BenchmarkSNB_kHop2/3 对应 SNB 复杂读的邻域发现类查询（CR3/CR9 形态）：
-// 高扇出起点的 2/3 跳邻域计数。
+// BenchmarkSNB_kHop2/3 correspond to SNB complex-read neighborhood
+// discovery queries (CR3/CR9 shapes): 2/3-hop neighborhood counts from
+// high fan-out start nodes.
 func BenchmarkSNB_kHop2(b *testing.B) {
 	g, srcs, _ := benchSNB(b)
 	b.ResetTimer()
@@ -95,7 +99,7 @@ func BenchmarkSNB_kHop2(b *testing.B) {
 			b.Fatal(err)
 		}
 		if res.Count() < 10 {
-			b.Fatalf("高扇出起点 2 跳邻域异常小: %d", res.Count())
+			b.Fatalf("2-hop neighborhood of high fan-out start suspiciously small: %d", res.Count())
 		}
 	}
 }
@@ -109,24 +113,24 @@ func BenchmarkSNB_kHop3(b *testing.B) {
 			b.Fatal(err)
 		}
 		if res.Count() < 10 {
-			b.Fatalf("高扇出起点 3 跳邻域异常小: %d", res.Count())
+			b.Fatalf("3-hop neighborhood of high fan-out start suspiciously small: %d", res.Count())
 		}
 	}
 }
 
-// BenchmarkSNB_ShortestPath 对应 CR14：两节点间最短路径（双向 BFS）。
+// BenchmarkSNB_ShortestPath corresponds to CR14: shortest path between two nodes (bidirectional BFS).
 func BenchmarkSNB_ShortestPath(b *testing.B) {
 	g, _, pairs := benchSNB(b)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		p := pairs[i%len(pairs)]
 		if _, found, err := g.ShortestPathIDs(p[0], p[1]); err != nil || !found {
-			b.Fatalf("curated pair 不可达: %v", p)
+			b.Fatalf("curated pair unreachable: %v", p)
 		}
 	}
 }
 
-// BenchmarkSNB_Reachability 可达性判定（超节点快路径）。
+// BenchmarkSNB_Reachability: reachability determination (supernode fast path).
 func BenchmarkSNB_Reachability(b *testing.B) {
 	g, srcs, _ := benchSNB(b)
 	b.ResetTimer()
@@ -137,8 +141,9 @@ func BenchmarkSNB_Reachability(b *testing.B) {
 	}
 }
 
-// BenchmarkSNB_MultiSourceBFS 多源批量遍历（一个需求对应多个入口服务
-// 的调用图场景）：16 个高扇出起点一次 BFS。
+// BenchmarkSNB_MultiSourceBFS: batched multi-source traversal (the
+// call-graph scenario where one requirement spans multiple entry
+// services): one BFS over 16 high fan-out start nodes.
 func BenchmarkSNB_MultiSourceBFS(b *testing.B) {
 	g, srcs, _ := benchSNB(b)
 	b.ResetTimer()
@@ -148,13 +153,13 @@ func BenchmarkSNB_MultiSourceBFS(b *testing.B) {
 			b.Fatal(err)
 		}
 		if res.Count() < 800 {
-			b.Fatalf("多源邻域异常小: %d", res.Count())
+			b.Fatalf("multi-source neighborhood suspiciously small: %d", res.Count())
 		}
 	}
 }
 
-// BenchmarkSNB_LoadSnapshot 冷启动路径：快照加载 + 自动 Seal 的吞吐
-// （对应服务模式重启恢复成本）。
+// BenchmarkSNB_LoadSnapshot: cold-start path — snapshot load + automatic
+// Seal throughput (the restart-recovery cost in service mode).
 func BenchmarkSNB_LoadSnapshot(b *testing.B) {
 	g := vectra.New()
 	for i := 0; i < 1005; i++ {

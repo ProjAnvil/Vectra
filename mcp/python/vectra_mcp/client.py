@@ -26,11 +26,11 @@ class Client:
                 raise VectraError(f"{resp.status_code}: {resp.text}") from None
         return resp.json()
 
-    # 写入
+    # write
     def batch(self, nodes: list[dict], edges: list[dict]) -> dict:
         return self._check(self._http.post("/v1/batch", json={"nodes": nodes, "edges": edges}))
 
-    # 查询
+    # query
     def stats(self) -> dict:
         return self._check(self._http.get("/v1/stats"))
 

@@ -10,10 +10,11 @@ import (
 )
 
 // ============================================================
-// 三节点进程内混沌集群（Graphalytics robustacy 轴的集群版）
+// Three-node in-process chaos cluster (cluster edition of the
+// Graphalytics robustness axis)
 // ============================================================
 
-// disconnect 模拟节点失联（双向断开 transport，非优雅）。
+// disconnect simulates a node losing contact (bidirectional transport break, ungraceful).
 func (tc *testCluster) disconnect(tn *testNode) {
 	tn.trans.DisconnectAll()
 	for _, other := range tc.nodes {
@@ -23,7 +24,7 @@ func (tc *testCluster) disconnect(tn *testNode) {
 	}
 }
 
-// reconnect 恢复双向连通。
+// reconnect restores bidirectional connectivity.
 func (tc *testCluster) reconnect(tn *testNode) {
 	for _, other := range tc.nodes {
 		if other != tn {
@@ -42,11 +43,11 @@ func writeBatch(t *testing.T, tn *testNode, n int) {
 	}
 	resp, out := postJSON(t, tn.URL()+"/v1/batch", body)
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("写入 svc-%d 失败: %d %v", n, resp.StatusCode, out)
+		t.Fatalf("write svc-%d failed: %d %v", n, resp.StatusCode, out)
 	}
 }
 
-// TestClusterBootstrapAndReplicate T1：引导 → 选主 → 写入 → 三副本一致。
+// TestClusterBootstrapAndReplicate T1: bootstrap → leader election → write → three-replica consistency.
 func TestClusterBootstrapAndReplicate(t *testing.T) {
 	tc := newTestCluster(t, 3)
 	leader := tc.leaderWithin(15 * time.Second)
@@ -54,27 +55,27 @@ func TestClusterBootstrapAndReplicate(t *testing.T) {
 	writeBatch(t, leader, 2)
 	tc.waitAllPublished(2, 0, 15*time.Second)
 
-	// 三节点 stats 完全一致
+	// All three nodes' stats identical
 	for _, tn := range tc.nodes {
 		resp, out := getJSON(t, tn.URL()+"/v1/stats")
 		if resp.StatusCode != http.StatusOK || out["nodes"] != float64(2) {
-			t.Fatalf("节点 %s stats: %d %v", tn.node.cfg.NodeID, resp.StatusCode, out)
+			t.Fatalf("node %s stats: %d %v", tn.node.cfg.NodeID, resp.StatusCode, out)
 		}
 	}
 }
 
-// TestClusterLeaderFailover T2：leader 失联（非优雅）→ 剩余节点重选 →
-// 写入继续 → 旧 leader 回归后追平。
+// TestClusterLeaderFailover T2: leader loses contact (ungraceful) → remaining
+// nodes re-elect → writes continue → old leader catches up after returning.
 func TestClusterLeaderFailover(t *testing.T) {
 	tc := newTestCluster(t, 3)
 	leader := tc.leaderWithin(15 * time.Second)
 	writeBatch(t, leader, 1)
 	tc.waitAllPublished(1, 0, 15*time.Second)
 
-	// leader 宕机
+	// Leader goes down
 	tc.disconnect(leader)
 
-	// 剩余两节点选出新 leader
+	// Remaining two nodes elect a new leader
 	var newLeader *testNode
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
@@ -90,17 +91,17 @@ func TestClusterLeaderFailover(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	if newLeader == nil {
-		t.Fatal("leader 宕机后没有新 leader 当选")
+		t.Fatal("no new leader elected after leader went down")
 	}
 	if newLeader == leader {
-		t.Fatal("失联的旧 leader 不应仍是 leader")
+		t.Fatal("the disconnected old leader should no longer be leader")
 	}
 
-	// 新 leader 继续写入
+	// New leader continues writing
 	writeBatch(t, newLeader, 2)
 	writeBatch(t, newLeader, 3)
 
-	// 两个存活节点追平（失联节点除外）
+	// Two live nodes catch up (disconnected node excluded)
 	deadline = time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		ok := true
@@ -120,18 +121,19 @@ func TestClusterLeaderFailover(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	// 旧 leader 回归 → 日志回放追平（T3 场景）
+	// Old leader returns → catches up via log replay (T3 scenario)
 	tc.reconnect(leader)
 	tc.waitAllPublished(3, 0, 20*time.Second)
 
-	// 集群整体仍可写
+	// Cluster as a whole is still writable
 	l2 := tc.leaderWithin(15 * time.Second)
 	writeBatch(t, l2, 4)
 	tc.waitAllPublished(4, 0, 20*time.Second)
 }
 
-// TestClusterFollowerCatchupByLog 边写边离线：follower 掉线期间的
-// 提交在重连后经日志回放补齐（不只是快照路径）。
+// TestClusterFollowerCatchupByLog Writes while a follower is offline: commits
+// made during the outage are caught up via log replay after reconnection
+// (not just the snapshot path).
 func TestClusterFollowerCatchupByLog(t *testing.T) {
 	tc := newTestCluster(t, 3)
 	leader := tc.leaderWithin(15 * time.Second)
@@ -149,7 +151,7 @@ func TestClusterFollowerCatchupByLog(t *testing.T) {
 	for i := 2; i <= 6; i++ {
 		writeBatch(t, leader, i)
 	}
-	// 存活的另一个节点追平
+	// The other surviving node catches up
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		ok := true
@@ -173,8 +175,9 @@ func TestClusterFollowerCatchupByLog(t *testing.T) {
 	tc.waitAllPublished(6, 0, 20*time.Second)
 }
 
-// TestClusterEdgesReplicatedAcrossFailover 跨故障切换的边数据完整性：
-// 宕机前写的边 + 新 leader 写的边在最终收敛后全部可见且可达性正确。
+// TestClusterEdgesReplicatedAcrossFailover Edge data integrity across failover:
+// edges written before the crash plus edges written by the new leader are all
+// visible after final convergence, with correct reachability.
 func TestClusterEdgesReplicatedAcrossFailover(t *testing.T) {
 	tc := newTestCluster(t, 3)
 	leader := tc.leaderWithin(15 * time.Second)
@@ -190,7 +193,7 @@ func TestClusterEdgesReplicatedAcrossFailover(t *testing.T) {
 		},
 	})
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("初始写入: %d %v", resp.StatusCode, out)
+		t.Fatalf("initial write: %d %v", resp.StatusCode, out)
 	}
 	tc.waitAllPublished(3, 2, 15*time.Second)
 
@@ -206,32 +209,33 @@ func TestClusterEdgesReplicatedAcrossFailover(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	if newLeader == nil {
-		t.Fatal("无新 leader")
+		t.Fatal("no new leader")
 	}
-	// 新 leader 补一条边
+	// New leader adds one more edge
 	resp, out = postJSON(t, newLeader.URL()+"/v1/batch", map[string]any{
 		"edges": []map[string]any{
 			{"srcKey": "gateway", "dstKey": "db", "label": "DIRECT"},
 		},
 	})
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("新 leader 写入: %d %v", resp.StatusCode, out)
+		t.Fatalf("new leader write: %d %v", resp.StatusCode, out)
 	}
 
 	tc.reconnect(leader)
 	tc.waitAllPublished(3, 3, 20*time.Second)
 
-	// 收敛后：跨两任 leader 的数据在所有副本上查询一致
+	// After convergence: data from both leader terms queries identically on all replicas
 	for _, tn := range tc.nodes {
 		resp, out := getJSON(t, tn.URL()+"/v1/path?from=gateway&to=db")
 		if resp.StatusCode != http.StatusOK || out["found"] != true || out["hops"] != float64(1) {
-			t.Fatalf("节点 %s path: %d %v", tn.node.cfg.NodeID, resp.StatusCode, out)
+			t.Fatalf("node %s path: %d %v", tn.node.cfg.NodeID, resp.StatusCode, out)
 		}
 	}
 }
 
-// TestClusterReadsAvailableDuringSeal 查询不中断声明：写入与发布
-// 并发进行时，follower 上的连续查询不失败（免锁读 + 原子指针交换）。
+// TestClusterReadsAvailableDuringSeal Uninterrupted-query claim: while writes
+// and publishes run concurrently, continuous queries on a follower never fail
+// (lock-free reads + atomic pointer swap).
 func TestClusterReadsAvailableDuringSeal(t *testing.T) {
 	tc := newTestCluster(t, 3)
 	leader := tc.leaderWithin(15 * time.Second)
@@ -257,7 +261,7 @@ func TestClusterReadsAvailableDuringSeal(t *testing.T) {
 			resp, _ := getJSON(t, follower.URL()+"/v1/stats")
 			if resp.StatusCode != http.StatusOK {
 				select {
-				case fail <- fmt.Errorf("查询在发布期失败: %d", resp.StatusCode):
+				case fail <- fmt.Errorf("query failed during publish: %d", resp.StatusCode):
 				default:
 				}
 				return

@@ -10,17 +10,19 @@ import (
 )
 
 // ============================================================
-// SNAP email-Eu-core 集成测试（LDBC 审计式外部验证）
+// SNAP email-Eu-core integration tests (LDBC audit-style external
+// verification)
 //
-// 数据集是真实邮件网络，统计值由 SNAP/SuiteSparse 独立发布。
-// 这些数字不是我们自己算的——是外部 ground-truth。
+// The dataset is a real email network; the statistics are published
+// independently by SNAP/SuiteSparse. These numbers were not computed by
+// us — they are external ground truth.
 // ============================================================
 
-// TestSNAP_PublishedStats 对外发布统计值：
-// 1005 节点 / 25571 边 / 203 个 SCC / 最大 SCC 803 节点。
-// 由 1005/203/803 可推出其余 202 个 SCC 全为单例；
-// 另外数据文件里有 642 个自环节点（awk '$1==$2' 直接核对），
-// 因此 Cycles() = 1 个 803-SCC + 642 个自环 = 643。
+// TestSNAP_PublishedStats: externally published statistics:
+// 1005 nodes / 25571 edges / 203 SCCs / largest SCC 803 nodes.
+// From 1005/203/803 the remaining 202 SCCs must all be singletons;
+// the data file also has 642 self-loop nodes (cross-checked with
+// awk '$1==$2'), hence Cycles() = one 803-SCC + 642 self-loops = 643.
 func TestSNAP_PublishedStats(t *testing.T) {
 	g, _ := loadSNAPEmail(t)
 	st := g.Stats()
@@ -38,16 +40,17 @@ func TestSNAP_PublishedStats(t *testing.T) {
 	}
 	cycles := g.Cycles()
 	if len(cycles) != 643 {
-		t.Fatalf("Cycles() = %d, want 643 (1 个 803-SCC + 642 自环节点)", len(cycles))
+		t.Fatalf("Cycles() = %d, want 643 (one 803-SCC + 642 self-loop nodes)", len(cycles))
 	}
 	if cycles[0].Len() != 803 {
 		t.Errorf("largest cycle = %d nodes, want 803", cycles[0].Len())
 	}
 }
 
-// TestSNAP_LargestSCCStronglyConnected 最大 SCC 的定义即测试：
-// 803 个成员两两互达。对全部 803 个成员做 BFS，断言覆盖所有成员。
-// （803 次 BFS × 25k 边 ≈ 2000 万次边访问，真实数据上的全量验证。）
+// TestSNAP_LargestSCCStronglyConnected: the definition of the largest SCC
+// is itself the test — all 803 members mutually reachable. BFS from all
+// 803 members, asserting every member is covered. (803 BFS runs × 25k
+// edges ≈ 20M edge visits, a full-scale check on real data.)
 func TestSNAP_LargestSCCStronglyConnected(t *testing.T) {
 	g, _ := loadSNAPEmail(t)
 	scc := g.Cycles()[0]
@@ -56,7 +59,7 @@ func TestSNAP_LargestSCCStronglyConnected(t *testing.T) {
 		members[id] = true
 	}
 	if len(members) != 803 {
-		t.Fatalf("SCC 成员 = %d, want 803", len(members))
+		t.Fatalf("SCC members = %d, want 803", len(members))
 	}
 	for _, src := range scc.Nodes {
 		res, err := g.BFS([]vectra.NodeID{src}, vectra.WithParallelThreshold(1<<30))
@@ -65,14 +68,16 @@ func TestSNAP_LargestSCCStronglyConnected(t *testing.T) {
 		}
 		for _, m := range scc.Nodes {
 			if !res.Reached(m) {
-				t.Fatalf("SCC 成员 %d 不可达成员 %d —— 违反强连通定义", src, m)
+				t.Fatalf("SCC member %d cannot reach member %d — violates strong connectivity", src, m)
 			}
 		}
 	}
 }
 
-// TestSNAP_ReachableSupersetOfSCC 超节点可达性包含整个起始分量
-// （分量成员经任意边互达的契约），且与参考实现逐点一致。
+// TestSNAP_ReachableSupersetOfSCC: supernode reachability contains the
+// entire start component (per the contract that component members are
+// mutually reachable via arbitrary edges), and matches the reference
+// implementation node for node.
 func TestSNAP_ReachableSupersetOfSCC(t *testing.T) {
 	g, el := loadSNAPEmail(t)
 	adj := el.adj()
@@ -93,19 +98,20 @@ func TestSNAP_ReachableSupersetOfSCC(t *testing.T) {
 				}
 			}
 			if !found {
-				t.Fatalf("Reachable(%d) 缺少同分量成员 %d", src, m)
+				t.Fatalf("Reachable(%d) missing same-component member %d", src, m)
 			}
 		}
-		// 与参考实现对账
+		// cross-check against the reference implementation
 		want := refBFS(adj, int(src))
 		if len(got) != len(want) {
-			t.Fatalf("Reachable(%d) = %d 节点, 参考 BFS = %d 节点", src, len(got), len(want))
+			t.Fatalf("Reachable(%d) = %d nodes, reference BFS = %d nodes", src, len(got), len(want))
 		}
 	}
 }
 
-// TestSNAP_ShortestPathCrossValidation 真实图上 300 对随机点：
-// 双向 BFS 与参考 BFS 距离一致；对可达对做路径合法性校验。
+// TestSNAP_ShortestPathCrossValidation: 300 random node pairs on the real
+// graph — bidirectional BFS distances match the reference BFS; reachable
+// pairs get path-validity checks.
 func TestSNAP_ShortestPathCrossValidation(t *testing.T) {
 	g, el := loadSNAPEmail(t)
 	adj := el.adj()
@@ -124,32 +130,33 @@ func TestSNAP_ShortestPathCrossValidation(t *testing.T) {
 		d, ok := want[int(v)]
 		if !ok {
 			if found {
-				t.Fatalf("%d->%d: 找到路径但参考实现说不可达", u, v)
+				t.Fatalf("%d->%d: path found but reference says unreachable", u, v)
 			}
 			unreachable++
 			continue
 		}
 		checked++
 		if !found {
-			t.Fatalf("%d->%d: 参考距离 %d 但未找到路径", u, v, d)
+			t.Fatalf("%d->%d: reference distance %d but no path found", u, v, d)
 		}
 		if p.Len() != d {
-			t.Fatalf("%d->%d: 路径长 %d, 参考距离 %d", u, v, p.Len(), d)
+			t.Fatalf("%d->%d: path length %d, reference distance %d", u, v, p.Len(), d)
 		}
 		for j := 0; j+1 < len(p.Nodes); j++ {
 			e, ok := g.EdgeByID(p.Edges[j])
 			if !ok || e.Src != p.Nodes[j] || e.Dst != p.Nodes[j+1] {
-				t.Fatalf("%d->%d: 路径第 %d 条边不合法", u, v, j)
+				t.Fatalf("%d->%d: path edge %d invalid", u, v, j)
 			}
 		}
 	}
 	if checked == 0 {
-		t.Fatal("300 对随机点全部不可达？真实邮件图不该如此")
+		t.Fatal("all 300 random pairs unreachable? A real email graph should not behave like that")
 	}
-	t.Logf("300 对随机点: %d 可达对全部通过交叉验证, %d 不可达对结论一致", checked, unreachable)
+	t.Logf("300 random pairs: %d reachable pairs all cross-validated, %d unreachable pairs agree", checked, unreachable)
 }
 
-// TestSNAP_SnapshotRoundtrip 真实图快照往返后查询行为不变。
+// TestSNAP_SnapshotRoundtrip: query behavior unchanged after a snapshot
+// round-trip on the real graph.
 func TestSNAP_SnapshotRoundtrip(t *testing.T) {
 	g, _ := loadSNAPEmail(t)
 	var buf bytes.Buffer
@@ -161,20 +168,21 @@ func TestSNAP_SnapshotRoundtrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if g2.Stats() != g.Stats() {
-		t.Fatalf("stats 往返后不一致: %+v vs %+v", g2.Stats(), g.Stats())
+		t.Fatalf("stats mismatch after round-trip: %+v vs %+v", g2.Stats(), g.Stats())
 	}
-	// 同一对点的路径长度一致
+	// path lengths agree for the same node pairs
 	for _, pair := range [][2]int{{0, 500}, {3, 999}, {1004, 42}} {
 		p1, ok1, _ := g.ShortestPathIDs(vectra.NodeID(pair[0]), vectra.NodeID(pair[1]))
 		p2, ok2, _ := g2.ShortestPathIDs(vectra.NodeID(pair[0]), vectra.NodeID(pair[1]))
 		if ok1 != ok2 || p1.Len() != p2.Len() {
-			t.Errorf("pair %v: 快照往返后路径不一致 (%d/%v vs %d/%v)",
+			t.Errorf("pair %v: path differs after snapshot round-trip (%d/%v vs %d/%v)",
 				pair, p1.Len(), ok1, p2.Len(), ok2)
 		}
 	}
 }
 
-// TestSNAP_InDegreeSpotCheck 度数抽查：反向 BFS 一跳邻居 == 参考实现入度。
+// TestSNAP_InDegreeSpotCheck: degree spot check — reverse BFS one-hop
+// neighbors == reference in-degree.
 func TestSNAP_InDegreeSpotCheck(t *testing.T) {
 	g, el := loadSNAPEmail(t)
 	inDeg := make(map[int]int)
@@ -187,7 +195,7 @@ func TestSNAP_InDegreeSpotCheck(t *testing.T) {
 			t.Fatal(err)
 		}
 		if len(ns) != len(uniqueTargets(el, probe)) {
-			t.Errorf("节点 %d 入邻居 %d, 参考去重入度 %d", probe, len(ns), len(uniqueTargets(el, probe)))
+			t.Errorf("node %d in-neighbors %d, reference deduped in-degree %d", probe, len(ns), len(uniqueTargets(el, probe)))
 		}
 	}
 }

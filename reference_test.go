@@ -13,14 +13,15 @@ import (
 )
 
 // ============================================================
-// 独立参考实现（交叉验证用）
+// Independent reference implementations (for cross-validation)
 //
-// 刻意用与 Vectra 完全不同的朴素写法（map 邻接 + 逐点遍历），
-// 不共享任何生产代码路径。LDBC Graphalytics 的验证方法：
-// 内核输出与参考实现逐一比对。
+// Deliberately naive and completely different from Vectra's style
+// (map adjacency + node-by-node traversal), sharing no production code
+// paths. LDBC Graphalytics' verification method: compare kernel output
+// one by one against the reference implementation.
 // ============================================================
 
-// refBFS 朴素 map 邻接 BFS，返回 深度表（含起点 0）。
+// refBFS is a naive map-adjacency BFS; returns the depth table (start 0 included).
 func refBFS(adj map[int][]int, start int) map[int]int {
 	dist := map[int]int{start: 0}
 	frontier := []int{start}
@@ -39,7 +40,8 @@ func refBFS(adj map[int][]int, start int) map[int]int {
 	return dist
 }
 
-// refReach 计算全部节点的可达性闭包（n 越大越慢，限小图）。
+// refReachAll computes the reachability closure of all nodes (slower as n
+// grows; small graphs only).
 func refReachAll(n int, adj map[int][]int) []map[int]bool {
 	reach := make([]map[int]bool, n)
 	for s := 0; s < n; s++ {
@@ -61,8 +63,9 @@ func refReachAll(n int, adj map[int][]int) []map[int]bool {
 	return reach
 }
 
-// refSCCBrute 用可达闭包定义直接求 SCC：u~v 当且仅当互达。
-// O(V·E)，只用于小图（≤300 节点），作为 Tarjan 的独立对照组。
+// refSCCBrute computes SCCs directly from the reachability-closure
+// definition: u~v iff mutually reachable. O(V·E), small graphs only
+// (≤300 nodes), as an independent control group against Tarjan.
 func refSCCBrute(n int, adj map[int][]int) [][]int {
 	reach := refReachAll(n, adj)
 	assigned := make([]bool, n)
@@ -85,7 +88,8 @@ func refSCCBrute(n int, adj map[int][]int) [][]int {
 }
 
 // ============================================================
-// 测试图生成器：多种拓扑形态（不同形态压不同的代码路径）
+// Test graph generators: multiple topology shapes (each shape stresses
+// different code paths)
 // ============================================================
 
 type edgeList struct {
@@ -120,7 +124,7 @@ func (e edgeList) graph(t *testing.T) *vectra.Graph {
 	return g
 }
 
-// erGraph 稀疏随机图（Erdős–Rényi，多种子）。
+// erGraph: sparse random graph (Erdős–Rényi, multiple seeds).
 func erGraph(n int, p float64, seed int64) edgeList {
 	rng := rand.New(rand.NewSource(seed))
 	var e edgeList
@@ -136,7 +140,8 @@ func erGraph(n int, p float64, seed int64) edgeList {
 	return e
 }
 
-// layeredDAG 分层 DAG（层内无边、层间前向边）：无环、多源多汇。
+// layeredDAG: layered DAG (no intra-layer edges, forward inter-layer
+// edges): acyclic, multi-source multi-sink.
 func layeredDAG(layers []int, crossP float64, seed int64) edgeList {
 	rng := rand.New(rand.NewSource(seed))
 	var e edgeList
@@ -160,7 +165,8 @@ func layeredDAG(layers []int, crossP float64, seed int64) edgeList {
 	return e
 }
 
-// ringOfClusters k 个簇，簇内成环（大 SCC），簇间单向连接。
+// ringOfClusters: k clusters, each a ring internally (one large SCC),
+// one-way links between clusters.
 func ringOfClusters(clusters, size int) edgeList {
 	var e edgeList
 	e.n = clusters * size
@@ -189,9 +195,10 @@ var propertyShapes = []struct {
 	{"denseER-p0.3-seed5", func() edgeList { return erGraph(200, 0.3, 5) }},
 }
 
-// TestPropertyBFSMatchesReference 每个形态、全部起点：
-// Vectra BFS 深度（串行与并行）必须与参考 BFS 逐点一致。
-// 这正是 Graphalytics BFS 内核的验证方式（输出 = 逐点 level 向量）。
+// TestPropertyBFSMatchesReference: every shape, every start node —
+// Vectra BFS depths (serial and parallel) must match the reference BFS
+// node for node. This is exactly how the Graphalytics BFS kernel is
+// verified (output = per-node level vector).
 func TestPropertyBFSMatchesReference(t *testing.T) {
 	for _, shape := range propertyShapes {
 		t.Run(shape.name, func(t *testing.T) {
@@ -227,7 +234,8 @@ func TestPropertyBFSMatchesReference(t *testing.T) {
 	}
 }
 
-// TestPropertyReachableMatchesReference 可达集与参考 BFS 逐点一致。
+// TestPropertyReachableMatchesReference: reachable set matches the
+// reference BFS node for node.
 func TestPropertyReachableMatchesReference(t *testing.T) {
 	for _, shape := range propertyShapes {
 		t.Run(shape.name, func(t *testing.T) {
@@ -253,8 +261,9 @@ func TestPropertyReachableMatchesReference(t *testing.T) {
 	}
 }
 
-// TestPropertyShortestPathMatchesReference 每形态抽样 150 对：
-// 双向 BFS 路径长度 == 参考 BFS 距离，且路径连续、边真实存在。
+// TestPropertyShortestPathMatchesReference: 150 sampled node pairs per
+// shape — bidirectional BFS path length == reference BFS distance, and
+// the path is contiguous with real edges.
 func TestPropertyShortestPathMatchesReference(t *testing.T) {
 	for _, shape := range propertyShapes {
 		t.Run(shape.name, func(t *testing.T) {
@@ -279,7 +288,7 @@ func TestPropertyShortestPathMatchesReference(t *testing.T) {
 					if p.Len() != d {
 						t.Fatalf("%d->%d: path len=%d reference dist=%d", u, v, p.Len(), d)
 					}
-					// 路径合法性与最优性：每步边存在；逐前缀重算距离应等于剩余长度
+					// path validity and optimality: each step's edge exists; re-computing distance per prefix should equal the remaining length
 					for j := 0; j+1 < len(p.Nodes); j++ {
 						e, ok := g.EdgeByID(p.Edges[j])
 						if !ok || e.Src != p.Nodes[j] || e.Dst != p.Nodes[j+1] {
@@ -294,8 +303,9 @@ func TestPropertyShortestPathMatchesReference(t *testing.T) {
 	}
 }
 
-// TestPropertyCyclesMatchBruteForceSCC Cycles() 的 SCC 划分与
-// 可达闭包暴力定义完全一致（多环形态 + 稀疏随机形态）。
+// TestPropertyCyclesMatchBruteForceSCC: Cycles()'s SCC partition matches
+// the brute-force reachability-closure definition exactly (multi-cycle
+// shapes + sparse random shapes).
 func TestPropertyCyclesMatchBruteForceSCC(t *testing.T) {
 	for _, shape := range propertyShapes {
 		t.Run(shape.name, func(t *testing.T) {
@@ -304,7 +314,7 @@ func TestPropertyCyclesMatchBruteForceSCC(t *testing.T) {
 			adj := el.adj()
 			want := refSCCBrute(el.n, adj)
 
-			var wantMulti [][]int // 参考：大小>1 的分量
+			var wantMulti [][]int // reference: components of size>1
 			selfLoops := map[int]bool{}
 			for i := range el.src {
 				if el.src[i] == el.dst[i] {
@@ -318,7 +328,7 @@ func TestPropertyCyclesMatchBruteForceSCC(t *testing.T) {
 			}
 
 			got := g.Cycles()
-			// SCC 环 + 自环节点
+			// SCC cycles + self-loop nodes
 			wantCycleCount := len(wantMulti) + len(selfLoops)
 			if len(got) != wantCycleCount {
 				t.Fatalf("Cycles()=%d want %d (%d multi-SCC + %d self-loops)",
@@ -345,7 +355,7 @@ func TestPropertyCyclesMatchBruteForceSCC(t *testing.T) {
 	}
 }
 
-// TestPropertyStatsSCCCount 一致性：Stats.SCCs == 参考分量总数。
+// TestPropertyStatsSCCCount consistency: Stats.SCCs == reference component count.
 func TestPropertyStatsSCCCount(t *testing.T) {
 	for _, shape := range propertyShapes {
 		t.Run(shape.name, func(t *testing.T) {
@@ -360,15 +370,16 @@ func TestPropertyStatsSCCCount(t *testing.T) {
 }
 
 // ============================================================
-// SNAP 真实数据集加载
+// SNAP real-dataset loading
 // ============================================================
 
-// loadSNAPEmail 读入 gzip 边表构建图，返回图与边表（供参考实现使用）。
+// loadSNAPEmail reads the gzip edge list and builds the graph; returns the
+// graph and edge list (for the reference implementations).
 func loadSNAPEmail(t testing.TB) (*vectra.Graph, edgeList) {
 	t.Helper()
 	f, err := os.Open("testdata/email-Eu-core.txt.gz")
 	if err != nil {
-		t.Fatalf("打开数据集失败（testdata/email-Eu-core.txt.gz）: %v", err)
+		t.Fatalf("failed to open dataset (testdata/email-Eu-core.txt.gz): %v", err)
 	}
 	defer f.Close()
 	zr, err := gzip.NewReader(f)
@@ -411,7 +422,7 @@ func loadSNAPEmail(t testing.TB) (*vectra.Graph, edgeList) {
 		t.Fatal(err)
 	}
 	if line != 25571 {
-		t.Fatalf("读到 %d 行，期望 25571", line)
+		t.Fatalf("read %d lines, want 25571", line)
 	}
 	return g, el
 }
