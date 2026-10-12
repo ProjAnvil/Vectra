@@ -79,6 +79,8 @@ claude mcp add vectra -- /path/to/vectra-mcp
 | 最短路径 p50 | 3.2µs | 101µs | 1.1ms |
 | 注入（引擎 / raft+HTTP） | — | 950 万 / 140 万边每秒 | 940 万 / 130 万边每秒 |
 
+本地复现：`make bench [SIZE=medium] [MODE=http]`，数据目录与报告运行结束即删。
+
 正确性按 LDBC 方法验证：与独立参考实现做属性对账、真实数据集外部 ground truth（SNAP email-Eu-core：203 个 SCC / 最大 803，对外发布的数字）、混沌与退化图测试、确定性检查。覆盖率：根包 89.8% · csr/dag 100% · store 84.3% · engine+traverse 94.6% · server 83.5%。
 
 ## 仓库布局

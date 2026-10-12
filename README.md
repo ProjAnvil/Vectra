@@ -79,6 +79,8 @@ See [mcp/README.md](mcp/README.md) for all transports and host configurations.
 | shortest path p50 | 3.2µs | 101µs | 1.1ms |
 | injection (engine / raft+HTTP) | — | 9.5M / 1.4M edges/s | 9.4M / 1.3M edges/s |
 
+Reproduce locally: `make bench [SIZE=medium] [MODE=http]` — data and report are deleted when the run ends.
+
 Correctness is validated the LDBC way: property tests against independent reference implementations, real-dataset ground truth (SNAP email-Eu-core: 203 SCCs / largest 803, externally published numbers), chaos and degenerate-graph suites, determinism checks. Coverage: root 89.8% · csr/dag 100% · store 84.3% · engine+traverse 94.6% · server 83.5%.
 
 ## Repository layout
