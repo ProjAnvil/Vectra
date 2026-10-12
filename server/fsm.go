@@ -25,6 +25,9 @@ type ApplyResult struct {
 	NodesApplied int
 	EdgesApplied int
 	EdgesSkipped int // Edges referencing nonexistent nodes are deterministically skipped (counted in metrics)
+	EdgesDeleted int // Explicit deletes + cascade deletes
+	NodesDeleted int
+	NodesSkipped int // Deletes of nonexistent keys
 }
 
 // Metrics is the server's atomic counters (expvar is mounted in api.go).
@@ -33,6 +36,8 @@ type Metrics struct {
 	AppliedNodes   atomic.Int64
 	AppliedEdges   atomic.Int64
 	SkippedEdges   atomic.Int64
+	DeletedEdges   atomic.Int64
+	DeletedNodes   atomic.Int64
 	Seals          atomic.Int64
 	Restores       atomic.Int64
 	LeaderChanges  atomic.Int64
@@ -104,6 +109,23 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 			res.EdgesSkipped++ // Authoritative validation: replay skips invalid items, no divergence
 		}
 	}
+	for _, d := range b.EdgeDeletes {
+		n, err := f.live.DeleteEdge(d.SrcKey, d.DstKey, d.Label)
+		if err != nil {
+			res.EdgesSkipped++ // References a nonexistent node: deterministic skip, no divergence
+			continue
+		}
+		res.EdgesDeleted += n
+	}
+	for _, key := range b.NodeDeletes {
+		cascaded, err := f.live.DeleteNode(key)
+		if err != nil {
+			res.NodesSkipped++
+			continue
+		}
+		res.NodesDeleted++
+		res.EdgesDeleted += cascaded
+	}
 	f.dirty = true
 	f.version++
 	small := f.live.NodeCount()+f.live.EdgeCount() < f.smallGraphLimit
@@ -113,6 +135,8 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	f.metrics.AppliedNodes.Add(int64(res.NodesApplied))
 	f.metrics.AppliedEdges.Add(int64(res.EdgesApplied))
 	f.metrics.SkippedEdges.Add(int64(res.EdgesSkipped))
+	f.metrics.DeletedEdges.Add(int64(res.EdgesDeleted))
+	f.metrics.DeletedNodes.Add(int64(res.NodesDeleted))
 	if small {
 		f.wakePublisher()
 	}

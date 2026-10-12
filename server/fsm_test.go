@@ -239,3 +239,46 @@ func (m *memSink) Cancel() error               { m.canceled = true; return nil }
 var _ raft.SnapshotSink = (*memSink)(nil)
 
 var _ = vectra.New // Keep the engine import (Published returns *vectra.Graph)
+
+func TestFSMApplyDeletes(t *testing.T) {
+	f := newFSM(time.Hour)
+	f.Apply(&raft.Log{Data: mustGob(t, sampleBatch())}) // 3 nodes / 2 valid edges
+
+	del := Batch{Version: 2,
+		EdgeDeletes: []EdgeDelete{
+			{SrcKey: "gateway", DstKey: "auth", Label: "CALLS"},
+			{SrcKey: "ghost", DstKey: "db", Label: "QUERY"}, // references a nonexistent node → skipped
+		},
+		NodeDeletes: []string{"db"}, // cascades auth->db away
+	}
+	r := f.Apply(&raft.Log{Data: mustGob(t, del)}).(ApplyResult)
+	if r.EdgesDeleted != 2 || r.NodesDeleted != 1 || r.EdgesSkipped != 1 {
+		t.Fatalf("Apply = %+v, want edgesDeleted=2 nodesDeleted=1 skipped=1", r)
+	}
+	waitPublished(t, f, 2, 0, 2*time.Second) // gateway/auth remain, no edges left
+	if f.metrics.DeletedEdges.Load() != 2 || f.metrics.DeletedNodes.Load() != 1 {
+		t.Errorf("metrics = %d/%d, want 2/1",
+			f.metrics.DeletedEdges.Load(), f.metrics.DeletedNodes.Load())
+	}
+}
+
+func TestFSMApplyDeleteDeterministicReplay(t *testing.T) {
+	seq := []Batch{sampleBatch(), {Version: 2, NodeDeletes: []string{"auth"}}}
+	stats := func() (int, int) {
+		f := newFSM(time.Hour)
+		for _, b := range seq {
+			f.Apply(&raft.Log{Data: mustGob(t, b)})
+		}
+		f.sealNow()
+		st := f.Published().Stats()
+		return st.Nodes, st.Edges
+	}
+	n1, e1 := stats()
+	n2, e2 := stats()
+	if n1 != n2 || e1 != e2 {
+		t.Fatalf("replay diverged: %d/%d vs %d/%d", n1, e1, n2, e2)
+	}
+	if n1 != 2 || e1 != 0 {
+		t.Fatalf("stats = %d/%d, want 2/0 (auth delete cascades both edges)", n1, e1)
+	}
+}

@@ -6,10 +6,10 @@ import (
 )
 
 // batchVersion is the changeset format version. Evolution rule: add fields only (gob compatible).
-const batchVersion = 1
+const batchVersion = 2
 
-// NodeUpsert / EdgeUpsert are the atomic items of a changeset. v2 semantics are upsert-only:
-// an existing node key updates its props; edges append (multi-edges allowed). Deletes are out of scope for v2.
+// NodeUpsert / EdgeUpsert are the atomic items of a changeset. Semantics:
+// an existing node key updates its props; edges append (multi-edges allowed).
 type NodeUpsert struct {
 	Key   string
 	Label string
@@ -23,11 +23,24 @@ type EdgeUpsert struct {
 	Props  map[string]any
 }
 
-// Batch is a changeset carried by one raft log.
+// EdgeDelete addresses edges by their logical key (srcKey, dstKey, label) —
+// EdgeID cannot be used because Seal-time compaction renumbers IDs, and raft
+// logs / HTTP requests must not depend on it. Node deletes cascade edges.
+type EdgeDelete struct {
+	SrcKey string
+	DstKey string
+	Label  string
+}
+
+// Batch is a changeset carried by one raft log. Fixed apply order
+// (deterministic replay): node upserts → edge upserts → edge deletes →
+// node deletes.
 type Batch struct {
-	Version int
-	Nodes   []NodeUpsert
-	Edges   []EdgeUpsert
+	Version     int
+	Nodes       []NodeUpsert
+	Edges       []EdgeUpsert
+	EdgeDeletes []EdgeDelete
+	NodeDeletes []string
 }
 
 func encodeBatch(b Batch) ([]byte, error) {

@@ -82,6 +82,8 @@ func (n *Node) registerExpvar() {
 		expvar.Publish("vectra_applied_nodes", expvar.Func(func() any { return m.AppliedNodes.Load() }))
 		expvar.Publish("vectra_applied_edges", expvar.Func(func() any { return m.AppliedEdges.Load() }))
 		expvar.Publish("vectra_skipped_edges", expvar.Func(func() any { return m.SkippedEdges.Load() }))
+		expvar.Publish("vectra_deleted_edges", expvar.Func(func() any { return m.DeletedEdges.Load() }))
+		expvar.Publish("vectra_deleted_nodes", expvar.Func(func() any { return m.DeletedNodes.Load() }))
 		expvar.Publish("vectra_seals", expvar.Func(func() any { return m.Seals.Load() }))
 		expvar.Publish("vectra_restores", expvar.Func(func() any { return m.Restores.Load() }))
 		expvar.Publish("vectra_queries", expvar.Func(func() any { return n.queryCount.Load() }))
