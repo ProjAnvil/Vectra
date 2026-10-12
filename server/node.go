@@ -103,7 +103,6 @@ func New(cfg Config) (*Node, error) {
 	}
 
 	n := &Node{
-		cfg:      cfg,
 		registry: map[string]string{cfg.RaftAddr: meta.HTTPAddr},
 		closed:   make(chan struct{}),
 	}
@@ -137,6 +136,7 @@ func New(cfg Config) (*Node, error) {
 		}
 	}
 	n.trans = cfg.Transport
+	n.cfg = cfg // 注入默认值已填充完毕后再挂载
 
 	// FSM（发布器随之启动）
 	n.fsm = newFSM(cfg.SealInterval)
@@ -207,8 +207,10 @@ func loadOrCreateMeta(cfg Config) (nodeMeta, error) {
 		if m.NodeID != cfg.NodeID {
 			return m, fmt.Errorf("%w: dir=%s node=%s cfg=%s", ErrDirMismatch, cfg.DataDir, m.NodeID, cfg.NodeID)
 		}
-	} else {
+	} else if errors.Is(err, os.ErrNotExist) {
 		m = nodeMeta{NodeID: cfg.NodeID}
+	} else {
+		return m, fmt.Errorf("server: 读 meta.json: %w", err) // 权限类瞬态错误不绕过身份防线
 	}
 	// 地址允许漂移（重启换端口），ID 不允许
 	m.HTTPAddr, m.RaftAddr = cfg.HTTPAddr, cfg.RaftAddr
@@ -239,7 +241,9 @@ func (n *Node) Join(seedHTTP string) error {
 	var out struct {
 		Registry map[string]string `json:"registry"`
 	}
-	_ = json.Unmarshal(raw, &out)
+	if err := json.Unmarshal(raw, &out); err != nil {
+		fmt.Fprintf(os.Stderr, "vectra/server: join 响应解析失败（注册表未同步）: %v\n", err)
+	}
 	n.mergeRegistry(out.Registry)
 	return nil
 }

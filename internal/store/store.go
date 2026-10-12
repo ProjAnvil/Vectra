@@ -229,6 +229,11 @@ func Decode(r io.Reader) ([]Node, []Edge, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	// 计数下界：每节点至少 12 字节、每边至少 16 字节的定长字段，
+	// 防伪造计数触发超长预分配（v2 的 CRC 攻击者可自算）。
+	if int64(nn)*12+int64(ne)*16 > int64(len(rd.b)) {
+		return nil, nil, errTruncated
+	}
 	nodes := make([]Node, nn)
 	for i := range nodes {
 		if nodes[i].Key, err = rd.str(); err != nil {

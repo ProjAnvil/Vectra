@@ -59,29 +59,6 @@ type Result struct {
 	depth  []uint32
 }
 
-func (r *Result) Nodes() []uint32 {
-	total := 0
-	for _, l := range r.Layers {
-		total += len(l)
-	}
-	out := make([]uint32, 0, total)
-	for _, l := range r.Layers {
-		out = append(out, l...)
-	}
-	return out
-}
-
-func (r *Result) Count() int {
-	total := 0
-	for _, l := range r.Layers {
-		total += len(l)
-	}
-	return total
-}
-
-func (r *Result) Depth(id uint32) uint32 { return r.depth[id] }
-func (r *Result) Reached(id uint32) bool { return r.depth[id] != noDepth }
-
 // DepthRaw 返回深度数组本体（门面复用，避免整图拷贝；只读契约）。
 func (r *Result) DepthRaw() []uint32 { return r.depth }
 
@@ -216,6 +193,8 @@ func expandLayerParallel(adj csr.Adjacency, cfg Config, visited []uint32, fronti
 // Reachable 返回从 start 出发（含自身）可达的全部节点，按 ID 升序。
 // 无标签过滤时走 SCC 超节点快路径（查询面对 DAG，零环检测）；
 // 有过滤时分量成员间可能只有被过滤的边，退回严格节点级遍历。
+// 注意：超节点快路径不支持 NodeFilter（谓词与分量语义冲突），
+// 调用方不得在带 NodeFilter 的 Config 上走快路径。
 func Reachable(s engineSnapshot, start uint32, cfg Config) []uint32 {
 	adj := s.AdjacencyF()
 	if cfg.Direction == DirIn {

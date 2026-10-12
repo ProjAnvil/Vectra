@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"expvar"
 	"io"
 	"maps"
@@ -69,6 +70,8 @@ func (n *Node) Handler() http.Handler {
 	return mux
 }
 
+// expvarOnce 是进程级单例：同进程多节点（如测试集群）只有首个节点的
+// vitra_* 指标可见。单机生产部署无影响。
 var expvarOnce sync.Once
 
 func (n *Node) registerExpvar() {
@@ -127,7 +130,11 @@ func (n *Node) handleBatch(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusServiceUnavailable, "NOT_LEADER", "写入请发往 leader")
 			return
 		}
-		writeErr(w, http.StatusGatewayTimeout, "TIMEOUT", err.Error())
+		if errors.Is(err, ErrTimeout) {
+			writeErr(w, http.StatusGatewayTimeout, "TIMEOUT", err.Error())
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "INTERNAL", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -158,15 +165,17 @@ func (n *Node) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	fut := n.r.AddVoter(raft.ServerID(req.NodeID), raft.ServerAddress(req.RaftAddr), 0, 15*time.Second)
 	if err := fut.Error(); err != nil {
-		// 已是成员视为幂等成功
+		// 重复 join（节点已在配置中）是正常运维动作，幂等成功
+		if n.alreadyMember(req.NodeID, req.RaftAddr) {
+			n.mergeRegistry(map[string]string{req.RaftAddr: req.HTTPAddr})
+			writeJSON(w, http.StatusOK, map[string]any{"registry": maps.Clone(safeRegistry(n))})
+			return
+		}
 		writeErr(w, http.StatusConflict, "VALIDATION", "AddVoter: "+err.Error())
 		return
 	}
 	n.mergeRegistry(map[string]string{req.RaftAddr: req.HTTPAddr})
-	n.regMu.Lock()
-	regCopy := maps.Clone(n.registry)
-	n.regMu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"registry": regCopy})
+	writeJSON(w, http.StatusOK, map[string]any{"registry": safeRegistry(n)})
 }
 
 func (n *Node) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -357,6 +366,26 @@ func (n *Node) handleCycles(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"cycles": out})
+}
+
+// alreadyMember 检查 nodeID 是否已在集群配置中（幂等 join 判定）。
+func (n *Node) alreadyMember(nodeID, raftAddr string) bool {
+	cfgf := n.r.GetConfiguration()
+	if cfgf.Error() != nil {
+		return false
+	}
+	for _, s := range cfgf.Configuration().Servers {
+		if string(s.ID) == nodeID || string(s.Address) == raftAddr {
+			return true
+		}
+	}
+	return false
+}
+
+func safeRegistry(n *Node) map[string]string {
+	n.regMu.Lock()
+	defer n.regMu.Unlock()
+	return maps.Clone(n.registry)
 }
 
 func parseDirection(s string) vectra.Direction {

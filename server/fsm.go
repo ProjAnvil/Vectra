@@ -2,7 +2,9 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"io"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -53,6 +55,8 @@ type fsm struct {
 	smallGraphLimit int
 
 	lastSealNanos atomic.Int64
+	pubMu         sync.Mutex // 发布临界区：保证 published 按版本单调前进
+	publishedVer  int64      // pubMu 保护；防旧克隆晚到覆盖新快照
 
 	ready     chan struct{}
 	readyOnce sync.Once
@@ -169,11 +173,17 @@ func (f *fsm) publishOnce() {
 	f.mu.RUnlock()
 
 	if err := clone.Seal(); err != nil {
+		fmt.Fprintf(os.Stderr, "vectra/server: 发布失败（Seal）: %v\n", err)
 		return
 	}
-	f.published.Store(clone)
-	f.metrics.Seals.Add(1)
-	f.lastSealNanos.Store(time.Now().UnixNano())
+	f.pubMu.Lock()
+	if version > f.publishedVer { // Restore/发布器并发时只允许新版本落地
+		f.publishedVer = version
+		f.published.Store(clone)
+		f.metrics.Seals.Add(1)
+		f.lastSealNanos.Store(time.Now().UnixNano())
+	}
+	f.pubMu.Unlock()
 
 	f.mu.Lock()
 	if f.version == version { // 克隆之后没有新写入才清 dirty

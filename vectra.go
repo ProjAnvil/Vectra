@@ -281,14 +281,6 @@ func (g *Graph) SaveFile(path string) error {
 	return os.Rename(tmp, path)
 }
 
-func (g *Graph) saveBytes() ([]byte, error) {
-	var buf bytes.Buffer
-	if err := g.Save(&buf); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
 // Load 从快照恢复图并自动 Seal。
 func Load(r io.Reader) (*Graph, error) {
 	g, err := loadGraph(r)
@@ -359,6 +351,7 @@ func (g *Graph) Clone() *Graph {
 			dst, _ := g.snap.NodeInfo(e.Dst)
 			_, _ = c.AddEdge(src.Key, dst.Key, g.snap.LabelName(e.LabelID), e.Props)
 		}
+		c.indexKeys = slices.Clone(g.indexKeys) // 索引声明随克隆迁移
 		return c
 	}
 	for _, n := range g.nodes {
