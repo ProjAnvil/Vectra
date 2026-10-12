@@ -154,14 +154,6 @@ func (rd *reader) take(n int) ([]byte, error) {
 	return p, nil
 }
 
-func (rd *reader) u16() (uint16, error) {
-	p, err := rd.take(2)
-	if err != nil {
-		return 0, err
-	}
-	return binary.LittleEndian.Uint16(p), nil
-}
-
 func (rd *reader) u32() (uint32, error) {
 	p, err := rd.take(4)
 	if err != nil {

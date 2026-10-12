@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"expvar"
 	"io"
+	"maps"
 	"net/http"
 	"strconv"
 	"sync"
@@ -163,10 +164,7 @@ func (n *Node) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	n.mergeRegistry(map[string]string{req.RaftAddr: req.HTTPAddr})
 	n.regMu.Lock()
-	regCopy := make(map[string]string, len(n.registry))
-	for k, v := range n.registry {
-		regCopy[k] = v
-	}
+	regCopy := maps.Clone(n.registry)
 	n.regMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"registry": regCopy})
 }

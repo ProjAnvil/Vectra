@@ -2,6 +2,8 @@ package store_test
 
 import (
 	"bytes"
+	"errors"
+	"strings"
 	"testing"
 
 	"vectra/internal/store"
@@ -81,5 +83,98 @@ func TestEmptyGraphRoundtrip(t *testing.T) {
 	}
 	if len(nodes) != 0 || len(edges) != 0 {
 		t.Errorf("counts = %d/%d, want 0/0", len(nodes), len(edges))
+	}
+}
+
+func TestDecodeRejectsUnsupportedVersion(t *testing.T) {
+	data := []byte("VCTR\x09\x00" + "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+	if _, _, err := store.Decode(bytes.NewReader(data)); err == nil {
+		t.Fatal("v9 应被拒绝")
+	}
+}
+
+func TestDecodeRejectsTrailingGarbage(t *testing.T) {
+	var buf bytes.Buffer
+	_ = store.Encode(&buf, []store.Node{{Key: "a", Label: "L"}}, nil)
+	data := append([]byte{}, buf.Bytes()...)
+	data = append(data, 0xFF, 0xFF)
+	if _, _, err := store.Decode(bytes.NewReader(data)); err == nil {
+		t.Fatal("v1 尾部垃圾应被拒绝")
+	}
+}
+
+func TestDecodeRejectsHugeLengthField(t *testing.T) {
+	// v1 文件，key 长度字段伪造为 4GB——必须被边界检查快速拒绝
+	data := []byte("VCTR\x01\x00")
+	data = append(data, 1, 0, 0, 0)             // 1 node
+	data = append(data, 0, 0, 0, 0)             // 0 edges
+	data = append(data, 0xFF, 0xFF, 0xFF, 0xFF) // key len = 4294967295
+	if _, _, err := store.Decode(bytes.NewReader(data)); err == nil {
+		t.Fatal("超长长度字段应被拒绝")
+	}
+}
+
+func TestDecodeRejectsV2WithoutCRC(t *testing.T) {
+	var buf bytes.Buffer
+	_ = store.Encode(&buf, []store.Node{{Key: "a", Label: "L"}}, nil)
+	data := buf.Bytes()[:len(buf.Bytes())-3] // 掐掉 CRC 的一部分
+	if _, _, err := store.Decode(bytes.NewReader(data)); err == nil {
+		t.Fatal("不完整 CRC 应被拒绝")
+	}
+}
+
+func TestDecodeRejectsBadPropsJSON(t *testing.T) {
+	// 手工 v1：props 长度 5 但内容非法 JSON
+	data := []byte("VCTR\x01\x00")
+	data = append(data, 1, 0, 0, 0) // 1 node
+	data = append(data, 0, 0, 0, 0) // 0 edges
+	data = append(data, 1, 0, 0, 0)
+	data = append(data, 'a') // key "a"
+	data = append(data, 1, 0, 0, 0)
+	data = append(data, 'L')                     // label "L"
+	data = append(data, 5, 0, 0, 0)              // props len 5
+	data = append(data, '{', 'b', 'a', 'd', '!') // 非法 JSON
+	if _, _, err := store.Decode(bytes.NewReader(data)); err == nil {
+		t.Fatal("坏 props JSON 应被拒绝")
+	}
+}
+
+type failWriter struct{}
+
+func (failWriter) Write(p []byte) (int, error) { return 0, errors.New("disk full") }
+
+func TestEncodePropagatesWriteErrors(t *testing.T) {
+	if err := store.Encode(failWriter{}, []store.Node{{Key: "a", Label: "L"}}, nil); err == nil {
+		t.Fatal("写失败应传播错误")
+	}
+}
+
+// failAfterWriter 在第 n 次写入后开始失败——遍历 n 覆盖 Encode 的全部错误分支。
+type failAfterWriter struct{ n int }
+
+func (w *failAfterWriter) Write(p []byte) (int, error) {
+	w.n--
+	if w.n < 0 {
+		return 0, errors.New("disk full")
+	}
+	return len(p), nil
+}
+
+func TestEncodeFlushFailurePropagates(t *testing.T) {
+	// bufio 聚合中间写入，失败统一在 Flush 点冒出——一次注入即可覆盖
+	w := &failAfterWriter{n: 0}
+	big := strings.Repeat("k", 64<<10)
+	err := store.Encode(w, []store.Node{{Key: big, Label: "L"}}, nil)
+	if err == nil {
+		t.Fatal("Flush 失败未传播")
+	}
+}
+
+func TestEncodeRejectsUnmarshalableProps(t *testing.T) {
+	// func 值无法 JSON 序列化 → writeProps 的 Marshal 错误分支
+	var buf bytes.Buffer
+	err := store.Encode(&buf, []store.Node{{Key: "a", Label: "L", Props: map[string]any{"f": func() {}}}}, nil)
+	if err == nil {
+		t.Fatal("不可序列化 props 应报错")
 	}
 }

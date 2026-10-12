@@ -10,7 +10,9 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"maps"
 	"os"
+	"slices"
 
 	"vectra/internal/engine"
 	"vectra/internal/store"
@@ -363,12 +365,10 @@ func (g *Graph) Clone() *Graph {
 		c.nodes = append(c.nodes, Node{ID: NodeID(len(c.nodes)), Key: n.Key, Label: n.Label, Props: n.Props})
 		c.byKey[n.Key] = n.ID
 	}
-	c.edges = append(c.edges, g.edges...)
-	c.labels = append(c.labels, g.labels...)
-	for k, v := range g.labIDs {
-		c.labIDs[k] = v
-	}
-	c.indexKeys = append(c.indexKeys, g.indexKeys...)
+	c.edges = slices.Clone(g.edges)
+	c.labels = slices.Clone(g.labels)
+	c.labIDs = maps.Clone(g.labIDs)
+	c.indexKeys = slices.Clone(g.indexKeys)
 	return c
 }
 

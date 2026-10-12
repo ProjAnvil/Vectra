@@ -168,10 +168,7 @@ func expandLayerSerial(adj csr.Adjacency, cfg Config, visited []uint32, frontier
 }
 
 func expandLayerParallel(adj csr.Adjacency, cfg Config, visited []uint32, frontier []uint32) []uint32 {
-	workers := runtime.GOMAXPROCS(0)
-	if m := (len(frontier) + parallelChunk - 1) / parallelChunk; m < workers {
-		workers = m
-	}
+	workers := min(runtime.GOMAXPROCS(0), (len(frontier)+parallelChunk-1)/parallelChunk)
 	if workers <= 1 {
 		return expandLayerSerial(adj, cfg, visited, frontier)
 	}

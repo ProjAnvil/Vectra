@@ -332,13 +332,11 @@ func (n *Node) Ready() <-chan struct{} { return n.fsm.Ready() }
 func (n *Node) Close() {
 	n.closeOnce.Do(func() {
 		close(n.closed)
-		n.fsm.Close()
+		if n.fsm != nil {
+			n.fsm.Close()
+		}
 		if n.r != nil {
-			f := n.r.Shutdown()
-			if f.Error() != nil {
-				// 已在停机路径上，忽略二次关闭错误
-				_ = f
-			}
+			_ = n.r.Shutdown().Error()
 		}
 		if n.bolt != nil {
 			_ = n.bolt.Close()
