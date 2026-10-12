@@ -281,3 +281,63 @@ func buildCyclic(t *testing.T) *vectra.Graph {
 	return g
 }
 
+
+func TestParallelBFSEquivalentToSerial(t *testing.T) {
+	g := randGraph(t, 20000, 200000)
+	serial, err := g.BFS([]vectra.NodeID{0}, vectra.WithParallelThreshold(1<<30)) // 永远串行
+	if err != nil {
+		t.Fatal(err)
+	}
+	parallel, err := g.BFS([]vectra.NodeID{0}, vectra.WithParallelThreshold(0)) // 永远并行
+	if err != nil {
+		t.Fatal(err)
+	}
+	if serial.Count() != parallel.Count() {
+		t.Fatalf("count serial=%d parallel=%d", serial.Count(), parallel.Count())
+	}
+	for id, d := range serial.Depths {
+		if parallel.Depths[id] != d {
+			t.Fatalf("node %d depth serial=%d parallel=%d", id, d, parallel.Depths[id])
+		}
+	}
+}
+
+func TestParallelBFSRespectsMaxDepthAndLabels(t *testing.T) {
+	g := randGraph(t, 20000, 200000)
+	par, err := g.BFS([]vectra.NodeID{7}, vectra.WithParallelThreshold(0), vectra.WithMaxDepth(4), vectra.WithLabels("CALLS"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ser, err := g.BFS([]vectra.NodeID{7}, vectra.WithParallelThreshold(1<<30), vectra.WithMaxDepth(4), vectra.WithLabels("CALLS"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if par.Count() != ser.Count() {
+		t.Errorf("parallel=%d serial=%d", par.Count(), ser.Count())
+	}
+	for id := range ser.Depths {
+		if _, ok := par.Depths[id]; !ok {
+			t.Errorf("node %d missing in parallel result", id)
+		}
+	}
+}
+
+func TestParallelBFSDirectionInEquivalence(t *testing.T) {
+	g := randGraph(t, 20000, 200000)
+	par, err := g.BFS([]vectra.NodeID{123}, vectra.WithParallelThreshold(0), vectra.WithDirection(vectra.DirIn))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ser, err := g.BFS([]vectra.NodeID{123}, vectra.WithParallelThreshold(1<<30), vectra.WithDirection(vectra.DirIn))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if par.Count() != ser.Count() {
+		t.Errorf("parallel=%d serial=%d", par.Count(), ser.Count())
+	}
+	for id, d := range ser.Depths {
+		if par.Depths[id] != d {
+			t.Fatalf("node %d depth diverged", id)
+		}
+	}
+}
