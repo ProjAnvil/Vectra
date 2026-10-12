@@ -93,13 +93,13 @@ func TestBFSDepthAndNodes(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]uint32{"gateway": 0, "auth": 1, "ledger": 1, "db": 2, "kafka": 3}
-	if len(res.Depths) != len(want) {
-		t.Fatalf("Depths = %v, want %d entries", res.Depths, len(want))
+	if res.Count() != len(want) {
+		t.Fatalf("Count = %d, want %d entries", res.Count(), len(want))
 	}
 	for key, d := range want {
 		id := ids(t, g, key)[0]
-		if res.Depths[id] != d {
-			t.Errorf("depth[%s] = %d, want %d", key, res.Depths[id], d)
+		if res.Depth(id) != d {
+			t.Errorf("depth[%s] = %d, want %d", key, res.Depth(id), d)
 		}
 	}
 	if res.Count() != 5 {
@@ -117,7 +117,7 @@ func TestBFSMaxDepth(t *testing.T) {
 	if res.Count() != 4 { // gateway, auth, ledger, db
 		t.Errorf("Count = %d, want 4", res.Count())
 	}
-	if _, ok := res.Depths[ids(t, g, "kafka")[0]]; ok {
+	if res.Reached(ids(t, g, "kafka")[0]) {
 		t.Error("kafka reached with maxDepth=2")
 	}
 }
@@ -160,11 +160,11 @@ func TestBFSMultiSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Depths[ids(t, g, "auth")[0]] != 0 || res.Depths[ids(t, g, "ledger")[0]] != 0 {
+	if res.Depth(ids(t, g, "auth")[0]) != 0 || res.Depth(ids(t, g, "ledger")[0]) != 0 {
 		t.Error("start nodes should have depth 0")
 	}
-	if res.Depths[ids(t, g, "db")[0]] != 1 {
-		t.Errorf("db depth = %d, want 1", res.Depths[ids(t, g, "db")[0]])
+	if res.Depth(ids(t, g, "db")[0]) != 1 {
+		t.Errorf("db depth = %d, want 1", res.Depth(ids(t, g, "db")[0]))
 	}
 	if res.Count() != 4 {
 		t.Errorf("Count = %d, want 4", res.Count())
@@ -195,8 +195,8 @@ func TestBFSDirectionIn(t *testing.T) {
 		t.Fatalf("Count = %d, want %d", res.Count(), len(want))
 	}
 	for k, d := range want {
-		if res.Depths[ids(t, g, k)[0]] != d {
-			t.Errorf("depth[%s] = %d, want %d", k, res.Depths[ids(t, g, k)[0]], d)
+		if res.Depth(ids(t, g, k)[0]) != d {
+			t.Errorf("depth[%s] = %d, want %d", k, res.Depth(ids(t, g, k)[0]), d)
 		}
 	}
 }
@@ -224,8 +224,8 @@ func TestBFSHandlesCycles(t *testing.T) {
 	if res.Count() != 4 {
 		t.Errorf("Count = %d, want 4 (cycle must terminate)", res.Count())
 	}
-	if res.Depths[ids(t, g, "a")[0]] != 0 || res.Depths[ids(t, g, "b")[0]] != 1 {
-		t.Errorf("depths wrong: %v", res.Depths)
+	if res.Depth(ids(t, g, "a")[0]) != 0 || res.Depth(ids(t, g, "b")[0]) != 1 {
+		t.Error("depths wrong for cycle graph")
 	}
 }
 
@@ -282,7 +282,6 @@ func buildCyclic(t *testing.T) *vectra.Graph {
 	return g
 }
 
-
 func TestParallelBFSEquivalentToSerial(t *testing.T) {
 	g := randGraph(t, 20000, 200000)
 	serial, err := g.BFS([]vectra.NodeID{0}, vectra.WithParallelThreshold(1<<30)) // 永远串行
@@ -296,9 +295,12 @@ func TestParallelBFSEquivalentToSerial(t *testing.T) {
 	if serial.Count() != parallel.Count() {
 		t.Fatalf("count serial=%d parallel=%d", serial.Count(), parallel.Count())
 	}
-	for id, d := range serial.Depths {
-		if parallel.Depths[id] != d {
-			t.Fatalf("node %d depth serial=%d parallel=%d", id, d, parallel.Depths[id])
+	if serial.Count() != parallel.Count() {
+		t.Fatalf("count serial=%d parallel=%d", serial.Count(), parallel.Count())
+	}
+	for _, id := range serial.Nodes() {
+		if serial.Depth(id) != parallel.Depth(id) {
+			t.Fatalf("node %d depth serial=%d parallel=%d", id, serial.Depth(id), parallel.Depth(id))
 		}
 	}
 }
@@ -316,8 +318,8 @@ func TestParallelBFSRespectsMaxDepthAndLabels(t *testing.T) {
 	if par.Count() != ser.Count() {
 		t.Errorf("parallel=%d serial=%d", par.Count(), ser.Count())
 	}
-	for id := range ser.Depths {
-		if _, ok := par.Depths[id]; !ok {
+	for _, id := range ser.Nodes() {
+		if !par.Reached(id) {
 			t.Errorf("node %d missing in parallel result", id)
 		}
 	}
@@ -336,8 +338,8 @@ func TestParallelBFSDirectionInEquivalence(t *testing.T) {
 	if par.Count() != ser.Count() {
 		t.Errorf("parallel=%d serial=%d", par.Count(), ser.Count())
 	}
-	for id, d := range ser.Depths {
-		if par.Depths[id] != d {
+	for _, id := range ser.Nodes() {
+		if ser.Depth(id) != par.Depth(id) {
 			t.Fatalf("node %d depth diverged", id)
 		}
 	}
@@ -540,13 +542,13 @@ func TestShortestPathBidirectionalMatchesBFS(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		d, ok := bfs.Depths[to]
-		if !ok {
+		if !bfs.Reached(to) {
 			if found {
 				t.Fatalf("pair %d->%d: bidir found but BFS did not reach", from, to)
 			}
 			continue
 		}
+		d := bfs.Depth(to)
 		if !found {
 			t.Fatalf("pair %d->%d: BFS depth=%d but bidir not found", from, to, d)
 		}
@@ -574,8 +576,8 @@ func TestCyclesFindsSCCAndSelfLoop(t *testing.T) {
 	}
 	for _, e := range []struct{ s, d string }{
 		{"a", "b"}, {"b", "c"}, {"c", "a"}, // SCC {a,b,c}
-		{"c", "d"},                          // d 不在环
-		{"solo", "solo"},                    // 自环
+		{"c", "d"},       // d 不在环
+		{"solo", "solo"}, // 自环
 	} {
 		if _, err := g.AddEdge(e.s, e.d, "CALLS", nil); err != nil {
 			t.Fatal(err)

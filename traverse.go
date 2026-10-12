@@ -14,10 +14,15 @@ const (
 	DirIn
 )
 
+// noDepth 是"未到达"哨兵。
+const noDepth = ^uint32(0)
+
 // BFSResult 是一次 BFS 的完整结果：按层分组的成员 + 每节点深度。
+// 深度用平坦 uint32 数组而非 map——百万级结果集上 map 插入成本
+// 会吞掉 CSR 的访存优势（基准验证过），数组的 GC 成本也趋近于零。
 type BFSResult struct {
 	Layers [][]NodeID
-	Depths map[NodeID]uint32
+	depth  []uint32 // 未到达 = noDepth
 }
 
 // Nodes 返回全部到达节点（按层拼接）。
@@ -40,6 +45,24 @@ func (r *BFSResult) Count() int {
 		total += len(l)
 	}
 	return total
+}
+
+// Depth 返回节点深度；未到达返回 math.MaxUint32。
+func (r *BFSResult) Depth(id NodeID) uint32 { return r.depth[id] }
+
+// Reached 报告节点是否到达。
+func (r *BFSResult) Reached(id NodeID) bool { return r.depth[id] != noDepth }
+
+// DepthsMap 按需构建"节点->深度"映射（小结果集的便捷接口；
+// 大结果集请用 Depth/Reached/Nodes）。
+func (r *BFSResult) DepthsMap() map[NodeID]uint32 {
+	m := make(map[NodeID]uint32, r.Count())
+	for d, l := range r.Layers {
+		for _, n := range l {
+			m[n] = uint32(d)
+		}
+	}
+	return m
 }
 
 type bfsConfig struct {
@@ -83,12 +106,15 @@ func (g *Graph) BFS(starts []NodeID, opts ...BFSOption) (*BFSResult, error) {
 	visited := visitedPool.acquire(wordsFor(int(n)))
 	defer visitedPool.release(visited)
 
-	res := &BFSResult{Depths: make(map[NodeID]uint32, 16)}
+	res := &BFSResult{depth: make([]uint32, n)}
+	for i := range res.depth {
+		res.depth[i] = noDepth
+	}
 	frontier := make([]NodeID, 0, len(starts))
 	for _, s := range starts {
 		if !testAndSet(visited, uint32(s)) {
 			frontier = append(frontier, s)
-			res.Depths[s] = 0
+			res.depth[s] = 0
 		}
 	}
 	res.Layers = append(res.Layers, frontier)
@@ -100,7 +126,7 @@ func (g *Graph) BFS(starts []NodeID, opts ...BFSOption) (*BFSResult, error) {
 			next = g.expandLayerSerial(adj, mask, visited, frontier)
 		}
 		for _, v := range next {
-			res.Depths[v] = depth
+			res.depth[v] = depth
 		}
 		res.Layers = append(res.Layers, next)
 		frontier = next
@@ -266,6 +292,8 @@ func (g *Graph) ReachableIDs(start NodeID, opts ...ReachOption) ([]NodeID, error
 	return g.reachableNodeLevel(start, cfg.direction, mask), nil
 }
 
+// reachableSupernode 输出前按 NodeID 排序（分量编号是 Tarjan 发现序，
+// 与节点序无关）。
 func (g *Graph) reachableSupernode(start NodeID, cond dagCondensed) []NodeID {
 	seen := make([]bool, g.sccCount)
 	startSCC := g.sccOf[start]
@@ -292,7 +320,8 @@ func (g *Graph) reachableSupernode(start NodeID, cond dagCondensed) []NodeID {
 			out = append(out, NodeID(v))
 		}
 	}
-	return out // sccNodes 组内 NodeID 升序、分量间按 ID 升序 → 整体升序
+	slices.Sort(out)
+	return out
 }
 
 // reachableNodeLevel 是标签过滤时的严格可达性：节点级遍历，
