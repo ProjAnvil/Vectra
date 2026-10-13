@@ -61,6 +61,36 @@ cd server && go build -o vectra-server ./cmd/vectra-server
 
 Semantics: writes are linearizable (raft commit) — upserts plus logical-key deletes (node deletes cascade incident edges); reads are bounded-stale (≤ SealInterval, immediate for small graphs). Anti-split-brain: nodes with `Join` set never bootstrap. The 3-node in-process chaos suite (leader failover, log replay catch-up, zero query failures during republish) runs under `-race` in CI.
 
+## Transactions
+
+Since v0.4 the server supports **interactive optimistic transactions** on the same raft log — OCC against a per-key version table (each key's last-modified raft index). No locks are held across the conversation; validation is deterministic table lookups inside `fsm.Apply`, so every replica reaches the same commit/conflict decision:
+
+```
+read:    any query endpoint → take the X-Vectra-Snapshot response header (publishedSeq) as the token
+write:   POST /v1/txn {nodes, edges, edgeDeletes, nodeDeletes,
+                       txn: {snapshot: <token>, ser: false, readNodes: [...], readEdges: [...]}}
+success: 200 {committed: true, index, nodesApplied, edgesApplied, ...}
+conflict: 409 {committed: false, conflicts: [...], conflictTotal, hint}
+```
+
+**Isolation.** Default is snapshot isolation (SI): write-set validation, first-committer-wins — any written key modified after the token rejects the whole batch, so blind writes participate too (stronger than badger/FDB defaults, where blind writes sneak through). `"ser": true` adds read-set validation: keys recorded in `readNodes`/`readEdges` that changed after the token also reject (phantom / write-skew protection). Edge writes bump both endpoint versions; node deletes cascade to peer adjacency — all observable through validation. A `txn` field is required (400 `VALIDATION` without it — use `/v1/batch` for auto-commit); read sets are capped at 100,000 keys (400 `TXN_READSET_TOO_LARGE`).
+
+**Read-set coverage** — what to record for `ser: true`:
+
+| Endpoint | Record |
+|---|---|
+| `GET /v1/nodes/{key}` | `{key}` |
+| `GET /v1/neighbors` | `{key}` + all returned neighbor keys |
+| `POST /v1/query` | start keys + all reached keys |
+| `GET /v1/reachable` | `from` + all returned keys |
+| `/v1/path`, `/v1/stats`, `/v1/cycles` | SI-only — full-graph / frontier-dependent reads cannot be SER-validated |
+
+**Retry etiquette.** On 409: full-jitter exponential backoff `sleep = rand(0, min(500ms, 5ms·2^attempt))` (cf. [AWS Exponential Backoff and Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)), re-read to refresh the token, resubmit. Read-your-writes: poll `GET /v1/stats` until `publishedSeq >= index` from the commit response.
+
+**Overhead.** v0.4.0 acceptance is fsm-level (`BenchmarkFSMAutoCommit` / `TxnSI` / `TxnSER16` in `server/txn_bench_test.go` — direct `fsm.Apply`, `Snapshot = ^uint64(0)` so validation never conflicts): AutoCommit **34.9µs** · TxnSI **28.6µs** · TxnSER16 **38.6µs** per 17-node batch (Apple M5 Pro) — SI/SER within ~25% of auto-commit at a 16-key read set (SER16 ≈ +11%). HTTP-level txnsi/txnser workloads in vectra-bench are future work.
+
+**⚠️ Upgrading to 0.4.0.** Raft snapshots now carry a VCTX trailer (the version table). Old binaries cannot read 0.4.0 snapshots, and 0.4.0 rejects pre-0.4.0 snapshots ("legacy snapshot without VCTX rejected") — mixed-version clusters are unsupported. Small deployments: stop-the-world upgrade; after the upgrade the leader takes a fresh snapshot automatically (seal interval / first publish), after which all replicas carry VCTX.
+
 ## MCP (agents)
 
 Three first-class implementations — [Go (embedded engine)](mcp), [Python (FastMCP)](mcp/python), [TypeScript](mcp/ts) — exposing one-hop / multi-hop / shortest-path / reachability / cycles as MCP tools:
@@ -83,7 +113,7 @@ See [mcp/README.md](mcp/README.md) for all transports and host configurations.
 
 Reproduce locally: `make bench [SIZE=medium] [MODE=http]` — data and report are deleted when the run ends.
 
-Correctness is validated the LDBC way: property tests against independent reference implementations, real-dataset ground truth (SNAP email-Eu-core: 203 SCCs / largest 803, externally published numbers), chaos and degenerate-graph suites, determinism checks. Coverage: root 92.2% · csr/dag 100% · store 84.3% · engine+traverse 98.7% · server 83.8% · mcp 81.5%.
+Correctness is validated the LDBC way: property tests against independent reference implementations, real-dataset ground truth (SNAP email-Eu-core: 203 SCCs / largest 803, externally published numbers), chaos and degenerate-graph suites, determinism checks. Coverage: root 92.2% · csr/dag 100% · store 84.3% · engine+traverse 98.7% · server 86.8% · mcp 81.5%.
 
 ## Repository layout
 
