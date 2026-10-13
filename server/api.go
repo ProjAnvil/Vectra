@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"expvar"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
@@ -55,6 +56,7 @@ func (n *Node) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /v1/batch", n.handleBatch)
+	mux.HandleFunc("POST /v1/txn", n.handleTxn)
 	mux.HandleFunc("POST /v1/join", n.handleJoin)
 	mux.HandleFunc("GET /v1/health", n.handleHealth)
 	mux.HandleFunc("GET /v1/stats", n.handleStats)
@@ -106,12 +108,14 @@ func (n *Node) graph(w http.ResponseWriter) *vectra.Graph {
 	if !n.gateReady(w) {
 		return nil
 	}
-	g := n.fsm.Published()
-	if g == nil {
+	ps := n.fsm.published.Load()
+	if ps == nil {
 		writeErr(w, http.StatusServiceUnavailable, "NOT_READY", "snapshot not yet published")
 		return nil
 	}
-	return g
+	// Header must be set before any WriteHeader; writeJSON below is the first writer.
+	w.Header().Set("X-Vectra-Snapshot", strconv.FormatUint(ps.seq, 10))
+	return ps.graph
 }
 
 func (n *Node) handleBatch(w http.ResponseWriter, r *http.Request) {
@@ -149,6 +153,81 @@ func (n *Node) handleBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
+		"nodesApplied": res.NodesApplied,
+		"edgesApplied": res.EdgesApplied,
+		"edgesSkipped": res.EdgesSkipped,
+		"edgesDeleted": res.EdgesDeleted,
+		"nodesDeleted": res.NodesDeleted,
+		"nodesSkipped": res.NodesSkipped,
+	})
+}
+
+// maxReadSet caps the per-request SER read set: bounded validation work per
+// raft apply, and bounded request body size.
+const maxReadSet = 100_000
+
+func (n *Node) handleTxn(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Nodes       []NodeUpsert `json:"nodes"`
+		Edges       []EdgeUpsert `json:"edges"`
+		EdgeDeletes []EdgeDelete `json:"edgeDeletes"`
+		NodeDeletes []string     `json:"nodeDeletes"`
+		Txn         *TxnGuard    `json:"txn"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "bad request body: "+err.Error())
+		return
+	}
+	if req.Txn == nil {
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "txn field required (use /v1/batch for auto-commit)")
+		return
+	}
+	if len(req.Txn.ReadNodes) > maxReadSet {
+		writeErr(w, http.StatusBadRequest, "TXN_READSET_TOO_LARGE",
+			fmt.Sprintf("readNodes exceeds %d keys", maxReadSet))
+		return
+	}
+	if len(req.Txn.ReadEdges) > maxReadSet {
+		writeErr(w, http.StatusBadRequest, "TXN_READSET_TOO_LARGE",
+			fmt.Sprintf("readEdges exceeds %d keys", maxReadSet))
+		return
+	}
+	res, err := n.Apply(r.Context(), Batch{
+		Version:     batchVersion,
+		Nodes:       req.Nodes,
+		Edges:       req.Edges,
+		EdgeDeletes: req.EdgeDeletes,
+		NodeDeletes: req.NodeDeletes,
+		Txn:         req.Txn,
+	})
+	if err != nil {
+		if err == ErrNotLeader {
+			if hint := n.LeaderHint(); hint != "" {
+				w.Header().Set("X-Vectra-Leader", hint)
+			}
+			w.Header().Set("Retry-After", "1")
+			writeErr(w, http.StatusServiceUnavailable, "NOT_LEADER", "send writes to the leader")
+			return
+		}
+		if errors.Is(err, ErrTimeout) {
+			writeErr(w, http.StatusGatewayTimeout, "TIMEOUT", err.Error())
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "INTERNAL", err.Error())
+		return
+	}
+	if !res.Committed {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"committed":     false,
+			"conflicts":     res.Conflicts,
+			"conflictTotal": res.ConflictTotal,
+			"hint":          "refresh snapshot (X-Vectra-Snapshot) and retry with backoff",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"committed":    true,
+		"index":        res.Index,
 		"nodesApplied": res.NodesApplied,
 		"edgesApplied": res.EdgesApplied,
 		"edgesSkipped": res.EdgesSkipped,
@@ -221,13 +300,15 @@ func (n *Node) handleStats(w http.ResponseWriter, r *http.Request) {
 	n.queryCount.Add(1)
 	st := g.Stats()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"nodes":       st.Nodes,
-		"edges":       st.Edges,
-		"sccs":        st.SCCs,
-		"cyclicNodes": st.CyclicNodes,
-		"isLeader":    n.IsLeader(),
-		"term":        n.term(),
-		"publishedAt": n.fsm.lastSealNanos.Load() / int64(time.Millisecond),
+		"nodes":        st.Nodes,
+		"edges":        st.Edges,
+		"sccs":         st.SCCs,
+		"cyclicNodes":  st.CyclicNodes,
+		"isLeader":     n.IsLeader(),
+		"term":         n.term(),
+		"publishedAt":  n.fsm.lastSealNanos.Load() / int64(time.Millisecond),
+		"appliedIndex": n.fsm.appliedIndex.Load(),
+		"publishedSeq": n.fsm.PublishedSeq(),
 	})
 }
 

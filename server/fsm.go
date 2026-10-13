@@ -1,9 +1,13 @@
 package server
 
 import (
+	"bytes"
+	"encoding/binary"
+	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -20,14 +24,22 @@ import (
 // always far below this value.
 const defaultSmallGraphLimit = 100_000
 
+// maxConflicts caps the per-key conflict list returned to a rejected client;
+// ConflictTotal always reports the untruncated count.
+const maxConflicts = 100
+
 // ApplyResult is the return value of FSM.Apply (passed back via ApplyFuture.Response).
 type ApplyResult struct {
-	NodesApplied int
-	EdgesApplied int
-	EdgesSkipped int // Edges referencing nonexistent nodes are deterministically skipped (counted in metrics)
-	EdgesDeleted int // Explicit deletes + cascade deletes
-	NodesDeleted int
-	NodesSkipped int // Deletes of nonexistent keys
+	NodesApplied  int
+	EdgesApplied  int
+	EdgesSkipped  int // Edges referencing nonexistent nodes are deterministically skipped (counted in metrics)
+	EdgesDeleted  int // Explicit deletes + cascade deletes
+	NodesDeleted  int
+	NodesSkipped  int      // Deletes of nonexistent keys
+	Committed     bool     // false only for TxnGuard-rejected batches
+	Index         uint64   // raft log index of this entry
+	Conflicts     []string // conflicting keys, truncated to maxConflicts
+	ConflictTotal int      // total conflict count before truncation
 }
 
 // Metrics is the server's atomic counters (expvar is mounted in api.go).
@@ -41,6 +53,20 @@ type Metrics struct {
 	Seals          atomic.Int64
 	Restores       atomic.Int64
 	LeaderChanges  atomic.Int64
+	TxnCommits     atomic.Int64
+	TxnConflicts   atomic.Int64
+}
+
+// edgeVerKey addresses an edge in the version table by its logical key
+// (same identity discipline as EdgeDelete: Seal renumbers IDs, keys are stable).
+type edgeVerKey struct{ Src, Dst, Label string }
+
+// pubState bundles the published graph with the applied raft index it
+// reflects, so readers can never pair a newer seq with an older graph
+// (audit P1-2: token must never overshoot graph content).
+type pubState struct {
+	graph *vectra.Graph
+	seq   uint64
 }
 
 // fsm implements raft.FSM: a live writable graph + a hot-swap publisher.
@@ -55,7 +81,12 @@ type fsm struct {
 	live      *vectra.Graph
 	dirty     bool
 	version   int64 // Monotonically increasing; the publisher uses it to detect writes after cloning
-	published atomic.Pointer[vectra.Graph]
+	published atomic.Pointer[pubState]
+
+	nodeVer map[string]uint64     // per-node-key last-modified raft index; guarded by mu
+	edgeVer map[edgeVerKey]uint64 // per-edge-key last-modified raft index; guarded by mu
+
+	appliedIndex atomic.Uint64 // high-water mark of applied raft log indexes
 
 	sealInterval    time.Duration
 	smallGraphLimit int
@@ -76,6 +107,8 @@ type fsm struct {
 func newFSM(sealInterval time.Duration) *fsm {
 	f := &fsm{
 		live:            vectra.New(),
+		nodeVer:         map[string]uint64{},
+		edgeVer:         map[edgeVerKey]uint64{},
 		sealInterval:    sealInterval,
 		smallGraphLimit: defaultSmallGraphLimit,
 		ready:           make(chan struct{}),
@@ -97,6 +130,14 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	}
 	res := ApplyResult{}
 	f.mu.Lock()
+	wNodes, wEdges := f.effectiveWriteSet(b) // always: blind writes version too
+	if b.Txn != nil {
+		if conflicts, total := f.validateTxn(b.Txn, l.Index, wNodes, wEdges); conflicts != nil {
+			f.mu.Unlock()
+			f.metrics.TxnConflicts.Add(1)
+			return ApplyResult{Committed: false, Index: l.Index, Conflicts: conflicts, ConflictTotal: total}
+		}
+	}
 	for _, n := range b.Nodes {
 		if _, err := f.live.AddNode(n.Key, n.Label, n.Props); err == nil {
 			res.NodesApplied++
@@ -128,9 +169,19 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	}
 	f.dirty = true
 	f.version++
+	f.appliedIndex.Store(l.Index)
+	for _, k := range wNodes {
+		f.nodeVer[k] = l.Index
+	}
+	for _, k := range wEdges {
+		f.edgeVer[k] = l.Index
+	}
 	small := f.live.NodeCount()+f.live.EdgeCount() < f.smallGraphLimit
 	f.mu.Unlock()
 
+	if b.Txn != nil {
+		f.metrics.TxnCommits.Add(1)
+	}
 	f.metrics.AppliedBatches.Add(1)
 	f.metrics.AppliedNodes.Add(int64(res.NodesApplied))
 	f.metrics.AppliedEdges.Add(int64(res.EdgesApplied))
@@ -140,13 +191,27 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	if small {
 		f.wakePublisher()
 	}
+	res.Committed = true
+	res.Index = l.Index
 	return res
 }
 
 // Published returns the most recently sealed-and-published graph (immutable, lock-free concurrent reads).
 // Returns nil before the first publish.
 func (f *fsm) Published() *vectra.Graph {
-	return f.published.Load()
+	if ps := f.published.Load(); ps != nil {
+		return ps.graph
+	}
+	return nil
+}
+
+// PublishedSeq reports the applied raft index reflected by the current
+// published graph (0 before the first publish).
+func (f *fsm) PublishedSeq() uint64 {
+	if ps := f.published.Load(); ps != nil {
+		return ps.seq
+	}
+	return 0
 }
 
 // Ready closes once the first publish completes (read readiness gate for restart recovery).
@@ -195,6 +260,7 @@ func (f *fsm) publishOnce() {
 	}
 	clone := f.live.Clone()
 	version := f.version
+	seq := f.appliedIndex.Load()
 	f.mu.RUnlock()
 
 	if err := clone.Seal(); err != nil {
@@ -204,7 +270,7 @@ func (f *fsm) publishOnce() {
 	f.pubMu.Lock()
 	if version > f.publishedVer { // With Restore/publisher racing, only newer versions may land
 		f.publishedVer = version
-		f.published.Store(clone)
+		f.published.Store(&pubState{graph: clone, seq: seq})
 		f.metrics.Seals.Add(1)
 		f.lastSealNanos.Store(time.Now().UnixNano())
 	}
@@ -223,22 +289,68 @@ func (f *fsm) publishOnce() {
 func (f *fsm) Snapshot() (raft.FSMSnapshot, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return &graphSnapshot{clone: f.live.Clone()}, nil
+	// Copy the version tables under the same RLock as the graph clone: the
+	// snapshot's raft metadata index aligns with this call on the FSM thread
+	// (raft v1.8), and Persist runs later on the snapshot thread — it must
+	// only ever see this frozen copy.
+	return &graphSnapshot{
+		clone:   f.live.Clone(),
+		nodeVer: maps.Clone(f.nodeVer),
+		edgeVer: maps.Clone(f.edgeVer),
+		applied: f.appliedIndex.Load(),
+	}, nil
 }
 
 type graphSnapshot struct {
-	clone *vectra.Graph
+	clone   *vectra.Graph
+	nodeVer map[string]uint64
+	edgeVer map[edgeVerKey]uint64
+	applied uint64
 }
 
-// Persist serializes the cloned live graph into the sink (the unsealed state can
-// be exported directly, no Seal required — saves sealing a large graph once).
+// verSnapshot is the gob payload of the VCTX trailer: the version tables and
+// the applied-index high-water mark at Snapshot time.
+type verSnapshot struct {
+	NodeVer      map[string]uint64
+	EdgeVer      map[edgeVerKey]uint64
+	AppliedIndex uint64
+}
+
+const vctxMagic = "VCTX"
+
+// legacyStoreMagic is the header magic of pre-0.4.0 graph-only snapshots
+// (internal/store: "VCTR" | u16 version | counts...). Read as the u32 LE
+// framing length below, it parses as ~1.38e9, so genuine legacy snapshots
+// always fail the framing guard — which is where they are detected.
+const legacyStoreMagic = "VCTR"
+
+// errLegacySnapshot is the runbook-pointing rejection for pre-0.4.0 graph-only
+// snapshots: a replica restored from one would validate transactions against
+// an empty version table and diverge permanently from log-derived replicas.
+var errLegacySnapshot = errors.New("server: legacy snapshot without VCTX rejected; re-seed from a 0.4.0+ snapshot (see upgrade runbook)")
+
+// Persist serializes the cloned live graph plus the VCTX version-table trailer
+// into the sink (the unsealed state can be exported directly, no Seal required —
+// saves sealing a large graph once).
 func (s *graphSnapshot) Persist(sink raft.SnapshotSink) error {
 	data, err := s.clone.ExportSnapshot()
 	if err != nil {
 		return err
 	}
-	if _, err := sink.Write(data); err != nil {
+	var verBuf bytes.Buffer
+	if err := gob.NewEncoder(&verBuf).Encode(verSnapshot{
+		NodeVer: s.nodeVer, EdgeVer: s.edgeVer, AppliedIndex: s.applied,
+	}); err != nil {
 		return err
+	}
+	var head [4]byte
+	binary.LittleEndian.PutUint32(head[:], uint32(len(data)))
+	var fv [2]byte
+	binary.LittleEndian.PutUint16(fv[:], 1) // u16 LE format version, matches splitSnapshot
+	for _, chunk := range [][]byte{head[:], data, []byte(vctxMagic), fv[:], verBuf.Bytes()} {
+		if _, err := sink.Write(chunk); err != nil {
+			return err
+		}
 	}
 	return sink.Close()
 }
@@ -252,12 +364,19 @@ func (f *fsm) Restore(rc io.ReadCloser) error {
 	if err != nil {
 		return err
 	}
-	g, err := vectra.ImportSnapshot(data)
+	graph, vers, err := splitSnapshot(data)
+	if err != nil {
+		return err
+	}
+	g, err := vectra.ImportSnapshot(graph)
 	if err != nil {
 		return err
 	}
 	f.mu.Lock()
 	f.live = g
+	f.nodeVer = vers.NodeVer
+	f.edgeVer = vers.EdgeVer
+	f.appliedIndex.Store(vers.AppliedIndex)
 	f.dirty = true
 	f.version++
 	f.mu.Unlock()
@@ -266,7 +385,169 @@ func (f *fsm) Restore(rc io.ReadCloser) error {
 	return nil
 }
 
+// splitSnapshot separates the graph payload from the VCTX version-table
+// trailer. Legacy snapshots (pre-0.4.0, graph only) are rejected: replicas
+// restored from them would validate transactions against an empty table and
+// diverge permanently from log-derived replicas.
+func splitSnapshot(data []byte) ([]byte, verSnapshot, error) {
+	var vs verSnapshot
+	if len(data) < 6 { // u32 len + "VCTX" minimum
+		return nil, vs, errors.New("server: snapshot too short")
+	}
+	n := binary.LittleEndian.Uint32(data[:4])
+	// uint64 arithmetic: int(n)+10 wraps negative on 32-bit platforms for
+	// crafted framing lengths and would slip past the guard into the slicing
+	// below (out-of-range panic). 10 = u32 len + "VCTX" + u16 version.
+	if uint64(n)+10 > uint64(len(data)) {
+		// A genuine pre-0.4.0 snapshot starts with the store magic "VCTR",
+		// which parses here as a ~1.38e9 framing length — surface the
+		// runbook error, not the generic corrupt-framing one.
+		if bytes.HasPrefix(data, []byte(legacyStoreMagic)) {
+			return nil, vs, errLegacySnapshot
+		}
+		return nil, vs, errors.New("server: snapshot framing corrupt")
+	}
+	graph := data[4 : 4+n]
+	rest := data[4+n:]
+	if !bytes.HasPrefix(rest, []byte(vctxMagic)) {
+		return nil, vs, errLegacySnapshot
+	}
+	rest = rest[len(vctxMagic):]
+	if len(rest) < 2 {
+		return nil, vs, errors.New("server: VCTX version missing")
+	}
+	if binary.LittleEndian.Uint16(rest[:2]) != 1 {
+		return nil, vs, fmt.Errorf("server: unsupported VCTX version %d", binary.LittleEndian.Uint16(rest[:2]))
+	}
+	if err := gob.NewDecoder(bytes.NewReader(rest[2:])).Decode(&vs); err != nil {
+		return nil, vs, err
+	}
+	if vs.NodeVer == nil {
+		vs.NodeVer = map[string]uint64{}
+	}
+	if vs.EdgeVer == nil {
+		vs.EdgeVer = map[edgeVerKey]uint64{}
+	}
+	return graph, vs, nil
+}
+
 // Close stops the publisher (idempotent).
 func (f *fsm) Close() {
 	f.stopOnce.Do(func() { close(f.stop) })
 }
+
+// effectiveWriteSet enumerates every logical key the batch will modify,
+// including cascade peers of node deletes (their adjacency changes too).
+// Must run under f.mu with replay not yet started. Unconditional: request
+// keys are included even if replay will skip them (safe over-rejection only).
+func (f *fsm) effectiveWriteSet(b Batch) (nodes []string, edges []edgeVerKey) {
+	seenN := map[string]struct{}{}
+	seenE := map[edgeVerKey]struct{}{}
+	addN := func(k string) {
+		if _, ok := seenN[k]; !ok {
+			seenN[k] = struct{}{}
+			nodes = append(nodes, k)
+		}
+	}
+	addE := func(src, dst, label string) {
+		k := edgeVerKey{Src: src, Dst: dst, Label: label}
+		if _, ok := seenE[k]; !ok {
+			seenE[k] = struct{}{}
+			edges = append(edges, k)
+		}
+	}
+	for _, n := range b.Nodes {
+		addN(n.Key)
+	}
+	for _, e := range b.Edges {
+		addN(e.SrcKey)
+		addN(e.DstKey)
+		addE(e.SrcKey, e.DstKey, e.Label)
+	}
+	for _, d := range b.EdgeDeletes {
+		addN(d.SrcKey)
+		addN(d.DstKey)
+		addE(d.SrcKey, d.DstKey, d.Label)
+	}
+	for _, key := range b.NodeDeletes {
+		addN(key)
+		for _, dir := range []vectra.Direction{vectra.DirOut, vectra.DirIn} {
+			es, err := f.live.EdgesOf(key, dir)
+			if err != nil {
+				continue // nonexistent key: no incident edges to cascade
+			}
+			for _, e := range es {
+				// Edge.Src/Dst are NodeIDs; resolve back to string keys —
+				// the version table is key-addressed (Seal renumbers IDs).
+				src, ok1 := f.live.NodeByID(e.Src)
+				dst, ok2 := f.live.NodeByID(e.Dst)
+				if !ok1 || !ok2 {
+					continue
+				}
+				addN(src.Key)
+				addN(dst.Key)
+				addE(src.Key, dst.Key, e.Label)
+			}
+		}
+	}
+	return nodes, edges
+}
+
+// validateTxn returns the first maxConflicts conflicting keys and the total
+// conflict count for a guarded batch, or (nil, 0) when it may commit. Must
+// run under f.mu before replay.
+//
+// A table entry equal to this entry's own log index is the entry's earlier
+// application (same-index replay, e.g. re-applying an entry already included
+// in a restored snapshot) — not a conflict — so a replayed committed entry
+// reproduces its original decision. For fresh entries indexes strictly
+// increase, so own-index entries never occur in normal operation.
+func (f *fsm) validateTxn(tg *TxnGuard, idx uint64, wNodes []string, wEdges []edgeVerKey) ([]string, int) {
+	var conflicts []string
+	seen := map[string]struct{}{}
+	total := 0
+	add := func(k string) {
+		if _, ok := seen[k]; ok {
+			return
+		}
+		seen[k] = struct{}{}
+		total++
+		if len(conflicts) < maxConflicts {
+			conflicts = append(conflicts, k)
+		}
+	}
+	nodeDirty := func(k string) bool {
+		return f.nodeVer[k] > tg.Snapshot && f.nodeVer[k] != idx
+	}
+	edgeDirty := func(k edgeVerKey) bool {
+		return f.edgeVer[k] > tg.Snapshot && f.edgeVer[k] != idx
+	}
+	for _, k := range wNodes {
+		if nodeDirty(k) {
+			add(k)
+		}
+	}
+	for _, k := range wEdges {
+		if edgeDirty(k) {
+			add(edgeKeyString(k))
+		}
+	}
+	if tg.SER {
+		for _, k := range tg.ReadNodes {
+			if nodeDirty(k) {
+				add(k)
+			}
+		}
+		for _, e := range tg.ReadEdges {
+			if edgeDirty(edgeVerKey{Src: e.Src, Dst: e.Dst, Label: e.Label}) {
+				add(edgeKeyString(edgeVerKey{Src: e.Src, Dst: e.Dst, Label: e.Label}))
+			}
+		}
+	}
+	if total == 0 {
+		return nil, 0
+	}
+	return conflicts, total
+}
+
+func edgeKeyString(k edgeVerKey) string { return k.Src + "\x00" + k.Dst + "\x00" + k.Label }

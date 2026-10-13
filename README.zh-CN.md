@@ -61,6 +61,36 @@ cd server && go build -o vectra-server ./cmd/vectra-server
 
 一致性语义：写线性一致（raft 提交即返回）——upsert 加逻辑键删除（删点级联删边）；读有界过期（≤ SealInterval，小图即时）。防脑裂：设了 `Join` 的节点绝不引导。三节点进程内混沌测试（leader 宕机切换、日志回放追平、重发布期间查询零失败）在 `-race` 下进 CI。
 
+## 事务
+
+v0.4 起服务端在同一条 raft 日志上支持**交互式乐观事务**——基于每键版本表（各键最后被改的 raft index）的 OCC。会话期间不持任何锁；验证只是 `fsm.Apply` 内的确定性查表，每个副本必然得出相同的提交/冲突结论：
+
+```
+读:     任意查询端点 → 取响应头 X-Vectra-Snapshot（publishedSeq）作为 token
+写:     POST /v1/txn {nodes, edges, edgeDeletes, nodeDeletes,
+                     txn: {snapshot: <token>, ser: false, readNodes: [...], readEdges: [...]}}
+成功:   200 {committed: true, index, nodesApplied, edgesApplied, ...}
+冲突:   409 {committed: false, conflicts: [...], conflictTotal, hint}
+```
+
+**隔离级别。** 默认快照隔离（SI）：写集验证、先提交者赢——token 之后任何被写键被改过则整批拒绝，盲写同样参与验证（强于 badger/FDB 默认档，后者的盲写会溜过去）。`"ser": true` 追加读集验证：记录在 `readNodes`/`readEdges` 里的键在 token 之后被改同样拒绝（防幻读 / 写偏序）。边写入同时提升两端点的版本；删点级联影响邻居邻接——这些都能被验证观察到。`txn` 字段必填（缺失返回 400 `VALIDATION`——自动提交请用 `/v1/batch`）；readNodes 与 readEdges 上限 10 万键（400 `TXN_READSET_TOO_LARGE`）。
+
+**读集覆盖**——`ser: true` 时应记录哪些键：
+
+| 端点 | 记录 |
+|---|---|
+| `GET /v1/nodes/{key}` | `{key}` |
+| `GET /v1/neighbors` | `{key}` + 返回的全部邻居键 |
+| `POST /v1/query` | 起点键 + 到达的全部键 |
+| `GET /v1/reachable` | `from` + 返回的全部键 |
+| `/v1/path`、`/v1/stats`、`/v1/cycles` | 仅 SI——全图/依赖边界的读取无法做 SER 验证 |
+
+**重试礼仪。** 收到 409：full-jitter 指数退避 `sleep = rand(0, min(500ms, 5ms·2^attempt))`（参考 [AWS Exponential Backoff and Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)），重读取刷新 token，再提交。读己之写：轮询 `GET /v1/stats` 直到 `publishedSeq >= 提交响应里的 index`。
+
+**开销口径。** v0.4.0 以 fsm 级基准验收（`server/txn_bench_test.go` 的 `BenchmarkFSMAutoCommit` / `TxnSI` / `TxnSER16`——直接驱动 `fsm.Apply`，`Snapshot = ^uint64(0)` 使验证永不冲突）：AutoCommit **34.9µs** · TxnSI **28.6µs** · TxnSER16 **38.6µs**（AutoCommit/SER16 为 17 节点批次，TxnSI 为 1 节点批次；Apple M5 Pro）——16 键读集下 SI/SER 与自动提交差距 <25%（SER16 约 +11%）。vectra-bench 已内置 HTTP 级 `txnsi`/`txnser` 负载（`-mode http -workloads txnsi,txnser`）：S 档近线性扩展（1 → 16 worker：51 → 542 提交/s，SER 冲突 ≤ 4.3%）；大档位上遵守 RYW 礼仪的吞吐受发布周期支配（SealInterval + clone/Seal）——规模/间隔/并发的完整矩阵见 `docs/benchmarks/2026-10-13-oltp-txn.md`。
+
+**⚠️ 升级到 0.4.0。** raft 快照新增 VCTX 尾帧（版本表）。不兼容是双向的：旧二进制读不了 0.4.0 快照，0.4.0 也拒绝 0.4.0 之前的快照（"legacy snapshot without VCTX rejected"）——不支持新旧混布。磁盘上有 0.4.0 之前 raft 快照的节点会带着该错误拒绝启动（启动时 raft 恢复盘上快照即失败），因此不存在旧快照状态的原地转换。恢复方式是重播种（re-seed）：停掉全部节点，按运维策略删除 raft 快照状态（或整个数据目录），重启并重新导入数据——之后 raft 的快照策略（SnapshotThreshold / SnapshotInterval）会自动拍出带 VCTX 的新快照。
+
 ## MCP（AI agent）
 
 三个一等实现——[Go（嵌入引擎）](mcp)、[Python（FastMCP）](mcp/python)、[TypeScript](mcp/ts)——把一跳/多跳/最短路/可达性/循环依赖暴露为 MCP 工具：
@@ -83,7 +113,7 @@ claude mcp add vectra -- /path/to/vectra-mcp
 
 本地复现：`make bench [SIZE=medium] [MODE=http]`，数据目录与报告运行结束即删。
 
-正确性按 LDBC 方法验证：与独立参考实现做属性对账、真实数据集外部 ground truth（SNAP email-Eu-core：203 个 SCC / 最大 803，对外发布的数字）、混沌与退化图测试、确定性检查。覆盖率：根包 92.2% · csr/dag 100% · store 84.3% · engine+traverse 98.7% · server 83.8% · mcp 81.5%。
+正确性按 LDBC 方法验证：与独立参考实现做属性对账、真实数据集外部 ground truth（SNAP email-Eu-core：203 个 SCC / 最大 803，对外发布的数字）、混沌与退化图测试、确定性检查。覆盖率：根包 92.2% · csr/dag 100% · store 84.3% · engine+traverse 98.7% · server 86.9% · mcp 81.5%。
 
 ## 仓库布局
 

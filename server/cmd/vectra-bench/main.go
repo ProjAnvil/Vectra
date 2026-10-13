@@ -1,6 +1,7 @@
 // vectra-bench is Vectra's stress tool: generate a power-law dependency graph →
 // inject (direct engine writes or via HTTP/raft) → parameter curation →
-// concurrent stress of neighbors/multi-hop/path/reachability workloads →
+// concurrent stress of neighbors/multi-hop/path/reachability workloads
+// (http mode adds interactive-transaction txnsi/txnser) →
 // emit a markdown report. Data goes to a local temp directory, deleted after
 // the run (--keep retains it).
 //
@@ -57,7 +58,7 @@ func main() {
 	keep := flag.Bool("keep", false, "keep the data directory (debugging)")
 	out := flag.String("out", "", "write results to file (stdout by default)")
 	sealInterval := flag.Duration("seal-interval", 2*time.Second, "publish throttle interval in http mode")
-	workloads := flag.String("workloads", "", "comma-separated workload subset (all by default): neighbors,bfs2,bfs3,bfsall,path,reach")
+	workloads := flag.String("workloads", "", "comma-separated workload subset (all by default): neighbors,bfs2,bfs3,bfsall,path,reach; http mode additionally: txnsi,txnser (http-only)")
 	flag.Parse()
 
 	spec, ok := sizes[*size]
@@ -105,9 +106,10 @@ func main() {
 	case "engine":
 		queryGraph = injectEngine(rep, bg)
 	case "http":
-		baseURL, httpc, node = injectHTTP(rep, bg, dir, *sealInterval, *keep)
+		var wantNodes, wantEdges int
+		baseURL, httpc, node, wantNodes, wantEdges = injectHTTP(rep, bg, dir, *sealInterval, *keep)
 		defer node.Close()
-		queryGraph = waitPublished(node, spec)
+		queryGraph = waitPublished(node, wantNodes, wantEdges)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode: %s\n", *mode)
 		os.Exit(2)
@@ -119,12 +121,17 @@ func main() {
 	rep.CurateTime = time.Since(t0)
 
 	// 4. Workloads
-	ops := buildWorkloads(*mode, queryGraph, baseURL, httpc, params)
+	ops, txnStats := buildWorkloads(*mode, queryGraph, baseURL, httpc, params)
+	rep.Txn = txnStats
 	selected := ops
 	if *workloads != "" {
 		want := map[string]bool{}
 		for _, w := range strings.Split(*workloads, ",") {
 			want[strings.TrimSpace(w)] = true
+		}
+		available := map[string]bool{}
+		for _, o := range ops {
+			available[o.name] = true
 		}
 		selected = selected[:0]
 		for _, o := range ops {
@@ -132,9 +139,24 @@ func main() {
 				selected = append(selected, o)
 			}
 		}
+		// Names requested but unavailable in this mode (e.g. txnsi in engine
+		// mode): note and skip rather than failing the whole run.
+		for _, w := range strings.Split(*workloads, ",") {
+			w = strings.TrimSpace(w)
+			if w != "" && want[w] && !available[w] {
+				fmt.Fprintf(os.Stderr, "note: workload %q is not available in %s mode — skipped\n", w, *mode)
+				want[w] = false
+			}
+		}
+		if len(selected) == 0 {
+			fmt.Fprintln(os.Stderr, "note: no requested workloads available in this mode; nothing to run")
+		}
 	}
 	for _, w := range selected {
 		bench.RunWorkload(w.name, w.op, 1, *warmup) // Warmup discarded
+		if ts := txnStats[w.name]; ts != nil {
+			ts.Reset() // warmup OCC outcomes are discarded too
+		}
 		res := bench.RunWorkload(w.name, w.op, *workers, *duration)
 		fmt.Fprintf(os.Stderr, "  %-10s ops=%-7d p50=%-9s p99=%s\n",
 			res.Name, res.Ops, bench.FormatDur(res.P50), bench.FormatDur(res.P99))
@@ -177,7 +199,11 @@ func injectEngine(rep *report, bg *bench.Graph) *vectra.Graph {
 	return g
 }
 
-func injectHTTP(rep *report, bg *bench.Graph, dir string, sealInterval time.Duration, keep bool) (string, *http.Client, *server.Node) {
+// injectHTTP also returns the publish-wait targets: nodes applied (summed
+// from /v1/batch responses) and the unique-edge count. Batch edge writes are
+// true upserts collapsing duplicate (src,dst,label) triples, so what the
+// publisher can ever seal is the unique-triple count, not the generated one.
+func injectHTTP(rep *report, bg *bench.Graph, dir string, sealInterval time.Duration, keep bool) (string, *http.Client, *server.Node, int, int) {
 	// Probe a free port and release it for server.New's TCP transport to bind
 	probe, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -216,16 +242,18 @@ func injectHTTP(rep *report, bg *bench.Graph, dir string, sealInterval time.Dura
 	base := "http://" + httpLn.Addr().String()
 
 	// Chunked node injection
+	wantNodes := 0
 	t0 := time.Now()
 	for i := 0; i < len(bg.Nodes); i += nodeChunk {
 		end := min(i+nodeChunk, len(bg.Nodes))
-		postJSONAndWait(client, base+"/v1/batch", map[string]any{
+		wantNodes += postJSONAndWait(client, base+"/v1/batch", map[string]any{
 			"nodes": upsertNodes(bg.Nodes[i:end]),
-		})
+		}).NodesApplied
 	}
 	rep.InjectNodesPerS = rate(len(bg.Nodes), time.Since(t0))
 
 	// Chunked edge injection
+	wantEdges := uniqueEdgeCount(bg)
 	t0 = time.Now()
 	chunk := make([]bench.Edge, 0, edgeChunk)
 	flush := func() {
@@ -244,7 +272,7 @@ func injectHTTP(rep *report, bg *bench.Graph, dir string, sealInterval time.Dura
 	}
 	flush()
 	rep.InjectEdgesPerS = rate(len(bg.Edges), time.Since(t0))
-	return base, client, n
+	return base, client, n, wantNodes, wantEdges
 }
 
 func upsertNodes(nodes []bench.Node) []server.NodeUpsert {
@@ -267,7 +295,28 @@ func upsertEdges(bg *bench.Graph, edges []bench.Edge) []server.EdgeUpsert {
 	return out
 }
 
-func postJSONAndWait(c *http.Client, url string, body any) {
+// uniqueEdgeCount counts distinct (srcKey, dstKey, label) triples: batch
+// edge writes are true upserts that collapse duplicates, so the published
+// graph contains one edge per triple (the publish-wait target).
+func uniqueEdgeCount(bg *bench.Graph) int {
+	type triple struct {
+		src, dst int
+		label    string
+	}
+	seen := make(map[triple]struct{}, len(bg.Edges))
+	for _, e := range bg.Edges {
+		seen[triple{e.Src, e.Dst, e.Label}] = struct{}{}
+	}
+	return len(seen)
+}
+
+// batchResult mirrors the applied counters of a /v1/batch response.
+type batchResult struct {
+	NodesApplied int `json:"nodesApplied"`
+	EdgesApplied int `json:"edgesApplied"`
+}
+
+func postJSONAndWait(c *http.Client, url string, body any) batchResult {
 	data, _ := json.Marshal(body)
 	resp, err := c.Post(url, "application/json", bytes.NewReader(data))
 	if err != nil {
@@ -275,11 +324,13 @@ func postJSONAndWait(c *http.Client, url string, body any) {
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	var res batchResult
+	_ = json.NewDecoder(resp.Body).Decode(&res)
 	if resp.StatusCode != http.StatusOK {
 		fmt.Fprintf(os.Stderr, "injection failed: %s\n", resp.Status)
 		os.Exit(1)
 	}
+	return res
 }
 
 func waitLeader(n *server.Node) {
@@ -294,18 +345,23 @@ func waitLeader(n *server.Node) {
 	os.Exit(1)
 }
 
-func waitPublished(n *server.Node, spec sizeSpec) *vectra.Graph {
+// waitPublished blocks until the publisher has sealed a graph containing
+// everything injected. Targets are the applied counters from /v1/batch
+// responses: edge upserts collapse duplicate (src,dst,label) triples, so
+// the generated edge count can exceed what will ever publish.
+func waitPublished(n *server.Node, wantNodes, wantEdges int) *vectra.Graph {
 	fmt.Fprintf(os.Stderr, "waiting for publish (including large-graph Seal)...\n")
 	deadline := time.Now().Add(5 * time.Minute)
 	last := time.Now()
 	for time.Now().Before(deadline) {
 		if p := n.Published(); p != nil {
 			st := p.Stats()
-			if st.Nodes >= spec.nodes && st.Edges >= spec.edges {
+			if st.Nodes >= wantNodes && st.Edges >= wantEdges {
 				return p
 			}
 			if time.Since(last) > 10*time.Second {
-				fmt.Fprintf(os.Stderr, "  published %d/%d (waiting for all injected data to be published)...\n", st.Nodes, st.Edges)
+				fmt.Fprintf(os.Stderr, "  published %d/%d nodes, %d/%d edges (waiting for all injected data to be published)...\n",
+					st.Nodes, wantNodes, st.Edges, wantEdges)
 				last = time.Now()
 			}
 		}
@@ -330,9 +386,12 @@ type workload struct {
 	op   bench.Op
 }
 
-func buildWorkloads(mode string, g *vectra.Graph, base string, c *http.Client, p bench.QueryParams) []workload {
+// buildWorkloads returns the workloads for mode plus, in http mode, the OCC
+// stats per transaction workload (nil in engine mode, which registers no
+// transaction workloads).
+func buildWorkloads(mode string, g *vectra.Graph, base string, c *http.Client, p bench.QueryParams) ([]workload, map[string]*bench.TxnStats) {
 	if mode == "engine" {
-		return engineWorkloads(g, p)
+		return engineWorkloads(g, p), nil
 	}
 	return httpWorkloads(base, c, p)
 }
@@ -373,7 +432,7 @@ func engineWorkloads(g *vectra.Graph, p bench.QueryParams) []workload {
 	}
 }
 
-func httpWorkloads(base string, c *http.Client, p bench.QueryParams) []workload {
+func httpWorkloads(base string, c *http.Client, p bench.QueryParams) ([]workload, map[string]*bench.TxnStats) {
 	nextStart, nextPair := rotators(p)
 	get := func(url string) error {
 		resp, err := c.Get(url)
@@ -403,6 +462,8 @@ func httpWorkloads(base string, c *http.Client, p bench.QueryParams) []workload 
 		}
 		return nil
 	}
+	txnSIStats := &bench.TxnStats{}
+	txnSERStats := &bench.TxnStats{}
 	return []workload{
 		{"neighbors", func() error {
 			return get(base + "/v1/neighbors?key=" + nextStart() + "&dir=out")
@@ -417,7 +478,12 @@ func httpWorkloads(base string, c *http.Client, p bench.QueryParams) []workload 
 		{"reach", func() error {
 			return get(base + "/v1/reachable?from=" + nextStart())
 		}},
-	}
+		// Interactive-transaction workloads (http only): snapshot read →
+		// guarded upsert with OCC retry. SI validates only the write key;
+		// SER additionally validates the read set (start + 4 neighbors).
+		{"txnsi", bench.NewTxnOp(c, base, nextStart, false, 0, txnSIStats)},
+		{"txnser", bench.NewTxnOp(c, base, nextStart, true, 4, txnSERStats)},
+	}, map[string]*bench.TxnStats{"txnsi": txnSIStats, "txnser": txnSERStats}
 }
 
 // ---- Report ----
@@ -435,6 +501,7 @@ type report struct {
 	SealTime        time.Duration
 	CurateTime      time.Duration
 	Results         []bench.LoadResult
+	Txn             map[string]*bench.TxnStats // OCC stats per transaction workload (http mode)
 }
 
 func newReport(s sizeSpec, mode string, workers int, dur time.Duration, seed int64) *report {
@@ -462,6 +529,32 @@ func (r *report) markdown() string {
 		[]string{"workload", "ops", "QPS", "p50", "p90", "p99", "max", "err"},
 		rows,
 	))
+	// Transactions section (http mode): OCC outcomes per transaction
+	// workload. Latency columns reuse the main table rows; this section
+	// focuses on commit/conflict outcomes.
+	txnRows := make([][]string, 0, len(r.Txn))
+	for _, res := range r.Results {
+		ts, ok := r.Txn[res.Name]
+		if !ok {
+			continue
+		}
+		txnRows = append(txnRows, []string{
+			res.Name,
+			intComma(int(ts.Commits.Load())),
+			intComma(int(ts.Conflicts.Load())),
+			fmt.Sprintf("%.1f%%", ts.ConflictPct()),
+			fmt.Sprintf("%.1f", ts.CommitQPS(r.Dur)),
+			bench.FormatDur(res.P50),
+			bench.FormatDur(res.P99),
+		})
+	}
+	if len(txnRows) > 0 {
+		b.WriteString("\n### Transactions\n\n")
+		b.WriteString(bench.MarkdownTable(
+			[]string{"workload", "commits", "conflicts", "conflict%", "commit QPS", "p50", "p99"},
+			txnRows,
+		))
+	}
 	return b.String()
 }
 
