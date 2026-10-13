@@ -83,7 +83,7 @@ See [mcp/README.md](mcp/README.md) for all transports and host configurations.
 
 Reproduce locally: `make bench [SIZE=medium] [MODE=http]` — data and report are deleted when the run ends.
 
-Correctness is validated the LDBC way: property tests against independent reference implementations, real-dataset ground truth (SNAP email-Eu-core: 203 SCCs / largest 803, externally published numbers), chaos and degenerate-graph suites, determinism checks. Coverage: root 92.1% · csr/dag 100% · store 84.3% · engine+traverse 98.7% · server 83.8% · mcp 80.9%.
+Correctness is validated the LDBC way: property tests against independent reference implementations, real-dataset ground truth (SNAP email-Eu-core: 203 SCCs / largest 803, externally published numbers), chaos and degenerate-graph suites, determinism checks. Coverage: root 92.2% · csr/dag 100% · store 84.3% · engine+traverse 98.7% · server 83.8% · mcp 81.5%.
 
 ## Repository layout
 
