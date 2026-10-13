@@ -103,7 +103,7 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 		}
 	}
 	for _, e := range b.Edges {
-		if _, err := f.live.AddEdge(e.SrcKey, e.DstKey, e.Label, e.Props); err == nil {
+		if _, err := f.live.UpsertEdge(e.SrcKey, e.DstKey, e.Label, e.Props); err == nil {
 			res.EdgesApplied++
 		} else if errors.Is(err, vectra.ErrNodeNotFound) {
 			res.EdgesSkipped++ // Authoritative validation: replay skips invalid items, no divergence

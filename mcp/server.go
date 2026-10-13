@@ -249,7 +249,7 @@ func (svc *service) injectBatch(_ context.Context, _ *mcp.CallToolRequest, in in
 		}
 	}
 	for _, e := range in.Edges {
-		if _, err := svc.live.AddEdge(e.SrcKey, e.DstKey, e.Label, e.Props); err == nil {
+		if _, err := svc.live.UpsertEdge(e.SrcKey, e.DstKey, e.Label, e.Props); err == nil {
 			out.EdgesApplied++
 		} else {
 			out.EdgesSkipped++

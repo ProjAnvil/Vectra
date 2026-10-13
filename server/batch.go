@@ -9,7 +9,10 @@ import (
 const batchVersion = 2
 
 // NodeUpsert / EdgeUpsert are the atomic items of a changeset. Semantics:
-// an existing node key updates its props; edges append (multi-edges allowed).
+// an existing node key updates its props; edges upsert by their
+// (srcKey, dstKey, label) key — the most recent edge with the same key is
+// replaced in place and extra parallels collapse. Multigraph parallel
+// appends remain available via the embedded AddEdge API.
 type NodeUpsert struct {
 	Key   string
 	Label string

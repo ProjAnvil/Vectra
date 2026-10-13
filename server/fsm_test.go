@@ -282,3 +282,24 @@ func TestFSMApplyDeleteDeterministicReplay(t *testing.T) {
 		t.Fatalf("stats = %d/%d, want 2/0 (auth delete cascades both edges)", n1, e1)
 	}
 }
+
+func TestFSMApplyEdgeUpsertCollapses(t *testing.T) {
+	f := newFSM(time.Hour)
+	b := Batch{Version: 2,
+		Nodes: []NodeUpsert{{Key: "a", Label: "Svc"}, {Key: "b", Label: "Svc"}},
+		Edges: []EdgeUpsert{
+			{SrcKey: "a", DstKey: "b", Label: "E", Props: map[string]any{"w": 1}},
+			{SrcKey: "a", DstKey: "b", Label: "E", Props: map[string]any{"w": 2}}, // same key in one batch: upsert collapses
+		},
+	}
+	r1 := f.Apply(&raft.Log{Data: mustGob(t, b)}).(ApplyResult)
+	if r1.EdgesApplied != 2 {
+		t.Fatalf("EdgesApplied = %d, want 2", r1.EdgesApplied)
+	}
+	waitPublished(t, f, 2, 1, 2*time.Second)
+	f.Apply(&raft.Log{Data: mustGob(t, b)}) // replay must not duplicate
+	f.sealNow()
+	if st := f.Published().Stats(); st.Edges != 1 {
+		t.Fatalf("edges after replay = %d, want 1", st.Edges)
+	}
+}

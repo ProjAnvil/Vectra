@@ -243,3 +243,23 @@ func TestInjectDeleteSeal(t *testing.T) {
 		t.Fatalf("stats = %+v, want 1/0", st)
 	}
 }
+
+func TestInjectUpsertEdgeCollapses(t *testing.T) {
+	cs := newTestSession(t)
+	call[struct{}](t, cs, "inject_batch", map[string]any{
+		"nodes": []map[string]any{{"key": "a"}, {"key": "b"}, {"key": "c"}},
+		"edges": []map[string]any{
+			{"srcKey": "a", "dstKey": "b", "label": "E", "props": map[string]any{"w": 1}},
+			{"srcKey": "a", "dstKey": "b", "label": "E", "props": map[string]any{"w": 2}},
+			{"srcKey": "b", "dstKey": "c", "label": "E"},
+		},
+	})
+	call[struct{}](t, cs, "seal", map[string]any{})
+	st := call[struct {
+		Nodes int `json:"nodes"`
+		Edges int `json:"edges"`
+	}](t, cs, "stats", map[string]any{})
+	if st.Nodes != 3 || st.Edges != 2 { // a->b collapsed to one
+		t.Fatalf("stats = %+v, want 3/2", st)
+	}
+}
