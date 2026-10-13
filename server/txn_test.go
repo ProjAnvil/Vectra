@@ -652,3 +652,138 @@ func TestTxnSERPhantomOverHTTP(t *testing.T) {
 		t.Fatalf("SI same read set: status = %d, want 200", resp3.StatusCode)
 	}
 }
+
+// ============================================================
+// Cluster determinism, concurrent conflicts, failover drift.
+// ============================================================
+
+func TestTxnClusterDeterminism(t *testing.T) {
+	tc := newTestCluster(t, 3)
+	defer tc.closeAll()
+	lead := tc.leader(t)
+	// Interleave commits and conflicts over HTTP; then compare all replicas'
+	// version tables (same package access).
+	send := func(snapshot uint64, key string) bool {
+		raw, _ := json.Marshal(map[string]any{
+			"nodes": []map[string]any{{"key": key, "label": "S"}},
+			"txn":   map[string]any{"snapshot": snapshot}})
+		resp, err := http.Post(lead.URL()+"/v1/txn", "application/json", bytes.NewReader(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return resp.StatusCode == 200 && out["committed"] == true
+	}
+	send(0, "a") // commits at index 1
+	if send(0, "a") {
+		t.Fatal("second write to a with stale token must conflict")
+	}
+	tc.waitAllPublished(1, 0, 5*time.Second)
+	// The absolute index depends on preceding config entries; the invariant is
+	// that every replica has the SAME nodeVer[a] (>= 1: the write landed).
+	var first uint64
+	for i, tn := range tc.nodes {
+		tn.node.fsm.mu.RLock()
+		got := tn.node.fsm.nodeVer["a"]
+		tn.node.fsm.mu.RUnlock()
+		if got < 1 {
+			t.Fatalf("node %s: nodeVer[a]=%d, want >=1", tn.node.cfg.NodeID, got)
+		}
+		if i == 0 {
+			first = got
+		} else if got != first {
+			t.Fatalf("replica divergence: nodeVer[a] = %d vs %d", first, got)
+		}
+	}
+}
+
+func TestTxnFailoverNoDrift(t *testing.T) {
+	tc := newTestCluster(t, 3)
+	defer tc.closeAll()
+	lead := tc.leader(t)
+	raw, _ := json.Marshal(map[string]any{
+		"nodes": []map[string]any{{"key": "a", "label": "S"}},
+		"txn":   map[string]any{"snapshot": 0}})
+	resp, _ := http.Post(lead.URL()+"/v1/txn", "application/json", bytes.NewReader(raw))
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("seed txn status = %d", resp.StatusCode)
+	}
+	// Failover: stop the leader, wait for a new one (poll the fatal-free
+	// variant — the no-leader window is expected), retry with a stale token.
+	lead.srv.Close()
+	lead.node.Close()
+	deadline := time.Now().Add(10 * time.Second)
+	var next *testNode
+	for time.Now().Before(deadline) {
+		if n := tc.currentLeader(); n != nil && n != lead {
+			next = n
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if next == nil {
+		t.Fatal("no new leader elected")
+	}
+	stale, _ := json.Marshal(map[string]any{
+		"nodes": []map[string]any{{"key": "a", "label": "S"}},
+		"txn":   map[string]any{"snapshot": 0}})
+	resp2, err := http.Post(next.URL()+"/v1/txn", "application/json", bytes.NewReader(stale))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 409 {
+		t.Fatalf("post-failover stale token: status = %d, want 409", resp2.StatusCode)
+	}
+}
+
+func TestTxnConcurrentExactlyOneCommits(t *testing.T) {
+	tc := newTestCluster(t, 3)
+	defer tc.closeAll()
+	lead := tc.leader(t)
+	seed, _ := json.Marshal(map[string]any{"nodes": []map[string]any{{"key": "a", "label": "S"}}})
+	sr, _ := http.Post(lead.URL()+"/v1/batch", "application/json", bytes.NewReader(seed))
+	sr.Body.Close()
+	// RYW token: a literal snapshot 1 assumes the seed lands at raft index 1,
+	// but cluster bootstrap + AddVoter config entries occupy the earlier
+	// indexes (the seed lands at index 5 here), so a literal 1 is already
+	// stale and all four contenders would 409. The token a client holds right
+	// after the seed is the seed's own applied index: the first contender to
+	// apply sees lastMod == token (fresh) and commits, while every later one
+	// sees the winner's higher index (lastMod > token) and conflicts.
+	tok := lead.node.fsm.appliedIndex.Load()
+
+	var wg sync.WaitGroup
+	results := make([]int, 4) // HTTP status per contender
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			raw, _ := json.Marshal(map[string]any{
+				"nodes": []map[string]any{{"key": "a", "label": "S", "props": map[string]any{"w": i}}},
+				"txn":   map[string]any{"snapshot": tok}})
+			resp, err := http.Post(lead.URL()+"/v1/txn", "application/json", bytes.NewReader(raw))
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			resp.Body.Close()
+			results[i] = resp.StatusCode
+		}(i)
+	}
+	wg.Wait()
+	ok := 0
+	for _, c := range results {
+		if c == 200 {
+			ok++
+		} else if c != 409 {
+			t.Fatalf("unexpected status %d", c)
+		}
+	}
+	if ok != 1 {
+		t.Fatalf("committed = %d, want exactly 1 (statuses: %v)", ok, results)
+	}
+}
