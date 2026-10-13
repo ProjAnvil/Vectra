@@ -3,8 +3,11 @@ package server
 import (
 	"bytes"
 	"encoding/gob"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -450,5 +453,202 @@ func TestSplitSnapshotBadInputs(t *testing.T) {
 		if _, _, err := splitSnapshot(c.data); err == nil {
 			t.Errorf("%s: expected error", c.name)
 		}
+	}
+}
+
+// ============================================================
+// POST /v1/txn — HTTP contract tests (real raft cluster).
+// ============================================================
+
+// currentLeader returns nil when no leader is elected (failover window).
+func (tc *testCluster) currentLeader() *testNode {
+	for _, tn := range tc.nodes {
+		if tn.node.IsLeader() {
+			return tn
+		}
+	}
+	return nil
+}
+
+func (tc *testCluster) leader(t *testing.T) *testNode {
+	t.Helper()
+	if n := tc.currentLeader(); n != nil {
+		return n
+	}
+	t.Fatal("no leader")
+	return nil
+}
+
+func (tc *testCluster) closeAll() {
+	for _, tn := range tc.nodes {
+		tn.srv.Close()
+		tn.node.Close()
+	}
+}
+
+func TestTxnEndpointCommitThenConflict(t *testing.T) {
+	tc := newTestCluster(t, 3)
+	defer tc.closeAll()
+	lead := tc.leader(t)
+	body := func(snapshot uint64, key, val string) []byte {
+		b := map[string]any{
+			"nodes": []map[string]any{{"key": key, "label": "Svc", "props": map[string]any{"v": val}}},
+			"txn":   map[string]any{"snapshot": snapshot},
+		}
+		raw, _ := json.Marshal(b)
+		return raw
+	}
+	post := func(raw []byte) (int, map[string]any) {
+		resp, err := http.Post(lead.URL()+"/v1/txn", "application/json", bytes.NewReader(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return resp.StatusCode, out
+	}
+	// Seed one write so the first publish completes (query gate opens), then
+	// read the token from a stats response header (RYW pattern).
+	seed, _ := json.Marshal(map[string]any{"nodes": []map[string]any{{"key": "seed", "label": "S"}}})
+	sresp0, err := http.Post(lead.URL()+"/v1/batch", "application/json", bytes.NewReader(seed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sresp0.Body.Close()
+	hresp, err := http.Get(lead.URL() + "/v1/stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hresp.Body.Close()
+	if hresp.StatusCode != 200 {
+		t.Fatalf("stats after seed: %d", hresp.StatusCode)
+	}
+	tok, _ := strconv.ParseUint(hresp.Header.Get("X-Vectra-Snapshot"), 10, 64)
+	code, out := post(body(tok, "a", "1"))
+	if code != 200 || out["committed"] != true {
+		t.Fatalf("first txn: %d %v", code, out)
+	}
+	idx := uint64(out["index"].(float64))
+	// Stale token (< idx) writing the same key must conflict.
+	code, out = post(body(idx-1, "a", "2"))
+	if code != 409 || out["committed"] != false {
+		t.Fatalf("stale txn: %d %v", code, out)
+	}
+	if out["conflictTotal"].(float64) < 1 {
+		t.Fatalf("conflictTotal = %v", out["conflictTotal"])
+	}
+	// Fresh token commits.
+	code, out = post(body(idx, "a", "3"))
+	if code != 200 {
+		t.Fatalf("fresh txn: %d %v", code, out)
+	}
+	// seed + a (the 409 wrote nothing): the whole cluster must settle on 2 nodes.
+	tc.waitAllPublished(2, 0, 5*time.Second)
+}
+
+func TestTxnEndpointNotLeaderAndStats(t *testing.T) {
+	tc := newTestCluster(t, 3)
+	defer tc.closeAll()
+	lead := tc.leader(t)
+	var follower *testNode
+	for _, tn := range tc.nodes {
+		if tn != lead {
+			follower = tn
+			break
+		}
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"nodes": []map[string]any{{"key": "a", "label": "S"}},
+		"txn":   map[string]any{"snapshot": 0}})
+	resp, err := http.Post(follower.URL()+"/v1/txn", "application/json", bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 503 {
+		t.Fatalf("follower /v1/txn: status = %d, want 503", resp.StatusCode)
+	}
+	// Seed one write so the first publish completes (query gate opens) —
+	// the stats endpoint is gated on readiness, and this cluster has no
+	// committed entries yet (the follower POST above never reached raft).
+	seed, _ := json.Marshal(map[string]any{"nodes": []map[string]any{{"key": "s", "label": "S"}}})
+	sresp0, err := http.Post(lead.URL()+"/v1/batch", "application/json", bytes.NewReader(seed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sresp0.Body.Close()
+	// Stats exposes both indexes, and the invariant publishedSeq <= appliedIndex.
+	sresp, err := http.Get(lead.URL() + "/v1/stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sresp.Body.Close()
+	var st map[string]any
+	_ = json.NewDecoder(sresp.Body).Decode(&st)
+	applied := st["appliedIndex"].(float64)
+	published := st["publishedSeq"].(float64)
+	if published > applied {
+		t.Fatalf("publishedSeq(%v) > appliedIndex(%v)", published, applied)
+	}
+}
+
+func TestTxnEndpointReadsetCap(t *testing.T) {
+	tc := newTestCluster(t, 3)
+	defer tc.closeAll()
+	lead := tc.leader(t)
+	big := make([]string, 100_001)
+	raw, _ := json.Marshal(map[string]any{
+		"txn": map[string]any{"snapshot": 0, "readNodes": big},
+	})
+	resp, err := http.Post(lead.URL()+"/v1/txn", "application/json", bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestTxnSERPhantomOverHTTP(t *testing.T) {
+	tc := newTestCluster(t, 3)
+	defer tc.closeAll()
+	lead := tc.leader(t)
+	seed := map[string]any{"nodes": []map[string]any{
+		{"key": "u", "label": "S"}, {"key": "v", "label": "S"}}}
+	raw, _ := json.Marshal(seed)
+	resp, _ := http.Post(lead.URL()+"/v1/batch", "application/json", bytes.NewReader(raw))
+	resp.Body.Close()
+	tc.waitAllPublished(2, 0, 5*time.Second)
+
+	// Token from a query (add node w + edge u->w concurrently first? No:
+	// establish base, then read u's neighbors at token T, then bump u).
+	nresp, _ := http.Get(lead.URL() + "/v1/neighbors?key=u")
+	nresp.Body.Close()
+	tok64, _ := strconv.ParseUint(nresp.Header.Get("X-Vectra-Snapshot"), 10, 64)
+
+	// Concurrent auto-commit write bumps nodeVer[u].
+	bump, _ := json.Marshal(map[string]any{"edges": []map[string]any{
+		{"srcKey": "u", "dstKey": "v", "label": "E"}}})
+	bresp, _ := http.Post(lead.URL()+"/v1/batch", "application/json", bytes.NewReader(bump))
+	bresp.Body.Close()
+
+	ser, _ := json.Marshal(map[string]any{
+		"nodes": []map[string]any{{"key": "w", "label": "S"}},
+		"txn":   map[string]any{"snapshot": tok64, "ser": true, "readNodes": []string{"u"}}})
+	resp2, _ := http.Post(lead.URL()+"/v1/txn", "application/json", bytes.NewReader(ser))
+	resp2.Body.Close()
+	if resp2.StatusCode != 409 {
+		t.Fatalf("SER phantom: status = %d, want 409", resp2.StatusCode)
+	}
+	// SI with the same read set commits (write-skew split).
+	si, _ := json.Marshal(map[string]any{
+		"nodes": []map[string]any{{"key": "w", "label": "S"}},
+		"txn":   map[string]any{"snapshot": tok64, "readNodes": []string{"u"}}})
+	resp3, _ := http.Post(lead.URL()+"/v1/txn", "application/json", bytes.NewReader(si))
+	resp3.Body.Close()
+	if resp3.StatusCode != 200 {
+		t.Fatalf("SI same read set: status = %d, want 200", resp3.StatusCode)
 	}
 }
