@@ -82,3 +82,21 @@ func ExampleGraph_UpsertEdge() {
 	fmt.Println(g.EdgeCount())
 	// Output: 0
 }
+
+// ExampleGraph_EdgesOf shows the read-modify-write weight-update pattern:
+// read the current weight via EdgesOf, then replace it with UpsertEdge.
+func ExampleGraph_EdgesOf() {
+	g := vectra.New()
+	g.AddNode("a", "Agent", nil)
+	g.AddNode("b", "Agent", nil)
+	g.AddEdge("a", "b", "MENTIONS", map[string]any{"weight": 1})
+
+	es, _ := g.EdgesOf("a", vectra.DirOut)
+	w := es[0].Props["weight"].(int)
+	g.UpsertEdge("a", "b", "MENTIONS", map[string]any{"weight": w + 1})
+
+	g.Seal()
+	es, _ = g.EdgesOf("a", vectra.DirOut)
+	fmt.Println(es[0].Props["weight"], len(es))
+	// Output: 2 1
+}

@@ -83,3 +83,50 @@ func (g *Graph) NeighborsOf(key string, dir Direction, labels ...string) ([]Node
 	}
 	return out, nil
 }
+
+// EdgesOf returns the live edges incident to key, filtered by direction and
+// optional labels. Unlike NeighborsOf (deduplicated nodes), every parallel
+// edge is returned with its own props — this is the entry point for reading
+// weight-like attributes, e.g. read-modify-write updates via UpsertEdge
+// (safe under the embedded single-writer model). Works both before and
+// after Seal; a deleted node key yields ErrNodeNotFound.
+func (g *Graph) EdgesOf(key string, dir Direction, labels ...string) ([]Edge, error) {
+	n, ok := g.NodeByKey(key)
+	if !ok {
+		return nil, ErrNodeNotFound
+	}
+	mask := g.labelMask(labels)
+	var out []Edge
+	if g.sealed {
+		adj := g.snap.AdjacencyF()
+		if dir == DirIn {
+			adj = g.snap.AdjacencyR()
+		}
+		_, eids, lb := adj.Row(uint32(n.ID))
+		for i := range eids {
+			if mask != nil && !mask[lb[i]] {
+				continue
+			}
+			if e, ok := g.EdgeByID(EdgeID(eids[i])); ok {
+				out = append(out, e)
+			}
+		}
+		return out, nil
+	}
+	for i, e := range g.edges {
+		if g.tombE[i] {
+			continue
+		}
+		if dir == DirOut && e.src != n.ID {
+			continue
+		}
+		if dir == DirIn && e.dst != n.ID {
+			continue
+		}
+		if mask != nil && !mask[e.label] {
+			continue
+		}
+		out = append(out, Edge{ID: EdgeID(i), Src: e.src, Dst: e.dst, Label: g.labels[e.label], Props: e.props})
+	}
+	return out, nil
+}
