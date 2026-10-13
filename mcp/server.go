@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the implementation version advertised by the MCP service.
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // defaultLimit is the default cap on nodes returned by bfs/reachable
 // (results are capped; the total field still reflects the true size,
