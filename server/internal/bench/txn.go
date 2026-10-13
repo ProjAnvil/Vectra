@@ -15,6 +15,15 @@ import (
 // outcome, not an op error.
 const maxTxnAttempts = 3
 
+// txnPollInterval is the read-your-writes poll cadence against GET /v1/stats
+// after a successful commit.
+const txnPollInterval = 10 * time.Millisecond
+
+// txnPublishWaitCap bounds the read-your-writes wait after a commit. On
+// expiry the op proceeds without error: the wait is best-effort client
+// etiquette, not a correctness gate.
+const txnPublishWaitCap = 5 * time.Second
+
 // TxnStats tracks OCC outcomes for transaction workloads: a 409 is a normal
 // optimistic-concurrency result, not an error.
 type TxnStats struct {
@@ -52,9 +61,20 @@ func (s *TxnStats) Reset() {
 // client pattern: read neighbors of a rotating start node (capturing the
 // X-Vectra-Snapshot token and neighbor keys), then commit a guarded upsert
 // of the start node (SER additionally validates the read set). On 409 the
-// op refreshes the token and retries, at most maxTxnAttempts total; only
-// transport/5xx failures surface as op errors.
+// op refreshes the token and retries, at most maxTxnAttempts total. After a
+// successful commit the op follows the documented read-your-writes
+// etiquette — poll GET /v1/stats until publishedSeq reaches the commit's
+// index (capped at txnPublishWaitCap) — so the next read snapshot includes
+// the op's own writes instead of conflicting with them. The wait is part of
+// the measured op latency (documented client cost). Only transport/5xx
+// failures surface as op errors.
 func NewTxnOp(c *http.Client, base string, nextStart func() string, ser bool, readFanout int, stats *TxnStats) Op {
+	return newTxnOp(c, base, nextStart, ser, readFanout, stats, txnPublishWaitCap)
+}
+
+// newTxnOp is NewTxnOp with an overridable read-your-writes wait cap so
+// tests can exercise cap expiry quickly.
+func newTxnOp(c *http.Client, base string, nextStart func() string, ser bool, readFanout int, stats *TxnStats, waitCap time.Duration) Op {
 	return func() error {
 		start := nextStart()
 		for attempt := 1; attempt <= maxTxnAttempts; attempt++ {
@@ -67,12 +87,17 @@ func NewTxnOp(c *http.Client, base string, nextStart func() string, ser bool, re
 			// 2. Write phase: upsert the start node (same key family as the
 			//    read → realistic hot-node contention; start nodes are
 			//    degree-weighted by the parameter curator).
-			committed, err := commitTxn(c, base, start, attempt, snapshot, ser, readNodes)
+			committed, index, err := commitTxn(c, base, start, attempt, snapshot, ser, readNodes)
 			if err != nil {
 				return err
 			}
 			if committed {
 				stats.Commits.Add(1)
+				// 3. Read-your-writes: the commit is durable in the raft log
+				//    but the read snapshot is published on a SealInterval
+				//    throttle; without waiting, our next guard conflicts
+				//    with our own not-yet-published write.
+				waitForPublish(c, base, index, waitCap)
 				return nil
 			}
 			// 409: normal optimistic-concurrency rejection. Refresh the
@@ -145,33 +170,78 @@ func readNeighbors(c *http.Client, base, key string, readFanout int) (uint64, []
 }
 
 // commitTxn posts the guarded upsert of key (write marker w = attempt) and
-// reports whether it committed. A 409 response is returned as
-// committed=false with a nil error.
-func commitTxn(c *http.Client, base, key string, attempt int, snapshot uint64, ser bool, readNodes []string) (bool, error) {
+// reports whether it committed plus the commit's raft index (for the
+// read-your-writes wait). A 409 response is returned as committed=false
+// with a nil error.
+func commitTxn(c *http.Client, base, key string, attempt int, snapshot uint64, ser bool, readNodes []string) (bool, uint64, error) {
 	body, err := json.Marshal(txnRequestBody{
 		Nodes: []txnNode{{Key: key, Label: "Svc", Props: map[string]any{"w": attempt}}},
 		Txn:   txnGuardBody{Snapshot: snapshot, SER: ser, ReadNodes: readNodes},
 	})
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	resp, err := c.Post(base+"/v1/txn", "application/json", bytes.NewReader(body))
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	defer resp.Body.Close()
 	var out struct {
-		Committed bool `json:"committed"`
+		Committed bool    `json:"committed"`
+		Index     float64 `json:"index"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return false, fmt.Errorf("txn %q decode: %w", key, err)
+		return false, 0, fmt.Errorf("txn %q decode: %w", key, err)
 	}
 	switch resp.StatusCode {
 	case http.StatusOK:
-		return out.Committed, nil
+		return out.Committed, uint64(out.Index), nil
 	case http.StatusConflict:
-		return false, nil
+		return false, 0, nil
 	default:
-		return false, fmt.Errorf("txn %q: %s", key, resp.Status)
+		return false, 0, fmt.Errorf("txn %q: %s", key, resp.Status)
 	}
+}
+
+// waitForPublish blocks until the stats endpoint reports a publishedSeq at
+// or beyond the commit's raft index, polling every txnPollInterval and at
+// most waitCap total. Poll failures (transport, non-200, malformed body)
+// simply read as "not yet published". Cap expiry proceeds silently: the
+// wait is best-effort client etiquette that keeps the next read from
+// conflicting with our own not-yet-published write, not a correctness gate.
+func waitForPublish(c *http.Client, base string, index uint64, waitCap time.Duration) {
+	deadline := time.Now().Add(waitCap)
+	for {
+		if seq, err := fetchPublishedSeq(c, base); err == nil && seq >= float64(index) {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			return
+		}
+		time.Sleep(txnPollInterval)
+	}
+}
+
+// fetchPublishedSeq reads publishedSeq from GET /v1/stats. The endpoint
+// returns a heterogeneous JSON object, so it is decoded as a map and the
+// field read as a float64 (JSON numbers decode to float64 in any-valued
+// maps).
+func fetchPublishedSeq(c *http.Client, base string) (float64, error) {
+	resp, err := c.Get(base + "/v1/stats")
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("stats: %s", resp.Status)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return 0, fmt.Errorf("stats decode: %w", err)
+	}
+	seq, ok := body["publishedSeq"].(float64)
+	if !ok {
+		return 0, fmt.Errorf("stats: publishedSeq missing or non-numeric")
+	}
+	return seq, nil
 }
