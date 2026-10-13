@@ -26,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	gometrics "github.com/hashicorp/go-metrics"
 	"github.com/projanvil/vectra"
 	"github.com/projanvil/vectra/server"
 	"github.com/projanvil/vectra/server/internal/bench"
@@ -102,10 +103,20 @@ func main() {
 	var baseURL string
 	var httpc *http.Client
 	var node *server.Node
+	// Non-nil in http mode: captures hashicorp/go-metrics samples emitted by
+	// the raft stack (see the http case below and logsPerBatch usage in the
+	// workload loop).
+	var sink *gometrics.InmemSink
 	switch *mode {
 	case "engine":
 		queryGraph = injectEngine(rep, bg)
 	case "http":
+		// hashicorp/raft and raft-boltdb report metrics through the
+		// hashicorp/go-metrics global instance, whose default sink discards
+		// everything. Install an inmem sink before server.New builds the raft
+		// stack so raft.boltdb.logsPerBatch samples are retained.
+		sink = gometrics.NewInmemSink(10*time.Second, time.Minute)
+		_, _ = gometrics.NewGlobal(&gometrics.Config{EnableHostname: false, FilterDefault: true}, sink)
 		var wantNodes, wantEdges int
 		baseURL, httpc, node, wantNodes, wantEdges = injectHTTP(rep, bg, dir, *sealInterval, *keep)
 		defer node.Close()
@@ -152,6 +163,12 @@ func main() {
 			fmt.Fprintln(os.Stderr, "note: no requested workloads available in this mode; nothing to run")
 		}
 	}
+	// Two-snapshot diff: the inmem sink cannot be cleared and keeps rolling
+	// intervals spanning injection as well, so capture the logsPerBatch
+	// aggregates right before the workload loop and again after it; the phase
+	// mean is the delta. In http-only-workload runs (e.g. WORKLOADS=txnsi)
+	// this isolates the transaction-commit batches from injection.
+	count0, sum0 := logsPerBatch(sink)
 	for _, w := range selected {
 		bench.RunWorkload(w.name, w.op, 1, *warmup) // Warmup discarded
 		if ts := txnStats[w.name]; ts != nil {
@@ -161,6 +178,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %-10s ops=%-7d p50=%-9s p99=%s\n",
 			res.Name, res.Ops, bench.FormatDur(res.P50), bench.FormatDur(res.P99))
 		rep.Results = append(rep.Results, res)
+	}
+	if n, sum := logsPerBatch(sink); n-count0 > 0 {
+		fmt.Fprintf(os.Stderr, "raft logsPerBatch (txnsi phase): mean=%.2f samples=%.0f\n",
+			(sum-sum0)/(n-count0), n-count0)
 	}
 
 	// 5. Output
@@ -273,6 +294,26 @@ func injectHTTP(rep *report, bg *bench.Graph, dir string, sealInterval time.Dura
 	flush()
 	rep.InjectEdgesPerS = rate(len(bg.Edges), time.Since(t0))
 	return base, client, n, wantNodes, wantEdges
+}
+
+// logsPerBatch sums the raft.boltdb.logsPerBatch sample aggregates retained
+// by the inmem sink across all intervals: (count, sum). The sink keeps a
+// rolling window and cannot be cleared, so callers isolate a phase by taking
+// two snapshots and diffing. Returns (0, 0) in engine mode (no sink
+// installed). Do NOT substitute bolt page statistics — bbolt's Stats() has no
+// notion of logs per batch; this metric comes from raft-boltdb via
+// go-metrics samples.
+func logsPerBatch(sink *gometrics.InmemSink) (count, sum float64) {
+	if sink == nil {
+		return 0, 0
+	}
+	for _, im := range sink.Data() {
+		if sv, ok := im.Samples["raft.boltdb.logsPerBatch"]; ok {
+			count += float64(sv.Count)
+			sum += sv.Sum
+		}
+	}
+	return count, sum
 }
 
 func upsertNodes(nodes []bench.Node) []server.NodeUpsert {
