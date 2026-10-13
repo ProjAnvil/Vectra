@@ -113,7 +113,7 @@ claude mcp add vectra -- /path/to/vectra-mcp
 
 本地复现：`make bench [SIZE=medium] [MODE=http]`，数据目录与报告运行结束即删。
 
-正确性按 LDBC 方法验证：与独立参考实现做属性对账、真实数据集外部 ground truth（SNAP email-Eu-core：203 个 SCC / 最大 803，对外发布的数字）、混沌与退化图测试、确定性检查。覆盖率：根包 92.2% · csr/dag 100% · store 84.3% · engine+traverse 98.7% · server 86.8% · mcp 81.5%。
+正确性按 LDBC 方法验证：与独立参考实现做属性对账、真实数据集外部 ground truth（SNAP email-Eu-core：203 个 SCC / 最大 803，对外发布的数字）、混沌与退化图测试、确定性检查。覆盖率：根包 92.2% · csr/dag 100% · store 84.3% · engine+traverse 98.7% · server 86.9% · mcp 81.5%。
 
 ## 仓库布局
 
