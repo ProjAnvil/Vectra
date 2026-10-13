@@ -37,7 +37,7 @@ function limit(keys: string[], limit: number) {
 }
 
 const server = new McpServer(
-  { name: "vectra", version: "0.2.1" },
+  { name: "vectra", version: "0.4.0" },
   {
     instructions:
       "Vectra dependency-graph engine via its HTTP API. Writes go through inject_batch " +
