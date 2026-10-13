@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
@@ -304,6 +305,10 @@ func TestFSMSnapshotVCTXPersistRestore(t *testing.T) {
 	applyAt(f, Batch{Version: 3, Nodes: []NodeUpsert{{Key: "a", Label: "S"}}}, 5)
 	applyAt(f, Batch{Version: 3, Nodes: []NodeUpsert{{Key: "a", Label: "S"}},
 		Txn: &TxnGuard{Snapshot: 5}}, 6) // committed -> nodeVer[a]=6
+	// Edge-key round-trip: a separate edge (c->d) so node "a"'s version stays
+	// 6 and the existing assertions keep their meaning.
+	applyAt(f, Batch{Version: 3, Nodes: []NodeUpsert{{Key: "c", Label: "S"}, {Key: "d", Label: "S"}},
+		Edges: []EdgeUpsert{{SrcKey: "c", DstKey: "d", Label: "CALLS"}}}, 7)
 	raw := persistSnap(t, f)
 
 	f2 := newFSM(time.Hour)
@@ -313,12 +318,15 @@ func TestFSMSnapshotVCTXPersistRestore(t *testing.T) {
 	if got := f2.nodeVer["a"]; got != 6 {
 		t.Fatalf("nodeVer[a] = %d, want 6", got)
 	}
-	if got := f2.appliedIndex.Load(); got != 6 {
-		t.Fatalf("appliedIndex = %d, want 6", got)
+	if got := f2.edgeVer[edgeVerKey{Src: "c", Dst: "d", Label: "CALLS"}]; got != 7 {
+		t.Fatalf("edgeVer[c->d CALLS] = %d, want 7", got)
+	}
+	if got := f2.appliedIndex.Load(); got != 7 {
+		t.Fatalf("appliedIndex = %d, want 7", got)
 	}
 	// Post-restore log replay continues from restored table state.
 	r := applyAt(f2, Batch{Version: 3, Nodes: []NodeUpsert{{Key: "a", Label: "S"}},
-		Txn: &TxnGuard{Snapshot: 5}}, 7).(ApplyResult)
+		Txn: &TxnGuard{Snapshot: 5}}, 8).(ApplyResult)
 	if r.Committed {
 		t.Fatal("token 5 < lastMod 6 must reject after restore")
 	}
@@ -605,9 +613,49 @@ func TestTxnEndpointReadsetCap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 	if resp.StatusCode != 400 {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	var out struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Error.Code != "TXN_READSET_TOO_LARGE" {
+		t.Fatalf("error code = %q, want TXN_READSET_TOO_LARGE", out.Error.Code)
+	}
+}
+
+func TestTxnEndpointNilTxnRejected(t *testing.T) {
+	tc := newTestCluster(t, 3)
+	defer tc.closeAll()
+	lead := tc.leader(t)
+	// Auto-commit shaped body (no "txn" field): /v1/txn must reject it with a
+	// VALIDATION 400 rather than silently treating it as a zero-snapshot txn.
+	raw, _ := json.Marshal(map[string]any{
+		"nodes": []map[string]any{{"key": "a", "label": "S"}}})
+	resp, err := http.Post(lead.URL()+"/v1/txn", "application/json", bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	var out struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Error.Code != "VALIDATION" {
+		t.Fatalf("error code = %q, want VALIDATION", out.Error.Code)
 	}
 }
 
@@ -785,5 +833,197 @@ func TestTxnConcurrentExactlyOneCommits(t *testing.T) {
 	}
 	if ok != 1 {
 		t.Fatalf("committed = %d, want exactly 1 (statuses: %v)", ok, results)
+	}
+}
+
+func TestFSMRestoreReplayRealisticVariant(t *testing.T) {
+	// The realistic raft restore shape: the snapshot is taken after only the
+	// FIRST TWO entries, so the restored table does NOT contain the suffix's
+	// own effects. Replaying entries 3-4 is then a fresh application — no
+	// table entry ever equals the replay index, so the same-index exclusion in
+	// validateTxn is never exercised and the decisions rest purely on the
+	// persisted prefix state (exactly what a follower restored mid-stream sees).
+	build := []Batch{
+		{Version: 3, Nodes: []NodeUpsert{{Key: "a", Label: "S"}, {Key: "b", Label: "S"}}},
+		{Version: 3, Edges: []EdgeUpsert{{SrcKey: "a", DstKey: "b", Label: "E"}}},
+		{Version: 3, Nodes: []NodeUpsert{{Key: "a", Label: "S"}}, Txn: &TxnGuard{Snapshot: 1}},
+		{Version: 3, Nodes: []NodeUpsert{{Key: "c", Label: "S"}}, Txn: &TxnGuard{Snapshot: 2, SER: true, ReadNodes: []string{"a"}}},
+	}
+	suffix := func(f *fsm, from int) []bool {
+		var out []bool
+		for i, b := range build[from:] {
+			out = append(out, applyAt(f, b, uint64(from+i+1)).(ApplyResult).Committed)
+		}
+		return out
+	}
+	// Uninterrupted reference run: [commit, commit, reject, commit].
+	full := newFSM(time.Hour)
+	want := suffix(full, 0)
+	if want[2] != false || want[3] != true {
+		t.Fatalf("uninterrupted decisions = %v, want entry 3 rejected / entry 4 committed", want)
+	}
+	// Snapshot after exactly the first two entries, then restore + replay.
+	part := newFSM(time.Hour)
+	for i, b := range build[:2] {
+		applyAt(part, b, uint64(i+1))
+	}
+	raw := persistSnap(t, part)
+	res := newFSM(time.Hour)
+	if err := res.Restore(io.NopCloser(bytes.NewReader(raw))); err != nil {
+		t.Fatal(err)
+	}
+	got := suffix(res, 2)
+	wantTail := want[2:]
+	for i := range wantTail {
+		if got[i] != wantTail[i] {
+			t.Fatalf("suffix divergence at %d: restored=%v uninterrupted=%v", i, got, wantTail)
+		}
+	}
+	if res.nodeVer["a"] != full.nodeVer["a"] {
+		t.Fatalf("nodeVer[a]: restored=%d uninterrupted=%d", res.nodeVer["a"], full.nodeVer["a"])
+	}
+}
+
+// ============================================================
+// Task 7 coverage additions — defensive branches of the txn path.
+// ============================================================
+
+// frameSnapshot builds a VCTX-framed snapshot: u32 LE graph length + graph
+// payload + trailer bytes (starting where "VCTX" would sit).
+func frameSnapshot(graph, trailer []byte) []byte {
+	out := make([]byte, 4, 4+len(graph)+len(trailer))
+	binary.LittleEndian.PutUint32(out, uint32(len(graph)))
+	out = append(out, graph...)
+	return append(out, trailer...)
+}
+
+func TestSplitSnapshotFramingVariants(t *testing.T) {
+	graph := []byte("GRAPHPAYLOAD")
+	verBytes := func(v any) []byte {
+		var b bytes.Buffer
+		if err := gob.NewEncoder(&b).Encode(v); err != nil {
+			t.Fatal(err)
+		}
+		return append([]byte{1, 0}, b.Bytes()...) // u16 LE format version 1 + gob body
+	}
+	errCases := []struct {
+		name    string
+		trailer []byte
+	}{
+		{"wrong magic after graph (legacy shape)", []byte("LEGX" + "\x01\x00" + "junk")},
+		{"VCTX magic but version truncated", []byte("VCTX\x01")},
+		{"unsupported VCTX version 2", []byte("VCTX\x02\x00" + "junk")},
+		{"valid framing, corrupt gob body", append([]byte("VCTX"), verBytes("not-a-verSnapshot")...)},
+	}
+	for _, c := range errCases {
+		if _, _, err := splitSnapshot(frameSnapshot(graph, c.trailer)); err == nil {
+			t.Errorf("%s: expected error", c.name)
+		}
+	}
+	// Valid framing with an all-zero verSnapshot: nil maps must be defaulted
+	// to empty maps (Restore assigns them verbatim, nil maps would panic on
+	// later writes).
+	gr, vs, err := splitSnapshot(frameSnapshot(graph, append([]byte("VCTX"), verBytes(verSnapshot{})...)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gr) != "GRAPHPAYLOAD" {
+		t.Fatalf("graph = %q", gr)
+	}
+	if vs.NodeVer == nil || vs.EdgeVer == nil {
+		t.Fatalf("nil maps not defaulted: %+v", vs)
+	}
+}
+
+func TestFSMTxnEdgeKeyConflicts(t *testing.T) {
+	f := newFSM(time.Hour)
+	applyAt(f, Batch{Version: 3, Nodes: []NodeUpsert{{Key: "a", Label: "S"}, {Key: "b", Label: "S"}},
+		Edges: []EdgeUpsert{{SrcKey: "a", DstKey: "b", Label: "E"}}}, 5) // edgeVer[a,b,E]=5
+	// SI: re-writing the same edge at a stale token conflicts. An edge write
+	// also bumps its endpoint nodes' versions, so the conflict list reports
+	// the endpoint node keys AND the edge key (src NUL dst NUL label).
+	r := applyAt(f, Batch{Version: 3, Edges: []EdgeUpsert{{SrcKey: "a", DstKey: "b", Label: "E"}},
+		Txn: &TxnGuard{Snapshot: 3}}, 6).(ApplyResult)
+	if r.Committed {
+		t.Fatal("SI edge write-write conflict must be rejected")
+	}
+	want := edgeKeyString(edgeVerKey{Src: "a", Dst: "b", Label: "E"})
+	found := false
+	for _, k := range r.Conflicts {
+		if k == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("conflicts = %v, want to contain edge key %q", r.Conflicts, want)
+	}
+	// SER: a read-edge recorded in the guard is validated too — here nothing
+	// else is touched, so the edge key is the sole conflict.
+	r = applyAt(f, Batch{Version: 3, Nodes: []NodeUpsert{{Key: "c", Label: "S"}},
+		Txn: &TxnGuard{Snapshot: 3, SER: true, ReadEdges: []EdgeRef{{Src: "a", Dst: "b", Label: "E"}}}}, 7).(ApplyResult)
+	if r.Committed {
+		t.Fatal("SER read-edge anti-dependency must be rejected")
+	}
+	if len(r.Conflicts) != 1 || r.Conflicts[0] != want {
+		t.Fatalf("conflicts = %v, want [%s]", r.Conflicts, want)
+	}
+}
+
+func TestTxnEndpointBadBody(t *testing.T) {
+	tc := newTestCluster(t, 3)
+	defer tc.closeAll()
+	lead := tc.leader(t)
+	resp, err := http.Post(lead.URL()+"/v1/txn", "application/json", bytes.NewReader([]byte("{not json")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	var out struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Error.Code != "VALIDATION" {
+		t.Fatalf("error code = %q, want VALIDATION", out.Error.Code)
+	}
+}
+
+// failingReader simulates a truncated snapshot stream (disk error / short read).
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+func (failingReader) Close() error             { return nil }
+
+func TestFSMRestoreReaderError(t *testing.T) {
+	f := newFSM(time.Hour)
+	if err := f.Restore(failingReader{}); err == nil {
+		t.Fatal("short snapshot stream must error")
+	}
+}
+
+func TestFSMApplyCorruptLogRejected(t *testing.T) {
+	f := newFSM(time.Hour)
+	if got := f.PublishedSeq(); got != 0 {
+		t.Fatalf("PublishedSeq before first publish = %d, want 0", got)
+	}
+	// A corrupt raft log entry must surface the decode error, never a
+	// half-applied ApplyResult (deterministic-skip discipline does not
+	// extend to undecodable batches).
+	if _, ok := f.Apply(&raft.Log{Data: []byte{0xFF, 0xFE, 0xFD}, Index: 1}).(ApplyResult); ok {
+		t.Fatal("corrupt log data must not produce an ApplyResult")
+	}
+}
+
+func TestFSMNodeDeleteMissingSkipped(t *testing.T) {
+	f := newFSM(time.Hour)
+	r := applyAt(f, Batch{Version: 3, NodeDeletes: []string{"ghost"}}, 5).(ApplyResult)
+	if !r.Committed || r.NodesSkipped != 1 || r.NodesDeleted != 0 {
+		t.Fatalf("deleting a nonexistent key: %+v", r)
 	}
 }
