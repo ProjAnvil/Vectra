@@ -20,14 +20,22 @@ import (
 // always far below this value.
 const defaultSmallGraphLimit = 100_000
 
+// maxConflicts caps the per-key conflict list returned to a rejected client;
+// ConflictTotal always reports the untruncated count.
+const maxConflicts = 100
+
 // ApplyResult is the return value of FSM.Apply (passed back via ApplyFuture.Response).
 type ApplyResult struct {
-	NodesApplied int
-	EdgesApplied int
-	EdgesSkipped int // Edges referencing nonexistent nodes are deterministically skipped (counted in metrics)
-	EdgesDeleted int // Explicit deletes + cascade deletes
-	NodesDeleted int
-	NodesSkipped int // Deletes of nonexistent keys
+	NodesApplied  int
+	EdgesApplied  int
+	EdgesSkipped  int // Edges referencing nonexistent nodes are deterministically skipped (counted in metrics)
+	EdgesDeleted  int // Explicit deletes + cascade deletes
+	NodesDeleted  int
+	NodesSkipped  int      // Deletes of nonexistent keys
+	Committed     bool     // false only for TxnGuard-rejected batches
+	Index         uint64   // raft log index of this entry
+	Conflicts     []string // conflicting keys, truncated to maxConflicts
+	ConflictTotal int      // total conflict count before truncation
 }
 
 // Metrics is the server's atomic counters (expvar is mounted in api.go).
@@ -41,7 +49,13 @@ type Metrics struct {
 	Seals          atomic.Int64
 	Restores       atomic.Int64
 	LeaderChanges  atomic.Int64
+	TxnCommits     atomic.Int64
+	TxnConflicts   atomic.Int64
 }
+
+// edgeVerKey addresses an edge in the version table by its logical key
+// (same identity discipline as EdgeDelete: Seal renumbers IDs, keys are stable).
+type edgeVerKey struct{ Src, Dst, Label string }
 
 // fsm implements raft.FSM: a live writable graph + a hot-swap publisher.
 //
@@ -56,6 +70,11 @@ type fsm struct {
 	dirty     bool
 	version   int64 // Monotonically increasing; the publisher uses it to detect writes after cloning
 	published atomic.Pointer[vectra.Graph]
+
+	nodeVer map[string]uint64     // per-node-key last-modified raft index; guarded by mu
+	edgeVer map[edgeVerKey]uint64 // per-edge-key last-modified raft index; guarded by mu
+
+	appliedIndex atomic.Uint64 // high-water mark of applied raft log indexes
 
 	sealInterval    time.Duration
 	smallGraphLimit int
@@ -76,6 +95,8 @@ type fsm struct {
 func newFSM(sealInterval time.Duration) *fsm {
 	f := &fsm{
 		live:            vectra.New(),
+		nodeVer:         map[string]uint64{},
+		edgeVer:         map[edgeVerKey]uint64{},
 		sealInterval:    sealInterval,
 		smallGraphLimit: defaultSmallGraphLimit,
 		ready:           make(chan struct{}),
@@ -97,6 +118,14 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	}
 	res := ApplyResult{}
 	f.mu.Lock()
+	wNodes, wEdges := f.effectiveWriteSet(b) // always: blind writes version too
+	if b.Txn != nil {
+		if conflicts, total := f.validateTxn(b.Txn, wNodes, wEdges); conflicts != nil {
+			f.mu.Unlock()
+			f.metrics.TxnConflicts.Add(1)
+			return ApplyResult{Committed: false, Index: l.Index, Conflicts: conflicts, ConflictTotal: total}
+		}
+	}
 	for _, n := range b.Nodes {
 		if _, err := f.live.AddNode(n.Key, n.Label, n.Props); err == nil {
 			res.NodesApplied++
@@ -128,9 +157,19 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	}
 	f.dirty = true
 	f.version++
+	f.appliedIndex.Store(l.Index)
+	for _, k := range wNodes {
+		f.nodeVer[k] = l.Index
+	}
+	for _, k := range wEdges {
+		f.edgeVer[k] = l.Index
+	}
 	small := f.live.NodeCount()+f.live.EdgeCount() < f.smallGraphLimit
 	f.mu.Unlock()
 
+	if b.Txn != nil {
+		f.metrics.TxnCommits.Add(1)
+	}
 	f.metrics.AppliedBatches.Add(1)
 	f.metrics.AppliedNodes.Add(int64(res.NodesApplied))
 	f.metrics.AppliedEdges.Add(int64(res.EdgesApplied))
@@ -140,6 +179,8 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	if small {
 		f.wakePublisher()
 	}
+	res.Committed = true
+	res.Index = l.Index
 	return res
 }
 
@@ -270,3 +311,107 @@ func (f *fsm) Restore(rc io.ReadCloser) error {
 func (f *fsm) Close() {
 	f.stopOnce.Do(func() { close(f.stop) })
 }
+
+// effectiveWriteSet enumerates every logical key the batch will modify,
+// including cascade peers of node deletes (their adjacency changes too).
+// Must run under f.mu with replay not yet started. Unconditional: request
+// keys are included even if replay will skip them (safe over-rejection only).
+func (f *fsm) effectiveWriteSet(b Batch) (nodes []string, edges []edgeVerKey) {
+	seenN := map[string]struct{}{}
+	seenE := map[edgeVerKey]struct{}{}
+	addN := func(k string) {
+		if _, ok := seenN[k]; !ok {
+			seenN[k] = struct{}{}
+			nodes = append(nodes, k)
+		}
+	}
+	addE := func(src, dst, label string) {
+		k := edgeVerKey{Src: src, Dst: dst, Label: label}
+		if _, ok := seenE[k]; !ok {
+			seenE[k] = struct{}{}
+			edges = append(edges, k)
+		}
+	}
+	for _, n := range b.Nodes {
+		addN(n.Key)
+	}
+	for _, e := range b.Edges {
+		addN(e.SrcKey)
+		addN(e.DstKey)
+		addE(e.SrcKey, e.DstKey, e.Label)
+	}
+	for _, d := range b.EdgeDeletes {
+		addN(d.SrcKey)
+		addN(d.DstKey)
+		addE(d.SrcKey, d.DstKey, d.Label)
+	}
+	for _, key := range b.NodeDeletes {
+		addN(key)
+		for _, dir := range []vectra.Direction{vectra.DirOut, vectra.DirIn} {
+			es, err := f.live.EdgesOf(key, dir)
+			if err != nil {
+				continue // nonexistent key: no incident edges to cascade
+			}
+			for _, e := range es {
+				// Edge.Src/Dst are NodeIDs; resolve back to string keys —
+				// the version table is key-addressed (Seal renumbers IDs).
+				src, ok1 := f.live.NodeByID(e.Src)
+				dst, ok2 := f.live.NodeByID(e.Dst)
+				if !ok1 || !ok2 {
+					continue
+				}
+				addN(src.Key)
+				addN(dst.Key)
+				addE(src.Key, dst.Key, e.Label)
+			}
+		}
+	}
+	return nodes, edges
+}
+
+// validateTxn returns the first maxConflicts conflicting keys and the total
+// conflict count for a guarded batch, or (nil, 0) when it may commit. Must
+// run under f.mu before replay.
+func (f *fsm) validateTxn(tg *TxnGuard, wNodes []string, wEdges []edgeVerKey) ([]string, int) {
+	var conflicts []string
+	seen := map[string]struct{}{}
+	total := 0
+	add := func(k string) {
+		if _, ok := seen[k]; ok {
+			return
+		}
+		seen[k] = struct{}{}
+		total++
+		if len(conflicts) < maxConflicts {
+			conflicts = append(conflicts, k)
+		}
+	}
+	for _, k := range wNodes {
+		if f.nodeVer[k] > tg.Snapshot {
+			add(k)
+		}
+	}
+	for _, k := range wEdges {
+		if f.edgeVer[k] > tg.Snapshot {
+			add(edgeKeyString(k))
+		}
+	}
+	if tg.SER {
+		for _, k := range tg.ReadNodes {
+			if f.nodeVer[k] > tg.Snapshot {
+				add(k)
+			}
+		}
+		for _, e := range tg.ReadEdges {
+			if f.edgeVer[edgeVerKey{Src: e.Src, Dst: e.Dst, Label: e.Label}] > tg.Snapshot {
+				add(edgeKeyString(edgeVerKey{Src: e.Src, Dst: e.Dst, Label: e.Label}))
+			}
+		}
+	}
+	if total == 0 {
+		return nil, 0
+	}
+	return conflicts, total
+}
+
+func edgeKeyString(k edgeVerKey) string { return k.Src + "\x00" + k.Dst + "\x00" + k.Label }
