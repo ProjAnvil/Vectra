@@ -318,6 +318,17 @@ type verSnapshot struct {
 
 const vctxMagic = "VCTX"
 
+// legacyStoreMagic is the header magic of pre-0.4.0 graph-only snapshots
+// (internal/store: "VCTR" | u16 version | counts...). Read as the u32 LE
+// framing length below, it parses as ~1.38e9, so genuine legacy snapshots
+// always fail the framing guard — which is where they are detected.
+const legacyStoreMagic = "VCTR"
+
+// errLegacySnapshot is the runbook-pointing rejection for pre-0.4.0 graph-only
+// snapshots: a replica restored from one would validate transactions against
+// an empty version table and diverge permanently from log-derived replicas.
+var errLegacySnapshot = errors.New("server: legacy snapshot without VCTX rejected; re-seed from a 0.4.0+ snapshot (see upgrade runbook)")
+
 // Persist serializes the cloned live graph plus the VCTX version-table trailer
 // into the sink (the unsealed state can be exported directly, no Seal required —
 // saves sealing a large graph once).
@@ -384,13 +395,22 @@ func splitSnapshot(data []byte) ([]byte, verSnapshot, error) {
 		return nil, vs, errors.New("server: snapshot too short")
 	}
 	n := binary.LittleEndian.Uint32(data[:4])
-	if int(n)+4+4+2 > len(data) {
+	// uint64 arithmetic: int(n)+10 wraps negative on 32-bit platforms for
+	// crafted framing lengths and would slip past the guard into the slicing
+	// below (out-of-range panic). 10 = u32 len + "VCTX" + u16 version.
+	if uint64(n)+10 > uint64(len(data)) {
+		// A genuine pre-0.4.0 snapshot starts with the store magic "VCTR",
+		// which parses here as a ~1.38e9 framing length — surface the
+		// runbook error, not the generic corrupt-framing one.
+		if bytes.HasPrefix(data, []byte(legacyStoreMagic)) {
+			return nil, vs, errLegacySnapshot
+		}
 		return nil, vs, errors.New("server: snapshot framing corrupt")
 	}
 	graph := data[4 : 4+n]
 	rest := data[4+n:]
 	if !bytes.HasPrefix(rest, []byte(vctxMagic)) {
-		return nil, vs, errors.New("server: legacy snapshot without VCTX rejected; re-seed from a 0.4.0+ snapshot (see upgrade runbook)")
+		return nil, vs, errLegacySnapshot
 	}
 	rest = rest[len(vctxMagic):]
 	if len(rest) < 2 {

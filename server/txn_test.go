@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -339,9 +340,19 @@ func TestFSMRestoreRejectsLegacy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A genuine pre-0.4.0 snapshot starts with the store magic "VCTR", which
+	// the framing-length guard reads as ~1.38e9 — the legacy check there must
+	// still surface the runbook error, not "framing corrupt".
+	if !bytes.HasPrefix(legacy, []byte("VCTR")) {
+		t.Fatalf("legacy export must start with the store magic, got %q", legacy[:min(4, len(legacy))])
+	}
 	f2 := newFSM(time.Hour)
-	if err := f2.Restore(io.NopCloser(bytes.NewReader(legacy))); err == nil {
+	err = f2.Restore(io.NopCloser(bytes.NewReader(legacy)))
+	if err == nil {
 		t.Fatal("legacy snapshot (no VCTX) must be rejected")
+	}
+	if !strings.Contains(err.Error(), "legacy snapshot") {
+		t.Fatalf("error = %q, want the runbook-pointing legacy-snapshot message", err.Error())
 	}
 }
 
@@ -449,18 +460,28 @@ func TestPublishedBundleSeqInvariant(t *testing.T) {
 }
 
 func TestSplitSnapshotBadInputs(t *testing.T) {
+	// A genuine pre-0.4.0 store header (>= 6 bytes): magic "VCTR" + u16
+	// version + counts — long enough to pass the too-short guard, so it must
+	// be caught by the VCTR check inside the framing-length failure.
+	legacyShape := []byte("VCTR\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00")
 	cases := []struct {
 		name string
 		data []byte
 	}{
 		{"too short", []byte("ab")},
 		{"length overflow", append([]byte{0xFF, 0xFF, 0xFF, 0xFF}, []byte("VCTX...")...)},
-		{"graph only (legacy shape)", []byte("VCTR")},
+		{"graph only (legacy shape)", legacyShape},
 	}
 	for _, c := range cases {
 		if _, _, err := splitSnapshot(c.data); err == nil {
 			t.Errorf("%s: expected error", c.name)
 		}
+	}
+	// The legacy shape fails the framing guard (store magic parses as a
+	// ~1.38e9 u32 length): the error must point at the runbook, not claim
+	// generic framing corruption.
+	if _, _, err := splitSnapshot(legacyShape); err == nil || !strings.Contains(err.Error(), "legacy snapshot") {
+		t.Fatalf("legacy shape: err = %v, want the legacy-snapshot message", err)
 	}
 }
 
@@ -517,22 +538,50 @@ func TestTxnEndpointCommitThenConflict(t *testing.T) {
 		return resp.StatusCode, out
 	}
 	// Seed one write so the first publish completes (query gate opens), then
-	// read the token from a stats response header (RYW pattern).
+	// read the token from a stats response header (RYW pattern). The publish
+	// is asynchronous to the POST return, so poll stats until it settles.
 	seed, _ := json.Marshal(map[string]any{"nodes": []map[string]any{{"key": "seed", "label": "S"}}})
 	sresp0, err := http.Post(lead.URL()+"/v1/batch", "application/json", bytes.NewReader(seed))
 	if err != nil {
 		t.Fatal(err)
 	}
 	sresp0.Body.Close()
-	hresp, err := http.Get(lead.URL() + "/v1/stats")
-	if err != nil {
+	var hresp *http.Response
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		hresp, err = http.Get(lead.URL() + "/v1/stats")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hresp.StatusCode == 200 {
+			break
+		}
+		status := hresp.StatusCode
+		hresp.Body.Close()
+		hresp = nil
+		if time.Now().After(deadline) {
+			t.Fatalf("stats after seed: %d (first publish did not settle)", status)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var st map[string]any
+	if err := json.NewDecoder(hresp.Body).Decode(&st); err != nil {
 		t.Fatal(err)
 	}
 	hresp.Body.Close()
-	if hresp.StatusCode != 200 {
-		t.Fatalf("stats after seed: %d", hresp.StatusCode)
+	// X-Vectra-Snapshot is the client protocol's only token source: pin that
+	// it parses as a positive u64 and stays consistent with the stats body's
+	// publishedSeq (header and body must describe the same publish).
+	tok, perr := strconv.ParseUint(hresp.Header.Get("X-Vectra-Snapshot"), 10, 64)
+	if perr != nil {
+		t.Fatalf("X-Vectra-Snapshot %q: %v", hresp.Header.Get("X-Vectra-Snapshot"), perr)
 	}
-	tok, _ := strconv.ParseUint(hresp.Header.Get("X-Vectra-Snapshot"), 10, 64)
+	if tok == 0 {
+		t.Fatalf("X-Vectra-Snapshot = 0, want > 0 once the seed is published")
+	}
+	if pub, ok := st["publishedSeq"].(float64); !ok || uint64(pub) != tok {
+		t.Fatalf("X-Vectra-Snapshot = %d, stats publishedSeq = %v (header/body mismatch)", tok, st["publishedSeq"])
+	}
 	code, out := post(body(tok, "a", "1"))
 	if code != 200 || out["committed"] != true {
 		t.Fatalf("first txn: %d %v", code, out)
@@ -605,28 +654,37 @@ func TestTxnEndpointReadsetCap(t *testing.T) {
 	tc := newTestCluster(t, 3)
 	defer tc.closeAll()
 	lead := tc.leader(t)
-	big := make([]string, 100_001)
-	raw, _ := json.Marshal(map[string]any{
-		"txn": map[string]any{"snapshot": 0, "readNodes": big},
-	})
-	resp, err := http.Post(lead.URL()+"/v1/txn", "application/json", bytes.NewReader(raw))
-	if err != nil {
-		t.Fatal(err)
+	// readNodes and readEdges are capped symmetrically at maxReadSet each;
+	// each element of bigEdges decodes as a zero EdgeRef.
+	bigNodes := make([]string, maxReadSet+1)
+	bigEdges := make([]map[string]any, maxReadSet+1)
+	for i := range bigEdges {
+		bigEdges[i] = map[string]any{}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 400 {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
-	}
-	var out struct {
-		Error struct {
-			Code string `json:"code"`
-		} `json:"error"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		t.Fatal(err)
-	}
-	if out.Error.Code != "TXN_READSET_TOO_LARGE" {
-		t.Fatalf("error code = %q, want TXN_READSET_TOO_LARGE", out.Error.Code)
+	for name, reads := range map[string]any{"readNodes": bigNodes, "readEdges": bigEdges} {
+		raw, _ := json.Marshal(map[string]any{
+			"txn": map[string]any{"snapshot": 0, name: reads},
+		})
+		resp, err := http.Post(lead.URL()+"/v1/txn", "application/json", bytes.NewReader(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&out)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != 400 {
+			t.Fatalf("%s over cap: status = %d, want 400", name, resp.StatusCode)
+		}
+		if out.Error.Code != "TXN_READSET_TOO_LARGE" {
+			t.Fatalf("%s over cap: error code = %q, want TXN_READSET_TOO_LARGE", name, out.Error.Code)
+		}
 	}
 }
 

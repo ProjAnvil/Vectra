@@ -187,6 +187,11 @@ func (n *Node) handleTxn(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("readNodes exceeds %d keys", maxReadSet))
 		return
 	}
+	if len(req.Txn.ReadEdges) > maxReadSet {
+		writeErr(w, http.StatusBadRequest, "TXN_READSET_TOO_LARGE",
+			fmt.Sprintf("readEdges exceeds %d keys", maxReadSet))
+		return
+	}
 	res, err := n.Apply(r.Context(), Batch{
 		Version:     batchVersion,
 		Nodes:       req.Nodes,
