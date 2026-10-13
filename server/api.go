@@ -106,12 +106,14 @@ func (n *Node) graph(w http.ResponseWriter) *vectra.Graph {
 	if !n.gateReady(w) {
 		return nil
 	}
-	g := n.fsm.Published()
-	if g == nil {
+	ps := n.fsm.published.Load()
+	if ps == nil {
 		writeErr(w, http.StatusServiceUnavailable, "NOT_READY", "snapshot not yet published")
 		return nil
 	}
-	return g
+	// Header must be set before any WriteHeader; writeJSON below is the first writer.
+	w.Header().Set("X-Vectra-Snapshot", strconv.FormatUint(ps.seq, 10))
+	return ps.graph
 }
 
 func (n *Node) handleBatch(w http.ResponseWriter, r *http.Request) {
@@ -221,13 +223,15 @@ func (n *Node) handleStats(w http.ResponseWriter, r *http.Request) {
 	n.queryCount.Add(1)
 	st := g.Stats()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"nodes":       st.Nodes,
-		"edges":       st.Edges,
-		"sccs":        st.SCCs,
-		"cyclicNodes": st.CyclicNodes,
-		"isLeader":    n.IsLeader(),
-		"term":        n.term(),
-		"publishedAt": n.fsm.lastSealNanos.Load() / int64(time.Millisecond),
+		"nodes":        st.Nodes,
+		"edges":        st.Edges,
+		"sccs":         st.SCCs,
+		"cyclicNodes":  st.CyclicNodes,
+		"isLeader":     n.IsLeader(),
+		"term":         n.term(),
+		"publishedAt":  n.fsm.lastSealNanos.Load() / int64(time.Millisecond),
+		"appliedIndex": n.fsm.appliedIndex.Load(),
+		"publishedSeq": n.fsm.PublishedSeq(),
 	})
 }
 

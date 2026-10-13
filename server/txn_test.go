@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -394,6 +395,45 @@ func TestFSMSnapshotFrozenDuringConcurrentApply(t *testing.T) {
 	}
 	if _, ok := f2.nodeVer["b"]; ok {
 		t.Fatal("post-Snapshot apply leaked into persisted table")
+	}
+}
+
+func TestPublishedBundleSeqInvariant(t *testing.T) {
+	f := newFSM(5 * time.Millisecond)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var observed atomic.Int32
+	wg.Add(1)
+	go func() { // Reader: every observed (graph, seq) must contain all writes ≤ seq.
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if ps := f.published.Load(); ps != nil {
+				observed.Add(1)
+				// Write k lives at raft index k; the graph must contain every
+				// node whose index is ≤ the published seq.
+				for k := 1; uint64(k) <= ps.seq; k++ {
+					if _, ok := ps.graph.NodeByKey(fmt.Sprintf("n%03d", k)); !ok {
+						t.Errorf("seq=%d but node n%03d (index %d) missing", ps.seq, k, k)
+						return
+					}
+				}
+			}
+		}
+	}()
+	for k := 1; k <= 50; k++ {
+		applyAt(f, Batch{Version: 3, Nodes: []NodeUpsert{
+			{Key: fmt.Sprintf("n%03d", k), Label: "S"}}}, uint64(k))
+		time.Sleep(time.Millisecond)
+	}
+	close(stop)
+	wg.Wait()
+	if observed.Load() < 2 {
+		t.Fatalf("reader only observed %d bundles; invariant never exercised", observed.Load())
 	}
 }
 

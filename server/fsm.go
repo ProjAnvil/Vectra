@@ -61,6 +61,14 @@ type Metrics struct {
 // (same identity discipline as EdgeDelete: Seal renumbers IDs, keys are stable).
 type edgeVerKey struct{ Src, Dst, Label string }
 
+// pubState bundles the published graph with the applied raft index it
+// reflects, so readers can never pair a newer seq with an older graph
+// (audit P1-2: token must never overshoot graph content).
+type pubState struct {
+	graph *vectra.Graph
+	seq   uint64
+}
+
 // fsm implements raft.FSM: a live writable graph + a hot-swap publisher.
 //
 //   - Apply: deterministically replays a batch into live (short critical section under RLock);
@@ -73,7 +81,7 @@ type fsm struct {
 	live      *vectra.Graph
 	dirty     bool
 	version   int64 // Monotonically increasing; the publisher uses it to detect writes after cloning
-	published atomic.Pointer[vectra.Graph]
+	published atomic.Pointer[pubState]
 
 	nodeVer map[string]uint64     // per-node-key last-modified raft index; guarded by mu
 	edgeVer map[edgeVerKey]uint64 // per-edge-key last-modified raft index; guarded by mu
@@ -191,7 +199,19 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 // Published returns the most recently sealed-and-published graph (immutable, lock-free concurrent reads).
 // Returns nil before the first publish.
 func (f *fsm) Published() *vectra.Graph {
-	return f.published.Load()
+	if ps := f.published.Load(); ps != nil {
+		return ps.graph
+	}
+	return nil
+}
+
+// PublishedSeq reports the applied raft index reflected by the current
+// published graph (0 before the first publish).
+func (f *fsm) PublishedSeq() uint64 {
+	if ps := f.published.Load(); ps != nil {
+		return ps.seq
+	}
+	return 0
 }
 
 // Ready closes once the first publish completes (read readiness gate for restart recovery).
@@ -240,6 +260,7 @@ func (f *fsm) publishOnce() {
 	}
 	clone := f.live.Clone()
 	version := f.version
+	seq := f.appliedIndex.Load()
 	f.mu.RUnlock()
 
 	if err := clone.Seal(); err != nil {
@@ -249,7 +270,7 @@ func (f *fsm) publishOnce() {
 	f.pubMu.Lock()
 	if version > f.publishedVer { // With Restore/publisher racing, only newer versions may land
 		f.publishedVer = version
-		f.published.Store(clone)
+		f.published.Store(&pubState{graph: clone, seq: seq})
 		f.metrics.Seals.Add(1)
 		f.lastSealNanos.Store(time.Now().UnixNano())
 	}
