@@ -3,15 +3,18 @@ package bench
 import (
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func TestRunWorkloadCountsAndLatency(t *testing.T) {
-	i := 0
+	// Op is invoked from concurrent workers; the counter must be atomic
+	// (RunWorkload gives no serialization guarantees to the closure).
+	var i atomic.Int64
 	res := RunWorkload("probe", func() error {
-		i++
-		if i%3 == 0 {
+		n := i.Add(1)
+		if n%3 == 0 {
 			return errors.New("boom")
 		}
 		time.Sleep(200 * time.Microsecond)
