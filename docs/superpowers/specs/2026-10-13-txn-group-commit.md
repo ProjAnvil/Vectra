@@ -123,6 +123,21 @@ expvar 新增：`vectra_txn_group_batches`（派发的组条目数）、`vectra_
 
 实现前先证实"批=1"假设：在 bench 或 dev 模式暴露 raft-boltdb `logsPerBatch`/`numTx` 统计，S 档 16 worker 跑 txnsi 记录 raft StoreLogs 批分布。若批已 >1 而 TPS 仍 500，停止本设计、重诊瓶颈（FSM bolt fsync / 上游锁），把结论写回 spec。**这是闸门任务，不许跳过。**
 
+### 4.1 Task 0 实测结果（2026-10-13，feat/txn-group-commit @ dd2d094）：闸门触发，实现停止
+
+- **测量方法**：bench http 模式在 `server.New` 之前安装 go-metrics inmem sink（10s 间隔/1min 保留，全局实例替换黑洞默认 sink），工作负载循环前后双快照差分取 txnsi 压测段 `raft.boltdb.logsPerBatch` 聚合（metric 源头 raft-boltdb v2.4.2 `bolt_store.go:217`，每次 `StoreLogs` 一个样本；方法论经独立评审对照 go-metrics/raft-boltdb 源码逐层核验）。
+- **数据**（S 档 / http / 16 worker / txnsi / 10s / seed=42，两次运行互证，0 err / 0 OCC 冲突）：
+
+| run | logsPerBatch 段均值 | samples | txnsi 提交 QPS | p50 |
+|---|---|---|---|---|
+| 1 | **5.51** | 1,055 | **578.5**（5,785 ops） | 26.55ms |
+| 2 | **5.69** | 1,047 | **593.1**（5,931 ops） | 25.99ms |
+
+- **自洽校验**：Σlogs ≈ 5.51×1055 ≈ 5,813 ≈ 压测段提交事务数（含 ~19 笔单 worker warmup）——每事务恰 1 条 raft 日志、~1,055 次 `StoreLogs`，批均值 5.5 可信（两次运行偏差 <4%）。
+- **判定**：段均值 >1.5 且 TPS 仍 ~500，两个停止条件**同时成立**——"批=1"假设被推翻。leader 的机会主义 drain 批已经把 ~5.5 条已提交日志合入每次 `StoreLogs`（~100 批/s × ~5.5 条/批 ≈ 550 事务/s）：fsync 摊销已天然发生，吞吐上限落在**每批流水线成本**（批周期 ~10ms：FSM apply 侧 bolt fsync / apply-发布串行点 / 上游单写者），而非日志批稀疏。
+- **后果**：§1 的瓶颈模型（"每事务一条 raft 日志一次 fsync"为主瓶颈）不成立，按闸门规则 **v0.5.0 TxnGroup 组提交停止实现**（Task 1-7 不派发）。
+- **待重诊**（瓶颈在别处）：FSM apply 侧 bolt fsync 计时与批周期分解、apply/发布路径串行点、上游锁竞争 profile。重诊结论决定下一步形态：修正后的组提交设计（若能进一步摊薄每批周期）、§8 的 raft 调参 + BatchingFSM 路线，或 FSM 持久化层改造。原始输出存 `.superpowers/sdd/2026-10-13-txn-group-commit/task-0-bench-output*.txt`。
+
 ## 5. 测试计划（矩阵，含审计 P2-6 补项）
 
 | 类别 | 用例 |
