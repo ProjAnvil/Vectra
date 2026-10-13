@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"fmt"
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -278,5 +279,136 @@ func TestFSMTxnConflictsTruncated(t *testing.T) {
 	}
 	if len(r.Conflicts) != maxConflicts || r.ConflictTotal != 150 {
 		t.Fatalf("len(Conflicts)=%d ConflictTotal=%d, want %d/150", len(r.Conflicts), r.ConflictTotal, maxConflicts)
+	}
+}
+
+func persistSnap(t *testing.T, f *fsm) []byte {
+	t.Helper()
+	snap, err := f.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := snap.Persist(&memSink{buf: &buf}); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestFSMSnapshotVCTXPersistRestore(t *testing.T) {
+	f := newFSM(time.Hour)
+	applyAt(f, Batch{Version: 3, Nodes: []NodeUpsert{{Key: "a", Label: "S"}}}, 5)
+	applyAt(f, Batch{Version: 3, Nodes: []NodeUpsert{{Key: "a", Label: "S"}},
+		Txn: &TxnGuard{Snapshot: 5}}, 6) // committed -> nodeVer[a]=6
+	raw := persistSnap(t, f)
+
+	f2 := newFSM(time.Hour)
+	if err := f2.Restore(io.NopCloser(bytes.NewReader(raw))); err != nil {
+		t.Fatal(err)
+	}
+	if got := f2.nodeVer["a"]; got != 6 {
+		t.Fatalf("nodeVer[a] = %d, want 6", got)
+	}
+	if got := f2.appliedIndex.Load(); got != 6 {
+		t.Fatalf("appliedIndex = %d, want 6", got)
+	}
+	// Post-restore log replay continues from restored table state.
+	r := applyAt(f2, Batch{Version: 3, Nodes: []NodeUpsert{{Key: "a", Label: "S"}},
+		Txn: &TxnGuard{Snapshot: 5}}, 7).(ApplyResult)
+	if r.Committed {
+		t.Fatal("token 5 < lastMod 6 must reject after restore")
+	}
+}
+
+func TestFSMRestoreRejectsLegacy(t *testing.T) {
+	f := newFSM(time.Hour)
+	applyAt(f, Batch{Version: 3, Nodes: []NodeUpsert{{Key: "a", Label: "S"}}}, 5)
+	legacy, err := f.live.ExportSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f2 := newFSM(time.Hour)
+	if err := f2.Restore(io.NopCloser(bytes.NewReader(legacy))); err == nil {
+		t.Fatal("legacy snapshot (no VCTX) must be rejected")
+	}
+}
+
+func TestFSMRestoreReplayEquivalence(t *testing.T) {
+	// The core audit-P1-4 property: a replica restored mid-stream and replaying
+	// the same suffix must reach identical accept/reject decisions (and table).
+	build := func() []Batch {
+		return []Batch{
+			{Version: 3, Nodes: []NodeUpsert{{Key: "a", Label: "S"}, {Key: "b", Label: "S"}}},
+			{Version: 3, Edges: []EdgeUpsert{{SrcKey: "a", DstKey: "b", Label: "E"}}},
+			{Version: 3, Nodes: []NodeUpsert{{Key: "a", Label: "S"}}, Txn: &TxnGuard{Snapshot: 1}},
+			{Version: 3, Nodes: []NodeUpsert{{Key: "c", Label: "S"}}, Txn: &TxnGuard{Snapshot: 2, SER: true, ReadNodes: []string{"a"}}},
+		}
+	}
+	cont := func(f *fsm, from int) []bool {
+		var out []bool
+		for i, b := range build()[from:] {
+			out = append(out, applyAt(f, b, uint64(from+i+1)).(ApplyResult).Committed)
+		}
+		return out
+	}
+	// Uninterrupted.
+	full := newFSM(time.Hour)
+	want := cont(full, 0)
+	// Restored after entry 2.
+	part := newFSM(time.Hour)
+	cont(part, 0)
+	// persist WITHOUT letting further applies leak in: snapshot now.
+	raw := persistSnap(t, part)
+	res := newFSM(time.Hour)
+	if err := res.Restore(io.NopCloser(bytes.NewReader(raw))); err != nil {
+		t.Fatal(err)
+	}
+	got := cont(res, 2)
+	wantTail := want[2:]
+	for i := range wantTail {
+		if got[i] != wantTail[i] {
+			t.Fatalf("divergence at suffix %d: restored=%v uninterrupted=%v", i, got, wantTail)
+		}
+	}
+	if res.nodeVer["a"] != full.nodeVer["a"] {
+		t.Fatalf("nodeVer[a]: restored=%d uninterrupted=%d", res.nodeVer["a"], full.nodeVer["a"])
+	}
+}
+
+func TestFSMSnapshotFrozenDuringConcurrentApply(t *testing.T) {
+	f := newFSM(time.Hour)
+	applyAt(f, Batch{Version: 3, Nodes: []NodeUpsert{{Key: "a", Label: "S"}}}, 5)
+	snap, err := f.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Applies after Snapshot() must not appear in what Persist writes.
+	applyAt(f, Batch{Version: 3, Nodes: []NodeUpsert{{Key: "b", Label: "S"}}}, 6)
+	var buf bytes.Buffer
+	if err := snap.Persist(&memSink{buf: &buf}); err != nil {
+		t.Fatal(err)
+	}
+	f2 := newFSM(time.Hour)
+	if err := f2.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f2.nodeVer["b"]; ok {
+		t.Fatal("post-Snapshot apply leaked into persisted table")
+	}
+}
+
+func TestSplitSnapshotBadInputs(t *testing.T) {
+	cases := []struct {
+		name string
+		data []byte
+	}{
+		{"too short", []byte("ab")},
+		{"length overflow", append([]byte{0xFF, 0xFF, 0xFF, 0xFF}, []byte("VCTX...")...)},
+		{"graph only (legacy shape)", []byte("VCTR")},
+	}
+	for _, c := range cases {
+		if _, _, err := splitSnapshot(c.data); err == nil {
+			t.Errorf("%s: expected error", c.name)
+		}
 	}
 }

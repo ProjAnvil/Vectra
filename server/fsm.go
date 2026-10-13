@@ -1,9 +1,13 @@
 package server
 
 import (
+	"bytes"
+	"encoding/binary"
+	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -120,7 +124,7 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	f.mu.Lock()
 	wNodes, wEdges := f.effectiveWriteSet(b) // always: blind writes version too
 	if b.Txn != nil {
-		if conflicts, total := f.validateTxn(b.Txn, wNodes, wEdges); conflicts != nil {
+		if conflicts, total := f.validateTxn(b.Txn, l.Index, wNodes, wEdges); conflicts != nil {
 			f.mu.Unlock()
 			f.metrics.TxnConflicts.Add(1)
 			return ApplyResult{Committed: false, Index: l.Index, Conflicts: conflicts, ConflictTotal: total}
@@ -264,22 +268,57 @@ func (f *fsm) publishOnce() {
 func (f *fsm) Snapshot() (raft.FSMSnapshot, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return &graphSnapshot{clone: f.live.Clone()}, nil
+	// Copy the version tables under the same RLock as the graph clone: the
+	// snapshot's raft metadata index aligns with this call on the FSM thread
+	// (raft v1.8), and Persist runs later on the snapshot thread — it must
+	// only ever see this frozen copy.
+	return &graphSnapshot{
+		clone:   f.live.Clone(),
+		nodeVer: maps.Clone(f.nodeVer),
+		edgeVer: maps.Clone(f.edgeVer),
+		applied: f.appliedIndex.Load(),
+	}, nil
 }
 
 type graphSnapshot struct {
-	clone *vectra.Graph
+	clone   *vectra.Graph
+	nodeVer map[string]uint64
+	edgeVer map[edgeVerKey]uint64
+	applied uint64
 }
 
-// Persist serializes the cloned live graph into the sink (the unsealed state can
-// be exported directly, no Seal required — saves sealing a large graph once).
+// verSnapshot is the gob payload of the VCTX trailer: the version tables and
+// the applied-index high-water mark at Snapshot time.
+type verSnapshot struct {
+	NodeVer      map[string]uint64
+	EdgeVer      map[edgeVerKey]uint64
+	AppliedIndex uint64
+}
+
+const vctxMagic = "VCTX"
+
+// Persist serializes the cloned live graph plus the VCTX version-table trailer
+// into the sink (the unsealed state can be exported directly, no Seal required —
+// saves sealing a large graph once).
 func (s *graphSnapshot) Persist(sink raft.SnapshotSink) error {
 	data, err := s.clone.ExportSnapshot()
 	if err != nil {
 		return err
 	}
-	if _, err := sink.Write(data); err != nil {
+	var verBuf bytes.Buffer
+	if err := gob.NewEncoder(&verBuf).Encode(verSnapshot{
+		NodeVer: s.nodeVer, EdgeVer: s.edgeVer, AppliedIndex: s.applied,
+	}); err != nil {
 		return err
+	}
+	var head [4]byte
+	binary.LittleEndian.PutUint32(head[:], uint32(len(data)))
+	var fv [2]byte
+	binary.LittleEndian.PutUint16(fv[:], 1) // u16 LE format version, matches splitSnapshot
+	for _, chunk := range [][]byte{head[:], data, []byte(vctxMagic), fv[:], verBuf.Bytes()} {
+		if _, err := sink.Write(chunk); err != nil {
+			return err
+		}
 	}
 	return sink.Close()
 }
@@ -293,18 +332,62 @@ func (f *fsm) Restore(rc io.ReadCloser) error {
 	if err != nil {
 		return err
 	}
-	g, err := vectra.ImportSnapshot(data)
+	graph, vers, err := splitSnapshot(data)
+	if err != nil {
+		return err
+	}
+	g, err := vectra.ImportSnapshot(graph)
 	if err != nil {
 		return err
 	}
 	f.mu.Lock()
 	f.live = g
+	f.nodeVer = vers.NodeVer
+	f.edgeVer = vers.EdgeVer
+	f.appliedIndex.Store(vers.AppliedIndex)
 	f.dirty = true
 	f.version++
 	f.mu.Unlock()
 	f.metrics.Restores.Add(1)
 	f.sealNow()
 	return nil
+}
+
+// splitSnapshot separates the graph payload from the VCTX version-table
+// trailer. Legacy snapshots (pre-0.4.0, graph only) are rejected: replicas
+// restored from them would validate transactions against an empty table and
+// diverge permanently from log-derived replicas.
+func splitSnapshot(data []byte) ([]byte, verSnapshot, error) {
+	var vs verSnapshot
+	if len(data) < 6 { // u32 len + "VCTX" minimum
+		return nil, vs, errors.New("server: snapshot too short")
+	}
+	n := binary.LittleEndian.Uint32(data[:4])
+	if int(n)+4+4+2 > len(data) {
+		return nil, vs, errors.New("server: snapshot framing corrupt")
+	}
+	graph := data[4 : 4+n]
+	rest := data[4+n:]
+	if !bytes.HasPrefix(rest, []byte(vctxMagic)) {
+		return nil, vs, errors.New("server: legacy snapshot without VCTX rejected; re-seed from a 0.4.0+ snapshot (see upgrade runbook)")
+	}
+	rest = rest[len(vctxMagic):]
+	if len(rest) < 2 {
+		return nil, vs, errors.New("server: VCTX version missing")
+	}
+	if binary.LittleEndian.Uint16(rest[:2]) != 1 {
+		return nil, vs, fmt.Errorf("server: unsupported VCTX version %d", binary.LittleEndian.Uint16(rest[:2]))
+	}
+	if err := gob.NewDecoder(bytes.NewReader(rest[2:])).Decode(&vs); err != nil {
+		return nil, vs, err
+	}
+	if vs.NodeVer == nil {
+		vs.NodeVer = map[string]uint64{}
+	}
+	if vs.EdgeVer == nil {
+		vs.EdgeVer = map[edgeVerKey]uint64{}
+	}
+	return graph, vs, nil
 }
 
 // Close stops the publisher (idempotent).
@@ -372,7 +455,13 @@ func (f *fsm) effectiveWriteSet(b Batch) (nodes []string, edges []edgeVerKey) {
 // validateTxn returns the first maxConflicts conflicting keys and the total
 // conflict count for a guarded batch, or (nil, 0) when it may commit. Must
 // run under f.mu before replay.
-func (f *fsm) validateTxn(tg *TxnGuard, wNodes []string, wEdges []edgeVerKey) ([]string, int) {
+//
+// A table entry equal to this entry's own log index is the entry's earlier
+// application (same-index replay, e.g. re-applying an entry already included
+// in a restored snapshot) — not a conflict — so a replayed committed entry
+// reproduces its original decision. For fresh entries indexes strictly
+// increase, so own-index entries never occur in normal operation.
+func (f *fsm) validateTxn(tg *TxnGuard, idx uint64, wNodes []string, wEdges []edgeVerKey) ([]string, int) {
 	var conflicts []string
 	seen := map[string]struct{}{}
 	total := 0
@@ -386,24 +475,30 @@ func (f *fsm) validateTxn(tg *TxnGuard, wNodes []string, wEdges []edgeVerKey) ([
 			conflicts = append(conflicts, k)
 		}
 	}
+	nodeDirty := func(k string) bool {
+		return f.nodeVer[k] > tg.Snapshot && f.nodeVer[k] != idx
+	}
+	edgeDirty := func(k edgeVerKey) bool {
+		return f.edgeVer[k] > tg.Snapshot && f.edgeVer[k] != idx
+	}
 	for _, k := range wNodes {
-		if f.nodeVer[k] > tg.Snapshot {
+		if nodeDirty(k) {
 			add(k)
 		}
 	}
 	for _, k := range wEdges {
-		if f.edgeVer[k] > tg.Snapshot {
+		if edgeDirty(k) {
 			add(edgeKeyString(k))
 		}
 	}
 	if tg.SER {
 		for _, k := range tg.ReadNodes {
-			if f.nodeVer[k] > tg.Snapshot {
+			if nodeDirty(k) {
 				add(k)
 			}
 		}
 		for _, e := range tg.ReadEdges {
-			if f.edgeVer[edgeVerKey{Src: e.Src, Dst: e.Dst, Label: e.Label}] > tg.Snapshot {
+			if edgeDirty(edgeVerKey{Src: e.Src, Dst: e.Dst, Label: e.Label}) {
 				add(edgeKeyString(edgeVerKey{Src: e.Src, Dst: e.Dst, Label: e.Label}))
 			}
 		}
