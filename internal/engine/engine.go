@@ -10,7 +10,9 @@ package engine
 
 import (
 	"cmp"
+	"encoding/json"
 	"slices"
+	"sort"
 
 	"github.com/projanvil/vectra/internal/csr"
 	"github.com/projanvil/vectra/internal/dag"
@@ -34,11 +36,66 @@ type EdgeRec struct {
 	Props   map[string]any
 }
 
-// indexEntry is a property index entry: sorted jointly by value and node ID,
-// searched by binary search.
-type indexEntry struct {
+// Typed property-index entries: each bucket is sorted jointly by value and
+// node ID, searched by binary search.
+type strEntry struct {
 	val string
 	id  uint32
+}
+
+type numEntry struct {
+	val float64
+	id  uint32
+}
+
+type boolEntry struct {
+	val bool
+	id  uint32
+}
+
+// propIndex is the index of one property key: three type buckets. Numbers
+// normalize to float64 (all int/uint/float widths and json.Number), so a
+// value written as int 42 matches the float64 42 a JSON round-trip produces.
+// Values of other kinds (nil, slices, maps) are not indexed.
+type propIndex struct {
+	strs  []strEntry
+	nums  []numEntry
+	bools []boolEntry
+}
+
+// toFloat normalizes any numeric Go value to float64; non-numerics return
+// ok=false.
+func toFloat(v any) (float64, bool) {
+	switch n := v.(type) {
+	case int:
+		return float64(n), true
+	case int8:
+		return float64(n), true
+	case int16:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case uint:
+		return float64(n), true
+	case uint8:
+		return float64(n), true
+	case uint16:
+		return float64(n), true
+	case uint32:
+		return float64(n), true
+	case uint64:
+		return float64(n), true
+	case float32:
+		return float64(n), true
+	case float64:
+		return n, true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	}
+	return 0, false
 }
 
 // Snapshot is all query state after Seal.
@@ -58,12 +115,12 @@ type Snapshot struct {
 	sccNodes   []uint32      // members grouped by component (ascending within group)
 	selfLoop   []bool
 
-	indexes map[string][]indexEntry // property key -> sorted index (built at Seal time)
+	indexes map[string]*propIndex // property key -> typed index (built at Seal time)
 }
 
 // Seal builds an immutable snapshot from raw records: forward/reverse CSR,
 // Tarjan SCC, forward/reverse condensation DAG, component member tables,
-// self-loop flags, and string property indexes.
+// self-loop flags, and typed property indexes.
 func Seal(nodes []NodeRec, edges []EdgeRec, labels []string, indexKeys []string) (*Snapshot, error) {
 	s := &Snapshot{nodes: nodes, edges: edges, labels: labels}
 	n := uint32(len(nodes))
@@ -121,21 +178,43 @@ func Seal(nodes []NodeRec, edges []EdgeRec, labels []string, indexKeys []string)
 	}
 
 	if len(indexKeys) > 0 {
-		s.indexes = make(map[string][]indexEntry, len(indexKeys))
+		s.indexes = make(map[string]*propIndex, len(indexKeys))
 		for _, key := range indexKeys {
-			var entries []indexEntry
+			pi := &propIndex{}
 			for id, nr := range nodes {
-				if str, ok := nr.Props[key].(string); ok {
-					entries = append(entries, indexEntry{val: str, id: uint32(id)})
+				switch v := nr.Props[key].(type) {
+				case string:
+					pi.strs = append(pi.strs, strEntry{val: v, id: uint32(id)})
+				case bool:
+					pi.bools = append(pi.bools, boolEntry{val: v, id: uint32(id)})
+				default:
+					if f, ok := toFloat(nr.Props[key]); ok {
+						pi.nums = append(pi.nums, numEntry{val: f, id: uint32(id)})
+					}
 				}
 			}
-			slices.SortFunc(entries, func(a, b indexEntry) int {
+			slices.SortFunc(pi.strs, func(a, b strEntry) int {
 				if a.val != b.val {
 					return cmp.Compare(a.val, b.val)
 				}
 				return cmp.Compare(a.id, b.id)
 			})
-			s.indexes[key] = entries
+			slices.SortFunc(pi.nums, func(a, b numEntry) int {
+				if a.val != b.val {
+					return cmp.Compare(a.val, b.val)
+				}
+				return cmp.Compare(a.id, b.id)
+			})
+			slices.SortFunc(pi.bools, func(a, b boolEntry) int {
+				if a.val != b.val {
+					if !a.val {
+						return -1
+					}
+					return 1
+				}
+				return cmp.Compare(a.id, b.id)
+			})
+			s.indexes[key] = pi
 		}
 	}
 	return s, nil
@@ -196,13 +275,14 @@ func (s *Snapshot) SCCMembers(scc uint32) []uint32 {
 // SelfLoop reports whether the node has a self-loop.
 func (s *Snapshot) SelfLoop(v uint32) bool { return s.selfLoop[v] }
 
-// LookupIndex binary-searches the string property index built at Seal time;
-// an unregistered key returns ok=false.
+// LookupIndex binary-searches the string bucket of the property index built
+// at Seal time; an unregistered key returns ok=false.
 func (s *Snapshot) LookupIndex(key, value string) ([]uint32, bool) {
-	entries, ok := s.indexes[key]
+	pi, ok := s.indexes[key]
 	if !ok {
 		return nil, false
 	}
+	entries := pi.strs
 	lo, hi := 0, len(entries)
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
@@ -217,6 +297,62 @@ func (s *Snapshot) LookupIndex(key, value string) ([]uint32, bool) {
 		out = append(out, entries[i].id)
 	}
 	return out, true
+}
+
+// LookupNumber finds nodes whose numeric property equals value (numbers are
+// indexed as normalized float64); an unregistered key returns ok=false.
+func (s *Snapshot) LookupNumber(key string, value float64) ([]uint32, bool) {
+	return s.LookupNumberRange(key, &value, &value)
+}
+
+// LookupNumberRange finds nodes whose numeric property lies in [lo, hi]
+// (inclusive; a nil bound leaves that side unbounded), ascending by value
+// then ID; an unregistered key returns ok=false.
+func (s *Snapshot) LookupNumberRange(key string, lo, hi *float64) ([]uint32, bool) {
+	pi, ok := s.indexes[key]
+	if !ok {
+		return nil, false
+	}
+	nums := pi.nums
+	loIdx := 0
+	if lo != nil {
+		loIdx = sort.Search(len(nums), func(i int) bool { return nums[i].val >= *lo })
+	}
+	hiIdx := len(nums)
+	if hi != nil {
+		hiIdx = sort.Search(len(nums), func(i int) bool { return nums[i].val > *hi })
+	}
+	out := make([]uint32, 0, max(0, hiIdx-loIdx))
+	for i := loIdx; i < hiIdx; i++ {
+		out = append(out, nums[i].id)
+	}
+	return out, true
+}
+
+// LookupBool finds nodes whose boolean property equals value; an unregistered
+// key returns ok=false.
+func (s *Snapshot) LookupBool(key string, value bool) ([]uint32, bool) {
+	pi, ok := s.indexes[key]
+	if !ok {
+		return nil, false
+	}
+	var out []uint32
+	for _, e := range pi.bools {
+		if e.val == value {
+			out = append(out, e.id)
+		}
+	}
+	return out, true
+}
+
+// LabelID resolves a label name to its ID (false when never interned).
+func (s *Snapshot) LabelID(name string) (uint32, bool) {
+	for id, l := range s.labels {
+		if l == name {
+			return uint32(id), true
+		}
+	}
+	return 0, false
 }
 
 // IndexedKeys returns the property keys indexes were built for at Seal time,
