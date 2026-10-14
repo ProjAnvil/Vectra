@@ -43,9 +43,26 @@ for _, c := range g.Cycles() { ... }
 g.SaveFile("deps.vg")
 ```
 
-快照说明：v3 格式会持久化 `IndexProperty` 声明，`vectra.Load` 恢复图的同时恢复查询索引（重载后 `LookupByProperty` 立即可用；v2/v1 旧文件仍可读但不含索引声明）。props 以 JSON 序列化——整数读回为 `float64`，消费方需按数值比较或自行转换。
+快照说明：v3 格式会持久化 `IndexProperty` 声明，`vectra.Load` 恢复图的同时恢复查询索引（重载后类型化查找立即可用；v2/v1 旧文件仍可读但不含索引声明）。属性索引是**类型化的**——每个 key 三个有序桶（string / number / bool）：`LookupByProperty`（字符串等值）、`LookupByNumber` / `LookupByNumberRange(min, max *float64)`（数值等值 / 范围）、`LookupByBool`。数值在索引里统一归一化为 `float64`：Go API 写入的 `int` 与 JSON 快照读回的同值落进同一桶——"整数读回变 float64" 的老坑在索引查找上不复存在（`int64` 超过 2^53 有精度损失，JSON 数值模型的固有限制）。
 
 **⚠️ 升级到 0.5.0。** 存储快照改以 v3 格式写入。不兼容是单向的：v1/v2 旧文件仍可读，但 0.5 之前的二进制读不了 v3 文件——跨版本交换 `.vg` 快照的嵌入式与 MCP 用户需要两端都在 0.5+。raft 集群新旧混布策略不变（本就不支持）。
+
+## Cypher 子集查询
+
+Seal 后的图可回答 openCypher/GQL 风格的模式查询——DSL 直接编译到现有 CSR 遍历原语上（`bfs` / `neighbors` / `lookup_property` 就是它的物理算子）：
+
+```go
+res, _ := g.Cypher(`MATCH (b {type:'controller'})-[:CALLS*1..2]->(s)
+                    WHERE s.env = 'prod' AND s.w >= 3
+                    RETURN b.key, s ORDER BY s.w DESC LIMIT 10`)
+// res.Columns = ["b.key", "s"]; res.Rows = [{"b.key": "gw", "s": {key,label,props,...}}, ...]
+```
+
+语法：`MATCH pattern[, pattern...] [WHERE expr] RETURN *|items [ORDER BY item [ASC|DESC]...] [LIMIT n]`；节点 `(var:Label {prop:literal})`，边 `-[var:REL|REL*n..m]->` / `<-[...]-` / `--`（无方向）；WHERE 支持 `= <> < <= > >=`、`STARTS/ENDS WITH`、`CONTAINS`、`IN [...]`、`AND/OR/NOT`、伪属性 `var.key / var.label / var.id`，以及定长单跳上的边属性谓词（`WHERE e.weight > 3`——并行边各绑定一行）。
+
+语义（刻意设计并已文档化）：变长边采用**节点对语义**——目标的最短距离落在跳数窗口内即匹配（`[:CALLS*1..2]` = 按最短路径 1..2 跳；环不会制造更长的匹配），中间节点不施加目标模式过滤，变长段不绑定边变量。行按具名绑定 + 终点去重；WHERE 采用 null 传播逻辑（属性缺失永不满足，`NOT` 救不回来）。锚定在模式允许时走类型化属性索引（`{type:'controller'}`），否则全扫。中间行数上限 1,000,000（超限报错并提示收窄模式或加 `LIMIT`）。
+
+其他接入面：server `POST /v1/cypher`（`{"query": "..."}` → `{columns, rows, count}`；解析错 400 `PARSE`）、三语 MCP 的 `cypher` 工具（默认 limit 1000，`total` 报真实总数）。
 
 ## 服务模式（可选模块）
 
@@ -54,7 +71,7 @@ g.SaveFile("deps.vg")
 ```
 写入: 客户端 →POST /v1/batch→ leader ─raft→ 多数派提交 → FSM 确定性回放
 发布器（每节点）: RLock 克隆 → 锁外 Seal → 原子指针交换
-查询: GET /v1/* → 本地 published 快照（免锁，永不中断）
+查询: GET /v1/* 与 POST /v1/query、/v1/cypher → 本地 published 快照（免锁，永不中断）
 ```
 
 ```bash
@@ -97,7 +114,7 @@ v0.4 起服务端在同一条 raft 日志上支持**交互式乐观事务**—�
 
 ## MCP（AI agent）
 
-三个一等实现——[Go（嵌入引擎）](mcp)、[Python（FastMCP）](mcp/python)、[TypeScript](mcp/ts)——把一跳/多跳/最短路/可达性/循环依赖（含环内边）暴露为 MCP 工具，另提供 `inject_batch` 写入（支持 `allowParallel`）：
+三个一等实现——[Go（嵌入引擎）](mcp)、[Python（FastMCP）](mcp/python)、[TypeScript](mcp/ts)——把一跳/多跳/最短路/可达性/循环依赖（含环内边）/Cypher 子集模式查询暴露为 MCP 工具，另提供 `inject_batch` 写入（支持 `allowParallel`；`lookup_property` 接受 string/number/bool 值）：
 
 ```bash
 claude mcp add vectra -- /path/to/vectra-mcp
@@ -122,10 +139,12 @@ claude mcp add vectra -- /path/to/vectra-mcp
 ## 仓库布局
 
 ```
-vectra.go            门面：写入、Seal、快照、属性索引
+vectra.go            门面：写入、Seal、快照、类型化属性索引
+cypher.go            门面：Cypher 子集查询入口（Graph.Cypher）
 internal/csr         CSR 邻接（无指针 uint32 数组）
 internal/dag         Tarjan SCC、凝聚图、拓扑层级
 internal/engine      密封快照 + 访问器 + Seal 流水线
+internal/cypher      Cypher 子集词法、语法、AST、行式执行器
 internal/traverse    算法：层同步 BFS、可达性、双向最短路、循环发现
 internal/store       快照编解码（v3：索引声明区 + CRC32 尾校验，v1/v2 读兼容）
 server/              独立模块：raft 复制 + HTTP API + 热替换发布器
@@ -143,7 +162,7 @@ docs/benchmarks/     压测设计与结果
 
 ## 明确不做
 
-在线写 / delta-CSR（会推翻两个核心赌注）、超 1000 万边的磁盘溢出、核心内置完整 GQL 解析器、分片。路线图：k-hop 预计算、极简查询 DSL、属性类型化索引。
+在线写 / delta-CSR（会推翻两个核心赌注）、超 1000 万边的磁盘溢出、核心内置完整 GQL 解析器、分片。原路线图两项已落地：极简查询 DSL（`Graph.Cypher`、`/v1/cypher`、MCP `cypher`）与属性类型化索引。路线图：k-hop 预计算。
 
 ## 许可证
 
