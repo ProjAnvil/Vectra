@@ -261,6 +261,9 @@ func (s *Snapshot) EdgeInfo(id uint32) (src, dst uint32, label string, props map
 // LabelName returns the name for a label ID.
 func (s *Snapshot) LabelName(id uint32) string { return s.labels[id] }
 
+// LabelCount returns the label-registry size (edge-label mask upper bound).
+func (s *Snapshot) LabelCount() int { return len(s.labels) }
+
 // SCCOf returns the component ID a node belongs to.
 func (s *Snapshot) SCCOf(v uint32) uint32 { return s.sccOf[v] }
 
