@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"expvar"
@@ -60,6 +61,7 @@ func (n *Node) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/join", n.handleJoin)
 	mux.HandleFunc("GET /v1/health", n.handleHealth)
 	mux.HandleFunc("GET /v1/stats", n.handleStats)
+	mux.HandleFunc("GET /v1/await", n.handleAwait)
 	mux.HandleFunc("GET /v1/nodes/{key}", n.handleNode)
 	mux.HandleFunc("GET /v1/neighbors", n.handleNeighbors)
 	mux.HandleFunc("POST /v1/query", n.handleQuery)
@@ -310,6 +312,41 @@ func (n *Node) handleStats(w http.ResponseWriter, r *http.Request) {
 		"appliedIndex": n.fsm.appliedIndex.Load(),
 		"publishedSeq": n.fsm.PublishedSeq(),
 	})
+}
+
+// awaitTimeoutBounds cap the server-side long poll and set the default when
+// timeoutMs is omitted.
+const (
+	maxAwaitTimeout  = 30 * time.Second
+	defaultAwaitWait = 5 * time.Second
+)
+
+// handleAwait is the read-your-writes long poll: block until publishedSeq
+// >= seq (or the timeout / client disconnect), then return the current seq.
+// Always 200 with reached reporting the outcome — an unsatisfied timeout is
+// a normal "not yet published" answer, and the client decides to re-await.
+// No readiness gate: waiting for the first publish is legitimate (Restore's
+// first publish carries a seq and wakes waiters). Not counted as a query.
+func (n *Node) handleAwait(w http.ResponseWriter, r *http.Request) {
+	seq, err := strconv.ParseUint(r.URL.Query().Get("seq"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "seq query parameter required (uint)")
+		return
+	}
+	wait := defaultAwaitWait
+	if s := r.URL.Query().Get("timeoutMs"); s != "" {
+		ms, err := strconv.Atoi(s)
+		if err != nil || ms < 0 {
+			writeErr(w, http.StatusBadRequest, "VALIDATION", "timeoutMs must be a non-negative integer")
+			return
+		}
+		wait = min(time.Duration(ms)*time.Millisecond, maxAwaitTimeout)
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), wait)
+	defer cancel()
+	got := n.fsm.WaitPublished(ctx, seq)
+	w.Header().Set("X-Vectra-Snapshot", strconv.FormatUint(got, 10))
+	writeJSON(w, http.StatusOK, map[string]any{"publishedSeq": got, "reached": got >= seq})
 }
 
 func (n *Node) handleNode(w http.ResponseWriter, r *http.Request) {

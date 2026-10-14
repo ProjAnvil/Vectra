@@ -406,7 +406,8 @@ func (g *Graph) Seal() error {
 }
 
 // Save writes the whole graph to w. Requires Seal first (guarantees a
-// consistent exported state).
+// consistent exported state). Property-index declarations are persisted too
+// (store v3), so Load restores both the graph and its lookup indexes.
 func (g *Graph) Save(w io.Writer) error {
 	if !g.sealed {
 		return ErrNotSealed
@@ -428,7 +429,7 @@ func (g *Graph) Save(w io.Writer) error {
 			Props:  e.Props,
 		})
 	}
-	return store.Encode(w, nodes, edges)
+	return store.Encode(w, store.Data{Nodes: nodes, Edges: edges, IndexKeys: g.snap.IndexedKeys()})
 }
 
 // SaveFile saves to a path: temp file + fsync + atomic rename, avoiding
@@ -456,7 +457,9 @@ func (g *Graph) SaveFile(path string) error {
 	return os.Rename(tmp, path)
 }
 
-// Load restores a graph from a snapshot and Seals it automatically.
+// Load restores a graph from a snapshot and Seals it automatically. Index
+// declarations persisted by the snapshot (store v3) are re-registered before
+// Seal, so LookupByProperty works immediately (v1/v2 files carry none).
 func Load(r io.Reader) (*Graph, error) {
 	g, err := loadGraph(r)
 	if err != nil {
@@ -469,17 +472,20 @@ func Load(r io.Reader) (*Graph, error) {
 }
 
 func loadGraph(r io.Reader) (*Graph, error) {
-	nodes, edges, err := store.Decode(r)
+	data, err := store.Decode(r)
 	if err != nil {
 		return nil, err
 	}
 	g := New()
-	for _, n := range nodes {
+	for _, k := range data.IndexKeys {
+		g.IndexProperty(k)
+	}
+	for _, n := range data.Nodes {
 		if _, err := g.AddNode(n.Key, n.Label, n.Props); err != nil {
 			return nil, err
 		}
 	}
-	for _, e := range edges {
+	for _, e := range data.Edges {
 		if _, err := g.AddEdge(e.SrcKey, e.DstKey, e.Label, e.Props); err != nil {
 			return nil, err
 		}
@@ -511,6 +517,17 @@ func (g *Graph) IndexProperty(key string) *Graph {
 	}
 	g.indexKeys = append(g.indexKeys, key)
 	return g
+}
+
+// IndexedPropertyKeys returns the property-index declarations: the live list
+// before Seal, the sealed snapshot's built index keys afterwards (nil when
+// none). Consumers that persist or hand over a graph (snapshot services,
+// clone-and-extend flows) use it to preserve index configuration.
+func (g *Graph) IndexedPropertyKeys() []string {
+	if g.sealed {
+		return g.snap.IndexedKeys()
+	}
+	return slices.Clone(g.indexKeys)
 }
 
 // Clone deep-copies into a graph that can keep taking writes (the result is
@@ -594,7 +611,7 @@ func (g *Graph) ExportSnapshot() ([]byte, error) {
 		})
 	}
 	var buf bytes.Buffer
-	if err := store.Encode(&buf, nodes, edges); err != nil {
+	if err := store.Encode(&buf, store.Data{Nodes: nodes, Edges: edges, IndexKeys: g.indexKeys}); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil

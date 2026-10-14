@@ -6,6 +6,7 @@
 package traverse
 
 import (
+	"cmp"
 	"runtime"
 	"slices"
 	"sync"
@@ -372,27 +373,40 @@ func anyEdge(s engineSnapshot, u, v uint32) uint32 {
 	return 0 // path is contiguous by construction; unreachable in practice
 }
 
-// Cycle is one circular dependency: the member list of a multi-node SCC, or
-// a single self-loop node.
+// CycleEdge is one edge with both endpoints on the cycle: an intra-SCC edge
+// of a multi-node cycle, or the self-loop of a singleton cycle.
+type CycleEdge struct {
+	Src    uint32
+	Dst    uint32
+	EdgeID uint32
+}
+
+// Cycle is one circular dependency: the member list of a multi-node SCC plus
+// its intra-member edges, or a single self-loop node and its loop edge.
 type Cycle struct {
 	Nodes []uint32
+	Edges []CycleEdge
 }
 
 func (c Cycle) Len() int { return len(c.Nodes) }
 
 // Cycles returns all circular dependencies, descending by member count, then
-// ascending by smallest member ID.
+// ascending by smallest member ID. Edges includes every intra-SCC edge — the
+// perimeter plus chords — because both determine the cycle's severity.
 func Cycles(s engineSnapshot) []Cycle {
 	var cycles []Cycle
 	for c := uint32(0); c < s.SCCCount(); c++ {
 		if mem := s.SCCMembers(c); len(mem) > 1 {
-			cycles = append(cycles, Cycle{Nodes: mem})
+			cycles = append(cycles, Cycle{Nodes: mem, Edges: intraSCCEdges(s, mem)})
 		}
 	}
 	n := s.NodeCount()
 	for v := 0; v < n; v++ {
 		if s.SelfLoop(uint32(v)) {
-			cycles = append(cycles, Cycle{Nodes: []uint32{uint32(v)}})
+			cycles = append(cycles, Cycle{
+				Nodes: []uint32{uint32(v)},
+				Edges: selfLoopEdges(s, uint32(v)),
+			})
 		}
 	}
 	slices.SortFunc(cycles, func(a, b Cycle) int {
@@ -402,6 +416,44 @@ func Cycles(s engineSnapshot) []Cycle {
 		return int(a.Nodes[0]) - int(b.Nodes[0])
 	})
 	return cycles
+}
+
+// intraSCCEdges collects the edges whose endpoints are both component
+// members. CSR rows keep insertion order, so the result is explicitly sorted
+// by (src, dst, edgeID) — a canonical order independent of write sequence.
+func intraSCCEdges(s engineSnapshot, mem []uint32) []CycleEdge {
+	in := make(map[uint32]struct{}, len(mem))
+	for _, m := range mem {
+		in[m] = struct{}{}
+	}
+	var out []CycleEdge
+	for _, u := range mem { // SCCMembers are ascending
+		tg, eids, _ := s.AdjacencyF().Row(u)
+		for i, v := range tg {
+			if _, ok := in[v]; ok {
+				out = append(out, CycleEdge{Src: u, Dst: v, EdgeID: eids[i]})
+			}
+		}
+	}
+	slices.SortFunc(out, func(a, b CycleEdge) int {
+		return cmp.Or(
+			cmp.Compare(a.Src, b.Src),
+			cmp.Compare(a.Dst, b.Dst),
+			cmp.Compare(a.EdgeID, b.EdgeID),
+		)
+	})
+	return out
+}
+
+func selfLoopEdges(s engineSnapshot, v uint32) []CycleEdge {
+	tg, eids, _ := s.AdjacencyF().Row(v)
+	var out []CycleEdge
+	for i, w := range tg {
+		if w == v {
+			out = append(out, CycleEdge{Src: v, Dst: v, EdgeID: eids[i]})
+		}
+	}
+	return out
 }
 
 // ---- visited bitmap buffer pool ----

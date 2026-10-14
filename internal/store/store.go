@@ -1,11 +1,14 @@
 // Package store implements Vectra's single-file binary snapshot. Under the
 // small-graph all-in-memory assumption the disk only serves crash recovery:
 // whole-graph rewrite, rebuild CSR/SCC on load, no incremental WAL.
-// Format v2 (little-endian): "VCTR" | u16 version(2) | u32 node count | u32 edge count |
+// Format v3 (little-endian): "VCTR" | u16 version(3) | u32 node count | u32 edge count |
 // node{ key string, label string, props JSON }* | edge{ srcKey, dstKey, label, props }*
-// | u32 CRC32(IEEE, covering all preceding bytes).
+// | u32 indexKey count | key string* | u32 CRC32(IEEE, covering all preceding bytes).
 // string = u32 length + bytes; props = u32 JSON length + JSON (0 = nil).
-// v1 (no CRC trailer) remains readable; dispatched by header version.
+// The indexKey section persists the property-index declarations so a reloaded
+// graph can rebuild them at Seal time (without it, Load-based services such as
+// vectra-mcp -snapshot lose every lookup index). v2 (no indexKey section) and
+// v1 (additionally no CRC trailer) remain readable; dispatched by header version.
 package store
 
 import (
@@ -19,14 +22,16 @@ import (
 
 const (
 	magic         = "VCTR"
-	versionV2     = 2
+	versionV3     = 3
+	versionV2     = 2 // no indexKey section, read compatibility only
 	versionLegacy = 1 // no CRC trailer, read compatibility only
 	headerSize    = 6 // magic(4) + version(2); count fields start after this
 )
 
 // Node / Edge use string keys rather than internal NodeIDs: the snapshot is
 // decoupled from ID assignment order and rebuilt on load. props serialize to
-// JSON (numbers become float64 on roundtrip, a known v1 limitation).
+// JSON (numbers become float64 on roundtrip, a known limitation — see the
+// README's snapshot notes).
 type Node struct {
 	Key   string
 	Label string
@@ -38,6 +43,15 @@ type Edge struct {
 	DstKey string
 	Label  string
 	Props  map[string]any
+}
+
+// Data is the full decoded content of a snapshot: nodes, edges, and the
+// property-index declarations to re-register before Seal. IndexKeys is nil
+// for v1/v2 files (they never persisted any).
+type Data struct {
+	Nodes     []Node
+	Edges     []Edge
+	IndexKeys []string
 }
 
 // crcWriter aggregates the CRC of the written byte stream (appended as a
@@ -94,24 +108,25 @@ func writeProps(w io.Writer, props map[string]any) error {
 	return err
 }
 
-// Encode writes the whole graph to w in v2 format (CRC32 trailer).
-func Encode(w io.Writer, nodes []Node, edges []Edge) error {
+// Encode writes the whole graph to w in v3 format (indexKey section + CRC32
+// trailer).
+func Encode(w io.Writer, d Data) error {
 	cw := &crcWriter{bw: bufio.NewWriter(w)}
 	var head [4]byte
 	copy(head[:], magic)
 	if _, err := cw.Write(head[:]); err != nil {
 		return err
 	}
-	if err := binary.Write(cw, binary.LittleEndian, uint16(versionV2)); err != nil {
+	if err := binary.Write(cw, binary.LittleEndian, uint16(versionV3)); err != nil {
 		return err
 	}
-	if err := putU32(cw, uint32(len(nodes))); err != nil {
+	if err := putU32(cw, uint32(len(d.Nodes))); err != nil {
 		return err
 	}
-	if err := putU32(cw, uint32(len(edges))); err != nil {
+	if err := putU32(cw, uint32(len(d.Edges))); err != nil {
 		return err
 	}
-	for _, n := range nodes {
+	for _, n := range d.Nodes {
 		if err := writeString(cw, n.Key); err != nil {
 			return err
 		}
@@ -122,7 +137,7 @@ func Encode(w io.Writer, nodes []Node, edges []Edge) error {
 			return err
 		}
 	}
-	for _, e := range edges {
+	for _, e := range d.Edges {
 		if err := writeString(cw, e.SrcKey); err != nil {
 			return err
 		}
@@ -133,6 +148,14 @@ func Encode(w io.Writer, nodes []Node, edges []Edge) error {
 			return err
 		}
 		if err := writeProps(cw, e.Props); err != nil {
+			return err
+		}
+	}
+	if err := putU32(cw, uint32(len(d.IndexKeys))); err != nil {
+		return err
+	}
+	for _, k := range d.IndexKeys {
+		if err := writeString(cw, k); err != nil {
 			return err
 		}
 	}
@@ -197,78 +220,96 @@ func (rd *reader) props() (map[string]any, error) {
 	return m, nil
 }
 
-// Decode restores node and edge data from a snapshot. Reads fully first;
-// v2 verifies the CRC, v1 is accepted for compatibility.
-func Decode(r io.Reader) ([]Node, []Edge, error) {
+// Decode restores the snapshot content. Reads fully first; v3/v2 verify the
+// CRC; v2 and v1 are accepted for compatibility (they carry no index keys).
+func Decode(r io.Reader) (Data, error) {
 	raw, err := io.ReadAll(r)
 	if err != nil {
-		return nil, nil, err
+		return Data{}, err
 	}
 	if len(raw) < headerSize+4 {
-		return nil, nil, errTruncated
+		return Data{}, errTruncated
 	}
 	if string(raw[:4]) != magic {
-		return nil, nil, errors.New("store: bad magic")
+		return Data{}, errors.New("store: bad magic")
 	}
 	ver := binary.LittleEndian.Uint16(raw[4:6])
 	body := raw
 	switch ver {
-	case versionV2:
+	case versionV3, versionV2:
 		body = raw[:len(raw)-4]
 		want := binary.LittleEndian.Uint32(raw[len(raw)-4:])
 		if got := crc32.ChecksumIEEE(body); got != want {
-			return nil, nil, errors.New("store: CRC mismatch")
+			return Data{}, errors.New("store: CRC mismatch")
 		}
 	case versionLegacy:
 		// v1 has no CRC trailer
 	default:
-		return nil, nil, errors.New("store: unsupported version")
+		return Data{}, errors.New("store: unsupported version")
 	}
 
 	rd := &reader{b: body[headerSize:]} // header already pre-parsed
 	nn, err := rd.u32()
 	if err != nil {
-		return nil, nil, err
+		return Data{}, err
 	}
 	ne, err := rd.u32()
 	if err != nil {
-		return nil, nil, err
+		return Data{}, err
 	}
 	// Count lower bound: at least 12 fixed-size bytes per node and 16 per
 	// edge, preventing forged counts from triggering oversized preallocation
-	// (a v2 attacker can compute the CRC themselves).
+	// (a CRC'd file can be forged by anyone who computes the CRC themselves).
 	if int64(nn)*12+int64(ne)*16 > int64(len(rd.b)) {
-		return nil, nil, errTruncated
+		return Data{}, errTruncated
 	}
 	nodes := make([]Node, nn)
 	for i := range nodes {
 		if nodes[i].Key, err = rd.str(); err != nil {
-			return nil, nil, err
+			return Data{}, err
 		}
 		if nodes[i].Label, err = rd.str(); err != nil {
-			return nil, nil, err
+			return Data{}, err
 		}
 		if nodes[i].Props, err = rd.props(); err != nil {
-			return nil, nil, err
+			return Data{}, err
 		}
 	}
 	edges := make([]Edge, ne)
 	for i := range edges {
 		if edges[i].SrcKey, err = rd.str(); err != nil {
-			return nil, nil, err
+			return Data{}, err
 		}
 		if edges[i].DstKey, err = rd.str(); err != nil {
-			return nil, nil, err
+			return Data{}, err
 		}
 		if edges[i].Label, err = rd.str(); err != nil {
-			return nil, nil, err
+			return Data{}, err
 		}
 		if edges[i].Props, err = rd.props(); err != nil {
-			return nil, nil, err
+			return Data{}, err
+		}
+	}
+	var indexKeys []string
+	if ver == versionV3 {
+		nk, err := rd.u32()
+		if err != nil {
+			return Data{}, err
+		}
+		if int64(nk)*4 > int64(len(rd.b)-rd.i) { // same forged-count guard, 4 bytes per key minimum
+			return Data{}, errTruncated
+		}
+		if nk > 0 {
+			indexKeys = make([]string, nk)
+			for i := range indexKeys {
+				if indexKeys[i], err = rd.str(); err != nil {
+					return Data{}, err
+				}
+			}
 		}
 	}
 	if rd.i != len(rd.b) {
-		return nil, nil, errors.New("store: trailing garbage")
+		return Data{}, errors.New("store: trailing garbage")
 	}
-	return nodes, edges, nil
+	return Data{Nodes: nodes, Edges: edges, IndexKeys: indexKeys}, nil
 }

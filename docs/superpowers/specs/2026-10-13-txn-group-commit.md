@@ -1,6 +1,7 @@
 # Spec: TxnGroup — 事务组提交（v0.5.0）
 
-> 状态：rev2（已合入 spec 审计结论：P0-1 slot 约定、P1-2 batcher 边界、P1-3 混布破坏面、P1-4 appliedIndex/metrics 规则与 effectiveWriteSet 禁令；composite 编码数学经对抗推演确认成立）
+> 状态：**withdrawn（2026-10-14 用户批准撤回，Task 1-7 不派发）**——Task 0 闸门 + Task 0b 重诊双证据（§4/§4.2）：瓶颈为 dev 机 fsync 延迟与客户端 RYW 轮询，组提交 2ms 窗口在闭环保守负载下与 drain 周期结构性冗余，验收线在本硬件算术不可达。v0.5.0 重定范围为 RYW await 端点 + Linux 存储重定基线（见 `2026-10-14-ryw-await.md`）。本文档保留为有据负结果。
+> 状态历史：rev2（已合入 spec 审计结论：P0-1 slot 约定、P1-2 batcher 边界、P1-3 混布破坏面、P1-4 appliedIndex/metrics 规则与 effectiveWriteSet 禁令；composite 编码数学经对抗推演确认成立）
 > 日期：2026-10-13
 > 依据：组提交调研（hashicorp/raft v1.8 机制、etcd/Calvin/Aria/MySQL/PG 先例、YugabyteDB 单条日志多写先例）+ 增量发布调研（GART/LSMGraph/Aspen，作未来工作）+ v0.4.0 基准（docs/benchmarks/2026-10-13-oltp-txn.md）
 
@@ -122,6 +123,34 @@ expvar 新增：`vectra_txn_group_batches`（派发的组条目数）、`vectra_
 ## 4. 诊断先行（Plan Task 0，调研强调）
 
 实现前先证实"批=1"假设：在 bench 或 dev 模式暴露 raft-boltdb `logsPerBatch`/`numTx` 统计，S 档 16 worker 跑 txnsi 记录 raft StoreLogs 批分布。若批已 >1 而 TPS 仍 500，停止本设计、重诊瓶颈（FSM bolt fsync / 上游锁），把结论写回 spec。**这是闸门任务，不许跳过。**
+
+### 4.1 Task 0 实测结果（2026-10-13，feat/txn-group-commit @ dd2d094）：闸门触发，实现停止
+
+- **测量方法**：bench http 模式在 `server.New` 之前安装 go-metrics inmem sink（10s 间隔/1min 保留，全局实例替换黑洞默认 sink），工作负载循环前后双快照差分取 txnsi 压测段 `raft.boltdb.logsPerBatch` 聚合（metric 源头 raft-boltdb v2.4.2 `bolt_store.go:217`，每次 `StoreLogs` 一个样本；方法论经独立评审对照 go-metrics/raft-boltdb 源码逐层核验）。
+- **数据**（S 档 / http / 16 worker / txnsi / 10s / seed=42，两次运行互证，0 err / 0 OCC 冲突）：
+
+| run | logsPerBatch 段均值 | samples | txnsi 提交 QPS | p50 |
+|---|---|---|---|---|
+| 1 | **5.51** | 1,055 | **578.5**（5,785 ops） | 26.55ms |
+| 2 | **5.69** | 1,047 | **593.1**（5,931 ops） | 25.99ms |
+
+- **自洽校验**：Σlogs ≈ 5.51×1055 ≈ 5,813 ≈ 压测段提交事务数（含 ~19 笔单 worker warmup）——每事务恰 1 条 raft 日志、~1,055 次 `StoreLogs`，批均值 5.5 可信（两次运行偏差 <4%）。
+- **判定**：段均值 >1.5 且 TPS 仍 ~500，两个停止条件**同时成立**——"批=1"假设被推翻。leader 的机会主义 drain 批已经把 ~5.5 条已提交日志合入每次 `StoreLogs`（~100 批/s × ~5.5 条/批 ≈ 550 事务/s）：fsync 摊销已天然发生，吞吐上限落在**每批流水线成本**（批周期 ~10ms：FSM apply 侧 bolt fsync / apply-发布串行点 / 上游单写者），而非日志批稀疏。
+- **后果**：§1 的瓶颈模型（"每事务一条 raft 日志一次 fsync"为主瓶颈）不成立，按闸门规则 **v0.5.0 TxnGroup 组提交停止实现**（Task 1-7 不派发）。
+- **待重诊**（瓶颈在别处）：FSM apply 侧 bolt fsync 计时与批周期分解、apply/发布路径串行点、上游锁竞争 profile。重诊结论决定下一步形态：修正后的组提交设计（若能进一步摊薄每批周期）、§8 的 raft 调参 + BatchingFSM 路线，或 FSM 持久化层改造。原始输出存 `.superpowers/sdd/2026-10-13-txn-group-commit/task-0-bench-output*.txt`。
+
+### 4.2 Task 0b 重诊结果（2026-10-14）：瓶颈为 dev 机 fsync 延迟 + 客户端 RYW 轮询，组提交机制结构性冗余
+
+三路独立测量（完整数据与原始输出：`.superpowers/sdd/2026-10-13-txn-group-commit/task-0b-rediagnosis.md`；S 档/http/16w/txnsi/10s/seed42 三次运行互证，偏差 <4%）：
+
+1. **bolt StoreLogs 微基准**（M5 Pro/APFS）：每次调用 ≈ **7ms，与批大小基本无关**（1→256 条仅 +14%）——单次 bolt 提交+fsync 固定延迟主导。批周期 ~10ms = 7ms StoreLogs + ~3ms 流水线其余；97 批/s × 7ms ≈ 68% leader-loop 占空比，批率已贴 fsync 上限。
+2. **客户端相位分解**（p50 ≈ 26.5ms）：read 0.65ms（2.5%）+ commit 15.6ms（59%，= 半周期排队 ~5ms + 一个完整批周期 ~10ms）+ **RYW 等待 11.1ms（42%，= 10ms 客户端轮询量化 + ~1-3ms 发布滞后）**。三相位和与闭环保守律 TPS = 16/26.5ms ≈ 604 均与实测吻合（578-594）。
+3. **算术判定**：2,700/s @16w 需每 op ≤5.93ms，**低于本机 fsync 下限 7ms**——即使 read 与 RYW 为零，16/7ms = 2,286/s。任何保持每派发周期一次持久 fsync 的设计（即任何保持久性的设计）在本硬件上不可达。drain 周期（10ms）在闭环保守负载下自然收集全部到达（预测 16×10/26.5 ≈ 6.0/批，实测 5.5-5.7 ✓）；**2ms 显式窗口 < 自然周期，攒不出更大的批——TxnGroup 的核心机制在本 regime 结构性冗余**（组提交只在日志速率受限的 regime 有增益，本负载是延迟受限）。
+
+**结论与建议**（按 §4.1 的三岔决策，三者皆非——瓶颈不在此三者）：
+- **撤回 Task 1-7**（维持不派发），本 spec 保留为有据负结果（Task 0 + 0b 双证据）；
+- v0.5.0 重定范围为：(a) **RYW await/长轮询端点**（§9 未来工作上提——最大单点杠杆：11.1ms → ~2ms，TPS → ~950/s，+60%，无正确性风险）；(b) **Linux 级存储重定基线**后再决定是否需要任何服务端攒批（生产 NVMe fsync 0.2-1ms → 批周期 ~1-3ms，配 await 后 ~4,000/s，5× 验收线在生产级存储上可达）；
+- 重定范围决策属发布门，升级用户定夺。
 
 ## 5. 测试计划（矩阵，含审计 P2-6 补项）
 

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,23 +15,26 @@ import (
 )
 
 // stubTxnServer serves GET /v1/neighbors (snapshot header + neighbor keys),
-// POST /v1/txn (commits at index 7), and GET /v1/stats according to small
+// POST /v1/txn (commits at index 7), and GET /v1/await according to small
 // scripts: snapshots, txn outcomes, and publishedSeq values are consumed per
-// call in order; exhausted scripts stick to their last entry. An empty seqs
-// script means "already published" (publishedSeq 100 >= index 7). Captured
-// txn bodies are exposed via posts() for assertions.
+// call in order; exhausted scripts stick to their last entry. The await
+// handler answers immediately with the scripted seq and reached =
+// seq >= requested (the real endpoint blocks; the client loop re-issues,
+// so call counts preserve the RYW-etiquette semantics under test). An empty
+// seqs script means "already published" (publishedSeq 100 >= index 7).
+// Captured txn bodies are exposed via posts() for assertions.
 type stubTxnServer struct {
 	*httptest.Server
 	mu         sync.Mutex
 	snapshots  []string  // per neighbors-call X-Vectra-Snapshot values
 	outcomes   []int     // per txn-call status codes
-	seqs       []float64 // per stats-poll publishedSeq values
+	seqs       []float64 // per await-call publishedSeq values
 	snapIdx    int
 	txnIdx     int
 	seqIdx     int
 	bodies     []txnRequestBody
 	neighbors  atomic.Int64
-	statsPolls atomic.Int64
+	awaitCalls atomic.Int64
 }
 
 func newStubTxnServer(t *testing.T, snapshots []string, outcomes []int, seqs []float64) *stubTxnServer {
@@ -48,7 +52,8 @@ func newStubTxnServer(t *testing.T, snapshots []string, outcomes []int, seqs []f
 			s.neighbors.Add(1)
 			w.Header().Set("X-Vectra-Snapshot", snap)
 			fmt.Fprint(w, `{"nodes":[{"key":"nbr-a","label":"Svc","props":{}},{"key":"nbr-b","label":"Svc","props":{}}]}`)
-		case "/v1/stats":
+		case "/v1/await":
+			want, _ := strconv.ParseFloat(r.URL.Query().Get("seq"), 64)
 			s.mu.Lock()
 			seq := 100.0
 			if len(s.seqs) > 0 {
@@ -58,8 +63,8 @@ func newStubTxnServer(t *testing.T, snapshots []string, outcomes []int, seqs []f
 				}
 			}
 			s.mu.Unlock()
-			s.statsPolls.Add(1)
-			fmt.Fprintf(w, `{"publishedSeq":%v,"nodes":10,"edges":20}`, seq)
+			s.awaitCalls.Add(1)
+			fmt.Fprintf(w, `{"publishedSeq":%v,"reached":%t}`, seq, seq >= want)
 		case "/v1/txn":
 			var body txnRequestBody
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -105,9 +110,9 @@ func TestNewTxnOpHappyPath(t *testing.T) {
 	if stats.Conflicts.Load() != 0 || stats.Retries.Load() != 0 {
 		t.Errorf("conflicts = %d, retries = %d, want 0/0", stats.Conflicts.Load(), stats.Retries.Load())
 	}
-	// Default stats script is already-published: exactly one RYW poll.
-	if got := srv.statsPolls.Load(); got != 1 {
-		t.Errorf("stats polls = %d, want 1", got)
+	// Default stats script is already-published: exactly one await round trip.
+	if got := srv.awaitCalls.Load(); got != 1 {
+		t.Errorf("await calls = %d, want 1", got)
 	}
 
 	posts := srv.posts()
@@ -204,17 +209,17 @@ func TestNewTxnOpPersistentConflict(t *testing.T) {
 	if stats.Retries.Load() != maxTxnAttempts-1 {
 		t.Errorf("retries = %d, want %d", stats.Retries.Load(), maxTxnAttempts-1)
 	}
-	// 409 paths never commit, so they must never poll stats (RYW waits
+	// 409 paths never commit, so they must never await (RYW waits
 	// happen only after successful commits).
-	if got := srv.statsPolls.Load(); got != 0 {
-		t.Errorf("stats polls = %d, want 0 (conflict path must not poll)", got)
+	if got := srv.awaitCalls.Load(); got != 0 {
+		t.Errorf("await calls = %d, want 0 (conflict path must not await)", got)
 	}
 }
 
 func TestNewTxnOpWaitsForPublish(t *testing.T) {
 	// The commit lands at index 7 but publishedSeq only crosses it on the
-	// third poll (5 → 6 → 7): the op must keep polling instead of returning
-	// straight after the 200, per the documented RYW etiquette.
+	// third await answer (5 → 6 → 7): the op must keep awaiting instead of
+	// returning straight after the 200, per the documented RYW etiquette.
 	srv := newStubTxnServer(t, []string{"42"}, []int{http.StatusOK}, []float64{5, 6, 7})
 	var stats TxnStats
 	op := NewTxnOp(srv.Client(), srv.URL, func() string { return "start-1" }, false, 2, &stats)
@@ -225,14 +230,14 @@ func TestNewTxnOpWaitsForPublish(t *testing.T) {
 	if stats.Commits.Load() != 1 {
 		t.Errorf("commits = %d, want 1", stats.Commits.Load())
 	}
-	if got := srv.statsPolls.Load(); got != 3 {
-		t.Errorf("stats polls = %d, want 3 (poll until publishedSeq >= commit index)", got)
+	if got := srv.awaitCalls.Load(); got != 3 {
+		t.Errorf("await calls = %d, want 3 (re-await until publishedSeq >= commit index)", got)
 	}
 }
 
 func TestNewTxnOpAlreadyPublished(t *testing.T) {
 	// publishedSeq (99) already covers the commit index (7): the wait
-	// resolves on the very first poll.
+	// resolves on the very first await.
 	srv := newStubTxnServer(t, []string{"42"}, []int{http.StatusOK}, []float64{99})
 	var stats TxnStats
 	op := NewTxnOp(srv.Client(), srv.URL, func() string { return "start-1" }, false, 2, &stats)
@@ -243,15 +248,17 @@ func TestNewTxnOpAlreadyPublished(t *testing.T) {
 	if stats.Commits.Load() != 1 {
 		t.Errorf("commits = %d, want 1", stats.Commits.Load())
 	}
-	if got := srv.statsPolls.Load(); got != 1 {
-		t.Errorf("stats polls = %d, want exactly 1 when already published", got)
+	if got := srv.awaitCalls.Load(); got != 1 {
+		t.Errorf("await calls = %d, want exactly 1 when already published", got)
 	}
 }
 
 func TestNewTxnOpPublishWaitCapExpiry(t *testing.T) {
 	// publishedSeq never catches up: the wait must give up at the cap
 	// (overridden small for the test; the production default stays 5s) and
-	// the op still returns nil — etiquette, not a correctness gate.
+	// the op still returns nil — etiquette, not a correctness gate. The stub
+	// answers awaits instantly (the real endpoint blocks), so the client loop
+	// re-issues until the cap.
 	srv := newStubTxnServer(t, []string{"42"}, []int{http.StatusOK}, []float64{0})
 	var stats TxnStats
 	const waitCap = 50 * time.Millisecond
@@ -264,8 +271,8 @@ func TestNewTxnOpPublishWaitCapExpiry(t *testing.T) {
 	if elapsed := time.Since(start); elapsed < waitCap {
 		t.Errorf("elapsed = %v, want >= %v (cap respected before giving up)", elapsed, waitCap)
 	}
-	if got := srv.statsPolls.Load(); got < 2 {
-		t.Errorf("stats polls = %d, want >= 2 (kept polling until the cap)", got)
+	if got := srv.awaitCalls.Load(); got < 2 {
+		t.Errorf("await calls = %d, want >= 2 (kept awaiting until the cap)", got)
 	}
 	if stats.Commits.Load() != 1 {
 		t.Errorf("commits = %d, want 1", stats.Commits.Load())
@@ -314,9 +321,9 @@ func TestTxnStatsConcurrent(t *testing.T) {
 				return
 			}
 			fmt.Fprint(w, `{"committed":true,"index":1}`)
-		case "/v1/stats":
-			// Always published (5 >= 1): one cheap poll per commit.
-			fmt.Fprint(w, `{"publishedSeq":5}`)
+		case "/v1/await":
+			// Always published (5 >= 1): one instant await per commit.
+			fmt.Fprint(w, `{"publishedSeq":5,"reached":true}`)
 		default:
 			http.NotFound(w, r)
 		}

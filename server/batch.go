@@ -11,8 +11,12 @@ const batchVersion = 3
 // NodeUpsert / EdgeUpsert are the atomic items of a changeset. Semantics:
 // an existing node key updates its props; edges upsert by their
 // (srcKey, dstKey, label) key — the most recent edge with the same key is
-// replaced in place and extra parallels collapse. Multigraph parallel
-// appends remain available via the embedded AddEdge API.
+// replaced in place and extra parallels collapse (last write wins on props).
+// AllowParallel=true opts an edge out of upsert: it is appended as a true
+// parallel edge (embedded AddEdge semantics) for pairs carrying several
+// semantically distinct relations (e.g. multiple injection points between
+// the same components). Multigraph parallel appends are also available via
+// the embedded AddEdge API directly.
 type NodeUpsert struct {
 	Key   string
 	Label string
@@ -20,10 +24,11 @@ type NodeUpsert struct {
 }
 
 type EdgeUpsert struct {
-	SrcKey string
-	DstKey string
-	Label  string
-	Props  map[string]any
+	SrcKey        string
+	DstKey        string
+	Label         string
+	Props         map[string]any
+	AllowParallel bool // zero value = upsert collapse (pre-0.5 behavior); gob/JSON additive
 }
 
 // EdgeDelete addresses edges by their logical key (srcKey, dstKey, label) —

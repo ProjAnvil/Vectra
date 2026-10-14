@@ -18,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -26,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	gometrics "github.com/hashicorp/go-metrics"
 	"github.com/projanvil/vectra"
 	"github.com/projanvil/vectra/server"
 	"github.com/projanvil/vectra/server/internal/bench"
@@ -102,10 +104,20 @@ func main() {
 	var baseURL string
 	var httpc *http.Client
 	var node *server.Node
+	// Non-nil in http mode: captures hashicorp/go-metrics samples emitted by
+	// the raft stack (see the http case below and logsPerBatch usage in the
+	// workload loop).
+	var sink *gometrics.InmemSink
 	switch *mode {
 	case "engine":
 		queryGraph = injectEngine(rep, bg)
 	case "http":
+		// hashicorp/raft and raft-boltdb report metrics through the
+		// hashicorp/go-metrics global instance, whose default sink discards
+		// everything. Install an inmem sink before server.New builds the raft
+		// stack so raft.boltdb.logsPerBatch samples are retained.
+		sink = gometrics.NewInmemSink(10*time.Second, time.Minute)
+		_, _ = gometrics.NewGlobal(&gometrics.Config{EnableHostname: false, FilterDefault: true}, sink)
 		var wantNodes, wantEdges int
 		baseURL, httpc, node, wantNodes, wantEdges = injectHTTP(rep, bg, dir, *sealInterval, *keep)
 		defer node.Close()
@@ -152,6 +164,13 @@ func main() {
 			fmt.Fprintln(os.Stderr, "note: no requested workloads available in this mode; nothing to run")
 		}
 	}
+	// Two-snapshot diff: the inmem sink cannot be cleared and keeps rolling
+	// intervals spanning injection as well, so capture the logsPerBatch
+	// aggregates right before the workload loop and again after it; the phase
+	// mean is the delta. In http-only-workload runs (e.g. WORKLOADS=txnsi)
+	// this isolates the transaction-commit batches from injection.
+	count0, sum0 := logsPerBatch(sink)
+	timers0 := sinkTimers(sink)
 	for _, w := range selected {
 		bench.RunWorkload(w.name, w.op, 1, *warmup) // Warmup discarded
 		if ts := txnStats[w.name]; ts != nil {
@@ -160,7 +179,44 @@ func main() {
 		res := bench.RunWorkload(w.name, w.op, *workers, *duration)
 		fmt.Fprintf(os.Stderr, "  %-10s ops=%-7d p50=%-9s p99=%s\n",
 			res.Name, res.Ops, bench.FormatDur(res.P50), bench.FormatDur(res.P99))
+		if ts := txnStats[w.name]; ts != nil {
+			rd, cm, wt := ts.PhaseMeans()
+			fmt.Fprintf(os.Stderr, "  %-10s phases: read=%s commit=%s rywWait=%s (wait per commit, others per attempt)\n",
+				res.Name, bench.FormatDur(rd), bench.FormatDur(cm), bench.FormatDur(wt))
+		}
 		rep.Results = append(rep.Results, res)
+	}
+	if n, sum := logsPerBatch(sink); n-count0 > 0 {
+		fmt.Fprintf(os.Stderr, "raft logsPerBatch (txnsi phase): mean=%.2f samples=%.0f\n",
+			(sum-sum0)/(n-count0), n-count0)
+	}
+	// Server-side pipeline decomposition over the same phase window: timers
+	// the raft stack emits through go-metrics (values are milliseconds).
+	// dispatchLog covers the leader loop's store-and-dispatch step (bolt
+	// StoreLogs + fsync live here); commitTime measures dispatch→committed
+	// per log; fsm.enqueue measures FSM handoff. NOTE: raft stamps a zero
+	// dispatch time on barrier/config entries, whose elapsed overflows
+	// float32 to +Inf — Inf−Inf makes the phase-diff mean NaN; counts stay
+	// valid (cross-check: dispatchLog count ≈ StoreLogs batches, commitTime
+	// count ≈ logs). NaN means are skipped, not errors.
+	timers1 := sinkTimers(sink)
+	for _, name := range []string{"raft.leader.dispatchLog", "raft.commitTime", "raft.fsm.enqueue"} {
+		a, ok0 := timers0[name]
+		b, ok1 := timers1[name]
+		if !ok1 {
+			continue
+		}
+		if !ok0 {
+			a = sampleAgg{}
+		}
+		if n := b.count - a.count; n > 0 {
+			mean := (b.sum - a.sum) / n
+			if math.IsNaN(mean) || math.IsInf(mean, 0) {
+				fmt.Fprintf(os.Stderr, "%s (phase): samples=%.0f (mean unavailable: Inf-poisoned samples)\n", name, n)
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "%s (phase): mean=%.2fms samples=%.0f\n", name, mean, n)
+		}
 	}
 
 	// 5. Output
@@ -273,6 +329,51 @@ func injectHTTP(rep *report, bg *bench.Graph, dir string, sealInterval time.Dura
 	flush()
 	rep.InjectEdgesPerS = rate(len(bg.Edges), time.Since(t0))
 	return base, client, n, wantNodes, wantEdges
+}
+
+// logsPerBatch sums the raft.boltdb.logsPerBatch sample aggregates retained
+// by the inmem sink across all intervals: (count, sum). The sink keeps a
+// rolling window and cannot be cleared, so callers isolate a phase by taking
+// two snapshots and diffing. Returns (0, 0) in engine mode (no sink
+// installed). Do NOT substitute bolt page statistics — bbolt's Stats() has no
+// notion of logs per batch; this metric comes from raft-boltdb via
+// go-metrics samples.
+func logsPerBatch(sink *gometrics.InmemSink) (count, sum float64) {
+	if sink == nil {
+		return 0, 0
+	}
+	for _, im := range sink.Data() {
+		if sv, ok := im.Samples["raft.boltdb.logsPerBatch"]; ok {
+			count += float64(sv.Count)
+			sum += sv.Sum
+		}
+	}
+	return count, sum
+}
+
+// sampleAgg is the (count, sum) pair of one go-metrics sample series over
+// the sink's retained intervals.
+type sampleAgg struct {
+	count, sum float64
+}
+
+// sinkTimers snapshots every sample series the inmem sink retained, keyed by
+// metric name (values as emitted: timers are milliseconds, counters/logsPerBatch
+// are dimensionless). Two snapshots diff into a phase window.
+func sinkTimers(sink *gometrics.InmemSink) map[string]sampleAgg {
+	if sink == nil {
+		return nil
+	}
+	out := make(map[string]sampleAgg)
+	for _, im := range sink.Data() {
+		for name, sv := range im.Samples {
+			a := out[name]
+			a.count += float64(sv.Count)
+			a.sum += sv.Sum
+			out[name] = a
+		}
+	}
+	return out
 }
 
 func upsertNodes(nodes []bench.Node) []server.NodeUpsert {

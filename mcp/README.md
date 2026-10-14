@@ -12,7 +12,7 @@ Vectra ships first-class [Model Context Protocol](https://modelcontextprotocol.i
 
 | Tool | Kind | Description |
 |---|---|---|
-| `inject_batch` | write | Upsert nodes/edges (props supported) |
+| `inject_batch` | write | Upsert nodes/edges (props supported); `allowParallel: true` on an edge appends a parallel edge instead of upsert-collapse |
 | `seal` (Go only) | write | Build query indexes; graph becomes queryable |
 | `stats` | read | nodes/edges/SCCs/cyclic-nodes |
 | `get_node` | read | Node by key |
@@ -20,7 +20,7 @@ Vectra ships first-class [Model Context Protocol](https://modelcontextprotocol.i
 | `bfs` | read | **Multi-hop** (1..maxDepth, 0 = unlimited), returns per-node depth |
 | `shortest_path` | read | Bidirectional BFS path |
 | `reachable` | read | Blast radius from a node |
-| `cycles` | read | Dependency cycles, largest first |
+| `cycles` | read | Dependency cycles, largest first, with per-cycle edges (src/dst/label) |
 | `lookup_property` (Go only) | read | Property-index lookup (env/team/tier…) |
 
 ## Go (embedded engine)
@@ -48,7 +48,9 @@ Claude Desktop (`claude_desktop_config.json`):
 }
 ```
 
-Writes accumulate; call `seal` once after `inject_batch` to make the graph queryable (the tool error message reminds the agent if it forgets). Property keys seen during injection are auto-indexed at seal time.
+Writes accumulate; call `seal` once after `inject_batch` to make the graph queryable (the tool error message reminds the agent if it forgets). Property keys seen during injection are auto-indexed at seal time, and the snapshot file (store v3) persists index declarations — `lookup_property` works immediately after a `-snapshot` restart, no re-injection needed. Post-restart injections extend the persisted graph; each `seal` re-saves the file. Writing again after a seal re-opens a writable copy of the published state: until the next seal, queries keep serving the previous published view (bounded-stale reads, the same model as the server module).
+
+**Parameter naming convention** (spelled out because agents guess on first call): a single node is `key`; traversal endpoints are `from`/`to` (`bfs` takes a list in `from`); property lookup uses the `propKey`/`propValue` pair; shared controls are `direction` (`"out"` default | `"in"`), `label`/`labels`, `limit` (default 1000), `maxDepth` (0 = unlimited).
 
 ## Python (wraps the HTTP API)
 
