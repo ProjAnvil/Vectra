@@ -87,7 +87,7 @@ v0.4 起服务端在同一条 raft 日志上支持**交互式乐观事务**—�
 | `GET /v1/reachable` | `from` + 返回的全部键 |
 | `/v1/path`、`/v1/stats`、`/v1/cycles` | 仅 SI——全图/依赖边界的读取无法做 SER 验证 |
 
-**重试礼仪。** 收到 409：full-jitter 指数退避 `sleep = rand(0, min(500ms, 5ms·2^attempt))`（参考 [AWS Exponential Backoff and Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)），重读取刷新 token，再提交。读己之写：轮询 `GET /v1/stats` 直到 `publishedSeq >= 提交响应里的 index`。
+**重试礼仪。** 收到 409：full-jitter 指数退避 `sleep = rand(0, min(500ms, 5ms·2^attempt))`（参考 [AWS Exponential Backoff and Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)），重读取刷新 token，再提交。读己之写（v0.5）：`GET /v1/await?seq=<index>&timeoutMs=5000`——服务端长轮询，本副本发布覆盖到提交序号即返回 `{publishedSeq, reached}`（附 `X-Vectra-Snapshot` 头）；`reached:false` 则重发。轮询 `GET /v1/stats` 保留为 0.5 之前版本的兼容回退。S 档 16w txnsi：~542 → ~846 提交/s，RYW 等待 11.1ms → ~3.1ms（docs/benchmarks/2026-10-14-ryw-await.md）。
 
 **开销口径。** v0.4.0 以 fsm 级基准验收（`server/txn_bench_test.go` 的 `BenchmarkFSMAutoCommit` / `TxnSI` / `TxnSER16`——直接驱动 `fsm.Apply`，`Snapshot = ^uint64(0)` 使验证永不冲突）：AutoCommit **34.9µs** · TxnSI **28.6µs** · TxnSER16 **38.6µs**（AutoCommit/SER16 为 17 节点批次，TxnSI 为 1 节点批次；Apple M5 Pro）——16 键读集下 SI/SER 与自动提交差距 <25%（SER16 约 +11%）。vectra-bench 已内置 HTTP 级 `txnsi`/`txnser` 负载（`-mode http -workloads txnsi,txnser`）：S 档近线性扩展（1 → 16 worker：51 → 542 提交/s，SER 冲突 ≤ 4.3%）；大档位上遵守 RYW 礼仪的吞吐受发布周期支配（SealInterval + clone/Seal）——规模/间隔/并发的完整矩阵见 `docs/benchmarks/2026-10-13-oltp-txn.md`。
 
