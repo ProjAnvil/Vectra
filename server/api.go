@@ -65,6 +65,7 @@ func (n *Node) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/nodes/{key}", n.handleNode)
 	mux.HandleFunc("GET /v1/neighbors", n.handleNeighbors)
 	mux.HandleFunc("POST /v1/query", n.handleQuery)
+	mux.HandleFunc("POST /v1/cypher", n.handleCypher)
 	mux.HandleFunc("GET /v1/reachable", n.handleReachable)
 	mux.HandleFunc("GET /v1/path", n.handlePath)
 	mux.HandleFunc("GET /v1/cycles", n.handleCycles)
@@ -439,6 +440,42 @@ func (n *Node) handleQuery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"count": res.Count(), "nodes": out, "layers": layers})
+}
+
+// cypherRequest is the request body of POST /v1/cypher.
+type cypherRequest struct {
+	Query string `json:"query"`
+}
+
+// handleCypher runs one Cypher-subset statement against the published
+// snapshot. Parse/semantic errors are client errors (400 PARSE); execution
+// failures are 500.
+func (n *Node) handleCypher(w http.ResponseWriter, r *http.Request) {
+	var req cypherRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "bad request body: "+err.Error())
+		return
+	}
+	if req.Query == "" {
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "missing query")
+		return
+	}
+	g := n.graph(w)
+	if g == nil {
+		return
+	}
+	n.queryCount.Add(1)
+	res, err := g.Cypher(req.Query)
+	if err != nil {
+		var ce *vectra.CypherError
+		if errors.As(err, &ce) {
+			writeErr(w, http.StatusBadRequest, "PARSE", err.Error())
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "INTERNAL", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"columns": res.Columns, "rows": res.Rows, "count": len(res.Rows)})
 }
 
 func (n *Node) handleReachable(w http.ResponseWriter, r *http.Request) {
