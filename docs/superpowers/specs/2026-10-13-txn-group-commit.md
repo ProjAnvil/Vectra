@@ -1,6 +1,7 @@
 # Spec: TxnGroup — 事务组提交（v0.5.0）
 
-> 状态：rev2（已合入 spec 审计结论：P0-1 slot 约定、P1-2 batcher 边界、P1-3 混布破坏面、P1-4 appliedIndex/metrics 规则与 effectiveWriteSet 禁令；composite 编码数学经对抗推演确认成立）
+> 状态：**withdrawn（2026-10-14 用户批准撤回，Task 1-7 不派发）**——Task 0 闸门 + Task 0b 重诊双证据（§4/§4.2）：瓶颈为 dev 机 fsync 延迟与客户端 RYW 轮询，组提交 2ms 窗口在闭环保守负载下与 drain 周期结构性冗余，验收线在本硬件算术不可达。v0.5.0 重定范围为 RYW await 端点 + Linux 存储重定基线（见 `2026-10-14-ryw-await.md`）。本文档保留为有据负结果。
+> 状态历史：rev2（已合入 spec 审计结论：P0-1 slot 约定、P1-2 batcher 边界、P1-3 混布破坏面、P1-4 appliedIndex/metrics 规则与 effectiveWriteSet 禁令；composite 编码数学经对抗推演确认成立）
 > 日期：2026-10-13
 > 依据：组提交调研（hashicorp/raft v1.8 机制、etcd/Calvin/Aria/MySQL/PG 先例、YugabyteDB 单条日志多写先例）+ 增量发布调研（GART/LSMGraph/Aspen，作未来工作）+ v0.4.0 基准（docs/benchmarks/2026-10-13-oltp-txn.md）
 

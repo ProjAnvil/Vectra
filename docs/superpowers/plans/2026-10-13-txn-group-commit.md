@@ -1,5 +1,7 @@
 # v0.5.0: TxnGroup 组提交实现计划
 
+> **状态：WITHDRAWN（2026-10-14）**——Task 0 闸门触发（logsPerBatch 均值 5.5）+ Task 0b 重诊（spec §4.2）：验收线在本硬件算术不可达，机制结构性冗余。Task 1-7 永不派发；本计划保留作历史记录。继任计划：`2026-10-14-ryw-await.md`。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** leader 侧 batcher 把并发 `/v1/txn` 攒成一条 raft 日志（多个子事务，一次 fsync），S 档 16w 提交 QPS ≥ v0.4.0 的 5×（≥2,700/s），单请求延迟无回归（p50 增量 <1ms）。
