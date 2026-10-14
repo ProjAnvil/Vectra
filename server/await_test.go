@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -62,5 +65,87 @@ func TestWaitPublishedTimeoutReturnsCurrentSeq(t *testing.T) {
 	}
 	if elapsed := time.Since(t0); elapsed < 25*time.Millisecond {
 		t.Fatalf("returned early: %v", elapsed)
+	}
+}
+
+// ---- GET /v1/await ----
+
+func TestAwaitEndpoint(t *testing.T) {
+	tc := newTestCluster(t, 1)
+	tn := tc.nodes[0]
+	// one write so publishedSeq > 0 and stable
+	postJSON(t, tn.URL()+"/v1/batch", map[string]any{
+		"nodes": []map[string]any{{"key": "a", "label": "S"}},
+	})
+	cur := tn.node.fsm.PublishedSeq()
+	if cur == 0 {
+		t.Fatal("precondition: something published")
+	}
+
+	// satisfied: returns immediately
+	resp, out := getJSON(t, tn.URL()+"/v1/await?seq="+strconv.FormatUint(cur, 10))
+	if resp.StatusCode != http.StatusOK || out["reached"] != true {
+		t.Fatalf("satisfied await = %d %v", resp.StatusCode, out)
+	}
+	if resp.Header.Get("X-Vectra-Snapshot") != strconv.FormatUint(cur, 10) {
+		t.Fatalf("X-Vectra-Snapshot = %q, want %d", resp.Header.Get("X-Vectra-Snapshot"), cur)
+	}
+
+	// unsatisfied with a short timeout: reached=false, takes >= timeout
+	t0 := time.Now()
+	resp, out = getJSON(t, tn.URL()+"/v1/await?seq="+strconv.FormatUint(cur+5, 10)+"&timeoutMs=80")
+	if resp.StatusCode != http.StatusOK || out["reached"] != false {
+		t.Fatalf("unsatisfied await = %d %v", resp.StatusCode, out)
+	}
+	if time.Since(t0) < 70*time.Millisecond {
+		t.Fatalf("await returned early: %v", time.Since(t0))
+	}
+
+	// bad params
+	resp, _ = getJSON(t, tn.URL()+"/v1/await")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("missing seq = %d, want 400", resp.StatusCode)
+	}
+	resp, _ = getJSON(t, tn.URL()+"/v1/await?seq=1&timeoutMs=-1")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("negative timeoutMs = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestAwaitWakesOnLateWrite(t *testing.T) {
+	tc := newTestCluster(t, 1)
+	tn := tc.nodes[0]
+	postJSON(t, tn.URL()+"/v1/batch", map[string]any{
+		"nodes": []map[string]any{{"key": "a", "label": "S"}},
+	})
+	cur := tn.node.fsm.PublishedSeq()
+
+	type out struct {
+		Reached      bool    `json:"reached"`
+		PublishedSeq float64 `json:"publishedSeq"`
+	}
+	resCh := make(chan out, 1)
+	go func() {
+		resp, err := http.Get(tn.URL() + "/v1/await?seq=" + strconv.FormatUint(cur+1, 10) + "&timeoutMs=5000")
+		if err != nil {
+			resCh <- out{}
+			return
+		}
+		defer resp.Body.Close()
+		var o out
+		_ = json.NewDecoder(resp.Body).Decode(&o)
+		resCh <- o
+	}()
+	time.Sleep(100 * time.Millisecond)
+	postJSON(t, tn.URL()+"/v1/batch", map[string]any{
+		"nodes": []map[string]any{{"key": "b", "label": "S"}},
+	})
+	select {
+	case o := <-resCh:
+		if !o.Reached {
+			t.Fatalf("await did not wake on publish: %+v", o)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("await never returned")
 	}
 }
