@@ -218,18 +218,18 @@ func TestExportSealedMatchesSave(t *testing.T) {
 	}
 }
 
-// ---- snapshot format v2: CRC integrity ----
+// ---- snapshot format v3: CRC integrity ----
 
-func TestSnapshotCRCv2Roundtrip(t *testing.T) {
+func TestSnapshotCRCv3Roundtrip(t *testing.T) {
 	g := buildCyclic(t)
 	var buf bytes.Buffer
 	if err := g.Save(&buf); err != nil {
 		t.Fatal(err)
 	}
 	data := buf.Bytes()
-	// version = 2
-	if data[4] != 2 || data[5] != 0 {
-		t.Errorf("version bytes = %d/%d, want 2/0", data[4], data[5])
+	// version = 3
+	if data[4] != 3 || data[5] != 0 {
+		t.Errorf("version bytes = %d/%d, want 3/0", data[4], data[5])
 	}
 	g2, err := vectra.Load(bytes.NewReader(data))
 	if err != nil {

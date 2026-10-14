@@ -219,6 +219,21 @@ func (s *Snapshot) LookupIndex(key, value string) ([]uint32, bool) {
 	return out, true
 }
 
+// IndexedKeys returns the property keys indexes were built for at Seal time,
+// ascending (nil when none) — the declarations a snapshot file must persist so
+// a reloaded graph can rebuild its indexes.
+func (s *Snapshot) IndexedKeys() []string {
+	if len(s.indexes) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(s.indexes))
+	for k := range s.indexes {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
 // ExportNodes / ExportEdges return the raw record slices (shared references,
 // read-only contract).
 func (s *Snapshot) ExportNodes() []NodeRec { return s.nodes }
