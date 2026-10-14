@@ -41,7 +41,9 @@ def _limit(keys: list[str], limit: int) -> dict:
 @mcp.tool
 def inject_batch(nodes: list[dict], edges: list[dict]) -> dict:
     """Upsert nodes/edges (same keys update). nodes: [{key,label,props}],
-    edges: [{srcKey,dstKey,label,props}]. Returns applied/skipped counts."""
+    edges: [{srcKey,dstKey,label,props,allowParallel?}] — set allowParallel=true
+    to append a true parallel edge instead of collapsing onto the existing
+    (srcKey,dstKey,label) upsert. Returns applied/skipped counts."""
     try:
         return _c().batch(nodes, edges)
     except VectraError as e:

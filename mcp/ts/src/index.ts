@@ -56,6 +56,9 @@ const edgeSchema = z.object({
   dstKey: z.string(),
   label: z.string().optional(),
   props: z.record(z.string(), z.unknown()).optional(),
+  allowParallel: z.boolean().optional().describe(
+    "append a true parallel edge instead of collapsing onto the existing (srcKey,dstKey,label) upsert",
+  ),
 });
 
 server.tool(

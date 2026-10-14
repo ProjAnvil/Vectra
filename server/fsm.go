@@ -144,7 +144,13 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 		}
 	}
 	for _, e := range b.Edges {
-		if _, err := f.live.UpsertEdge(e.SrcKey, e.DstKey, e.Label, e.Props); err == nil {
+		var err error
+		if e.AllowParallel {
+			_, err = f.live.AddEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
+		} else {
+			_, err = f.live.UpsertEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
+		}
+		if err == nil {
 			res.EdgesApplied++
 		} else if errors.Is(err, vectra.ErrNodeNotFound) {
 			res.EdgesSkipped++ // Authoritative validation: replay skips invalid items, no divergence
