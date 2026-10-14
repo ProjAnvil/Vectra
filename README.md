@@ -13,7 +13,7 @@ Since v0.2 the same engine upgrades into an optional **multi-replica infrastruct
 | Whole graph in memory, CSR with zero pointers (`[]uint32` arrays) | GC cost independent of edge count; lock-free concurrent reads after `Seal()` |
 | Layer-synchronized parallel BFS (morsel-driven, atomic-OR bitmap dedup) | 3.3× over naive map adjacency at 10M edges |
 | SCC compression at write time (Tarjan) — queries face a DAG | Reachability with one bit per component; `Cycles()` as a free diagnostic |
-| Single-file snapshot with CRC32 (v2 format) | Atomic publish/backup; blue-green hot swap in server mode |
+| Single-file snapshot with CRC32 (v3 format) | Atomic publish/backup; blue-green hot swap in server mode; property-index declarations round-trip |
 
 ## Quickstart (embedded)
 
@@ -43,6 +43,8 @@ for _, c := range g.Cycles() { ... }
 g.SaveFile("deps.vg")
 ```
 
+Snapshot notes: the v3 format persists `IndexProperty` declarations, so `vectra.Load` restores both the graph and its lookup indexes (`LookupByProperty` works immediately after reload; v2/v1 files remain readable but carry no index declarations). Props serialize as JSON — integers read back as `float64`, so compare numerically or convert on the consumer side.
+
 ## Server mode (optional module)
 
 All embedded graph products (Kuzu, CozoDB, SQLite) ship without replication; every Raft-backed product is a server. Vectra follows the rqlite precedent — replication wraps the engine, it is not baked in:
@@ -59,7 +61,7 @@ cd server && go build -o vectra-server ./cmd/vectra-server
 ./vectra-server -id n2 -data /data/n2 -join http://n1:8080              # join
 ```
 
-Semantics: writes are linearizable (raft commit) — upserts plus logical-key deletes (node deletes cascade incident edges); reads are bounded-stale (≤ SealInterval, immediate for small graphs). Anti-split-brain: nodes with `Join` set never bootstrap. The 3-node in-process chaos suite (leader failover, log replay catch-up, zero query failures during republish) runs under `-race` in CI.
+Semantics: writes are linearizable (raft commit) — upserts plus logical-key deletes (node deletes cascade incident edges); reads are bounded-stale (≤ SealInterval, immediate for small graphs). Edge identity in batches is the `(srcKey, dstKey, label)` triple — upserts collapse parallels and the last write wins on props; set `"allowParallel": true` on an edge item to append a true parallel edge instead. Anti-split-brain: nodes with `Join` set never bootstrap. The 3-node in-process chaos suite (leader failover, log replay catch-up, zero query failures during republish) runs under `-race` in CI.
 
 ## Transactions
 
@@ -123,7 +125,7 @@ internal/csr         CSR adjacency (pointer-free uint32 arrays)
 internal/dag         Tarjan SCC, condensation, topological levels
 internal/engine      sealed snapshot + accessors + Seal pipeline
 internal/traverse    algorithms: layer-synced BFS, reachability, bidirectional path, cycles
-internal/store       snapshot codec (v2: CRC32 trailer, v1 read-compatible)
+internal/store       snapshot codec (v3: indexKey section + CRC32 trailer, v1/v2 read-compatible)
 server/              separate module: raft replication + HTTP API + hot-swap publisher
                      ├─ cmd/vectra-server   service binary
                      ├─ cmd/vectra-bench    stress-test harness

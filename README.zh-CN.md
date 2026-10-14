@@ -13,7 +13,7 @@ v0.2 起，同一引擎可升级为**多副本基础服务**：独立的 `server
 | 全内存 + 无指针 CSR（`[]uint32` 平坦数组） | GC 成本与边数无关；`Seal()` 后并发读免锁 |
 | 层同步并行 BFS（morsel 驱动 + 原子 Or 位图去重） | 1000 万边上比朴素 map 邻接快 3.3 倍 |
 | 写入侧 SCC 压缩（Tarjan）——查询面对 DAG | 可达性每位图一比特；`Cycles()` 免费诊断循环依赖 |
-| 单文件快照 + CRC32（v2 格式） | 原子发布/备份；服务模式蓝绿热替换 |
+| 单文件快照 + CRC32（v3 格式） | 原子发布/备份；服务模式蓝绿热替换；属性索引声明随快照往返 |
 
 ## 快速上手（嵌入式）
 
@@ -43,6 +43,8 @@ for _, c := range g.Cycles() { ... }
 g.SaveFile("deps.vg")
 ```
 
+快照说明：v3 格式会持久化 `IndexProperty` 声明，`vectra.Load` 恢复图的同时恢复查询索引（重载后 `LookupByProperty` 立即可用；v2/v1 旧文件仍可读但不含索引声明）。props 以 JSON 序列化——整数读回为 `float64`，消费方需按数值比较或自行转换。
+
 ## 服务模式（可选模块）
 
 所有嵌入式图产品（Kuzu、CozoDB、SQLite）都不带复制；所有 Raft 产品都是 server。Vectra 沿用 rqlite 先例——复制包在引擎外，不进核心：
@@ -59,7 +61,7 @@ cd server && go build -o vectra-server ./cmd/vectra-server
 ./vectra-server -id n2 -data /data/n2 -join http://n1:8080         # 加入集群
 ```
 
-一致性语义：写线性一致（raft 提交即返回）——upsert 加逻辑键删除（删点级联删边）；读有界过期（≤ SealInterval，小图即时）。防脑裂：设了 `Join` 的节点绝不引导。三节点进程内混沌测试（leader 宕机切换、日志回放追平、重发布期间查询零失败）在 `-race` 下进 CI。
+一致性语义：写线性一致（raft 提交即返回）——upsert 加逻辑键删除（删点级联删边）；读有界过期（≤ SealInterval，小图即时）。批量中边的身份是 `(srcKey, dstKey, label)` 三元组——upsert 折叠平行边、props 后写覆盖；边条目设 `"allowParallel": true` 则改为追加真正的平行边。防脑裂：设了 `Join` 的节点绝不引导。三节点进程内混沌测试（leader 宕机切换、日志回放追平、重发布期间查询零失败）在 `-race` 下进 CI。
 
 ## 事务
 
@@ -123,7 +125,7 @@ internal/csr         CSR 邻接（无指针 uint32 数组）
 internal/dag         Tarjan SCC、凝聚图、拓扑层级
 internal/engine      密封快照 + 访问器 + Seal 流水线
 internal/traverse    算法：层同步 BFS、可达性、双向最短路、循环发现
-internal/store       快照编解码（v2：CRC32 尾校验，v1 读兼容）
+internal/store       快照编解码（v3：索引声明区 + CRC32 尾校验，v1/v2 读兼容）
 server/              独立模块：raft 复制 + HTTP API + 热替换发布器
                      ├─ cmd/vectra-server   服务二进制
                      ├─ cmd/vectra-bench    压测工具
