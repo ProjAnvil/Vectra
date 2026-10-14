@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/gob"
 	"errors"
@@ -82,6 +83,10 @@ type fsm struct {
 	dirty     bool
 	version   int64 // Monotonically increasing; the publisher uses it to detect writes after cloning
 	published atomic.Pointer[pubState]
+	// pubNotify is the publish-notification channel (long-poll primitive):
+	// closed on every successful publish, then swapped for a fresh one.
+	// Waiters snapshot it and select; see WaitPublished.
+	pubNotify atomic.Pointer[chan struct{}]
 
 	nodeVer map[string]uint64     // per-node-key last-modified raft index; guarded by mu
 	edgeVer map[edgeVerKey]uint64 // per-edge-key last-modified raft index; guarded by mu
@@ -116,6 +121,8 @@ func newFSM(sealInterval time.Duration) *fsm {
 		wake:            make(chan struct{}, 1),
 		metrics:         &Metrics{},
 	}
+	notify := make(chan struct{})
+	f.pubNotify.Store(&notify)
 	// Throttle interval counts from process start to avoid the zero-value epoch (Since = 59 years) triggering an immediate publish
 	f.lastSealNanos.Store(time.Now().UnixNano())
 	go f.publishLoop()
@@ -220,6 +227,31 @@ func (f *fsm) PublishedSeq() uint64 {
 	return 0
 }
 
+// waitCh returns the current publish-notification channel; it is closed on
+// the next successful publish.
+func (f *fsm) waitCh() <-chan struct{} { return *f.pubNotify.Load() }
+
+// WaitPublished blocks until publishedSeq >= minSeq or ctx ends, then
+// returns the current publishedSeq. Lock-free: publishers close-and-swap
+// pubNotify under pubMu; waiters double-check the seq around snapshotting
+// the channel so a publish landing between check and arm is never missed.
+func (f *fsm) WaitPublished(ctx context.Context, minSeq uint64) uint64 {
+	for {
+		if seq := f.PublishedSeq(); seq >= minSeq {
+			return seq
+		}
+		ch := f.waitCh()
+		if seq := f.PublishedSeq(); seq >= minSeq {
+			return seq
+		}
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return f.PublishedSeq()
+		}
+	}
+}
+
 // Ready closes once the first publish completes (read readiness gate for restart recovery).
 func (f *fsm) Ready() <-chan struct{} { return f.ready }
 
@@ -279,6 +311,11 @@ func (f *fsm) publishOnce() {
 		f.published.Store(&pubState{graph: clone, seq: seq})
 		f.metrics.Seals.Add(1)
 		f.lastSealNanos.Store(time.Now().UnixNano())
+		// Wake long-poll waiters: close the current notification channel and
+		// arm a fresh one. Inside pubMu so publishes serialize the swap.
+		fresh := make(chan struct{})
+		old := f.pubNotify.Swap(&fresh)
+		close(*old)
 	}
 	f.pubMu.Unlock()
 
