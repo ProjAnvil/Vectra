@@ -36,7 +36,7 @@ reach, _ := g.Reachable("gateway")
 // 双向 BFS 最短路径
 path, found, _ := g.ShortestPath("gateway", "kafka")
 
-// 循环依赖发现
+// 循环依赖发现（节点 + 环内边，带 label/props）
 for _, c := range g.Cycles() { ... }
 
 // 原子单文件快照
@@ -44,6 +44,8 @@ g.SaveFile("deps.vg")
 ```
 
 快照说明：v3 格式会持久化 `IndexProperty` 声明，`vectra.Load` 恢复图的同时恢复查询索引（重载后 `LookupByProperty` 立即可用；v2/v1 旧文件仍可读但不含索引声明）。props 以 JSON 序列化——整数读回为 `float64`，消费方需按数值比较或自行转换。
+
+**⚠️ 升级到 0.5.0。** 存储快照改以 v3 格式写入。不兼容是单向的：v1/v2 旧文件仍可读，但 0.5 之前的二进制读不了 v3 文件——跨版本交换 `.vg` 快照的嵌入式与 MCP 用户需要两端都在 0.5+。raft 集群新旧混布策略不变（本就不支持）。
 
 ## 服务模式（可选模块）
 
@@ -61,7 +63,7 @@ cd server && go build -o vectra-server ./cmd/vectra-server
 ./vectra-server -id n2 -data /data/n2 -join http://n1:8080         # 加入集群
 ```
 
-一致性语义：写线性一致（raft 提交即返回）——upsert 加逻辑键删除（删点级联删边）；读有界过期（≤ SealInterval，小图即时）。批量中边的身份是 `(srcKey, dstKey, label)` 三元组——upsert 折叠平行边、props 后写覆盖；边条目设 `"allowParallel": true` 则改为追加真正的平行边。防脑裂：设了 `Join` 的节点绝不引导。三节点进程内混沌测试（leader 宕机切换、日志回放追平、重发布期间查询零失败）在 `-race` 下进 CI。
+一致性语义：写线性一致（raft 提交即返回）——upsert 加逻辑键删除（删点级联删边）；读有界过期（≤ SealInterval，小图即时）。批量与事务写入中边的身份是 `(srcKey, dstKey, label)` 三元组——upsert 折叠平行边、props 后写覆盖；边条目设 `"allowParallel": true` 则改为追加真正的平行边。防脑裂：设了 `Join` 的节点绝不引导。三节点进程内混沌测试（leader 宕机切换、日志回放追平、重发布期间查询零失败）在 `-race` 下进 CI。
 
 ## 事务
 
@@ -87,7 +89,7 @@ v0.4 起服务端在同一条 raft 日志上支持**交互式乐观事务**—�
 | `GET /v1/reachable` | `from` + 返回的全部键 |
 | `/v1/path`、`/v1/stats`、`/v1/cycles` | 仅 SI——全图/依赖边界的读取无法做 SER 验证 |
 
-**重试礼仪。** 收到 409：full-jitter 指数退避 `sleep = rand(0, min(500ms, 5ms·2^attempt))`（参考 [AWS Exponential Backoff and Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)），重读取刷新 token，再提交。读己之写（v0.5）：`GET /v1/await?seq=<index>&timeoutMs=5000`——服务端长轮询，本副本发布覆盖到提交序号即返回 `{publishedSeq, reached}`（附 `X-Vectra-Snapshot` 头）；`reached:false` 则重发。轮询 `GET /v1/stats` 保留为 0.5 之前版本的兼容回退。S 档 16w txnsi：~542 → ~846 提交/s，RYW 等待 11.1ms → ~3.1ms（docs/benchmarks/2026-10-14-ryw-await.md）。
+**重试礼仪。** 收到 409：full-jitter 指数退避 `sleep = rand(0, min(500ms, 5ms·2^attempt))`（参考 [AWS Exponential Backoff and Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)），重读取刷新 token，再提交。读己之写（v0.5）：`GET /v1/await?seq=<index>&timeoutMs=5000`（`timeoutMs` 默认 5s、上限 30s）——服务端长轮询，本副本发布覆盖到提交序号即返回 `{publishedSeq, reached}` 并附 `X-Vectra-Snapshot` 头；`reached:false` 则重发。轮询 `GET /v1/stats` 保留为 0.5 之前版本的兼容回退。S 档 / http / 16 worker / Apple M5 Pro：txnsi ~542 → ~846 提交/s（+56%），txnser ~556 → ~822（+48%），RYW 等待 11.1ms → ~3.1ms，p50 26.5 → ~18.3ms（docs/benchmarks/2026-10-14-ryw-await.md）。
 
 **开销口径。** v0.4.0 以 fsm 级基准验收（`server/txn_bench_test.go` 的 `BenchmarkFSMAutoCommit` / `TxnSI` / `TxnSER16`——直接驱动 `fsm.Apply`，`Snapshot = ^uint64(0)` 使验证永不冲突）：AutoCommit **34.9µs** · TxnSI **28.6µs** · TxnSER16 **38.6µs**（AutoCommit/SER16 为 17 节点批次，TxnSI 为 1 节点批次；Apple M5 Pro）——16 键读集下 SI/SER 与自动提交差距 <25%（SER16 约 +11%）。vectra-bench 已内置 HTTP 级 `txnsi`/`txnser` 负载（`-mode http -workloads txnsi,txnser`）：S 档近线性扩展（1 → 16 worker：51 → 542 提交/s，SER 冲突 ≤ 4.3%）；大档位上遵守 RYW 礼仪的吞吐受发布周期支配（SealInterval + clone/Seal）——规模/间隔/并发的完整矩阵见 `docs/benchmarks/2026-10-13-oltp-txn.md`。
 
@@ -95,7 +97,7 @@ v0.4 起服务端在同一条 raft 日志上支持**交互式乐观事务**—�
 
 ## MCP（AI agent）
 
-三个一等实现——[Go（嵌入引擎）](mcp)、[Python（FastMCP）](mcp/python)、[TypeScript](mcp/ts)——把一跳/多跳/最短路/可达性/循环依赖暴露为 MCP 工具：
+三个一等实现——[Go（嵌入引擎）](mcp)、[Python（FastMCP）](mcp/python)、[TypeScript](mcp/ts)——把一跳/多跳/最短路/可达性/循环依赖（含环内边）暴露为 MCP 工具，另提供 `inject_batch` 写入（支持 `allowParallel`）：
 
 ```bash
 claude mcp add vectra -- /path/to/vectra-mcp
@@ -115,7 +117,7 @@ claude mcp add vectra -- /path/to/vectra-mcp
 
 本地复现：`make bench [SIZE=medium] [MODE=http]`，数据目录与报告运行结束即删。
 
-正确性按 LDBC 方法验证：与独立参考实现做属性对账、真实数据集外部 ground truth（SNAP email-Eu-core：203 个 SCC / 最大 803，对外发布的数字）、混沌与退化图测试、确定性检查。覆盖率：根包 92.2% · csr/dag 100% · store 84.3% · engine+traverse 98.7% · server 86.9% · mcp 81.5%。
+正确性按 LDBC 方法验证：与独立参考实现做属性对账、真实数据集外部 ground truth（SNAP email-Eu-core：203 个 SCC / 最大 803，对外发布的数字）、混沌与退化图测试、确定性检查。覆盖率：根包 92.3% · csr/dag 100% · store 84.0% · engine+traverse 98.8% · server 87.5% · mcp 85.6%。
 
 ## 仓库布局
 

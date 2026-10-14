@@ -36,7 +36,7 @@ reach, _ := g.Reachable("gateway")
 // bidirectional shortest path
 path, found, _ := g.ShortestPath("gateway", "kafka")
 
-// dependency-cycle discovery
+// dependency-cycle discovery (nodes + intra-cycle edges with label/props)
 for _, c := range g.Cycles() { ... }
 
 // atomic single-file snapshot
@@ -44,6 +44,8 @@ g.SaveFile("deps.vg")
 ```
 
 Snapshot notes: the v3 format persists `IndexProperty` declarations, so `vectra.Load` restores both the graph and its lookup indexes (`LookupByProperty` works immediately after reload; v2/v1 files remain readable but carry no index declarations). Props serialize as JSON — integers read back as `float64`, so compare numerically or convert on the consumer side.
+
+**⚠️ Upgrading to 0.5.0.** Store snapshots are now written in the v3 format. The incompatibility is one-directional: v1/v2 files remain readable, but pre-0.5 binaries cannot read v3 files — embedded and MCP users who exchange `.vg` snapshots across versions need both sides on 0.5+. The raft cluster mixed-version policy is unchanged (already unsupported).
 
 ## Server mode (optional module)
 
@@ -61,7 +63,7 @@ cd server && go build -o vectra-server ./cmd/vectra-server
 ./vectra-server -id n2 -data /data/n2 -join http://n1:8080              # join
 ```
 
-Semantics: writes are linearizable (raft commit) — upserts plus logical-key deletes (node deletes cascade incident edges); reads are bounded-stale (≤ SealInterval, immediate for small graphs). Edge identity in batches is the `(srcKey, dstKey, label)` triple — upserts collapse parallels and the last write wins on props; set `"allowParallel": true` on an edge item to append a true parallel edge instead. Anti-split-brain: nodes with `Join` set never bootstrap. The 3-node in-process chaos suite (leader failover, log replay catch-up, zero query failures during republish) runs under `-race` in CI.
+Semantics: writes are linearizable (raft commit) — upserts plus logical-key deletes (node deletes cascade incident edges); reads are bounded-stale (≤ SealInterval, immediate for small graphs). Edge identity in batch and transaction writes is the `(srcKey, dstKey, label)` triple — upserts collapse parallels and the last write wins on props; set `"allowParallel": true` on an edge item to append a true parallel edge instead. Anti-split-brain: nodes with `Join` set never bootstrap. The 3-node in-process chaos suite (leader failover, log replay catch-up, zero query failures during republish) runs under `-race` in CI.
 
 ## Transactions
 
@@ -87,7 +89,7 @@ conflict: 409 {committed: false, conflicts: [...], conflictTotal, hint}
 | `GET /v1/reachable` | `from` + all returned keys |
 | `/v1/path`, `/v1/stats`, `/v1/cycles` | SI-only — full-graph / frontier-dependent reads cannot be SER-validated |
 
-**Retry etiquette.** On 409: full-jitter exponential backoff `sleep = rand(0, min(500ms, 5ms·2^attempt))` (cf. [AWS Exponential Backoff and Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)), re-read to refresh the token, resubmit. Read-your-writes (v0.5): `GET /v1/await?seq=<index>&timeoutMs=5000` — a server-side long poll that returns `{publishedSeq, reached}` (plus the `X-Vectra-Snapshot` header) as soon as the local publish covers the commit; re-issue on `reached:false`. Polling `GET /v1/stats` remains a pre-0.5-compatible fallback. S-tier 16w txnsi: ~542 → ~846 commits/s, RYW wait 11.1ms → ~3.1ms (docs/benchmarks/2026-10-14-ryw-await.md).
+**Retry etiquette.** On 409: full-jitter exponential backoff `sleep = rand(0, min(500ms, 5ms·2^attempt))` (cf. [AWS Exponential Backoff and Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)), re-read to refresh the token, resubmit. Read-your-writes (v0.5): `GET /v1/await?seq=<index>&timeoutMs=5000` (`timeoutMs` defaults to 5s, capped at 30s) — a server-side long poll that returns `{publishedSeq, reached}` plus the `X-Vectra-Snapshot` header as soon as the local publish covers the commit; re-issue on `reached:false`. Polling `GET /v1/stats` remains a pre-0.5-compatible fallback. S-tier / http / 16 workers / Apple M5 Pro: txnsi ~542 → ~846 commits/s (+56%), txnser ~556 → ~822 (+48%), RYW wait 11.1ms → ~3.1ms, p50 26.5ms → ~18.3ms (docs/benchmarks/2026-10-14-ryw-await.md).
 
 **Overhead.** v0.4.0 acceptance is fsm-level (`BenchmarkFSMAutoCommit` / `TxnSI` / `TxnSER16` in `server/txn_bench_test.go` — direct `fsm.Apply`, `Snapshot = ^uint64(0)` so validation never conflicts): AutoCommit **34.9µs** · TxnSI **28.6µs** · TxnSER16 **38.6µs** (AutoCommit/SER16: 17-node batches, TxnSI: 1-node batch; Apple M5 Pro) — SI/SER within ~25% of auto-commit at a 16-key read set (SER16 ≈ +11%). HTTP-level `txnsi`/`txnser` workloads ship in vectra-bench (`-mode http -workloads txnsi,txnser`): S-tier scales near-linearly (51 → 542 commits/s at 1 → 16 workers, SER conflicts ≤ 4.3%); RYW-respecting throughput on larger graphs is bounded by the publish period (`SealInterval` + clone/Seal) — see `docs/benchmarks/2026-10-13-oltp-txn.md` for the size/interval/worker matrix.
 
@@ -95,7 +97,7 @@ conflict: 409 {committed: false, conflicts: [...], conflictTotal, hint}
 
 ## MCP (agents)
 
-Three first-class implementations — [Go (embedded engine)](mcp), [Python (FastMCP)](mcp/python), [TypeScript](mcp/ts) — exposing one-hop / multi-hop / shortest-path / reachability / cycles as MCP tools:
+Three first-class implementations — [Go (embedded engine)](mcp), [Python (FastMCP)](mcp/python), [TypeScript](mcp/ts) — exposing one-hop / multi-hop / shortest-path / reachability / cycles (with intra-cycle edges) as MCP tools, plus `inject_batch` for writes (`allowParallel` supported):
 
 ```bash
 claude mcp add vectra -- /path/to/vectra-mcp
@@ -115,7 +117,7 @@ See [mcp/README.md](mcp/README.md) for all transports and host configurations.
 
 Reproduce locally: `make bench [SIZE=medium] [MODE=http]` — data and report are deleted when the run ends.
 
-Correctness is validated the LDBC way: property tests against independent reference implementations, real-dataset ground truth (SNAP email-Eu-core: 203 SCCs / largest 803, externally published numbers), chaos and degenerate-graph suites, determinism checks. Coverage: root 92.2% · csr/dag 100% · store 84.3% · engine+traverse 98.7% · server 86.9% · mcp 81.5%.
+Correctness is validated the LDBC way: property tests against independent reference implementations, real-dataset ground truth (SNAP email-Eu-core: 203 SCCs / largest 803, externally published numbers), chaos and degenerate-graph suites, determinism checks. Coverage: root 92.3% · csr/dag 100% · store 84.0% · engine+traverse 98.8% · server 87.5% · mcp 85.6%.
 
 ## Repository layout
 
