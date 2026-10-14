@@ -263,9 +263,13 @@ func (g *Graph) ShortestPath(fromKey, toKey string) (Path, bool, error) {
 }
 
 // Cycle is one circular dependency: the member list of a strongly connected
-// component of size>1, or a single self-loop node.
+// component of size>1, or a single self-loop node. Edges carries the
+// intra-member edges with full label/props (perimeter plus chords), so
+// consumers can triage cycle severity without re-joining raw records via
+// EdgesOf.
 type Cycle struct {
 	Nodes []NodeID
+	Edges []Edge
 }
 
 // Len returns the number of nodes on the cycle.
@@ -285,6 +289,14 @@ func (g *Graph) Cycles() []Cycle {
 		out[i] = Cycle{Nodes: make([]NodeID, len(c.Nodes))}
 		for j, v := range c.Nodes {
 			out[i].Nodes[j] = NodeID(v)
+		}
+		if len(c.Edges) > 0 {
+			out[i].Edges = make([]Edge, len(c.Edges))
+			for j, ce := range c.Edges {
+				if e, ok := g.EdgeByID(EdgeID(ce.EdgeID)); ok {
+					out[i].Edges[j] = e
+				}
+			}
 		}
 	}
 	return out
