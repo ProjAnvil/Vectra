@@ -15,10 +15,6 @@ import (
 // outcome, not an op error.
 const maxTxnAttempts = 3
 
-// txnPollInterval is the read-your-writes poll cadence against GET /v1/stats
-// after a successful commit.
-const txnPollInterval = 10 * time.Millisecond
-
 // txnPublishWaitCap bounds the read-your-writes wait after a commit. On
 // expiry the op proceeds without error: the wait is best-effort client
 // etiquette, not a correctness gate.
@@ -236,45 +232,39 @@ func commitTxn(c *http.Client, base, key string, attempt int, snapshot uint64, s
 	}
 }
 
-// waitForPublish blocks until the stats endpoint reports a publishedSeq at
-// or beyond the commit's raft index, polling every txnPollInterval and at
-// most waitCap total. Poll failures (transport, non-200, malformed body)
-// simply read as "not yet published". Cap expiry proceeds silently: the
-// wait is best-effort client etiquette that keeps the next read from
-// conflicting with our own not-yet-published write, not a correctness gate.
+// awaitResponse mirrors GET /v1/await.
+type awaitResponse struct {
+	PublishedSeq float64 `json:"publishedSeq"`
+	Reached      bool    `json:"reached"`
+}
+
+// waitForPublish blocks until the server reports a publishedSeq at or beyond
+// the commit's raft index, using the /v1/await long poll (one round trip per
+// server-side wait window instead of client-side poll quantization), at most
+// waitCap total. Transport failures simply read as "not yet published" and
+// re-await; cap expiry proceeds silently — the wait is best-effort client
+// etiquette that keeps the next read from conflicting with our own
+// not-yet-published write, not a correctness gate.
 func waitForPublish(c *http.Client, base string, index uint64, waitCap time.Duration) {
 	deadline := time.Now().Add(waitCap)
 	for {
-		if seq, err := fetchPublishedSeq(c, base); err == nil && seq >= float64(index) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			return
+		}
+		serverWait := min(remaining, 5*time.Second)
+		resp, err := c.Get(base + "/v1/await?seq=" + strconv.FormatUint(index, 10) +
+			"&timeoutMs=" + strconv.Itoa(int(serverWait.Milliseconds())))
+		if err == nil {
+			var out awaitResponse
+			derr := json.NewDecoder(resp.Body).Decode(&out)
+			resp.Body.Close()
+			if derr == nil && out.Reached {
+				return
+			}
 		}
 		if !time.Now().Before(deadline) {
 			return
 		}
-		time.Sleep(txnPollInterval)
 	}
-}
-
-// fetchPublishedSeq reads publishedSeq from GET /v1/stats. The endpoint
-// returns a heterogeneous JSON object, so it is decoded as a map and the
-// field read as a float64 (JSON numbers decode to float64 in any-valued
-// maps).
-func fetchPublishedSeq(c *http.Client, base string) (float64, error) {
-	resp, err := c.Get(base + "/v1/stats")
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("stats: %s", resp.Status)
-	}
-	var body map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return 0, fmt.Errorf("stats decode: %w", err)
-	}
-	seq, ok := body["publishedSeq"].(float64)
-	if !ok {
-		return 0, fmt.Errorf("stats: publishedSeq missing or non-numeric")
-	}
-	return seq, nil
 }
