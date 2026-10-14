@@ -18,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -169,6 +170,7 @@ func main() {
 	// mean is the delta. In http-only-workload runs (e.g. WORKLOADS=txnsi)
 	// this isolates the transaction-commit batches from injection.
 	count0, sum0 := logsPerBatch(sink)
+	timers0 := sinkTimers(sink)
 	for _, w := range selected {
 		bench.RunWorkload(w.name, w.op, 1, *warmup) // Warmup discarded
 		if ts := txnStats[w.name]; ts != nil {
@@ -177,11 +179,44 @@ func main() {
 		res := bench.RunWorkload(w.name, w.op, *workers, *duration)
 		fmt.Fprintf(os.Stderr, "  %-10s ops=%-7d p50=%-9s p99=%s\n",
 			res.Name, res.Ops, bench.FormatDur(res.P50), bench.FormatDur(res.P99))
+		if ts := txnStats[w.name]; ts != nil {
+			rd, cm, wt := ts.PhaseMeans()
+			fmt.Fprintf(os.Stderr, "  %-10s phases: read=%s commit=%s rywWait=%s (wait per commit, others per attempt)\n",
+				res.Name, bench.FormatDur(rd), bench.FormatDur(cm), bench.FormatDur(wt))
+		}
 		rep.Results = append(rep.Results, res)
 	}
 	if n, sum := logsPerBatch(sink); n-count0 > 0 {
 		fmt.Fprintf(os.Stderr, "raft logsPerBatch (txnsi phase): mean=%.2f samples=%.0f\n",
 			(sum-sum0)/(n-count0), n-count0)
+	}
+	// Server-side pipeline decomposition over the same phase window: timers
+	// the raft stack emits through go-metrics (values are milliseconds).
+	// dispatchLog covers the leader loop's store-and-dispatch step (bolt
+	// StoreLogs + fsync live here); commitTime measures dispatch→committed
+	// per log; fsm.enqueue measures FSM handoff. NOTE: raft stamps a zero
+	// dispatch time on barrier/config entries, whose elapsed overflows
+	// float32 to +Inf — Inf−Inf makes the phase-diff mean NaN; counts stay
+	// valid (cross-check: dispatchLog count ≈ StoreLogs batches, commitTime
+	// count ≈ logs). NaN means are skipped, not errors.
+	timers1 := sinkTimers(sink)
+	for _, name := range []string{"raft.leader.dispatchLog", "raft.commitTime", "raft.fsm.enqueue"} {
+		a, ok0 := timers0[name]
+		b, ok1 := timers1[name]
+		if !ok1 {
+			continue
+		}
+		if !ok0 {
+			a = sampleAgg{}
+		}
+		if n := b.count - a.count; n > 0 {
+			mean := (b.sum - a.sum) / n
+			if math.IsNaN(mean) || math.IsInf(mean, 0) {
+				fmt.Fprintf(os.Stderr, "%s (phase): samples=%.0f (mean unavailable: Inf-poisoned samples)\n", name, n)
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "%s (phase): mean=%.2fms samples=%.0f\n", name, mean, n)
+		}
 	}
 
 	// 5. Output
@@ -314,6 +349,31 @@ func logsPerBatch(sink *gometrics.InmemSink) (count, sum float64) {
 		}
 	}
 	return count, sum
+}
+
+// sampleAgg is the (count, sum) pair of one go-metrics sample series over
+// the sink's retained intervals.
+type sampleAgg struct {
+	count, sum float64
+}
+
+// sinkTimers snapshots every sample series the inmem sink retained, keyed by
+// metric name (values as emitted: timers are milliseconds, counters/logsPerBatch
+// are dimensionless). Two snapshots diff into a phase window.
+func sinkTimers(sink *gometrics.InmemSink) map[string]sampleAgg {
+	if sink == nil {
+		return nil
+	}
+	out := make(map[string]sampleAgg)
+	for _, im := range sink.Data() {
+		for name, sv := range im.Samples {
+			a := out[name]
+			a.count += float64(sv.Count)
+			a.sum += sv.Sum
+			out[name] = a
+		}
+	}
+	return out
 }
 
 func upsertNodes(nodes []bench.Node) []server.NodeUpsert {

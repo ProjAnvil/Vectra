@@ -25,11 +25,32 @@ const txnPollInterval = 10 * time.Millisecond
 const txnPublishWaitCap = 5 * time.Second
 
 // TxnStats tracks OCC outcomes for transaction workloads: a 409 is a normal
-// optimistic-concurrency result, not an error.
+// optimistic-concurrency result, not an error. It also accumulates per-phase
+// client latency (read / commit / read-your-writes wait) so bottleneck
+// attribution can separate server pipeline cost from client etiquette cost.
 type TxnStats struct {
 	Commits   atomic.Int64
 	Conflicts atomic.Int64 // 409 rejections encountered (each retry attempt counts)
 	Retries   atomic.Int64
+
+	readNs   atomic.Int64 // Σ readNeighbors duration (one per attempt)
+	commitNs atomic.Int64 // Σ commitTxn duration (one per attempt)
+	waitNs   atomic.Int64 // Σ read-your-writes wait duration (one per commit)
+	attempts atomic.Int64 // read/commit samples
+}
+
+// PhaseMeans returns the mean client-side latency of each txn-op phase:
+// read (GET /v1/neighbors), commit (POST /v1/txn), and the read-your-writes
+// wait (per committed txn). Zero when no samples.
+func (s *TxnStats) PhaseMeans() (read, commit, wait time.Duration) {
+	if n := s.attempts.Load(); n > 0 {
+		read = time.Duration(s.readNs.Load() / n)
+		commit = time.Duration(s.commitNs.Load() / n)
+	}
+	if n := s.Commits.Load(); n > 0 {
+		wait = time.Duration(s.waitNs.Load() / n)
+	}
+	return read, commit, wait
 }
 
 // ConflictPct returns the share of finished attempts (commits + conflicts)
@@ -55,6 +76,10 @@ func (s *TxnStats) Reset() {
 	s.Commits.Store(0)
 	s.Conflicts.Store(0)
 	s.Retries.Store(0)
+	s.readNs.Store(0)
+	s.commitNs.Store(0)
+	s.waitNs.Store(0)
+	s.attempts.Store(0)
 }
 
 // NewTxnOp returns a workload op implementing the interactive-transaction
@@ -80,14 +105,20 @@ func newTxnOp(c *http.Client, base string, nextStart func() string, ser bool, re
 		for attempt := 1; attempt <= maxTxnAttempts; attempt++ {
 			// 1. Read phase: neighbors of the start node at the current
 			//    published snapshot; the token and read set guard the commit.
+			t0 := time.Now()
 			snapshot, readNodes, err := readNeighbors(c, base, start, readFanout)
+			stats.readNs.Add(int64(time.Since(t0)))
 			if err != nil {
 				return err
 			}
 			// 2. Write phase: upsert the start node (same key family as the
 			//    read → realistic hot-node contention; start nodes are
 			//    degree-weighted by the parameter curator).
+			t0 = time.Now()
 			committed, index, err := commitTxn(c, base, start, attempt, snapshot, ser, readNodes)
+			d := time.Since(t0)
+			stats.commitNs.Add(int64(d))
+			stats.attempts.Add(1)
 			if err != nil {
 				return err
 			}
@@ -97,7 +128,9 @@ func newTxnOp(c *http.Client, base string, nextStart func() string, ser bool, re
 				//    but the read snapshot is published on a SealInterval
 				//    throttle; without waiting, our next guard conflicts
 				//    with our own not-yet-published write.
+				t0 = time.Now()
 				waitForPublish(c, base, index, waitCap)
+				stats.waitNs.Add(int64(time.Since(t0)))
 				return nil
 			}
 			// 409: normal optimistic-concurrency rejection. Refresh the
