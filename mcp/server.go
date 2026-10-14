@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -35,24 +36,42 @@ type Options struct {
 
 // service holds the embedded engine state. Writes accumulate in the live
 // graph; after seal, queries go through the sealed view. MCP sessions may
-// call tools concurrently: write tools are mutually exclusive, queries are lock-free.
+// call tools concurrently: write tools are mutually exclusive (mu), queries
+// are lock-free — the view pointer is atomic so seal's publish never races
+// concurrent readers. ONE service backs every session of a server (stdio:
+// the single session; HTTP: all connections share it — see Handler).
 type service struct {
 	mu   sync.Mutex
 	live *vectra.Graph
-	view *vectra.Graph // sealed view (nil = not sealed)
+	view atomic.Pointer[vectra.Graph] // sealed view (nil = not sealed)
 
 	propKeys map[string]bool // property keys seen during injection, auto-indexed at seal
 	opts     Options
 }
 
-// New creates an MCP server (embedding the given graph; loads it if SnapshotPath is set).
-func New(g *vectra.Graph, opts Options) *mcp.Server {
+// newService builds the embedded state once: live graph, snapshot view,
+// auto-index seeds. Snapshot mode additionally lets writes continue from the
+// snapshot's content when the embedded graph is empty and still writable, so
+// post-restart injections extend the persisted graph instead of replacing it.
+func newService(g *vectra.Graph, opts Options) *service {
 	svc := &service{live: g, propKeys: map[string]bool{}, opts: opts}
 	if opts.SnapshotPath != "" {
 		if loaded, err := vectra.LoadFile(opts.SnapshotPath); err == nil {
-			svc.view = loaded // Load seals automatically
+			svc.view.Store(loaded) // Load seals automatically
+			for _, k := range loaded.IndexedPropertyKeys() {
+				svc.propKeys[k] = true // snapshot's indexes survive the next re-seal
+			}
+			if g != nil && !g.Sealed() && g.NodeCount() == 0 {
+				svc.live = loaded.Clone() // writes continue from the snapshot content
+			}
 		}
 	}
+	return svc
+}
+
+// newServer wires a protocol-level server for one session; state lives in
+// the (shared) service, so this stays cheap enough for per-session creation.
+func newServer(svc *service) *mcp.Server {
 	s := mcp.NewServer(
 		&mcp.Implementation{Name: "github.com/projanvil/vectra", Version: Version},
 		&mcp.ServerOptions{
@@ -66,10 +85,24 @@ func New(g *vectra.Graph, opts Options) *mcp.Server {
 	return s
 }
 
-// Handler returns an http.Handler for the Streamable HTTP transport (mounted at /mcp).
+// New creates a stdio-mode MCP server (embedding the given graph; loads it if
+// SnapshotPath is set).
+func New(g *vectra.Graph, opts Options) *mcp.Server {
+	return newServer(newService(g, opts))
+}
+
+// Handler returns an http.Handler for the Streamable HTTP transport (mounted
+// at /mcp). One shared service backs every session: all connections
+// serialize writes through the same mutex and watch the same sealed view
+// (per-session services would share the live graph without sharing the lock
+// — a data race — and would never observe each other's seals). The SDK asks
+// for a server per session (and once more per request for protocol-version
+// negotiation), so the callback only wires a lightweight mcp.Server — no
+// snapshot reload, no state.
 func Handler(g *vectra.Graph, opts Options) *mcp.StreamableHTTPHandler {
+	svc := newService(g, opts)
 	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
-		return New(g, opts) // one server instance per connection (stateless transport mode)
+		return newServer(svc)
 	}, nil)
 }
 
@@ -86,6 +119,9 @@ type edgeIn struct {
 	DstKey string         `json:"dstKey" jsonschema:"destination node key"`
 	Label  string         `json:"label,omitempty"`
 	Props  map[string]any `json:"props,omitempty"`
+	// AllowParallel appends a true parallel edge instead of collapsing onto
+	// the existing (srcKey,dstKey,label) upsert key (default false).
+	AllowParallel bool `json:"allowParallel,omitempty"`
 }
 
 type edgeDeleteIn struct {
@@ -164,14 +200,21 @@ type reachIn struct {
 	Limit int    `json:"limit,omitempty"`
 }
 
+type cycleEdgeOut struct {
+	Src   string `json:"src" jsonschema:"source node key"`
+	Dst   string `json:"dst" jsonschema:"destination node key"`
+	Label string `json:"label"`
+}
+
 type cyclesOut struct {
-	Cycles [][]string `json:"cycles" jsonschema:"member key list of each dependency cycle, sorted by size descending"`
+	Cycles [][]string       `json:"cycles" jsonschema:"member key list of each dependency cycle, sorted by size descending"`
+	Edges  [][]cycleEdgeOut `json:"edges,omitempty" jsonschema:"per-cycle intra-cycle edges (src/dst/label), aligned with cycles by index"`
 }
 
 type lookupIn struct {
-	PropKey string `json:"propKey"`
-	Value   string `json:"value"`
-	Limit   int    `json:"limit,omitempty"`
+	PropKey   string `json:"propKey"`
+	PropValue string `json:"propValue"`
+	Limit     int    `json:"limit,omitempty"`
 }
 
 // ---- tool registration ----
@@ -180,7 +223,9 @@ func registerTools(s *mcp.Server, svc *service) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "inject_batch",
 		Description: "Batch-write and delete nodes/edges (writes are upserts: same key updates props; " +
-			"deleteEdges removes by (srcKey,dstKey,label), deleteNodes removes nodes and cascades their edges). " +
+			"edge identity is (srcKey,dstKey,label) — set allowParallel=true on an edge to append a true " +
+			"parallel edge instead of collapsing onto the existing one; deleteEdges removes by " +
+			"(srcKey,dstKey,label), deleteNodes removes nodes and cascades their edges). " +
 			"Call seal after writing, before querying.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false},
 	}, svc.injectBatch)
@@ -202,34 +247,35 @@ func registerTools(s *mcp.Server, svc *service) {
 	}, svc.getNode)
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "neighbors", Description: "One-hop neighbors (direction: out/in, filterable by edge label).",
+		Name: "neighbors", Description: "One-hop neighbors. Params: key, direction (\"out\" default | \"in\"), label (optional edge-label filter).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.neighbors)
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "bfs",
-		Description: "Multi-hop traversal (1..maxDepth hop neighborhood): maxDepth=2 means friends of friends; " +
-			"0=unlimited. Returns per-node hop counts. Results are capped at 1000 by default; total is the true total.",
+		Description: "Multi-hop traversal. Params: from (one or more start keys), maxDepth (0=unlimited), " +
+			"labels (optional edge-label filter), direction (\"out\" | \"in\"), limit (default 1000). " +
+			"Returns per-node hop counts; total is the true total.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.bfs)
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "shortest_path", Description: "Shortest path between two nodes (bidirectional BFS).",
+		Name: "shortest_path", Description: "Shortest path between two nodes (bidirectional BFS). Params: from, to.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.shortestPath)
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "reachable", Description: "All nodes reachable from a source (dependency impact set / blast radius).",
+		Name: "reachable", Description: "All nodes reachable from a source (dependency impact set / blast radius). Params: from, limit (default 1000).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.reachable)
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "cycles", Description: "All dependency cycles (strongly connected component member lists, sorted by size descending).",
+		Name: "cycles", Description: "All dependency cycles (strongly connected component member lists, sorted by size descending). The edges field lists each cycle's intra-cycle edges (src/dst/label) for severity triage. No params.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.cycles)
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "lookup_property", Description: "Look up nodes by string property value (label-like props such as env/team/tier).",
+		Name: "lookup_property", Description: "Look up nodes by string property value (label-like props such as env/team/tier). Params: propKey, propValue, limit (default 1000).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.lookupProperty)
 }
@@ -239,6 +285,18 @@ func registerTools(s *mcp.Server, svc *service) {
 func (svc *service) injectBatch(_ context.Context, _ *mcp.CallToolRequest, in injectIn) (*mcp.CallToolResult, countsOut, error) {
 	svc.mu.Lock()
 	defer svc.mu.Unlock()
+	// Write-after-seal re-open: the last seal published live as an immutable
+	// view; the first new write lazily clones that view back into a writable
+	// graph (O(V+E), carries index declarations). Queries never notice — they
+	// keep reading the published view until the next seal, the same
+	// bounded-stale read model as the server module.
+	if (len(in.Nodes) > 0 || len(in.Edges) > 0 || len(in.DeleteEdges) > 0 || len(in.DeleteNodes) > 0) && svc.live.Sealed() {
+		live := vectra.New()
+		if v := svc.view.Load(); v != nil {
+			live = v.Clone()
+		}
+		svc.live = live
+	}
 	out := countsOut{}
 	for _, n := range in.Nodes {
 		if _, err := svc.live.AddNode(n.Key, n.Label, n.Props); err == nil {
@@ -249,7 +307,13 @@ func (svc *service) injectBatch(_ context.Context, _ *mcp.CallToolRequest, in in
 		}
 	}
 	for _, e := range in.Edges {
-		if _, err := svc.live.UpsertEdge(e.SrcKey, e.DstKey, e.Label, e.Props); err == nil {
+		var err error
+		if e.AllowParallel {
+			_, err = svc.live.AddEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
+		} else {
+			_, err = svc.live.UpsertEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
+		}
+		if err == nil {
 			out.EdgesApplied++
 		} else {
 			out.EdgesSkipped++
@@ -281,13 +345,13 @@ func (svc *service) seal(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) 
 	if err := svc.live.Seal(); err != nil {
 		return nil, statsOut{}, err
 	}
-	svc.view = svc.live
+	svc.view.Store(svc.live)
 	if svc.opts.SnapshotPath != "" {
-		if err := svc.view.SaveFile(svc.opts.SnapshotPath); err != nil {
+		if err := svc.live.SaveFile(svc.opts.SnapshotPath); err != nil {
 			return nil, statsOut{}, fmt.Errorf("snapshot save failed: %w", err)
 		}
 	}
-	st := svc.view.Stats()
+	st := svc.live.Stats()
 	return nil, statsOut{
 		Nodes: st.Nodes, Edges: st.Edges, SCCs: st.SCCs,
 		CyclicNodes: st.CyclicNodes, Sealed: true,
@@ -295,8 +359,10 @@ func (svc *service) seal(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) 
 }
 
 // view returns the sealed view; gives an actionable error when not sealed.
+// Lock-free: the atomic pointer makes the seal-time publish visible to
+// concurrent query tools without taking the write mutex.
 func (svc *service) viewOrSealHint() (*vectra.Graph, error) {
-	if v := svc.view; v != nil {
+	if v := svc.view.Load(); v != nil {
 		return v, nil
 	}
 	return nil, fmt.Errorf("graph is not sealed: call inject_batch to write, then seal before querying")
@@ -449,7 +515,7 @@ func (svc *service) cycles(_ context.Context, _ *mcp.CallToolRequest, _ struct{}
 		return nil, cyclesOut{}, err
 	}
 	cs := v.Cycles()
-	out := cyclesOut{Cycles: make([][]string, 0, len(cs))}
+	out := cyclesOut{Cycles: make([][]string, 0, len(cs)), Edges: make([][]cycleEdgeOut, 0, len(cs))}
 	for _, c := range cs {
 		mem := make([]string, len(c.Nodes))
 		for i, id := range c.Nodes {
@@ -457,6 +523,13 @@ func (svc *service) cycles(_ context.Context, _ *mcp.CallToolRequest, _ struct{}
 			mem[i] = n.Key
 		}
 		out.Cycles = append(out.Cycles, mem)
+		edges := make([]cycleEdgeOut, 0, len(c.Edges))
+		for _, e := range c.Edges {
+			src, _ := v.NodeByID(e.Src)
+			dst, _ := v.NodeByID(e.Dst)
+			edges = append(edges, cycleEdgeOut{Src: src.Key, Dst: dst.Key, Label: e.Label})
+		}
+		out.Edges = append(out.Edges, edges)
 	}
 	return nil, out, nil
 }
@@ -470,7 +543,7 @@ func (svc *service) lookupProperty(_ context.Context, _ *mcp.CallToolRequest, in
 	if limit <= 0 {
 		limit = defaultLimit
 	}
-	nodes, ok := v.LookupByProperty(in.PropKey, in.Value)
+	nodes, ok := v.LookupByProperty(in.PropKey, in.PropValue)
 	if !ok {
 		return nil, listOut{}, fmt.Errorf("property %q is not indexed (re-seal after it appears in injected data)", in.PropKey)
 	}
