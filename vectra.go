@@ -574,6 +574,43 @@ func (g *Graph) LookupByProperty(key, value string) ([]Node, bool) {
 		return nil, false
 	}
 	ids, ok := g.snap.LookupIndex(key, value)
+	return g.nodesFromIDs(ids, ok)
+}
+
+// LookupByNumber finds nodes whose numeric property equals v. Numbers of any
+// Go/JSON width normalize to float64 in the index, so int-written and
+// round-tripped values match alike.
+func (g *Graph) LookupByNumber(key string, v float64) ([]Node, bool) {
+	if !g.sealed {
+		return nil, false
+	}
+	ids, ok := g.snap.LookupNumber(key, v)
+	return g.nodesFromIDs(ids, ok)
+}
+
+// LookupByNumberRange finds nodes whose numeric property lies in [min, max]
+// (inclusive; nil leaves that side unbounded). int64 values beyond 2^53 lose
+// precision (inherent to the JSON number model).
+func (g *Graph) LookupByNumberRange(key string, min, max *float64) ([]Node, bool) {
+	if !g.sealed {
+		return nil, false
+	}
+	ids, ok := g.snap.LookupNumberRange(key, min, max)
+	return g.nodesFromIDs(ids, ok)
+}
+
+// LookupByBool finds nodes whose boolean property equals v.
+func (g *Graph) LookupByBool(key string, v bool) ([]Node, bool) {
+	if !g.sealed {
+		return nil, false
+	}
+	ids, ok := g.snap.LookupBool(key, v)
+	return g.nodesFromIDs(ids, ok)
+}
+
+// nodesFromIDs materializes index hits as nodes; ok passes the
+// registered/unregistered distinction through.
+func (g *Graph) nodesFromIDs(ids []uint32, ok bool) ([]Node, bool) {
 	if !ok {
 		return nil, false
 	}
