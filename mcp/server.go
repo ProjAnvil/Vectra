@@ -78,7 +78,7 @@ func newServer(svc *service) *mcp.Server {
 			Instructions: "Vectra in-memory graph engine (dependency graphs). Write with inject_batch, " +
 				"then call seal before querying; query tools: neighbors (one hop), " +
 				"bfs (multi-hop), shortest_path, reachable (impact set), cycles (dependency cycles), " +
-				"stats, get_node, lookup_property.",
+				"cypher (Cypher-subset pattern queries), stats, get_node, lookup_property.",
 		},
 	)
 	registerTools(s, svc)
@@ -213,8 +213,20 @@ type cyclesOut struct {
 
 type lookupIn struct {
 	PropKey   string `json:"propKey"`
-	PropValue string `json:"propValue"`
+	PropValue any    `json:"propValue" jsonschema:"string, number or boolean property value"`
 	Limit     int    `json:"limit,omitempty"`
+}
+
+type cypherIn struct {
+	Query string `json:"query" jsonschema:"Cypher-subset statement: MATCH ... [WHERE ...] RETURN ... [ORDER BY ...] [LIMIT n]"`
+	Limit int    `json:"limit,omitempty" jsonschema:"max rows returned, default 1000"`
+}
+
+type cypherOut struct {
+	Columns []string         `json:"columns"`
+	Rows    []map[string]any `json:"rows"`
+	Count   int              `json:"count" jsonschema:"rows returned in this call"`
+	Total   int              `json:"total" jsonschema:"true total (may be truncated by limit)"`
 }
 
 // ---- tool registration ----
@@ -275,9 +287,18 @@ func registerTools(s *mcp.Server, svc *service) {
 	}, svc.cycles)
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "lookup_property", Description: "Look up nodes by string property value (label-like props such as env/team/tier). Params: propKey, propValue, limit (default 1000).",
+		Name: "lookup_property", Description: "Look up nodes by property value, typed equality (string/number/bool — label-like props such as env/team/tier, numeric ids, flags). Params: propKey, propValue, limit (default 1000).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.lookupProperty)
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "cypher",
+		Description: "Query the graph with a Cypher-subset statement: MATCH (a:Label {prop:value})-[e:REL*1..3]->(b) " +
+			"WHERE b.w > 3 RETURN a.key, b ORDER BY b.w DESC LIMIT 10. Node-pair semantics for *hops " +
+			"(shortest distance within the hop window); pseudo-props a.key/a.label/a.id; edge vars bind on " +
+			"fixed single hops only. Limit defaults to 1000 (total reports the true size).",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, svc.cypher)
 }
 
 // ---- tool implementations ----
@@ -543,9 +564,28 @@ func (svc *service) lookupProperty(_ context.Context, _ *mcp.CallToolRequest, in
 	if limit <= 0 {
 		limit = defaultLimit
 	}
-	nodes, ok := v.LookupByProperty(in.PropKey, in.PropValue)
-	if !ok {
-		return nil, listOut{}, fmt.Errorf("property %q is not indexed (re-seal after it appears in injected data)", in.PropKey)
+	var nodes []vectra.Node
+	switch tv := in.PropValue.(type) {
+	case string:
+		ns, ok := v.LookupByProperty(in.PropKey, tv)
+		if !ok {
+			return nil, listOut{}, fmt.Errorf("property %q is not indexed (re-seal after it appears in injected data)", in.PropKey)
+		}
+		nodes = ns
+	case float64:
+		ns, ok := v.LookupByNumber(in.PropKey, tv)
+		if !ok {
+			return nil, listOut{}, fmt.Errorf("property %q is not indexed (re-seal after it appears in injected data)", in.PropKey)
+		}
+		nodes = ns
+	case bool:
+		ns, ok := v.LookupByBool(in.PropKey, tv)
+		if !ok {
+			return nil, listOut{}, fmt.Errorf("property %q is not indexed (re-seal after it appears in injected data)", in.PropKey)
+		}
+		nodes = ns
+	default:
+		return nil, listOut{}, fmt.Errorf("propValue must be a string, number or boolean, got %T", in.PropValue)
 	}
 	out := listOut{Total: len(nodes)}
 	for i, n := range nodes {
@@ -555,5 +595,29 @@ func (svc *service) lookupProperty(_ context.Context, _ *mcp.CallToolRequest, in
 		out.Nodes = append(out.Nodes, n.Key)
 	}
 	out.Count = len(out.Nodes)
+	return nil, out, nil
+}
+
+func (svc *service) cypher(_ context.Context, _ *mcp.CallToolRequest, in cypherIn) (*mcp.CallToolResult, cypherOut, error) {
+	v, err := svc.viewOrSealHint()
+	if err != nil {
+		return nil, cypherOut{}, err
+	}
+	res, err := v.Cypher(in.Query)
+	if err != nil {
+		return nil, cypherOut{}, err
+	}
+	limit := in.Limit
+	if limit <= 0 {
+		limit = defaultLimit
+	}
+	out := cypherOut{Columns: res.Columns, Total: len(res.Rows)}
+	for i, r := range res.Rows {
+		if i >= limit {
+			break
+		}
+		out.Rows = append(out.Rows, r)
+	}
+	out.Count = len(out.Rows)
 	return nil, out, nil
 }
