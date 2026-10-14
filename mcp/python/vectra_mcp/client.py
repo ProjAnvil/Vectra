@@ -60,3 +60,6 @@ class Client:
 
     def cycles(self) -> dict:
         return self._check(self._http.get("/v1/cycles"))
+
+    def cypher(self, query: str) -> dict:
+        return self._check(self._http.post("/v1/cypher", json={"query": query}))
