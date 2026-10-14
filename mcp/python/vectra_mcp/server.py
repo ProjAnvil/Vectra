@@ -23,7 +23,8 @@ mcp: FastMCP = FastMCP(
         "Vectra dependency-graph engine via its HTTP API. Writes go through "
         "inject_batch (raft-replicated by the server); reads are served from "
         "the server's published snapshot. Tools: neighbors (1-hop), bfs "
-        "(multi-hop), shortest_path, reachable (blast radius), cycles, stats."
+        "(multi-hop), shortest_path, reachable (blast radius), cycles, cypher "
+        "(Cypher-subset pattern queries), stats."
     ),
 )
 
@@ -100,6 +101,24 @@ def reachable(frm: str, limit: int = 1000) -> dict:
 def cycles() -> dict:
     """All dependency cycles (SCC member lists, largest first)."""
     return _c().cycles()
+
+
+@mcp.tool
+def cypher(query: str, limit: int = 1000) -> dict:
+    """Query the graph with a Cypher-subset statement:
+    MATCH (a:Label {prop:value})-[e:REL*1..3]->(b) WHERE b.w > 3
+    RETURN a.key, b ORDER BY b.w DESC LIMIT 10.
+    Node-pair semantics for *hops (shortest distance within the hop window);
+    pseudo-props a.key/a.label/a.id; edge vars bind on fixed single hops
+    only. total reflects the true row count even when truncated by limit."""
+    res = _c().cypher(query)
+    rows = res.get("rows", [])
+    return {
+        "columns": res.get("columns", []),
+        "count": min(len(rows), limit),
+        "total": len(rows),
+        "rows": rows[:limit],
+    }
 
 
 def main() -> None:

@@ -43,9 +43,26 @@ for _, c := range g.Cycles() { ... }
 g.SaveFile("deps.vg")
 ```
 
-Snapshot notes: the v3 format persists `IndexProperty` declarations, so `vectra.Load` restores both the graph and its lookup indexes (`LookupByProperty` works immediately after reload; v2/v1 files remain readable but carry no index declarations). Props serialize as JSON — integers read back as `float64`, so compare numerically or convert on the consumer side.
+Snapshot notes: the v3 format persists `IndexProperty` declarations, so `vectra.Load` restores both the graph and its lookup indexes (typed lookups work immediately after reload; v2/v1 files remain readable but carry no index declarations). Property indexes are **typed** — per key three sorted buckets (string / number / bool): `LookupByProperty` (string eq), `LookupByNumber` / `LookupByNumberRange(min, max *float64)` (numeric eq / range), `LookupByBool`. Numbers normalize to `float64` in the index, so an `int` written via the Go API and the same value read back from a JSON snapshot land in one bucket — the old "integers read back as float64" comparison pitfall disappears for indexed lookups (`int64` beyond 2^53 loses precision, inherent to the JSON number model).
 
 **⚠️ Upgrading to 0.5.0.** Store snapshots are now written in the v3 format. The incompatibility is one-directional: v1/v2 files remain readable, but pre-0.5 binaries cannot read v3 files — embedded and MCP users who exchange `.vg` snapshots across versions need both sides on 0.5+. The raft cluster mixed-version policy is unchanged (already unsupported).
+
+## Cypher-subset queries
+
+Sealed graphs answer openCypher/GQL-style pattern queries — the DSL compiles onto the same CSR traversal primitives (`bfs` / `neighbors` / `lookup_property` are the physical operators):
+
+```go
+res, _ := g.Cypher(`MATCH (b {type:'controller'})-[:CALLS*1..2]->(s)
+                    WHERE s.env = 'prod' AND s.w >= 3
+                    RETURN b.key, s ORDER BY s.w DESC LIMIT 10`)
+// res.Columns = ["b.key", "s"]; res.Rows = [{"b.key": "gw", "s": {key,label,props,...}}, ...]
+```
+
+Grammar: `MATCH pattern[, pattern...] [WHERE expr] RETURN *|items [ORDER BY item [ASC|DESC]...] [LIMIT n]`; node `(var:Label {prop:literal})`, edge `-[var:REL|REL*n..m]->` / `<-[...]-` / `--` (undirected); WHERE supports `= <> < <= > >=`, `STARTS/ENDS WITH`, `CONTAINS`, `IN [...]`, `AND/OR/NOT`, the pseudo-props `var.key / var.label / var.id`, and edge props on fixed single hops (`WHERE e.weight > 3` — parallel edges each bind a row).
+
+Semantics (deliberate, documented): variable-length edges follow **node-pair semantics** — a target matches when its *shortest distance* lies within the hop window (`[:CALLS*1..2]` = 1..2 hops by shortest path; cycles do not create longer matches), intermediate nodes are not filtered by the target pattern, and variable-length edges bind no edge variable. Rows dedup on named bindings + final position; WHERE uses null-propagating logic (a missing property never satisfies, and `NOT` does not rescue it). Anchoring uses the typed property indexes when the pattern allows (`{type:'controller'}`), scanning otherwise. Intermediate rows are capped at 1,000,000 (error asks for a narrower pattern or `LIMIT`).
+
+Same surface elsewhere: server `POST /v1/cypher` (`{"query": "..."}` → `{columns, rows, count}`; parse errors 400 `PARSE`), MCP tool `cypher` in all three servers (default limit 1000, `total` reports the true size).
 
 ## Server mode (optional module)
 
@@ -54,7 +71,7 @@ All embedded graph products (Kuzu, CozoDB, SQLite) ship without replication; eve
 ```
 write: client →POST /v1/batch→ leader ─raft→ majority commit → deterministic FSM replay
 publisher (each node): RLock clone → Seal outside the lock → atomic.Pointer swap
-queries: GET /v1/* → local published snapshot (lock-free, never interrupted)
+queries: GET /v1/* and POST /v1/query|/v1/cypher → local published snapshot (lock-free, never interrupted)
 ```
 
 ```bash
@@ -97,7 +114,7 @@ conflict: 409 {committed: false, conflicts: [...], conflictTotal, hint}
 
 ## MCP (agents)
 
-Three first-class implementations — [Go (embedded engine)](mcp), [Python (FastMCP)](mcp/python), [TypeScript](mcp/ts) — exposing one-hop / multi-hop / shortest-path / reachability / cycles (with intra-cycle edges) as MCP tools, plus `inject_batch` for writes (`allowParallel` supported):
+Three first-class implementations — [Go (embedded engine)](mcp), [Python (FastMCP)](mcp/python), [TypeScript](mcp/ts) — exposing one-hop / multi-hop / shortest-path / reachability / cycles (with intra-cycle edges) / Cypher-subset pattern queries as MCP tools, plus `inject_batch` for writes (`allowParallel` supported; `lookup_property` takes string/number/bool values):
 
 ```bash
 claude mcp add vectra -- /path/to/vectra-mcp
@@ -122,10 +139,12 @@ Correctness is validated the LDBC way: property tests against independent refere
 ## Repository layout
 
 ```
-vectra.go            facade: writes, Seal, snapshot, property index
+vectra.go            facade: writes, Seal, snapshot, typed property index
+cypher.go            facade: Cypher-subset query entry (Graph.Cypher)
 internal/csr         CSR adjacency (pointer-free uint32 arrays)
 internal/dag         Tarjan SCC, condensation, topological levels
 internal/engine      sealed snapshot + accessors + Seal pipeline
+internal/cypher      Cypher-subset lexer, parser, AST, row executor
 internal/traverse    algorithms: layer-synced BFS, reachability, bidirectional path, cycles
 internal/store       snapshot codec (v3: indexKey section + CRC32 trailer, v1/v2 read-compatible)
 server/              separate module: raft replication + HTTP API + hot-swap publisher
@@ -143,7 +162,7 @@ The core module has **zero third-party dependencies** (`go.sum` absent). The `se
 
 ## Not in scope (deliberately)
 
-Online writes / delta-CSR (they would forfeit the two core bets), disk spill beyond 10M edges, a full GQL parser in core, sharding. The roadmap holds: k-hop precomputation, a minimal query DSL, property-typed indexes.
+Online writes / delta-CSR (they would forfeit the two core bets), disk spill beyond 10M edges, a full GQL parser in core, sharding. Two former roadmap items shipped: the minimal query DSL (`Graph.Cypher`, `/v1/cypher`, MCP `cypher`) and property-typed indexes. The roadmap holds: k-hop precomputation.
 
 ## License
 
