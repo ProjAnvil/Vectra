@@ -1,0 +1,10 @@
+//go:build race
+
+package vectra_test
+
+// v07RaceBuild shrinks the acceptance benchmarks' heavy tiers under the race
+// detector: -race multiplies merge/inject costs ~5-10x, which would push the
+// full-scale tiers past the default test timeout without adding detection
+// value (the race detector needs concurrency, not scale). Full-scale numbers
+// come from the non-race runs recorded in docs/benchmarks.
+const v07RaceBuild = true
