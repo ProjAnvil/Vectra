@@ -234,6 +234,75 @@ func TestLookupProperty(t *testing.T) {
 	}
 }
 
+// TestInjectCountsAndImmediateVisibility: one inject_batch carrying a bad
+// edge (nonexistent endpoint) reports exact counts — the bad edge is skipped,
+// never fatal — and everything applied is queryable right away, no seal
+// needed: the Batch boundary around the write loops publishes the layer
+// before the tool returns.
+func TestInjectCountsAndImmediateVisibility(t *testing.T) {
+	cs := newTestSession(t)
+
+	inj := call[struct {
+		NodesApplied int `json:"nodesApplied"`
+		EdgesApplied int `json:"edgesApplied"`
+		EdgesSkipped int `json:"edgesSkipped"`
+	}](t, cs, "inject_batch", map[string]any{
+		"nodes": []map[string]any{
+			{"key": "a"}, {"key": "b"}, {"key": "c"},
+		},
+		"edges": []map[string]any{
+			{"srcKey": "a", "dstKey": "b", "label": "CALLS"},
+			{"srcKey": "b", "dstKey": "c", "label": "CALLS"},
+			{"srcKey": "ghost", "dstKey": "a", "label": "CALLS"}, // bad endpoint: skipped
+		},
+	})
+	if inj.NodesApplied != 3 || inj.EdgesApplied != 2 || inj.EdgesSkipped != 1 {
+		t.Fatalf("inject counts: %+v, want 3 nodes / 2 edges / 1 skipped", inj)
+	}
+
+	nb := call[struct {
+		Nodes []string `json:"nodes"`
+	}](t, cs, "neighbors", map[string]any{"key": "a", "direction": "out"})
+	if len(nb.Nodes) != 1 || nb.Nodes[0] != "b" {
+		t.Fatalf("neighbors right after inject (no seal): %+v", nb.Nodes)
+	}
+	st := call[struct {
+		Nodes int `json:"nodes"`
+		Edges int `json:"edges"`
+	}](t, cs, "stats", nil)
+	if st.Nodes != 3 || st.Edges != 2 {
+		t.Fatalf("stats right after inject: %+v, want 3/2", st)
+	}
+}
+
+// TestInjectOneLayerPerBatch: one inject_batch call — nodes, edges and
+// deletes, applied in kind order — must materialize as ONE micro-layer, not
+// one per op (the pre-batching v0.7 path). LayerPressure is the observable
+// proxy: 9 applied ops must leave exactly 1 unmerged layer.
+func TestInjectOneLayerPerBatch(t *testing.T) {
+	svc := newService(vectra.New(), Options{})
+	_, out, err := svc.injectBatch(context.Background(), nil, injectIn{
+		Nodes: []nodeIn{{Key: "a"}, {Key: "b"}, {Key: "c"}, {Key: "d"}},
+		Edges: []edgeIn{
+			{SrcKey: "a", DstKey: "b", Label: "E"},
+			{SrcKey: "b", DstKey: "c", Label: "E"},
+			{SrcKey: "a", DstKey: "d", Label: "E"},
+		},
+		DeleteEdges: []edgeDeleteIn{{SrcKey: "a", DstKey: "d", Label: "E"}},
+		DeleteNodes: []string{"d"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.NodesApplied != 4 || out.EdgesApplied != 3 || out.EdgesDeleted != 1 || out.NodesDeleted != 1 {
+		t.Fatalf("counts: %+v, want 4 nodes / 3 edges / 1 edge deleted / 1 node deleted", out)
+	}
+	layers, _ := svc.live.LayerPressure()
+	if layers != 1 {
+		t.Fatalf("unmerged layers = %d, want 1 (one micro-layer per inject_batch, not per op)", layers)
+	}
+}
+
 func TestInjectDeleteSeal(t *testing.T) {
 	cs := newTestSession(t)
 	call[struct{}](t, cs, "inject_batch", map[string]any{

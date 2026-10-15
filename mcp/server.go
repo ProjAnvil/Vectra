@@ -357,41 +357,52 @@ func (svc *service) injectBatch(_ context.Context, _ *mcp.CallToolRequest, in in
 	svc.mu.Lock()
 	defer svc.mu.Unlock()
 	out := countsOut{}
-	for _, n := range in.Nodes {
-		if _, err := svc.live.AddNode(n.Key, n.Label, n.Props); err == nil {
-			out.NodesApplied++
+	// One Batch boundary per tool call: the whole inject materializes as one
+	// micro-layer and — in WAL mode — flushes as one frame (one fsync), not
+	// one layer/frame per op (v0.7 per-op writes were an order of magnitude
+	// slower). Within-batch visibility is preserved (endpoint validation and
+	// upsert folding consult the builder mirrors), and the loops keep their
+	// lenient per-op error semantics: a failed item is counted as skipped,
+	// never fatal. The boundary's own flush error keeps the same lenient
+	// surface — the ops already hit memory and stay buffered in pendOps for
+	// the next successful flush (see Batch's direct-mode limitation note).
+	_ = svc.live.Batch(func(g *vectra.Graph) {
+		for _, n := range in.Nodes {
+			if _, err := g.AddNode(n.Key, n.Label, n.Props); err == nil {
+				out.NodesApplied++
+			}
+			for k := range n.Props {
+				svc.propKeys[k] = true
+			}
 		}
-		for k := range n.Props {
-			svc.propKeys[k] = true
+		for _, e := range in.Edges {
+			var err error
+			if e.AllowParallel {
+				_, err = g.AddEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
+			} else {
+				_, err = g.UpsertEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
+			}
+			if err == nil {
+				out.EdgesApplied++
+			} else {
+				out.EdgesSkipped++
+			}
+			for k := range e.Props {
+				svc.propKeys[k] = true
+			}
 		}
-	}
-	for _, e := range in.Edges {
-		var err error
-		if e.AllowParallel {
-			_, err = svc.live.AddEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
-		} else {
-			_, err = svc.live.UpsertEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
+		for _, d := range in.DeleteEdges {
+			if n, err := g.DeleteEdge(d.SrcKey, d.DstKey, d.Label); err == nil {
+				out.EdgesDeleted += n
+			}
 		}
-		if err == nil {
-			out.EdgesApplied++
-		} else {
-			out.EdgesSkipped++
+		for _, k := range in.DeleteNodes {
+			if n, err := g.DeleteNode(k); err == nil {
+				out.NodesDeleted++
+				out.EdgesDeleted += n
+			}
 		}
-		for k := range e.Props {
-			svc.propKeys[k] = true
-		}
-	}
-	for _, d := range in.DeleteEdges {
-		if n, err := svc.live.DeleteEdge(d.SrcKey, d.DstKey, d.Label); err == nil {
-			out.EdgesDeleted += n
-		}
-	}
-	for _, k := range in.DeleteNodes {
-		if n, err := svc.live.DeleteNode(k); err == nil {
-			out.NodesDeleted++
-			out.EdgesDeleted += n
-		}
-	}
+	})
 	return nil, out, nil
 }
 
