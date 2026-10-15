@@ -243,13 +243,23 @@ func (h *Handle) run() {
 // applyBatch commits one drained group as a single g.Batch — one
 // micro-layer and one WAL frame group for the whole group (group commit) —
 // then replies, then runs the merge triggers/stall.
+//
+// Before the batch applies, the C1 repair runs: if the merger published a
+// rebase since the last batch, the graph's writer-private mirrors hold
+// pre-rebase IDs that the rebase's dense renumbering may have assigned to
+// other keys; stamping one into this batch's layer would put two live
+// records on a single ID. RepairAfterRebase folds the generation once and
+// rebuilds the mirrors (a no-op without a rebase).
 func (h *Handle) applyBatch(pending []request) {
 	h.pubMu.Lock()
-	batchErr := h.g.Batch(func(g *vectra.Graph) {
-		for i := range pending {
-			pending[i].err = applyChangeset(g, pending[i].cs)
-		}
-	})
+	batchErr := h.g.RepairAfterRebase()
+	if batchErr == nil {
+		batchErr = h.g.Batch(func(g *vectra.Graph) {
+			for i := range pending {
+				pending[i].err = applyChangeset(g, pending[i].cs)
+			}
+		})
+	}
 	h.pubMu.Unlock()
 
 	for i := range pending {

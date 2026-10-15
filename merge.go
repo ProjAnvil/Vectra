@@ -23,16 +23,28 @@ package vectra
 //     that rebase validity is the foundation of the whole protocol
 //     (verified by the delta composition contract, Task 4).
 //
-// ID discipline under rebase (R1 corollary): the union of base+prefix has
-// node/edge counts ≤ the ratchet values the writer used when allocating
-// IDs in the tail layers, so tail-layer IDs never collide with the new
-// base's dense [0, count) range from FUTURE allocations. Tail records may
-// however carry IDs that the renumbered base now assigns to a different
-// key — NodeByID/EdgeByID resolve such collisions deterministically
-// (layer records win) and the next full merge (Seal/Compact/Close, or the
-// writer's fallback) restores dense uniqueness. Transient ID ambiguity
-// between background merges is the documented cost of never blocking the
-// writer on a merge.
+// ID discipline under rebase (R1 corollary, C1 repair): the union of
+// base+prefix has node/edge counts ≤ the ratchet values the writer used when
+// allocating IDs in the tail layers, so tail-layer IDs drawn FRESH from the
+// ratchet never collide with the new base's dense [0, count) range from
+// FUTURE allocations. The writer-private MIRRORS, however, still hold
+// pre-rebase IDs — and when the folded prefix contained tombstones, the
+// dense renumbering assigns those IDs to other keys. Reusing a mirror ID
+// into a fresh layer (AddNode override/revive, endpoint materialization,
+// UpsertEdge folds) would put two live records of one generation on one ID
+// with no later merge to clear it. PublishMerge therefore sets
+// rebaseHappened, and the writer (internal/writer's loop, before every
+// batch) rebuilds its mirrors via RepairAfterRebase — a full fold that
+// redoes the rebase's work once (rare under default thresholds).
+//
+// Residual, documented (R1 transient): between a rebase's publication and
+// the writer's next batch, tail-layer records that were stamped
+// legitimately BEFORE the rebase (mirror-transferred IDs of overrides,
+// revivals, folds) may briefly overlap the renumbered base's dense slots.
+// NodeByID/EdgeByID resolve such overlaps deterministically (layer records
+// win); the next batch's repair folds them away before any new write.
+// Eliminating the overlap entirely would mean renumbering immutable tail
+// layers — a v0.7.x candidate, out of scope here.
 
 import (
 	"github.com/projanvil/vectra/internal/delta"
@@ -159,5 +171,28 @@ func (g *Graph) PublishMerge(c *MergeCapture, r *MergeResult) bool {
 		base: r.snap, baseKeys: r.baseKeys, layers: tail,
 		lsn: cur.lsn, nodes: nodes, edges: edges,
 	})
+	// C1: the writer-private mirrors now hold pre-rebase IDs while the new
+	// base has renumbered — flag it so the writer rebuilds before its next
+	// batch stamps any of them into a fresh layer.
+	g.rebaseHappened.Store(true)
 	return true
+}
+
+// RepairAfterRebase rebuilds the writer-private mirrors when a background
+// merge rebase has been published since the last full merge on this
+// goroutine: after a rebase the mirrors carry pre-rebase node/edge IDs, and
+// the rebase's dense renumbering may have assigned those IDs to other keys —
+// reusing one into a fresh layer would collide two live records on a single
+// ID. The rebuild is a forceMerge (full fold, ratchets reset, dense IDs);
+// it redoes the rebase's sealing work once, which is the accepted cost under
+// default thresholds. A no-op when no rebase intervened.
+//
+// Write-path method (it rewrites writer-private state): run it on the
+// writer goroutine, under the same publication mutex that serializes
+// PublishMerge — internal/writer's loop calls it before every batch.
+func (g *Graph) RepairAfterRebase() error {
+	if !g.rebaseHappened.Load() {
+		return nil
+	}
+	return g.forceMerge()
 }

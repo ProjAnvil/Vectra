@@ -275,6 +275,16 @@ type Graph struct {
 	// (debug builds only; release builds compile the check away). Only the
 	// hook pair in writer_hook*.go touches it.
 	writerTok atomic.Uint64
+
+	// rebaseHappened is the C1 repair flag: set by PublishMerge when a
+	// background merge rebase renumbers the base, cleared by forceMerge.
+	// While set, the writer-private mirrors may carry pre-rebase IDs that the
+	// rebased base's dense renumbering assigned to OTHER keys — the writer
+	// must rebuild them (forceMerge) before stamping IDs into new layers, or
+	// two live records of one generation can share an ID. Atomic because the
+	// merger goroutine sets it (under the caller's publication mutex) while
+	// the writer goroutine reads it. Direct mode never sets it.
+	rebaseHappened atomic.Bool
 }
 
 // opKind orders pendOp entries exactly like the Changeset apply order:
@@ -1390,15 +1400,17 @@ func (v *genView) baseEdgeKeyFrom(er engine.EdgeRec) delta.EdgeKey {
 // immutable base and publishes {newBase, layers=nil}: tombstones applied to
 // the base first, layer records overlaid oldest→newest, labels/index
 // declarations merged, node and edge IDs renumbered densely (R1) with the
-// ratchets reset to the new base size. No-op when nothing is unmerged. The
-// old generation stays readable for concurrent holders; memory is reclaimed
-// by GC. Cycles() uses this before answering (spec §3.2).
+// ratchets reset to the new base size. No-op when nothing is unmerged —
+// except after a background rebase (rebaseHappened): the mirrors then hold
+// pre-rebase IDs even with an empty layer stack, so the rebuild still runs.
+// The old generation stays readable for concurrent holders; memory is
+// reclaimed by GC. Cycles() uses this before answering (spec §3.2).
 func (g *Graph) forceMerge() error {
 	if g.builder != nil {
 		g.publishLayer() // a mid-batch Seal flushes the pending batch first
 	}
 	v := g.view.Load()
-	if len(v.layers) == 0 {
+	if len(v.layers) == 0 && !g.rebaseHappened.Load() {
 		return nil
 	}
 	nodes, edges, labels, indexKeys := g.unionRecords()
@@ -1432,6 +1444,7 @@ func (g *Graph) forceMerge() error {
 	for _, er := range edges {
 		g.labels[labels[er.LabelID]] = true
 	}
+	g.rebaseHappened.Store(false) // mirrors now match the published view
 	g.view.Store(&genView{
 		base: snap, baseKeys: baseKeys, layers: nil,
 		lsn: v.lsn, nodes: g.nodeTotal, edges: g.edgeTotal,

@@ -43,11 +43,15 @@ func delEdgeCS(src, dst, label string) vectra.Changeset {
 	return vectra.Changeset{EdgeDeletes: []vectra.EdgeDelete{{SrcKey: src, DstKey: dst, Label: label}}}
 }
 
-// dumpState walks the key universe and dumps every live node and edge.
+// dumpState walks the key universe and dumps every live node and edge. Edges
+// are collected as a sorted MULTISET (one entry per visible parallel — the
+// T5 map keyed by src->dst:label silently deduplicated parallel edges and
+// let their props overwrite each other, so multiplicity regressions slipped
+// through; the sorted multiset keeps both exact).
 func dumpState(t *testing.T, g *vectra.Graph, keys []string) string {
 	t.Helper()
 	var out string
-	var nk, ek []string
+	var nk []string
 	nodeMap := map[string]string{}
 	for _, k := range keys {
 		if n, ok := g.NodeByKey(k); ok {
@@ -55,7 +59,7 @@ func dumpState(t *testing.T, g *vectra.Graph, keys []string) string {
 			nodeMap[k] = fmt.Sprintf("%s|%v", n.Label, n.Props)
 		}
 	}
-	edgeMap := map[string]string{}
+	var ek []string
 	for _, k := range keys {
 		for _, dir := range []vectra.Direction{vectra.DirOut, vectra.DirIn} {
 			es, err := g.EdgesOf(k, dir)
@@ -63,8 +67,7 @@ func dumpState(t *testing.T, g *vectra.Graph, keys []string) string {
 				continue
 			}
 			for _, e := range es {
-				key := fmt.Sprintf("%d->%d:%s", e.Src, e.Dst, e.Label)
-				edgeMap[key] = fmt.Sprintf("%v", e.Props)
+				ek = append(ek, fmt.Sprintf("%d->%d:%s = %v", e.Src, e.Dst, e.Label, e.Props))
 			}
 		}
 	}
@@ -72,12 +75,9 @@ func dumpState(t *testing.T, g *vectra.Graph, keys []string) string {
 	for _, k := range nk {
 		out += "N " + k + " = " + nodeMap[k] + "\n"
 	}
-	for k := range edgeMap {
-		ek = append(ek, k)
-	}
 	sort.Strings(ek)
 	for _, k := range ek {
-		out += "E " + k + " = " + edgeMap[k] + "\n"
+		out += "E " + k + "\n"
 	}
 	return out
 }
@@ -366,10 +366,15 @@ func TestMergeProtocolEquivalence(t *testing.T) {
 			if err := h.Submit(cs); err != nil {
 				t.Fatalf("Submit (seed %d): %v", seed, err)
 			}
+			// C1 regression net: live node IDs pairwise distinct and NodeByID
+			// round-trips throughout the stream, asserted at post-repair
+			// quiescent points (a collision that survives settles fails).
+			assertIDConsistencySettled(t, h, g, keys)
 		}
 		if err := h.Close(); err != nil {
 			t.Fatalf("Close (seed %d): %v", seed, err)
 		}
+		assertIDConsistency(t, g, keys, true)
 		want := dumpState(t, applyDirect(t, css), keys)
 		got := dumpState(t, g, keys)
 		if got != want {
