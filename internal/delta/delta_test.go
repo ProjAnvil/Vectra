@@ -259,32 +259,64 @@ func TestGoldenEdgeFoldParallelIdempotentDelete(t *testing.T) {
 	bothNode(t, g, b, "a", "P", nil)
 	bothNode(t, g, b, "b", "P", nil)
 	k := delta.EdgeKey{SrcKey: "a", DstKey: "b", Label: "KNOWS"}
+	del := delta.EdgeKey{SrcKey: "a", DstKey: "b", Label: "DEL"}
 
+	// Two KNOWS parallels with a different-triple edge (OTHER) interleaved
+	// between them. The fold must keep the NEWEST parallel — the later slot —
+	// which the final ordered view discriminates: [OTHER, K, DEL] here; a
+	// keep-oldest mutation would order [K, OTHER, DEL] instead.
 	bothAddEdge(t, g, b, "a", "b", "KNOWS", map[string]any{"w": 1})
+	bothAddEdge(t, g, b, "a", "b", "OTHER", map[string]any{"o": 1})
 	bothAddEdge(t, g, b, "a", "b", "KNOWS", map[string]any{"w": 2}) // parallel
-	// Fold two parallels: most recent survives with the new props.
 	bothFold(t, g, b, "a", "b", "KNOWS", map[string]any{"w": 3})
-	if g.EdgeCount() != 1 {
+	if g.EdgeCount() != 2 { // fold dropped exactly one parallel; OTHER survives
 		t.Fatalf("after fold: oracle edges=%d", g.EdgeCount())
 	}
-	// Fold then Add parallel: back to two live edges.
+	// Fold then Add parallel, then fold the pair again (still keep-newest).
 	bothAddEdge(t, g, b, "a", "b", "KNOWS", map[string]any{"w": 9})
-	// Fold again over the pair.
 	bothFold(t, g, b, "a", "b", "KNOWS", map[string]any{"w": 4})
 
-	// Delete the live edge, then idempotent zero-delete, then a triple whose
-	// label was never interned.
-	bothDeleteEdge(t, g, b, k)
-	bothDeleteEdge(t, g, b, k) // idempotent: 0 removed, no error
+	// Delete/idempotence dance on a third triple, leaving the discriminators
+	// (OTHER and the fold-kept KNOWS) live to the end.
+	bothAddEdge(t, g, b, "a", "b", "DEL", map[string]any{"d": 1})
+	bothDeleteEdge(t, g, b, del) // removes 1
+	bothDeleteEdge(t, g, b, del) // idempotent: 0 removed, no error
 	bothDeleteEdge(t, g, b, delta.EdgeKey{SrcKey: "a", DstKey: "b", Label: "NEVER"})
 	// Delete then re-add: edge live again (its base tombstone persists — the
 	// layer record wins over the layer's own tombstone).
-	bothAddEdge(t, g, b, "a", "b", "KNOWS", map[string]any{"w": 5})
+	bothAddEdge(t, g, b, "a", "b", "DEL", map[string]any{"d": 2})
 
 	l := b.Build()
 	assertSameView(t, g, l, []string{"a", "b"}, 2, 16)
 	if !l.EdgeTombstones()[k] {
 		t.Fatalf("folded/deleted key %v must carry a base edge tombstone", k)
+	}
+	if !l.EdgeTombstones()[del] {
+		t.Fatalf("deleted key %v must carry a base edge tombstone", del)
+	}
+}
+
+// TestGoldenFoldKeepsNewestParallel pins the fold recency rule in isolation:
+// with a different-triple edge sandwiched between two parallels of the same
+// triple, the fold must keep the NEWEST parallel (the later slot), giving the
+// ordered view [OTHER, K]. A keep-oldest mutation produces [K, OTHER] and
+// fails here (verified by mutation testing during review).
+func TestGoldenFoldKeepsNewestParallel(t *testing.T) {
+	g, b := vectra.New(), delta.NewBuilder()
+
+	bothNode(t, g, b, "a", "P", nil)
+	bothNode(t, g, b, "b", "P", nil)
+	bothAddEdge(t, g, b, "a", "b", "K", map[string]any{"w": 1}) // oldest parallel
+	bothAddEdge(t, g, b, "a", "b", "OTHER", map[string]any{"o": 1})
+	bothAddEdge(t, g, b, "a", "b", "K", map[string]any{"w": 2}) // newest parallel
+	bothFold(t, g, b, "a", "b", "K", map[string]any{"w": 3})
+
+	l := b.Build()
+	assertSameView(t, g, l, []string{"a", "b"}, 2, 8)
+	if got := l.Edges(); len(got) != 2 ||
+		got[0].Label != "OTHER" || got[0].Props["o"] != 1 ||
+		got[1].Label != "K" || got[1].Props["w"] != 3 {
+		t.Fatalf("fold must keep the newest parallel after the interleaved edge: %+v", got)
 	}
 }
 
@@ -308,83 +340,98 @@ func TestGoldenEndpointErrorsSelfLoopCascade(t *testing.T) {
 }
 
 // TestGoldenRandomSequences cross-checks the op mapping over randomized op
-// sequences with deterministic seeds. Divergence guards (paths where the
-// overlay deliberately differs from the single-graph oracle — missing-node
-// DeleteNode, dead-endpoint DeleteEdge — see delta package doc) are avoided
-// by construction: DeleteNode targets only live keys, DeleteEdge only
-// triples with live endpoints. AddEdge/UpsertEdgeFold use any key because
-// their endpoint errors match on both sides.
+// sequences with deterministic seeds. Two configurations: the wide space
+// exercises general traffic, the shrunk key/label space (2 keys x 1 label =
+// 4 triples) forces constant parallel collisions so folds — and their
+// keep-newest recency — are exercised densely. Divergence guards (paths
+// where the overlay deliberately differs from the single-graph oracle —
+// missing-node DeleteNode, dead-endpoint DeleteEdge — see delta package
+// doc) are avoided by construction: DeleteNode targets only live keys,
+// DeleteEdge only triples with live endpoints. AddEdge/UpsertEdgeFold use
+// any key because their endpoint errors match on both sides.
 func TestGoldenRandomSequences(t *testing.T) {
-	const nkeys = 6
-	labels := []string{"A", "B", "C"}
-	for seed := uint64(1); seed <= 10; seed++ {
-		t.Run(fmt.Sprintf("seed%d", seed), func(t *testing.T) {
-			rnd := rand.New(rand.NewPCG(seed, 0xdecafbad))
-			g, b := vectra.New(), delta.NewBuilder()
-			key := func(i int) string { return fmt.Sprintf("n%d", i) }
-			live := make([]bool, nkeys)
-			liveList := func() []int {
-				var out []int
-				for i := range live {
-					if live[i] {
-						out = append(out, i)
-					}
-				}
-				return out
-			}
-			rprops := func() map[string]any {
-				switch rnd.IntN(10) {
-				case 0:
-					return nil
-				case 1:
-					return map[string]any{}
-				}
-				m := make(map[string]any, 3)
-				for n := rnd.IntN(3) + 1; n > 0; n-- {
-					m[fmt.Sprintf("p%d", rnd.IntN(4))] = rnd.IntN(100)
-				}
-				return m
-			}
-			for op := 0; op < 150; op++ {
-				i, j := rnd.IntN(nkeys), rnd.IntN(nkeys)
-				label := labels[rnd.IntN(len(labels))]
-				switch rnd.IntN(5) {
-				case 0:
-					bothNode(t, g, b, key(i), label, rprops())
-					live[i] = true // (re)vive
-				case 1:
-					bothAddEdge(t, g, b, key(i), key(j), label, rprops())
-				case 2:
-					bothFold(t, g, b, key(i), key(j), label, rprops())
-				case 3:
-					ll := liveList()
-					if len(ll) == 0 {
-						bothNode(t, g, b, key(0), label, rprops())
-						live[0] = true
-						continue
-					}
-					ei, ej := ll[rnd.IntN(len(ll))], ll[rnd.IntN(len(ll))]
-					bothDeleteEdge(t, g, b, delta.EdgeKey{SrcKey: key(ei), DstKey: key(ej), Label: label})
-				case 4:
-					ll := liveList()
-					if len(ll) == 0 {
-						bothNode(t, g, b, key(0), label, rprops())
-						live[0] = true
-						continue
-					}
-					di := ll[rnd.IntN(len(ll))]
-					bothDeleteNode(t, g, b, key(di))
-					live[di] = false
-				}
-			}
-			all := make([]string, nkeys)
-			for i := range all {
-				all[i] = key(i)
-			}
-			l := b.Build()
-			assertSameView(t, g, l, all, nkeys, 320)
-		})
+	for _, cfg := range []struct {
+		name   string
+		nkeys  int
+		labels []string
+	}{
+		{"wide6x3", 6, []string{"A", "B", "C"}},
+		{"tight2x1", 2, []string{"A"}},
+	} {
+		for seed := uint64(1); seed <= 10; seed++ {
+			t.Run(fmt.Sprintf("%s/seed%d", cfg.name, seed), func(t *testing.T) {
+				runGoldenRandom(t, cfg.nkeys, cfg.labels, seed)
+			})
+		}
 	}
+}
+
+func runGoldenRandom(t *testing.T, nkeys int, labels []string, seed uint64) {
+	t.Helper()
+	rnd := rand.New(rand.NewPCG(seed, 0xdecafbad))
+	g, b := vectra.New(), delta.NewBuilder()
+	key := func(i int) string { return fmt.Sprintf("n%d", i) }
+	live := make([]bool, nkeys)
+	liveList := func() []int {
+		var out []int
+		for i := range live {
+			if live[i] {
+				out = append(out, i)
+			}
+		}
+		return out
+	}
+	rprops := func() map[string]any {
+		switch rnd.IntN(10) {
+		case 0:
+			return nil
+		case 1:
+			return map[string]any{}
+		}
+		m := make(map[string]any, 3)
+		for n := rnd.IntN(3) + 1; n > 0; n-- {
+			m[fmt.Sprintf("p%d", rnd.IntN(4))] = rnd.IntN(100)
+		}
+		return m
+	}
+	for op := 0; op < 150; op++ {
+		i, j := rnd.IntN(nkeys), rnd.IntN(nkeys)
+		label := labels[rnd.IntN(len(labels))]
+		switch rnd.IntN(5) {
+		case 0:
+			bothNode(t, g, b, key(i), label, rprops())
+			live[i] = true // (re)vive
+		case 1:
+			bothAddEdge(t, g, b, key(i), key(j), label, rprops())
+		case 2:
+			bothFold(t, g, b, key(i), key(j), label, rprops())
+		case 3:
+			ll := liveList()
+			if len(ll) == 0 {
+				bothNode(t, g, b, key(0), label, rprops())
+				live[0] = true
+				continue
+			}
+			ei, ej := ll[rnd.IntN(len(ll))], ll[rnd.IntN(len(ll))]
+			bothDeleteEdge(t, g, b, delta.EdgeKey{SrcKey: key(ei), DstKey: key(ej), Label: label})
+		case 4:
+			ll := liveList()
+			if len(ll) == 0 {
+				bothNode(t, g, b, key(0), label, rprops())
+				live[0] = true
+				continue
+			}
+			di := ll[rnd.IntN(len(ll))]
+			bothDeleteNode(t, g, b, key(di))
+			live[di] = false
+		}
+	}
+	all := make([]string, nkeys)
+	for i := range all {
+		all[i] = key(i)
+	}
+	l := b.Build()
+	assertSameView(t, g, l, all, nkeys, 320)
 }
 
 // --- overlay-only unit assertions (no single-graph oracle) --------------------
@@ -483,6 +530,34 @@ func TestDeleteEdgePureBaseTombstone(t *testing.T) {
 	l := b.Build()
 	if !l.EdgeTombstones()[k] {
 		t.Fatalf("deleted base key must be tombstoned")
+	}
+}
+
+// TestLiveNodeRecordWinsOverPureBaseTombstone pins the composition rule
+// "live layer records win over the layer's own tombstones" on the node
+// path: a pure base delete (key never written in this layer) followed by
+// the key's first UpsertNode leaves BOTH the live layer record and the base
+// tombstone in place — genView/merge applies the win rule (package doc).
+// Contrast: an in-layer delete followed by re-upsert clears the tombstone
+// eagerly (TestReviveClearsNodeTombstoneButNotEdgeTombstones).
+func TestLiveNodeRecordWinsOverPureBaseTombstone(t *testing.T) {
+	b := delta.NewBuilder()
+	if n, err := b.DeleteNode("x", nil); n != 0 || err != nil {
+		t.Fatalf("pure-base DeleteNode: n=%d err=%v", n, err)
+	}
+	if err := b.UpsertNode("x", "Service", map[string]any{"fresh": true}); err != nil {
+		t.Fatalf("UpsertNode: %v", err)
+	}
+	l := b.Build()
+	rec, ok := l.LookupNode("x")
+	if !ok || rec.Label != "Service" || rec.Props["fresh"] != true {
+		t.Fatalf("layer record must be live: %+v ok=%v", rec, ok)
+	}
+	if l.NodeCount() != 1 {
+		t.Fatalf("NodeCount: %d", l.NodeCount())
+	}
+	if !l.NodeTombstones()["x"] {
+		t.Fatalf("pure-base tombstone coexists with the live record; the consumer applies the win rule")
 	}
 }
 
