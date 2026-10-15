@@ -17,13 +17,17 @@ package vectra
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"os"
+	"path/filepath"
 	"slices"
 
 	"github.com/projanvil/vectra/internal/engine"
 	"github.com/projanvil/vectra/internal/store"
+	"github.com/projanvil/vectra/internal/wal"
 )
 
 // NodeID / EdgeID are integer identifiers within the graph. After Seal all
@@ -36,6 +40,9 @@ var (
 	ErrSealed       = errors.New("vectra: graph sealed, mutation rejected")
 	ErrNotSealed    = errors.New("vectra: graph not sealed, query rejected")
 	ErrNodeNotFound = errors.New("vectra: node key not found")
+	// ErrClosed is returned by write methods after Close. Queries remain
+	// legal on a closed graph (it reads the last checkpointed state).
+	ErrClosed = errors.New("vectra: graph closed, mutation rejected")
 )
 
 type Node struct {
@@ -80,6 +87,12 @@ type edgeKey struct {
 // Graph is a Vectra graph. Single writer during the write phase; immutable
 // after Seal with lock-free concurrent reads. On Seal the write-state memory
 // migrates into the snapshot and is released.
+//
+// WAL sessions (see Open): when a WAL is attached, every successful write
+// method is recorded as Changeset entries; writes outside Batch flush one
+// frame (one fsync in ModeAlways) per write, Batch flushes one frame per
+// boundary. A torn Batch (flush error) may leave memory ahead of the log —
+// the wrapper-mode writer (v0.7 task 5) closes that gap.
 type Graph struct {
 	nodes     []Node
 	byKey     map[string]NodeID
@@ -95,6 +108,34 @@ type Graph struct {
 	tombN   []bool               // parallel to nodes: true = deleted (revivable via AddNode)
 	deadE   int                  // true-count in tombE (visible edges = len(edges)-deadE)
 	deadN   int                  // true-count in tombN
+
+	// WAL session state (all zero for New()/Load() graphs — v0.6 behavior).
+	wal      *wal.WAL // nil = no recording
+	walDir   string   // checkpoint manifest location
+	snapPath string   // checkpoint snapshot target
+	pendOps  []pendOp // recorded-but-unflushed ops (inside Batch, or single writes mid-record)
+	batching bool     // inside Batch: records accumulate instead of flushing
+	closed   bool     // after Close: writes fail with ErrClosed, queries legal
+}
+
+// opKind orders pendOp entries exactly like the Changeset apply order:
+// node upserts → edge upserts → edge deletes → node deletes.
+type opKind int
+
+const (
+	opNode opKind = iota
+	opEdge
+	opEdgeDelete
+	opNodeDelete
+)
+
+// pendOp is one recorded write, kept in original order until flush.
+type pendOp struct {
+	kind opKind
+	node NodeUpsert
+	edge EdgeUpsert
+	edel EdgeDelete
+	ndel string
 }
 
 func New() *Graph {
@@ -131,8 +172,14 @@ func copyProps(props map[string]any) map[string]any {
 // replace them wholesale (AddNode/AddEdge again); in-place mutation is
 // forbidden.
 func (g *Graph) AddNode(key, label string, props map[string]any) (NodeID, error) {
+	if g.closed {
+		return 0, ErrClosed
+	}
 	if g.sealed {
 		return 0, ErrSealed
+	}
+	if err := g.recordNode(key, label, props); err != nil {
+		return 0, err
 	}
 	if id, ok := g.byKey[key]; ok {
 		if g.tombN[id] { // deleted then re-added: revive, reusing the ID
@@ -152,11 +199,17 @@ func (g *Graph) AddNode(key, label string, props map[string]any) (NodeID, error)
 
 // AddEdge appends a directed edge (multi-edges/self-loops both allowed).
 func (g *Graph) AddEdge(srcKey, dstKey, label string, props map[string]any) (EdgeID, error) {
+	if g.closed {
+		return 0, ErrClosed
+	}
 	if g.sealed {
 		return 0, ErrSealed
 	}
 	src, dst, lid, err := g.resolveEdge(srcKey, dstKey, label)
 	if err != nil {
+		return 0, err
+	}
+	if err := g.recordEdge(srcKey, dstKey, label, props, true); err != nil {
 		return 0, err
 	}
 	return g.appendEdge(src, dst, lid, props), nil
@@ -169,11 +222,17 @@ func (g *Graph) AddEdge(srcKey, dstKey, label string, props map[string]any) (Edg
 // triple is unique — it is the entry point for updating weight-like props
 // (relation strength, event counts).
 func (g *Graph) UpsertEdge(srcKey, dstKey, label string, props map[string]any) (EdgeID, error) {
+	if g.closed {
+		return 0, ErrClosed
+	}
 	if g.sealed {
 		return 0, ErrSealed
 	}
 	src, dst, lid, err := g.resolveEdge(srcKey, dstKey, label)
 	if err != nil {
+		return 0, err
+	}
+	if err := g.recordEdge(srcKey, dstKey, label, props, false); err != nil {
 		return 0, err
 	}
 	k := edgeKey{src: src, dst: dst, label: lid}
@@ -220,6 +279,9 @@ func (g *Graph) appendEdge(src, dst NodeID, lid uint32, props map[string]any) Ed
 // label) triple (idempotent: deleting a triple that never existed succeeds
 // with 0). Returns the number of edges actually deleted.
 func (g *Graph) DeleteEdge(srcKey, dstKey, label string) (int, error) {
+	if g.closed {
+		return 0, ErrClosed
+	}
 	if g.sealed {
 		return 0, ErrSealed
 	}
@@ -234,6 +296,9 @@ func (g *Graph) DeleteEdge(srcKey, dstKey, label string) (int, error) {
 	lid, ok := g.labIDs[label]
 	if !ok {
 		return 0, nil // label never interned: no match possible, idempotent success
+	}
+	if err := g.recordEdgeDelete(srcKey, dstKey, label); err != nil {
+		return 0, err
 	}
 	k := edgeKey{src: src, dst: dst, label: lid}
 	for _, id := range g.edgeIdx[k] {
@@ -250,12 +315,18 @@ func (g *Graph) DeleteEdge(srcKey, dstKey, label string) (int, error) {
 // index. Re-adding the same key via AddNode revives the node (ID reused).
 // Returns the number of cascaded edge deletions.
 func (g *Graph) DeleteNode(key string) (int, error) {
+	if g.closed {
+		return 0, ErrClosed
+	}
 	if g.sealed {
 		return 0, ErrSealed
 	}
 	id, ok := g.byKey[key]
 	if !ok || g.tombN[id] {
 		return 0, ErrNodeNotFound
+	}
+	if err := g.recordNodeDelete(key); err != nil {
+		return 0, err
 	}
 	removed := 0
 	for k, ids := range g.edgeIdx { // deleting during range is safe in Go
@@ -272,6 +343,304 @@ func (g *Graph) DeleteNode(key string) (int, error) {
 	g.tombN[id] = true
 	g.deadN++
 	return removed, nil
+}
+
+// --- WAL op recorder ---------------------------------------------------------
+//
+// When a WAL is attached, each successful write method records one pendOp
+// BEFORE mutating memory (log-first for single writes). Outside Batch the op
+// flushes immediately as its own frame — one fsync per write in ModeAlways,
+// the documented cost of unbatched direct-mode writes. Inside Batch the ops
+// accumulate and the boundary flushes them as frame(s).
+//
+// Frame partitioning: a Changeset applies ops in kind order (nodes → edges →
+// edge deletes → node deletes), so a batch whose op sequence is NOT
+// kind-ordered (e.g. delete a key, then re-add it) cannot be expressed as one
+// frame without reordering semantics. flushPending therefore cuts the op
+// sequence at every kind regression and emits one frame per kind-ordered run
+// — replaying the frames reproduces the original op order exactly. Normal
+// batches stay a single frame (one fsync).
+
+func (g *Graph) recordNode(key, label string, props map[string]any) error {
+	if g.wal == nil {
+		return nil
+	}
+	g.pendOps = append(g.pendOps, pendOp{kind: opNode, node: NodeUpsert{Key: key, Label: label, Props: copyProps(props)}})
+	return g.maybeFlush()
+}
+
+func (g *Graph) recordEdge(srcKey, dstKey, label string, props map[string]any, allowParallel bool) error {
+	if g.wal == nil {
+		return nil
+	}
+	g.pendOps = append(g.pendOps, pendOp{kind: opEdge, edge: EdgeUpsert{
+		SrcKey: srcKey, DstKey: dstKey, Label: label,
+		Props: copyProps(props), AllowParallel: allowParallel,
+	}})
+	return g.maybeFlush()
+}
+
+func (g *Graph) recordEdgeDelete(srcKey, dstKey, label string) error {
+	if g.wal == nil {
+		return nil
+	}
+	g.pendOps = append(g.pendOps, pendOp{kind: opEdgeDelete, edel: EdgeDelete{SrcKey: srcKey, DstKey: dstKey, Label: label}})
+	return g.maybeFlush()
+}
+
+func (g *Graph) recordNodeDelete(key string) error {
+	if g.wal == nil {
+		return nil
+	}
+	g.pendOps = append(g.pendOps, pendOp{kind: opNodeDelete, ndel: key})
+	return g.maybeFlush()
+}
+
+// maybeFlush flushes unless a Batch boundary is holding the buffer.
+func (g *Graph) maybeFlush() error {
+	if g.batching {
+		return nil
+	}
+	return g.flushPending()
+}
+
+// flushPending emits the buffered ops as one frame per kind-ordered run. On
+// error the unflushed ops stay buffered so a retry (e.g. a retried Close)
+// does not silently drop them.
+func (g *Graph) flushPending() error {
+	if g.wal == nil {
+		g.pendOps = nil
+		return nil
+	}
+	i := 0
+	for i < len(g.pendOps) {
+		j := i + 1
+		for j < len(g.pendOps) && g.pendOps[j].kind >= g.pendOps[j-1].kind {
+			j++
+		}
+		cs := Changeset{Version: changesetVersion}
+		for _, op := range g.pendOps[i:j] {
+			switch op.kind {
+			case opNode:
+				cs.Nodes = append(cs.Nodes, op.node)
+			case opEdge:
+				cs.Edges = append(cs.Edges, op.edge)
+			case opEdgeDelete:
+				cs.EdgeDeletes = append(cs.EdgeDeletes, op.edel)
+			case opNodeDelete:
+				cs.NodeDeletes = append(cs.NodeDeletes, op.ndel)
+			}
+		}
+		if _, err := g.wal.Append(cs); err != nil {
+			g.pendOps = append([]pendOp(nil), g.pendOps[i:]...)
+			return err
+		}
+		i = j
+	}
+	g.pendOps = nil
+	return nil
+}
+
+// applyChangeset replays one frame with the write-method semantics. Used by
+// Open's recovery path (recording is detached there — replaying must not
+// re-record). Any error means the frame references state the replay did not
+// rebuild identically: surfaced, not skipped.
+func (g *Graph) applyChangeset(cs Changeset) error {
+	for _, n := range cs.Nodes {
+		if _, err := g.AddNode(n.Key, n.Label, n.Props); err != nil {
+			return err
+		}
+	}
+	for _, e := range cs.Edges {
+		var err error
+		if e.AllowParallel {
+			_, err = g.AddEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
+		} else {
+			_, err = g.UpsertEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	for _, d := range cs.EdgeDeletes {
+		if _, err := g.DeleteEdge(d.SrcKey, d.DstKey, d.Label); err != nil {
+			return err
+		}
+	}
+	for _, key := range cs.NodeDeletes {
+		if _, err := g.DeleteNode(key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Batch groups writes into one WAL boundary: fn's write methods record
+// Changeset entries without flushing, and the boundary flushes them as one
+// frame (one fsync in ModeAlways — group commit for direct-mode writers).
+// A normal batch is exactly one frame; batches whose op order regresses
+// across Changeset kinds are split at each regression so replay preserves
+// the original op order (see the op-recorder comment).
+//
+// Without a WAL attached, Batch is a plain grouping with no extra semantics.
+// Nested Batch calls are absorbed into the outer boundary. WALOff callers
+// pay nothing; Batch outside a WAL session never errors on grouping alone.
+//
+// Known direct-mode limitation (closed by the v0.7 wrapper-mode writer): a
+// flush error at the boundary returns after fn's mutations already hit
+// memory — memory may be ahead of the log until the next successful flush.
+func (g *Graph) Batch(fn func(*Graph)) error {
+	if g.closed {
+		return ErrClosed
+	}
+	if g.sealed {
+		return ErrSealed
+	}
+	if g.wal == nil || g.batching {
+		fn(g)
+		return nil
+	}
+	g.batching = true
+	defer func() { g.batching = false }() // even if fn panics, never wedge the recorder
+	fn(g)
+	return g.flushPending()
+}
+
+// Open opens (or creates) a durable graph session at path. Unlike
+// LoadFile — which auto-Seals a snapshot — an Open session recovers into a
+// writable unsealed graph: snapshot first (when a checkpoint exists), then
+// WAL frames replayed in LSN order above the checkpoint boundary, with no
+// recording during replay. Sealing is deferred to the checkpoint at Close.
+//
+// Recovery rules:
+//   - manifest present: the snapshot at path is the base; frames with lsn >
+//     manifest.lsn replay on top. A missing snapshot file is an error.
+//   - no manifest, no WAL segments, snapshot present (first WAL-mode Open
+//     next to a v0.6 file): the snapshot is adopted.
+//   - no manifest, WAL segments present (checkpoint manifest lost, or a
+//     session that never Closed): recovery starts from an empty graph and
+//     replays every frame — the WAL is the source of truth.
+//
+// Close checkpoints (Seal → SaveFile → manifest → WAL reset); a checkpoint
+// failure returns an error and keeps the WAL for the next recovery attempt.
+func Open(path string, opts Options) (*Graph, error) {
+	if opts.WALMode == ModeOff {
+		// v0.6 behavior: snapshot-only. Existing file loads sealed; a missing
+		// file starts a fresh writable graph (durability via Seal+SaveFile).
+		if _, err := os.Stat(path); err == nil {
+			return LoadFile(path)
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return nil, err
+		}
+		return New(), nil
+	}
+
+	walDir := opts.WALDir
+	if walDir == "" {
+		walDir = path + ".wal"
+	}
+	man, hasMan, err := wal.ReadManifest(walDir)
+	if err != nil {
+		return nil, err
+	}
+	_ = man // the WAL itself reads the manifest back in Open for replay gating
+	hasSegs, err := wal.HasSegments(walDir)
+	if err != nil {
+		return nil, err
+	}
+
+	g := New()
+	loadSnapshot := func() error {
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		lg, err := loadGraph(f)
+		if err != nil {
+			return err
+		}
+		*g = *lg // loadGraph returns a fresh graph; move its state in (no WAL state yet)
+		return nil
+	}
+	switch {
+	case hasMan:
+		if err := loadSnapshot(); err != nil {
+			return nil, fmt.Errorf("vectra: manifest at %s references snapshot %s: %w", walDir, path, err)
+		}
+	case hasSegs:
+		// WAL-only recovery: start empty, replay everything below.
+	default:
+		if _, err := os.Stat(path); err == nil {
+			if err := loadSnapshot(); err != nil {
+				return nil, err
+			}
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return nil, err
+		}
+	}
+
+	w, err := wal.Open(walDir, opts.WALMode)
+	if err != nil {
+		return nil, err
+	}
+	// Replay with recording detached (g.wal still nil): replaying must not
+	// amplify frames. Torn tails stop at the last complete frame.
+	if _, err := w.Replay(g.applyChangeset); err != nil {
+		w.Close()
+		return nil, err
+	}
+	g.wal, g.walDir, g.snapPath = w, walDir, path
+	return g, nil
+}
+
+// Close ends a session. With a WAL attached, Close is a mandatory checkpoint:
+// flush pending frames + fsync → Seal → SaveFile → manifest → WAL reset.
+// Any failure returns the error WITHOUT deleting the WAL — the next Open
+// recovers from it (memory already holds every write). Close is idempotent
+// and retryable: a failed checkpoint can be re-attempted (Seal and SaveFile
+// are safe on an already-sealed graph).
+//
+// WALOff sessions: Close only flips to closed (writes then return ErrClosed;
+// durability was the caller's job, v0.6 style). In both modes queries stay
+// legal after Close.
+func (g *Graph) Close() error {
+	if g.closed {
+		return nil
+	}
+	if g.wal == nil {
+		g.closed = true
+		return nil
+	}
+	if err := g.flushPending(); err != nil {
+		return err
+	}
+	if err := g.wal.Sync(); err != nil {
+		return err
+	}
+	lsn := g.wal.LastLSN()
+	if err := g.Seal(); err != nil {
+		return err
+	}
+	if err := g.SaveFile(g.snapPath); err != nil {
+		return err
+	}
+	if err := wal.WriteManifest(g.walDir, wal.Manifest{
+		Snapshot: filepath.Base(g.snapPath),
+		Segment:  g.wal.Segment(),
+		LSN:      lsn,
+	}); err != nil {
+		return err
+	}
+	if err := g.wal.Reset(lsn); err != nil {
+		return err
+	}
+	if err := g.wal.Close(); err != nil {
+		return err
+	}
+	g.wal = nil
+	g.closed = true
+	return nil
 }
 
 func (g *Graph) NodeByKey(key string) (Node, bool) {
