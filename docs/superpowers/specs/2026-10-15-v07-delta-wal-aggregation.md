@@ -133,3 +133,13 @@ freeze（O(delta) 浅拷）→ 后台 `engine.Seal(unionRecords)`（纯函数零
 | gob/JSON 类型漂移 | 低 | 整帧 JSON（R9） |
 | 公共 API 语义漂移 | 中 | §6 新行为表 + README 迁移说明 + sentinel 保留一版 |
 | 恢复时长（逻辑日志重放 ∝ 变更数） | 中 | A7 线 + checkpoint 阈值即恢复上界（4MB WAL）；文档明示 |
+
+## 10. 实现期勘误（2026-10-15，T6 收口时记录）
+
+实现过程中与本 spec 字面表述不一致的落地点，行为契约以本节为准：
+
+1. **§4 gob 嵌入假设错误 → 落地为扁平字段 + 类型别名（T2 裁决）。** spec 假设 "gob 对嵌入结构打平编码"；实际 encoding/gob 不打平嵌入结构（嵌入值编码为单一嵌套字段），任何 embed 形态至少单向破坏旧 raft 日志。落地：server `Batch` 保留扁平遗留字段表，条目类型别名到 core 类型（同形同名），线格式与 pre-0.7 日志双向兼容（TestBatchGobLegacyRoundtrip 背书）；与 core `vectra.Changeset` 的互转走逐字段赋值（`ChangesetOf`）。
+2. **§4 checkpoint 顺序 → 水位快照机制（T2 修复轮）。** spec 的 "常规 checkpoint 仅导出 merge 完成后的不可变 base + manifest LSN = 精确导出边界" 落地为：checkpoint 从不原地写 `path`，而是写水位快照 `<db 去扩展名>-<lsn>.db` 并以 manifest 原子指名；SaveFile 与 manifest 落地之间的崩溃窗口由"上一份未动水位 + 全量 WAL 重放"关闭（已 checkpoint 的帧绝不会被应用两次——AllowParallel 追加与删除不幂等）。对账不变量保持：重放首帧 lsn == manifest.lsn + 1。
+3. **§4 组提交 fsync 表述 → 混合批按 kind 拆帧（T5 Important 2）。** spec 的 "一组一帧一次 fsync" 仅在批内 op 序按 Changeset kind 有序时成立；kind 回退批（如先删后加同键）在每次 kind 回退处切帧，多帧各自保序重放。层仍按 Batch 边界一对一（多帧一层的例外已写入 Graph doc）。
+4. **§4 "WAL ≥4MB 自动 checkpoint" 的最终裁量（T6/A.2）：已实现，落点在 writer 循环而非 merger。** `writer.Config.CheckpointBytes`（默认 4 MiB，负值关闭）：writer 的 afterBatch 钩子在有效帧字节达到阈值时于**写者 goroutine 上**执行完整 Seal 管线（merge + 水位快照 + manifest + WAL reset）——对免锁读者不可见，Submit 观察到一次 checkpoint 形态的写停顿。这与 spec §4 "writer→merger→checkpoint 全部经 merger goroutine 串行化" 的表述偏离（checkpoint 与 merge 同属 Seal 的所有权域，merger 侧 PublishMerge 是视图级 rebase、无 checkpoint 能力）；失败语义为粘性：错误经 Close 上报、触发器自禁用（显式 Compact/Close 仍可用），避免故障盘把每批变成重试风暴。直接模式（无包装层）不设自动触发，显式 Seal/Compact/Close 触发（文档化）。
+5. **§3.1/§6 Compact 与 deep compaction 的 R1 吸收口径。** spec 的 "`Compact()` = 显式 merge + deep compaction 重排"：落地中 merge 本身即稠密重建节点/边 ID（R1），不存在额外的 "deep" 阶段——`Compact()` 与 `Seal()` 跑同一管线、语义等价（T5 裁决 7，godoc 已写明）。
