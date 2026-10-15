@@ -336,7 +336,7 @@ func starItems(m *MatchClause) []*ReturnItem {
 func (ex *executor) itemValue(it *ReturnItem, r row) any {
 	if it.Prop == "" {
 		if id, ok := r.nodes[it.Var]; ok {
-			rec, _ := ex.snap.NodeInfo(id)
+			rec, _ := ex.nodeInfo(id)
 			return NodeVal{ID: id, Key: rec.Key, Label: rec.Label, Props: rec.Props}
 		}
 		if id, ok := r.edges[it.Var]; ok {
@@ -352,7 +352,7 @@ func (ex *executor) itemValue(it *ReturnItem, r row) any {
 }
 
 func (ex *executor) edgeVal(id uint32) EdgeVal {
-	src, dst, label, props, _ := ex.snap.EdgeInfo(id)
+	src, dst, label, props, _ := ex.edgeInfo(id)
 	return EdgeVal{ID: id, Src: src, Dst: dst, Label: label, Props: props}
 }
 
@@ -373,7 +373,7 @@ func (ex *executor) orderValue(name string, r row) any {
 // variable is unbound or the property is absent (evaluates to null).
 func (ex *executor) scalarOf(r row, v, name string) (any, bool) {
 	if id, ok := r.nodes[v]; ok {
-		rec, _ := ex.snap.NodeInfo(id)
+		rec, _ := ex.nodeInfo(id)
 		switch name {
 		case "key":
 			return rec.Key, true
@@ -386,7 +386,7 @@ func (ex *executor) scalarOf(r row, v, name string) (any, bool) {
 		return val, present
 	}
 	if id, ok := r.edges[v]; ok {
-		_, _, label, props, _ := ex.snap.EdgeInfo(id)
+		_, _, label, props, _ := ex.edgeInfo(id)
 		switch name {
 		case "label":
 			return label, true

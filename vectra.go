@@ -8,14 +8,18 @@
 // (a single public write, or one Batch(fn) boundary) is materialized into an
 // immutable micro-layer and published as a new generation
 // {base, layers[]} through an atomic.Pointer — readers never lock. Queries
-// are always legal:
+// are always legal and every family is immediately consistent:
 //
 //   - Point-query family (NodeByKey/NodeByID/EdgeByID/NodeCount/EdgeCount/
 //     EdgesOf/LookupBy*) reads the three sources base ∪ layers with
 //     tombstone shadowing — write-then-read is immediate.
-//   - Traversal family (BFS/Reachable/ShortestPath/Cypher/NeighborsOf) reads
-//     the merged base only until the three-source View lands (Task 4);
-//     Cycles is the exception and merges pending layers first.
+//   - Traversal family (BFS/Reachable/ShortestPath/Cypher/NeighborsOf)
+//     iterates rows over the same union through the generation View
+//     (internal/engine): with nothing unmerged it IS the base CSR (the
+//     slice-zip hot path runs untouched); Reachable's SCC-supernode
+//     acceleration exists only at merge boundaries, so unmerged delta falls
+//     back to node-level BFS. Cycles is the exception and merges pending
+//     layers first (SCC structures only exist on a merged base).
 //   - Seal() is an explicit merge (+ WAL checkpoint when a WAL is attached):
 //     layers fold into a fresh immutable base. Sealed() reports "no unmerged
 //     layers"; the v0.6 sealed/unsealed gates are dissolved (spec §6) —
@@ -1078,7 +1082,12 @@ func (g *Graph) NodeByKey(key string) (Node, bool) {
 // NodeByID resolves an ID to its visible record. Overridden/deleted records
 // (whose IDs may still be listed by older layers) do not resolve.
 func (g *Graph) NodeByID(id NodeID) (Node, bool) {
-	v := g.view.Load()
+	return g.view.Load().nodeByID(id)
+}
+
+// nodeByID is NodeByID pinned to this generation (the three-source surfaces
+// in view.go run against exactly one published genView).
+func (v *genView) nodeByID(id NodeID) (Node, bool) {
 	for i := len(v.layers) - 1; i >= 0; i-- {
 		l := v.layers[i]
 		idx, ok := l.FindNodeID(uint32(id))
@@ -1114,7 +1123,11 @@ func (g *Graph) NodeByID(id NodeID) (Node, bool) {
 // resolved first (a fold transfers the winner ID onto the newer record);
 // base records resolve unless a layer tombstones their key.
 func (g *Graph) EdgeByID(id EdgeID) (Edge, bool) {
-	v := g.view.Load()
+	return g.view.Load().edgeByID(id)
+}
+
+// edgeByID is EdgeByID pinned to this generation.
+func (v *genView) edgeByID(id EdgeID) (Edge, bool) {
 	for i := len(v.layers) - 1; i >= 0; i-- {
 		l := v.layers[i]
 		idx, ok := l.FindEdgeID(uint32(id))
@@ -1697,7 +1710,13 @@ func (g *Graph) LookupByBool(key string, v bool) ([]Node, bool) {
 // records and carved by layer tombstones, then filtered by match over the
 // winner's props.
 func (g *Graph) lookupNodes(key string, baseIndex func(*genView) ([]uint32, bool), match func(map[string]any) bool) ([]Node, bool) {
-	v := g.view.Load()
+	return lookupNodesOf(g.view.Load(), key, baseIndex, match)
+}
+
+// lookupNodesOf is lookupNodes pinned to one generation (the Cypher
+// execution source in view.go answers anchors against exactly the
+// generation its rows came from).
+func lookupNodesOf(v *genView, key string, baseIndex func(*genView) ([]uint32, bool), match func(map[string]any) bool) ([]Node, bool) {
 	ids, effective := baseIndex(v)
 	pending := false
 	for _, l := range v.layers {

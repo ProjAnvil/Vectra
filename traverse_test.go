@@ -229,17 +229,20 @@ func TestBFSHandlesCycles(t *testing.T) {
 	}
 }
 
-// TestBFSUnsealedReadsBase: the sealed gate is dissolved — BFS on a graph
-// with unmerged layers runs against the merged base. Here the base is empty
-// and the layer-resident start is out of range (traversal family is
-// base-only until the three-source View lands; TODO(Task4)).
-func TestBFSUnsealedReadsBase(t *testing.T) {
+// TestBFSUnsealedSeesLayerStart: the sealed gate is dissolved and the
+// traversal family is three-source (Task 4) — BFS anchors on a
+// layer-resident start in a graph that never merged anything.
+func TestBFSUnsealedSeesLayerStart(t *testing.T) {
 	g := vectra.New()
 	if _, err := g.AddNode("a", "S", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := g.BFS([]vectra.NodeID{0}); !errors.Is(err, vectra.ErrNodeNotFound) {
-		t.Errorf("err = %v, want ErrNodeNotFound (layer-resident start, base-only view)", err)
+	res, err := g.BFS([]vectra.NodeID{0})
+	if err != nil {
+		t.Fatalf("BFS on layer-resident start: %v", err)
+	}
+	if res.Count() != 1 {
+		t.Errorf("Count = %d, want 1", res.Count())
 	}
 	if err := g.Seal(); err != nil {
 		t.Fatal(err)

@@ -1,8 +1,15 @@
 // Package traverse implements the graph query algorithms: multi-source
 // level-synchronous BFS (serial + parallel), SCC-supernode reachability,
 // bidirectional shortest path, and cycle discovery. Algorithms depend only on
-// engine.Snapshot's read-only accessors and caller-supplied config (label
-// mask, node predicate); no write semantics.
+// read-only row accessors and caller-supplied config (label mask, node
+// predicate); no write semantics.
+//
+// Two row surfaces (v0.7 spec §3.2): the plain snapshot (csr slice-zip hot
+// path, exposed via FastAdjacency) and the three-source View (Rows over
+// base ∪ delta layers). RowSource is traverse's local dependency surface —
+// engine's View satisfies it structurally, keeping traverse free of any
+// engine import (the layering csr/dag (leaves) -> engine (state), with
+// traverse (algorithms) parallel to it).
 package traverse
 
 import (
@@ -16,10 +23,10 @@ import (
 	"github.com/projanvil/vectra/internal/dag"
 )
 
-// engineSnapshot is traverse's minimal dependency surface on the sealed
-// snapshot: engine.Snapshot's exported accessors satisfy it naturally —
-// traverse does not import engine, keeping the layering csr/dag (leaves) ->
-// engine (state), with traverse (algorithms) parallel to it.
+// engineSnapshot is traverse's dependency surface on SCC structures, which
+// exist only on a merged base: engine.Snapshot's exported accessors satisfy
+// it naturally. Used by the supernode reachability fast path and Cycles
+// (which callers run against a merged snapshot).
 type engineSnapshot interface {
 	AdjacencyF() csr.Adjacency
 	AdjacencyR() csr.Adjacency
@@ -30,6 +37,48 @@ type engineSnapshot interface {
 	SCCCount() uint32
 	SCCMembers(scc uint32) []uint32
 	SelfLoop(v uint32) bool
+}
+
+// RowSource is the three-source traversal surface: adjacency rows by node ID
+// and direction, the union ID-space node count, and the empty-delta fast
+// path (the plain base CSR — slice-zip hot loop, A1). Direction codes: 0 =
+// out, 1 = in. engine.View implements this interface structurally.
+type RowSource interface {
+	// Rows returns u's visible adjacency rows (base ∪ layers, tombstones
+	// applied, label IDs in the source's joint label table).
+	Rows(u uint32, dir int) []csr.AdjRow
+	// NodeCount returns the union ID-space size (visited/depth bound).
+	NodeCount() int
+	// FastAdjacency returns the base CSR and true when no delta source
+	// contributes (traversal then runs entirely on the CSR hot path).
+	FastAdjacency(dir int) (csr.Adjacency, bool)
+}
+
+// rower is the three-source View's direction-fixed row accessor: rows come
+// from the RowSource zipped into the parallel slices the View-path algorithm
+// bodies consume. The CSR fast path does NOT go through it — the algorithms
+// keep the original direct adj.Row loops (tiny leaf functions the compiler
+// inlines; an interface hop per node measurably regressed small-hot-graph
+// BFS, A1).
+type rower interface {
+	Row(u uint32) (targets, edgeIDs, labels []uint32)
+}
+
+// viewRow adapts a RowSource and direction.
+type viewRow struct {
+	src RowSource
+	dir int
+}
+
+func (v viewRow) Row(u uint32) ([]uint32, []uint32, []uint32) {
+	rows := v.src.Rows(u, v.dir)
+	tg := make([]uint32, len(rows))
+	eids := make([]uint32, len(rows))
+	lbs := make([]uint32, len(rows))
+	for i, r := range rows {
+		tg[i], eids[i], lbs[i] = r.Target, r.EdgeID, r.LabelID
+	}
+	return tg, eids, lbs
 }
 
 type Direction uint8
@@ -73,9 +122,11 @@ func (r *Result) DepthRaw() []uint32 { return r.depth }
 // BFS is a multi-source level-synchronous breadth-first search: starts at
 // depth 0, each layer expanded as a whole; once the frontier reaches the
 // threshold, chunks go to multiple goroutines, deduplicated via an atomic-Or
-// bitmap.
-func BFS(s engineSnapshot, starts []uint32, cfg Config) *Result {
-	n := uint32(s.NodeCount())
+// bitmap. src carries the whole visible graph: the plain base CSR when no
+// delta layers are unmerged (FastAdjacency hot path — the CSR slice-zip loop
+// runs unchanged, A1) or the three-source View otherwise.
+func BFS(src RowSource, starts []uint32, cfg Config) *Result {
+	n := uint32(src.NodeCount())
 	for _, st := range starts {
 		if st >= n {
 			return &Result{depth: filledNoDepth(n)}
@@ -83,10 +134,6 @@ func BFS(s engineSnapshot, starts []uint32, cfg Config) *Result {
 	}
 	if cfg.ParallelThreshold == 0 {
 		cfg.ParallelThreshold = 1 // 0 means force parallel: any non-empty layer goes parallel
-	}
-	adj := s.AdjacencyF()
-	if cfg.Direction == DirIn {
-		adj = s.AdjacencyR()
 	}
 	visited := visitedPool.acquire(wordsFor(int(n)))
 	defer visitedPool.release(visited)
@@ -100,12 +147,29 @@ func BFS(s engineSnapshot, starts []uint32, cfg Config) *Result {
 		}
 	}
 	res.Layers = append(res.Layers, frontier)
+	if adj, ok := src.FastAdjacency(int(cfg.Direction)); ok {
+		for depth := uint32(1); depth <= cfg.MaxDepth && len(frontier) > 0; depth++ {
+			var next []uint32
+			if len(frontier) >= cfg.ParallelThreshold {
+				next = expandLayerParallel(adj, cfg, visited, frontier)
+			} else {
+				next = expandLayerSerial(adj, cfg, visited, frontier)
+			}
+			for _, v := range next {
+				res.depth[v] = depth
+			}
+			res.Layers = append(res.Layers, next)
+			frontier = next
+		}
+		return res
+	}
+	r := viewRow{src: src, dir: int(cfg.Direction)}
 	for depth := uint32(1); depth <= cfg.MaxDepth && len(frontier) > 0; depth++ {
 		var next []uint32
 		if len(frontier) >= cfg.ParallelThreshold {
-			next = expandLayerParallel(adj, cfg, visited, frontier)
+			next = expandRowsParallel(r, cfg, visited, frontier)
 		} else {
-			next = expandLayerSerial(adj, cfg, visited, frontier)
+			next = expandRowsSerial(r, cfg, visited, frontier)
 		}
 		for _, v := range next {
 			res.depth[v] = depth
@@ -138,6 +202,8 @@ func accept(v uint32, cfg Config) bool {
 	return cfg.NodeFilter == nil || cfg.NodeFilter(v)
 }
 
+// expandLayerSerial is the CSR fast path (original hot loop: adj.Row is a
+// tiny leaf the compiler inlines — keep it direct, no interface).
 func expandLayerSerial(adj csr.Adjacency, cfg Config, visited []uint32, frontier []uint32) []uint32 {
 	var next []uint32
 	for _, u := range frontier {
@@ -200,40 +266,116 @@ func expandLayerParallel(adj csr.Adjacency, cfg Config, visited []uint32, fronti
 	return next
 }
 
+// expandRowsSerial/expandRowsParallel are the three-source View path: rows
+// come zipped from the rower (View rows per node).
+func expandRowsSerial(r rower, cfg Config, visited []uint32, frontier []uint32) []uint32 {
+	var next []uint32
+	for _, u := range frontier {
+		tg, _, lb := r.Row(u)
+		for i, v := range tg {
+			if cfg.LabelMask != nil && !cfg.LabelMask[lb[i]] {
+				continue
+			}
+			if !testAndSet(visited, v) && accept(v, cfg) {
+				next = append(next, v)
+			}
+		}
+	}
+	return next
+}
+
+func expandRowsParallel(r rower, cfg Config, visited []uint32, frontier []uint32) []uint32 {
+	workers := min(runtime.GOMAXPROCS(0), (len(frontier)+parallelChunk-1)/parallelChunk)
+	if workers <= 1 {
+		return expandRowsSerial(r, cfg, visited, frontier)
+	}
+	chunk := (len(frontier) + workers - 1) / workers
+	locals := make([][]uint32, workers)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		lo := w * chunk
+		if lo >= len(frontier) {
+			break
+		}
+		hi := min(lo+chunk, len(frontier))
+		wg.Add(1)
+		go func(w, lo, hi int) {
+			defer wg.Done()
+			local := make([]uint32, 0, (hi-lo)*2)
+			for _, u := range frontier[lo:hi] {
+				tg, _, lb := r.Row(u)
+				for i, v := range tg {
+					if cfg.LabelMask != nil && !cfg.LabelMask[lb[i]] {
+						continue
+					}
+					if !accept(v, cfg) {
+						continue
+					}
+					word := &visited[v>>5]
+					bit := uint32(1) << (v & 31)
+					if atomic.OrUint32(word, bit)&bit != 0 {
+						continue // already marked by another worker
+					}
+					local = append(local, v)
+				}
+			}
+			locals[w] = local
+		}(w, lo, hi)
+	}
+	wg.Wait()
+	var next []uint32
+	for _, l := range locals {
+		next = append(next, l...)
+	}
+	return next
+}
+
 // Reachable returns all nodes reachable from start (including itself),
-// ascending by ID. Without a label filter it takes the SCC-supernode fast
-// path (queries face a DAG, zero cycle detection); with a filter, members of
-// a component may be joined only by filtered-out edges, so it falls back to
-// strict node-level traversal. Note: the supernode fast path does not support
-// NodeFilter (the predicate conflicts with component semantics); callers must
-// not take the fast path with a Config carrying a NodeFilter.
-func Reachable(s engineSnapshot, start uint32, cfg Config) []uint32 {
-	adj := s.AdjacencyF()
-	if cfg.Direction == DirIn {
-		adj = s.AdjacencyR()
-	}
-	if cfg.LabelMask == nil {
-		return reachableSupernode(s, start, cfg.Direction)
-	}
-	n := uint32(s.NodeCount())
+// ascending by ID, via strict node-level traversal over the row source —
+// always correct, and the only option when a label filter is set or delta
+// layers are unmerged (supernode structures exist only on a merged base).
+// The SCC-supernode fast path is ReachableSupernode; the caller picks it
+// (no NodeFilter support there — the predicate conflicts with component
+// semantics).
+func Reachable(src RowSource, start uint32, cfg Config) []uint32 {
+	n := uint32(src.NodeCount())
 	visited := visitedPool.acquire(wordsFor(int(n)))
 	defer visitedPool.release(visited)
 	testAndSet(visited, start)
 	frontier := []uint32{start}
-	for len(frontier) > 0 {
-		var next []uint32
-		for _, u := range frontier {
-			tg, _, lb := adj.Row(u)
-			for i, v := range tg {
-				if !cfg.LabelMask[lb[i]] {
-					continue
-				}
-				if !testAndSet(visited, v) {
-					next = append(next, v)
+	if adj, ok := src.FastAdjacency(int(cfg.Direction)); ok {
+		for len(frontier) > 0 {
+			var next []uint32
+			for _, u := range frontier {
+				tg, _, lb := adj.Row(u)
+				for i, v := range tg {
+					if cfg.LabelMask != nil && !cfg.LabelMask[lb[i]] {
+						continue
+					}
+					if !testAndSet(visited, v) {
+						next = append(next, v)
+					}
 				}
 			}
+			frontier = next
 		}
-		frontier = next
+	} else {
+		r := viewRow{src: src, dir: int(cfg.Direction)}
+		for len(frontier) > 0 {
+			var next []uint32
+			for _, u := range frontier {
+				tg, _, lb := r.Row(u)
+				for i, v := range tg {
+					if cfg.LabelMask != nil && !cfg.LabelMask[lb[i]] {
+						continue
+					}
+					if !testAndSet(visited, v) {
+						next = append(next, v)
+					}
+				}
+			}
+			frontier = next
+		}
 	}
 	out := make([]uint32, 0, 64)
 	for v := uint32(0); v < n; v++ {
@@ -244,7 +386,11 @@ func Reachable(s engineSnapshot, start uint32, cfg Config) []uint32 {
 	return out
 }
 
-func reachableSupernode(s engineSnapshot, start uint32, dir Direction) []uint32 {
+// ReachableSupernode is the SCC-condensation fast path: BFS over the
+// condensation DAG of a MERGED snapshot (each visited bit is one component),
+// members collected per component. Callers must only use it without a label
+// filter or NodeFilter and with no unmerged delta.
+func ReachableSupernode(s engineSnapshot, start uint32, dir Direction) []uint32 {
 	cond := s.CondensedF()
 	if dir == DirIn {
 		cond = s.CondensedR()
@@ -280,12 +426,12 @@ func reachableSupernode(s engineSnapshot, start uint32, dir Direction) []uint32 
 // ShortestPath is a bidirectional BFS: the smaller frontier side expands a
 // full layer first, checking the opposite side's visited bitmap when marking;
 // the first meeting point is optimal. Returns node and edge sequences.
-func ShortestPath(s engineSnapshot, from, to uint32) (nodes, edges []uint32, found bool) {
+// src carries the whole visible graph (CSR fast path or three-source View).
+func ShortestPath(src RowSource, from, to uint32) (nodes, edges []uint32, found bool) {
 	if from == to {
 		return []uint32{from}, nil, true
 	}
-	n := int(s.NodeCount())
-	fAdj, bAdj := s.AdjacencyF(), s.AdjacencyR()
+	n := int(src.NodeCount())
 	fVis := visitedPool.acquire(wordsFor(n))
 	bVis := visitedPool.acquire(wordsFor(n))
 	defer visitedPool.release(fVis)
@@ -301,18 +447,40 @@ func ShortestPath(s engineSnapshot, from, to uint32) (nodes, edges []uint32, fou
 	fVis[from>>5] |= 1 << (from & 31)
 	bVis[to>>5] |= 1 << (to & 31)
 
+	if fAdj, ok := src.FastAdjacency(int(DirOut)); ok {
+		bAdj, _ := src.FastAdjacency(int(DirIn))
+		for len(fFront) > 0 && len(bFront) > 0 {
+			if len(fFront) <= len(bFront) {
+				next, meet, ok := expandMeeting(fFront, fAdj, fVis, bVis, fParent)
+				if ok {
+					nodes, edges := reconstructCSR(fAdj, meet, fParent, bParent)
+					return nodes, edges, true
+				}
+				fFront = next
+			} else {
+				next, meet, ok := expandMeeting(bFront, bAdj, bVis, fVis, bParent)
+				if ok {
+					nodes, edges := reconstructCSR(fAdj, meet, fParent, bParent)
+					return nodes, edges, true
+				}
+				bFront = next
+			}
+		}
+		return nil, nil, false
+	}
+	fRow, bRow := viewRow{src: src, dir: int(DirOut)}, viewRow{src: src, dir: int(DirIn)}
 	for len(fFront) > 0 && len(bFront) > 0 {
 		if len(fFront) <= len(bFront) {
-			next, meet, ok := expandMeeting(fFront, fAdj, fVis, bVis, fParent)
+			next, meet, ok := expandMeetingRows(fFront, fRow, fVis, bVis, fParent)
 			if ok {
-				nodes, edges := reconstruct(s, meet, fParent, bParent)
+				nodes, edges := reconstructRows(fRow, meet, fParent, bParent)
 				return nodes, edges, true
 			}
 			fFront = next
 		} else {
-			next, meet, ok := expandMeeting(bFront, bAdj, bVis, fVis, bParent)
+			next, meet, ok := expandMeetingRows(bFront, bRow, bVis, fVis, bParent)
 			if ok {
-				nodes, edges := reconstruct(s, meet, fParent, bParent)
+				nodes, edges := reconstructRows(fRow, meet, fParent, bParent)
 				return nodes, edges, true
 			}
 			bFront = next
@@ -322,7 +490,8 @@ func ShortestPath(s engineSnapshot, from, to uint32) (nodes, edges []uint32, fou
 }
 
 // expandMeeting expands one full layer and returns the new frontier; checks
-// the opposite side's visited bitmap when marking.
+// the opposite side's visited bitmap when marking. CSR fast path (original
+// hot loop: Neighbors is a slice view, no interface).
 func expandMeeting(frontier []uint32, adj csr.Adjacency, mine, theirs []uint32, parent []uint32) (next []uint32, meet uint32, found bool) {
 	for _, u := range frontier {
 		for _, v := range adj.Neighbors(u) {
@@ -343,7 +512,34 @@ func expandMeeting(frontier []uint32, adj csr.Adjacency, mine, theirs []uint32, 
 	return next, meet, found
 }
 
-func reconstruct(s engineSnapshot, meet uint32, fParent, bParent []uint32) ([]uint32, []uint32) {
+func expandMeetingRows(frontier []uint32, r rower, mine, theirs []uint32, parent []uint32) (next []uint32, meet uint32, found bool) {
+	for _, u := range frontier {
+		for _, v := range neighborsOf(r, u) {
+			w := &mine[v>>5]
+			bit := uint32(1) << (v & 31)
+			if *w&bit != 0 {
+				continue
+			}
+			*w |= bit
+			parent[v] = u
+			next = append(next, v)
+			if !found && theirs[v>>5]&bit != 0 {
+				meet = v
+				found = true
+			}
+		}
+	}
+	return next, meet, found
+}
+
+// neighborsOf is the rower's neighbor view (ShortestPath never needs edge
+// IDs during expansion — only for reconstruction).
+func neighborsOf(r rower, u uint32) []uint32 {
+	tg, _, _ := r.Row(u)
+	return tg
+}
+
+func reconstructCSR(adj csr.Adjacency, meet uint32, fParent, bParent []uint32) ([]uint32, []uint32) {
 	fwd := []uint32{meet} // meet -> from, reversed afterwards
 	for v := fParent[meet]; v != noParent; v = fParent[v] {
 		fwd = append(fwd, v)
@@ -358,19 +554,45 @@ func reconstruct(s engineSnapshot, meet uint32, fParent, bParent []uint32) ([]ui
 	nodes := append(fwd, bwd...)
 	edges := make([]uint32, 0, len(nodes)-1)
 	for i := 0; i+1 < len(nodes); i++ {
-		edges = append(edges, anyEdge(s, nodes[i], nodes[i+1]))
+		edges = append(edges, anyEdgeCSR(adj, nodes[i], nodes[i+1]))
 	}
 	return nodes, edges
 }
 
-func anyEdge(s engineSnapshot, u, v uint32) uint32 {
-	tg, eids, _ := s.AdjacencyF().Row(u)
+func anyEdgeCSR(adj csr.Adjacency, u, v uint32) uint32 {
+	tg, eids, _ := adj.Row(u)
 	for i, t := range tg {
 		if t == v {
 			return eids[i]
 		}
 	}
 	return 0 // path is contiguous by construction; unreachable in practice
+}
+
+func reconstructRows(r rower, meet uint32, fParent, bParent []uint32) ([]uint32, []uint32) {
+	fwd := []uint32{meet} // meet -> from, reversed afterwards
+	for v := fParent[meet]; v != noParent; v = fParent[v] {
+		fwd = append(fwd, v)
+	}
+	for i, j := 0, len(fwd)-1; i < j; i, j = i+1, j-1 {
+		fwd[i], fwd[j] = fwd[j], fwd[i]
+	}
+	var bwd []uint32 // meet -> to
+	for v := bParent[meet]; v != noParent; v = bParent[v] {
+		bwd = append(bwd, v)
+	}
+	nodes := append(fwd, bwd...)
+	edges := make([]uint32, 0, len(nodes)-1)
+	for i := 0; i+1 < len(nodes); i++ {
+		tg, eids, _ := r.Row(nodes[i])
+		for x, t := range tg {
+			if t == nodes[i+1] {
+				edges = append(edges, eids[x])
+				break
+			}
+		}
+	}
+	return nodes, edges
 }
 
 // CycleEdge is one edge with both endpoints on the cycle: an intra-SCC edge

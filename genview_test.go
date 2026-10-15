@@ -283,54 +283,69 @@ func TestIndexPropertyPendingUntilMerge(t *testing.T) {
 	}
 }
 
-// ---- traversal family: base-only until Task 4 ------------------------------
+// ---- traversal family: three-source immediate visibility (Task 4) ---------
 
-// TestTraversalFamilyBaseOnlyUntilTask4: with unmerged layers present, the
-// traversal family reads the merged base only (spec §3.2 family table; the
-// three-source View wiring is Task 4).
-// TODO(Task4): replace with three-source traversal expectations.
-func TestTraversalFamilyBaseOnlyUntilTask4(t *testing.T) {
+// TestTraversalFamilySeesLayersImmediately: with unmerged layers present,
+// the traversal family reads base ∪ layers (spec §3.2 family table: the
+// three-source View wiring landed in Task 4).
+func TestTraversalFamilySeesLayersImmediately(t *testing.T) {
 	g := vectra.New()
 	_, _ = g.AddNode("a", "S", nil)
 	_, _ = g.AddEdge("a", "a", "LOOP", nil)
-	// Unsealed BFS is legal (gate dissolved) but reads the base, which is
-	// empty: layer-resident starts are out of range.
-	if _, err := g.BFS([]vectra.NodeID{0}); err == nil {
-		t.Fatal("BFS on layer-resident start must fail (base-only until Task4)")
+	// Unsealed BFS anchors on the layer-resident start: the write is visible.
+	res, err := g.BFS([]vectra.NodeID{0})
+	if err != nil {
+		t.Fatalf("BFS on never-sealed graph: %v", err)
 	}
-	// after Seal the same query answers from the merged base
+	if res.Count() != 1 {
+		t.Fatalf("unsealed BFS count = %d, want 1", res.Count())
+	}
 	if err := g.Seal(); err != nil {
 		t.Fatal(err)
 	}
-	res, err := g.BFS([]vectra.NodeID{0})
+	// after Seal the same query answers from the merged base
+	res, err = g.BFS([]vectra.NodeID{0})
 	if err != nil || res.Count() != 1 {
 		t.Fatalf("post-Seal BFS: %+v %v", res, err)
 	}
-	// writes after Seal keep traversal on the last merged base (bounded-stale)
+	// writes after Seal stay visible to traversal without another merge
 	if _, err := g.AddNode("b", "S", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := g.BFS([]vectra.NodeID{0}); err != nil {
+	if _, err := g.AddEdge("a", "b", "CALLS", nil); err != nil {
+		t.Fatal(err)
+	}
+	res, err = g.BFS([]vectra.NodeID{0})
+	if err != nil {
 		t.Fatalf("BFS with layers present: %v", err)
 	}
-	ns, err := g.NeighborsOf("a", vectra.DirOut)
-	if err != nil || len(ns) != 1 || ns[0].Key != "a" {
-		t.Fatalf("NeighborsOf base-only: %+v %v", ns, err)
+	if res.Count() != 2 || res.Depth(mustID(t, g, "b")) != 1 {
+		t.Fatalf("layer edge a->b invisible to BFS: count=%d", res.Count())
 	}
-	// TODO(Task4): layer edge a->b invisible to NeighborsOf until the View lands.
+	ns, err := g.NeighborsOf("a", vectra.DirOut)
+	if err != nil || len(ns) != 2 {
+		t.Fatalf("NeighborsOf must see base LOOP + layer CALLS: %+v %v", ns, err)
+	}
+	got := []string{ns[0].Key, ns[1].Key}
+	slices.Sort(got)
+	if !slices.Equal(got, []string{"a", "b"}) {
+		t.Fatalf("NeighborsOf = %v", got)
+	}
 }
 
-// TestCypherUnsealedReadsBase: Cypher without a prior Seal runs against the
-// (possibly empty) base instead of erroring (gate dissolved).
-// TODO(Task4): Cypher over the three-source View.
-func TestCypherUnsealedReadsBase(t *testing.T) {
+// TestCypherUnsealedReadsLayers: Cypher without a prior Seal runs against
+// the three-source View (gate dissolved + Task 4 immediate visibility).
+func TestCypherUnsealedReadsLayers(t *testing.T) {
 	g := vectra.New()
-	res, err := g.Cypher(`MATCH (a) RETURN a.key`)
+	_, _ = g.AddNode("a", "S", nil)
+	_, _ = g.AddNode("b", "S", nil)
+	_, _ = g.AddEdge("a", "b", "CALLS", nil)
+	res, err := g.Cypher(`MATCH (x)-[:CALLS]->(y) RETURN x.key AS s, y.key AS d`)
 	if err != nil {
 		t.Fatalf("Cypher on unsealed graph: %v (gate dissolved)", err)
 	}
-	if len(res.Rows) != 0 {
-		t.Fatalf("rows = %d, want 0 (base empty until merge)", len(res.Rows))
+	if len(res.Rows) != 1 || res.Rows[0]["s"] != "a" || res.Rows[0]["d"] != "b" {
+		t.Fatalf("rows = %+v, want the layer edge a->b", res.Rows)
 	}
 }
 

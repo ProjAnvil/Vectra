@@ -5,6 +5,8 @@ import (
 	"slices"
 
 	"github.com/projanvil/vectra/internal/delta"
+	"github.com/projanvil/vectra/internal/engine"
+	tr "github.com/projanvil/vectra/internal/traverse"
 )
 
 // Query is the chained traversal builder:
@@ -63,34 +65,58 @@ func (q *Query) Run() (*BFSResult, error) {
 // NeighborsOf returns the one-hop neighbors of the node key (label-filtered,
 // empty = all, deduplicated).
 //
-// v0.7 traversal family: reads the merged base (spec §3.2; Task 4 wires the
-// three-source adjacency View). TODO(Task4).
+// v0.7 traversal family (spec §3.2, Task 4): row iteration over the
+// generation's three-source View — base rows tombstone-filtered plus layer
+// rows, so writes are visible immediately. With nothing unmerged the plain
+// CSR row zip runs (FastAdjacency hot path).
 func (g *Graph) NeighborsOf(key string, dir Direction, labels ...string) ([]Node, error) {
 	n, ok := g.NodeByKey(key)
 	if !ok {
 		return nil, ErrNodeNotFound
 	}
-	snap := g.view.Load().base
-	adj := snap.AdjacencyF()
+	v := g.view.Load()
+	src := v.rows()
+	lr := labelResolver(v.base)
+	if view, ok := src.(*engine.View); ok { // joint label table
+		lr = view
+	}
+	mask := labelMaskOf(lr, labels)
+	dirCode := int(tr.DirOut)
 	if dir == DirIn {
-		adj = snap.AdjacencyR()
+		dirCode = int(tr.DirIn)
 	}
-	if uint32(n.ID) >= uint32(snap.NodeCount()) {
-		// layer-resident node: no base row until the next merge
-		return nil, nil
+	materialize := func(id uint32) (Node, bool) {
+		return v.nodeByID(NodeID(id))
 	}
-	mask := labelMaskOf(snap, labels)
-	seen := make([]bool, snap.NodeCount())
+	if adj, fast := src.FastAdjacency(dirCode); fast {
+		tg, _, lb := adj.Row(uint32(n.ID))
+		seen := make([]bool, src.NodeCount())
+		var out []Node
+		for i, t := range tg {
+			if mask != nil && !mask[lb[i]] {
+				continue
+			}
+			if !seen[t] {
+				seen[t] = true
+				if rec, ok := materialize(t); ok {
+					out = append(out, rec)
+				}
+			}
+		}
+		return out, nil
+	}
+	rows := src.Rows(uint32(n.ID), dirCode)
+	seen := make([]bool, src.NodeCount())
 	var out []Node
-	tg, _, lb := adj.Row(uint32(n.ID))
-	for i, v := range tg {
-		if mask != nil && !mask[lb[i]] {
+	for _, r := range rows {
+		if mask != nil && !mask[r.LabelID] {
 			continue
 		}
-		if !seen[v] {
-			seen[v] = true
-			rec, _ := snap.NodeInfo(v)
-			out = append(out, Node{ID: NodeID(v), Key: rec.Key, Label: rec.Label, Props: rec.Props})
+		if !seen[r.Target] {
+			seen[r.Target] = true
+			if rec, ok := materialize(r.Target); ok {
+				out = append(out, rec)
+			}
 		}
 	}
 	return out, nil

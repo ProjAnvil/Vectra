@@ -87,23 +87,28 @@ func WithLabels(names ...string) BFSOption {
 // basis for parallelism — the frontier is a flat array, chunked across
 // goroutines once it crosses a threshold.
 //
-// v0.7 traversal family (spec §3.2): BFS runs against the merged base of
-// the current generation. Layer-resident nodes/edges become visible to
-// traversal only after a merge (Seal) — the three-source adjacency View is
-// Task 4. TODO(Task4): route through the generation View.
+// v0.7 traversal family (spec §3.2): BFS runs against the generation's
+// three-source View (base ∪ unmerged layers) — writes are visible
+// immediately. With nothing unmerged the View IS the base CSR and the
+// slice-zip hot path runs untouched (FastAdjacency).
 func (g *Graph) BFS(starts []NodeID, opts ...BFSOption) (*BFSResult, error) {
-	snap := g.view.Load().base
-	n := uint32(snap.NodeCount())
+	v := g.view.Load()
+	src := v.rows()
+	n := uint32(src.NodeCount())
 	for _, s := range starts {
 		if uint32(s) >= n {
 			return nil, ErrNodeNotFound
 		}
 	}
-	res := tr.BFS(snap, toU32s(starts), g.traverseConfig(snap, opts...))
+	res := tr.BFS(src, toU32s(starts), g.traverseConfig(v, src, opts...))
 	return &BFSResult{Layers: toNodeIDLayers(res.Layers), depth: res.DepthRaw()}, nil
 }
 
-func (g *Graph) traverseConfig(snap *engine.Snapshot, opts ...BFSOption) tr.Config {
+// traverseConfig builds the traversal config for one generation: the label
+// mask indexes the source's label table (the base's, or the View's joint
+// base ∪ pending-label table), and NodeFilter resolves node records through
+// the generation's winner resolution (layer overrides win).
+func (g *Graph) traverseConfig(v *genView, src tr.RowSource, opts ...BFSOption) tr.Config {
 	cfg := bfsConfig{maxDepth: ^uint32(0), parallelThr: tr.DefaultParallelThreshold, direction: DirOut}
 	for _, o := range opts {
 		o(&cfg)
@@ -114,26 +119,37 @@ func (g *Graph) traverseConfig(snap *engine.Snapshot, opts ...BFSOption) tr.Conf
 		ParallelThreshold: cfg.parallelThr,
 	}
 	if len(cfg.labelNames) > 0 {
-		tc.LabelMask = labelMaskOf(snap, cfg.labelNames)
+		lr := labelResolver(v.base)
+		if view, ok := src.(*engine.View); ok { // three-source: the joint label table
+			lr = view
+		}
+		tc.LabelMask = labelMaskOf(lr, cfg.labelNames)
 	}
 	if cfg.nodeFilter != nil {
 		tc.NodeFilter = func(id uint32) bool {
-			rec, _ := snap.NodeInfo(id)
+			rec, _ := v.nodeByID(NodeID(id))
 			return cfg.nodeFilter(Node{ID: NodeID(id), Key: rec.Key, Label: rec.Label, Props: rec.Props})
 		}
 	}
 	return tc
 }
 
+// labelResolver is the label-table surface shared by the base snapshot and
+// the three-source View (whose table is the joint base ∪ pending-labels).
+type labelResolver interface {
+	LabelCount() int
+	LabelID(name string) (uint32, bool)
+}
+
 // labelMaskOf turns a set of label names into a boolean mask indexed by the
-// base snapshot's labelIDs; empty names returns nil (no filtering).
-func labelMaskOf(snap *engine.Snapshot, names []string) []bool {
+// resolver's label table; empty names returns nil (no filtering).
+func labelMaskOf(lr labelResolver, names []string) []bool {
 	if len(names) == 0 {
 		return nil
 	}
-	mask := make([]bool, snap.LabelCount())
+	mask := make([]bool, lr.LabelCount())
 	for _, n := range names {
-		if id, ok := snap.LabelID(n); ok {
+		if id, ok := lr.LabelID(n); ok {
 			mask[id] = true
 		}
 	}
@@ -174,27 +190,43 @@ func ReachWithDirection(d Direction) ReachOption {
 }
 
 // ReachableIDs returns all nodes reachable from start (itself included),
-// ascending by NodeID. With no label filter it runs supernode BFS on the
-// SCC condensation DAG (the query-facing graph is acyclic; each visited bit
-// corresponds to one component); with a filter it falls back to strict
-// node-level traversal.
-//
-// v0.7 traversal family: reads the merged base (spec §3.2; Task 4 wires the
-// three-source View). TODO(Task4).
+// ascending by NodeID. With no label filter and nothing unmerged it runs
+// supernode BFS on the SCC condensation DAG (the query-facing graph is
+// acyclic; each visited bit corresponds to one component) — the supernode
+// acceleration exists only at merge boundaries (spec §3.2); a label filter
+// or unmerged delta layers fall back to strict node-level traversal over
+// the three-source View.
 func (g *Graph) ReachableIDs(start NodeID, opts ...ReachOption) ([]NodeID, error) {
-	snap := g.view.Load().base
-	if uint32(start) >= uint32(snap.NodeCount()) {
-		return nil, ErrNodeNotFound
-	}
+	v := g.view.Load()
 	cfg := reachConfig{direction: DirOut}
 	for _, o := range opts {
 		o(&cfg)
 	}
 	tc := tr.Config{Direction: tr.Direction(cfg.direction)}
 	if len(cfg.labelNames) > 0 {
-		tc.LabelMask = labelMaskOf(snap, cfg.labelNames)
+		tc.LabelMask = labelMaskOf(v.base, cfg.labelNames)
 	}
-	ids := tr.Reachable(snap, uint32(start), tc)
+	if tc.LabelMask == nil && len(v.layers) == 0 {
+		if uint32(start) >= uint32(v.base.NodeCount()) {
+			return nil, ErrNodeNotFound
+		}
+		ids := tr.ReachableSupernode(v.base, uint32(start), tr.Direction(cfg.direction))
+		out := make([]NodeID, len(ids))
+		for i, id := range ids {
+			out[i] = NodeID(id)
+		}
+		return out, nil
+	}
+	src := v.rows()
+	if uint32(start) >= uint32(src.NodeCount()) {
+		return nil, ErrNodeNotFound
+	}
+	if tc.LabelMask != nil {
+		if view, ok := src.(*engine.View); ok { // joint label table
+			tc.LabelMask = labelMaskOf(view, cfg.labelNames)
+		}
+	}
+	ids := tr.Reachable(src, uint32(start), tc)
 	out := make([]NodeID, len(ids))
 	for i, id := range ids {
 		out[i] = NodeID(id)
@@ -233,14 +265,16 @@ func (p Path) Len() int { return len(p.Edges) }
 // whole layer of the smaller side's frontier, checks the opposite side's
 // visited when marking; the first meeting point yields the optimal distance.
 //
-// v0.7 traversal family: reads the merged base (spec §3.2; Task 4 wires the
-// three-source View). TODO(Task4).
+// v0.7 traversal family (spec §3.2): runs over the generation's three-source
+// View — paths may cross base and layer edges alike; with nothing unmerged
+// it is the plain CSR bidirectional BFS (FastAdjacency hot path).
 func (g *Graph) ShortestPathIDs(from, to NodeID) (Path, bool, error) {
-	snap := g.view.Load().base
-	if uint32(from) >= uint32(snap.NodeCount()) || uint32(to) >= uint32(snap.NodeCount()) {
+	v := g.view.Load()
+	src := v.rows()
+	if uint32(from) >= uint32(src.NodeCount()) || uint32(to) >= uint32(src.NodeCount()) {
 		return Path{}, false, ErrNodeNotFound
 	}
-	nodes, edges, found := tr.ShortestPath(snap, uint32(from), uint32(to))
+	nodes, edges, found := tr.ShortestPath(src, uint32(from), uint32(to))
 	if !found {
 		return Path{}, false, nil
 	}

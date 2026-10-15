@@ -38,13 +38,52 @@ type Result struct {
 	Rows    []map[string]any
 }
 
-// Run parses and executes q against the sealed snapshot.
+// Source is the three-source execution surface (v0.7 spec §3.2): node/edge
+// records by ID across base ∪ delta layers, the joint label table, the
+// three-source property lookups for pattern anchoring, and adjacency rows
+// (with the empty-delta CSR fast path). The root facade implements it over
+// one immutable generation; engine.View supplies the row half structurally.
+type Source interface {
+	NodeCount() int
+	NodeInfo(id uint32) (engine.NodeRec, bool)
+	EdgeInfo(id uint32) (src, dst uint32, label string, props map[string]any, ok bool)
+	LabelCount() int
+	LabelID(name string) (uint32, bool)
+	LookupIndex(key, value string) ([]uint32, bool)
+	LookupNumber(key string, value float64) ([]uint32, bool)
+	LookupBool(key string, value bool) ([]uint32, bool)
+	FastAdjacency(dir int) (csr.Adjacency, bool)
+	Rows(u uint32, dir int) []csr.AdjRow
+}
+
+// Run parses and executes q against the sealed snapshot (the merged-base
+// hot path: no delta indirection anywhere).
 func Run(snap *engine.Snapshot, q string) (*Result, error) {
 	ast, err := Parse(q)
 	if err != nil {
 		return nil, err
 	}
-	ex := &executor{snap: snap, adjF: snap.AdjacencyF(), adjR: snap.AdjacencyR()}
+	ex := &executor{snap: snap, adjF: snap.AdjacencyF(), adjR: snap.AdjacencyR(), fastAdj: true}
+	return runStatement(ex, ast)
+}
+
+// RunView parses and executes q against a three-source Source. When the
+// source's delta is empty it takes the same CSR hot path as Run (via
+// FastAdjacency); otherwise adjacency rows come from the View.
+func RunView(src Source, q string) (*Result, error) {
+	ast, err := Parse(q)
+	if err != nil {
+		return nil, err
+	}
+	ex := &executor{src: src}
+	if adjF, ok := src.FastAdjacency(0); ok {
+		ex.adjF, ex.fastAdj = adjF, true
+		ex.adjR, _ = src.FastAdjacency(1)
+	}
+	return runStatement(ex, ast)
+}
+
+func runStatement(ex *executor, ast *Query) (*Result, error) {
 	rows, err := ex.matchRows(ast.Match)
 	if err != nil {
 		return nil, err
@@ -103,9 +142,13 @@ func (r row) dedupKey() string {
 }
 
 type executor struct {
-	snap *engine.Snapshot
-	adjF csr.Adjacency
-	adjR csr.Adjacency
+	snap *engine.Snapshot // merged-base execution (Run); nil in RunView
+	src  Source           // three-source execution (RunView); nil in Run
+	// adjacency closures for expansion: the CSR slices on both entries when
+	// the delta is empty (A1 fast path), nil rows otherwise.
+	adjF    csr.Adjacency
+	adjR    csr.Adjacency
+	fastAdj bool // adjF/adjR carry the whole graph (expansion uses them)
 	// labelIDCache: name -> (id, found)
 	labelIDCache map[string]uint32
 	// BFS scratch shared across variable-length expansions: depths[i] is
@@ -115,6 +158,65 @@ type executor struct {
 	genNow uint32
 }
 
+// The three-source dispatch helpers: RunView's source answers, Run's
+// snapshot otherwise. Exactly one of snap/src is set per executor.
+
+func (ex *executor) nodeCount() int {
+	if ex.src != nil {
+		return ex.src.NodeCount()
+	}
+	return ex.snap.NodeCount()
+}
+
+func (ex *executor) nodeInfo(id uint32) (engine.NodeRec, bool) {
+	if ex.src != nil {
+		return ex.src.NodeInfo(id)
+	}
+	return ex.snap.NodeInfo(id)
+}
+
+func (ex *executor) edgeInfo(id uint32) (uint32, uint32, string, map[string]any, bool) {
+	if ex.src != nil {
+		return ex.src.EdgeInfo(id)
+	}
+	return ex.snap.EdgeInfo(id)
+}
+
+func (ex *executor) labelCount() int {
+	if ex.src != nil {
+		return ex.src.LabelCount()
+	}
+	return ex.snap.LabelCount()
+}
+
+func (ex *executor) labelID(name string) (uint32, bool) {
+	if ex.src != nil {
+		return ex.src.LabelID(name)
+	}
+	return ex.snap.LabelID(name)
+}
+
+func (ex *executor) lookupIndex(key, value string) ([]uint32, bool) {
+	if ex.src != nil {
+		return ex.src.LookupIndex(key, value)
+	}
+	return ex.snap.LookupIndex(key, value)
+}
+
+func (ex *executor) lookupNumber(key string, value float64) ([]uint32, bool) {
+	if ex.src != nil {
+		return ex.src.LookupNumber(key, value)
+	}
+	return ex.snap.LookupNumber(key, value)
+}
+
+func (ex *executor) lookupBool(key string, value bool) ([]uint32, bool) {
+	if ex.src != nil {
+		return ex.src.LookupBool(key, value)
+	}
+	return ex.snap.LookupBool(key, value)
+}
+
 func (ex *executor) labelMask(labels []string) []bool {
 	if len(labels) == 0 {
 		return nil
@@ -122,12 +224,12 @@ func (ex *executor) labelMask(labels []string) []bool {
 	if ex.labelIDCache == nil {
 		ex.labelIDCache = map[string]uint32{}
 	}
-	mask := make([]bool, ex.snap.LabelCount())
+	mask := make([]bool, ex.labelCount())
 	for _, name := range labels {
 		id, cached := ex.labelIDCache[name]
 		if !cached {
 			var ok bool
-			id, ok = ex.snap.LabelID(name)
+			id, ok = ex.labelID(name)
 			if !ok {
 				continue // label never interned: no edge can match it
 			}
@@ -229,19 +331,19 @@ func (ex *executor) runPath(pat *PathPattern, base []row) ([]row, error) {
 // on indexed keys narrow via the typed indexes (intersecting when several
 // apply); anything left falls back to a full scan with the node predicate.
 func (ex *executor) anchorCandidates(np *NodePattern) []uint32 {
-	n := uint32(ex.snap.NodeCount())
+	n := uint32(ex.nodeCount())
 	var cand []uint32 // nil = unconstrained yet
 	for k, v := range np.Props {
 		var ids []uint32
 		var ok bool
 		switch tv := v.(type) {
 		case string:
-			ids, ok = ex.snap.LookupIndex(k, tv)
+			ids, ok = ex.lookupIndex(k, tv)
 		case bool:
-			ids, ok = ex.snap.LookupBool(k, tv)
+			ids, ok = ex.lookupBool(k, tv)
 		default:
 			if f, isNum := numVal(v); isNum {
-				ids, ok = ex.snap.LookupNumber(k, f)
+				ids, ok = ex.lookupNumber(k, f)
 			}
 		}
 		if !ok {
@@ -286,7 +388,7 @@ func intersectIDs(a, b []uint32) []uint32 {
 // equality (numbers compared after normalization). The pseudo-props "key" and
 // "label" read the node's identity fields, shadowing any same-named property.
 func (ex *executor) nodePred(np *NodePattern, id uint32) bool {
-	rec, ok := ex.snap.NodeInfo(id)
+	rec, ok := ex.nodeInfo(id)
 	if !ok {
 		return false
 	}
@@ -415,7 +517,32 @@ func (ex *executor) expand(rows []row, ep *EdgePattern, np *NodePattern) ([]row,
 }
 
 // directions returns the adjacency-row accessors for the edge direction.
+// On the CSR fast path (adjF/adjR set) these are the plain slice-zip Row
+// closures; on the three-source path each call zips the View's AdjRow slice
+// into the parallel arrays the expansion loops consume.
 func (ex *executor) directions(dir int) []func(uint32) ([]uint32, []uint32, []uint32) {
+	viewRow := func(d int) func(uint32) ([]uint32, []uint32, []uint32) {
+		return func(u uint32) ([]uint32, []uint32, []uint32) {
+			rows := ex.src.Rows(u, d)
+			tg := make([]uint32, len(rows))
+			eids := make([]uint32, len(rows))
+			lbs := make([]uint32, len(rows))
+			for i, r := range rows {
+				tg[i], eids[i], lbs[i] = r.Target, r.EdgeID, r.LabelID
+			}
+			return tg, eids, lbs
+		}
+	}
+	if ex.src != nil && !ex.fastAdj {
+		switch dir {
+		case DirIn:
+			return []func(uint32) ([]uint32, []uint32, []uint32){viewRow(1)}
+		case DirBoth:
+			return []func(uint32) ([]uint32, []uint32, []uint32){viewRow(0), viewRow(1)}
+		default:
+			return []func(uint32) ([]uint32, []uint32, []uint32){viewRow(0)}
+		}
+	}
 	switch dir {
 	case DirIn:
 		return []func(uint32) ([]uint32, []uint32, []uint32){ex.adjR.Row}
@@ -451,7 +578,7 @@ func (r row) extendNode(np *NodePattern, id uint32) (row, bool) {
 // node with its depth; the caller applies the hop window's lower bound and
 // the target node pattern.
 func (ex *executor) reachableWithin(start uint32, mask []bool, dir, maxHops int) map[uint32]uint32 {
-	n := uint32(ex.snap.NodeCount())
+	n := uint32(ex.nodeCount())
 	if int(start) >= int(n) {
 		return nil
 	}
