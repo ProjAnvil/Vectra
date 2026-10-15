@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/projanvil/vectra/internal/engine"
@@ -637,9 +638,18 @@ func (g *Graph) cleanupSnapshots(keep string) {
 		if e.IsDir() || e.Name() == keep {
 			continue
 		}
-		if strings.HasPrefix(e.Name(), namePrefix) && strings.HasSuffix(e.Name(), ".db") {
-			os.Remove(filepath.Join(dir, e.Name()))
+		if !strings.HasPrefix(e.Name(), namePrefix) || !strings.HasSuffix(e.Name(), ".db") {
+			continue
 		}
+		// Only <base>-<lsn>.db files are checkpoint artifacts: the middle
+		// segment must be all digits. User files that merely share the
+		// prefix (graph-backup.db, graph-export.db, date-stamped exports)
+		// are never touched.
+		mid := strings.TrimSuffix(strings.TrimPrefix(e.Name(), namePrefix), ".db")
+		if _, err := strconv.ParseUint(mid, 10, 64); err != nil {
+			continue
+		}
+		os.Remove(filepath.Join(dir, e.Name()))
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -451,7 +452,12 @@ func countWatermarkSnapshots(t *testing.T, dir, base string) int {
 	}
 	n := 0
 	for _, e := range es {
-		if !e.IsDir() && strings.HasPrefix(e.Name(), prefix) && strings.HasSuffix(e.Name(), ".db") {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), prefix) || !strings.HasSuffix(e.Name(), ".db") {
+			continue
+		}
+		// Same match as the production cleanup: only all-digit middles count.
+		mid := strings.TrimSuffix(strings.TrimPrefix(e.Name(), prefix), ".db")
+		if _, err := strconv.ParseUint(mid, 10, 64); err == nil {
 			n++
 		}
 	}
@@ -604,5 +610,43 @@ func TestCheckpointCrashWindowDeleteNodeClean(t *testing.T) {
 	}
 	if _, ok := g3.NodeByKey("x"); !ok {
 		t.Fatal("node x lost")
+	}
+}
+
+// TestCleanupSparesNonWatermarkFiles pins the cleanup match: only
+// <base>-<digits>.db files are checkpoint artifacts. User files that merely
+// share the prefix (graph-backup.db, graph-export.db, or date-stamped
+// exports) must survive every checkpoint.
+func TestCleanupSparesNonWatermarkFiles(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "graph.db")
+	userFiles := []string{"graph-backup.db", "graph-export.db", "graph-2026-10-15.db"}
+	for _, name := range userFiles {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("user data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	g := mustOpen(t, db, vectra.ModeAlways)
+	g.AddNode("a", "Svc", nil)
+	g.AddNode("b", "Svc", nil)
+	if err := g.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// A second checkpoint exercises the stale-watermark cleanup path with
+	// the user files present.
+	g2 := mustOpen(t, db, vectra.ModeAlways)
+	g2.AddNode("c", "Svc", nil)
+	if err := g2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range userFiles {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("user file %s deleted by checkpoint cleanup: %v", name, err)
+		}
+	}
+	if n := countWatermarkSnapshots(t, dir, "graph"); n != 1 {
+		t.Fatalf("watermark snapshots after second checkpoint = %d, want exactly the current one", n)
 	}
 }
