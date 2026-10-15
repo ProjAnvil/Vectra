@@ -1671,7 +1671,17 @@ func LoadFile(path string) (*Graph, error) {
 // base index plus a line scan of the delta (ok=true), and Seal folds the
 // declaration into the base index. Idempotent; unregistered keys yield
 // ok=false in LookupByProperty.
+//
+// Write-path method (it publishes a layer): after Close the declaration is
+// dropped and the graph returned unchanged (writes are closed; the chain
+// stays usable), and in wrapper mode it must run on the writer goroutine —
+// debug builds panic with ErrNotWriter otherwise (release builds rely on
+// the documented single-writer discipline, like Cycles).
 func (g *Graph) IndexProperty(key string) *Graph {
+	if g.closed {
+		return g
+	}
+	g.assertWriter()
 	if g.indexDeclared(key) {
 		return g
 	}

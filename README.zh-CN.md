@@ -27,6 +27,8 @@ g.AddEdge("gateway", "auth", "CALLS", nil)
 g.UpsertEdge("gateway", "auth", "CALLS", map[string]any{"weight": 2}) // 同键 (src,dst,label) 替换属性
 g.DeleteNode("ledger")                                               // 删点并级联删边
 
+// 批量导入：用 g.Batch(func(g *vectra.Graph) { ... }) —— 每批一个微层而非每写一个，快一个数量级
+
 // 链式遍历（Seal 与否都能查——写入立即可见）
 res, _ := g.Query().From("gateway").Out("CALLS").MaxDepth(3).Run()
 

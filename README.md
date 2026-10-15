@@ -27,6 +27,8 @@ g.AddEdge("gateway", "auth", "CALLS", nil)
 g.UpsertEdge("gateway", "auth", "CALLS", map[string]any{"weight": 2}) // replace props on the same (src,dst,label)
 g.DeleteNode("ledger")                                               // cascade-deletes incident edges
 
+// bulk import: g.Batch(func(g *vectra.Graph) { ... }) — one micro-layer per batch instead of per write, an order of magnitude faster
+
 // chained traversal (works with or without a Seal — writes are immediately visible)
 res, _ := g.Query().From("gateway").Out("CALLS").MaxDepth(3).Run()
 

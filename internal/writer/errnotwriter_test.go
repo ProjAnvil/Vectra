@@ -19,8 +19,9 @@ import (
 // TestErrNotWriterOnMergeEntries: Seal/Compact/Cycles walk the write path
 // (Seal/Compact rebuild writer-private mirrors; Cycles force-merges when
 // layers are unmerged), so the same debug protection applies — ErrNotWriter
-// from Seal/Compact, a debug panic from Cycles (its signature cannot carry
-// an error). Direct mode (no claim) keeps all three legal.
+// from Seal/Compact, a debug panic from Cycles and IndexProperty (their
+// signatures cannot carry an error). Direct mode (no claim) keeps all four
+// legal. Also pins IndexProperty's closed early-exit (task 6, I1).
 func TestErrNotWriterOnMergeEntries(t *testing.T) {
 	g := vectra.New()
 	h := writer.Attach(g, writer.Config{})
@@ -34,19 +35,25 @@ func TestErrNotWriterOnMergeEntries(t *testing.T) {
 	if err := g.Compact(); !errors.Is(err, vectra.ErrNotWriter) {
 		t.Fatalf("Compact from non-writer = %v, want ErrNotWriter", err)
 	}
-	func() {
+	assertPanicNotWriter := func(name string, call func()) {
+		t.Helper()
 		defer func() {
 			r := recover()
 			if r == nil {
-				t.Fatal("Cycles from non-writer must panic in debug builds")
+				t.Fatalf("%s from non-writer must panic in debug builds", name)
 			}
 			err, ok := r.(error)
 			if !ok || !errors.Is(err, vectra.ErrNotWriter) {
-				t.Fatalf("Cycles panic = %#v, want an error wrapping ErrNotWriter", r)
+				t.Fatalf("%s panic = %#v, want an error wrapping ErrNotWriter", name, r)
 			}
 		}()
-		_ = g.Cycles()
-	}()
+		call()
+	}
+	assertPanicNotWriter("Cycles", func() { _ = g.Cycles() })
+	assertPanicNotWriter("IndexProperty", func() { _ = g.IndexProperty("offwriter") })
+	if keys := g.IndexedPropertyKeys(); keys != nil {
+		t.Fatalf("IndexedPropertyKeys after rejected IndexProperty = %v, want nil", keys)
+	}
 
 	// the writer path itself still seals (Handle.Close runs the final Seal
 	// on the writer goroutine — it must not trip the assertion)
@@ -54,7 +61,7 @@ func TestErrNotWriterOnMergeEntries(t *testing.T) {
 		t.Fatalf("Close (writer-goroutine Seal): %v", err)
 	}
 
-	// direct mode restored: all three are plain calls again
+	// direct mode restored: all four are plain calls again
 	if err := g.Seal(); err != nil {
 		t.Fatalf("Seal after yield: %v", err)
 	}
@@ -63,6 +70,22 @@ func TestErrNotWriterOnMergeEntries(t *testing.T) {
 	}
 	if cs := g.Cycles(); len(cs) != 0 {
 		t.Fatalf("Cycles after yield = %d cycles, want 0", len(cs))
+	}
+	if ig := g.IndexProperty("legit"); ig != g {
+		t.Fatal("IndexProperty after yield must keep chaining")
+	}
+
+	// closed graphs drop the declaration instead of publishing a layer on a
+	// torn-down session (the chain stays usable)
+	closed := vectra.New()
+	if err := closed.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if ig := closed.IndexProperty("late"); ig != closed {
+		t.Fatal("IndexProperty on a closed graph must return the graph unchanged")
+	}
+	if keys := closed.IndexedPropertyKeys(); keys != nil {
+		t.Fatalf("IndexedPropertyKeys on closed graph = %v, want nil", keys)
 	}
 }
 
