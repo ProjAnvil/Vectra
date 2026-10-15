@@ -16,6 +16,56 @@ import (
 	"github.com/projanvil/vectra/internal/writer"
 )
 
+// TestErrNotWriterOnMergeEntries: Seal/Compact/Cycles walk the write path
+// (Seal/Compact rebuild writer-private mirrors; Cycles force-merges when
+// layers are unmerged), so the same debug protection applies — ErrNotWriter
+// from Seal/Compact, a debug panic from Cycles (its signature cannot carry
+// an error). Direct mode (no claim) keeps all three legal.
+func TestErrNotWriterOnMergeEntries(t *testing.T) {
+	g := vectra.New()
+	h := writer.Attach(g, writer.Config{})
+	if err := h.Submit(nodeCS("w0", "W", nil)); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+
+	if err := g.Seal(); !errors.Is(err, vectra.ErrNotWriter) {
+		t.Fatalf("Seal from non-writer = %v, want ErrNotWriter", err)
+	}
+	if err := g.Compact(); !errors.Is(err, vectra.ErrNotWriter) {
+		t.Fatalf("Compact from non-writer = %v, want ErrNotWriter", err)
+	}
+	func() {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("Cycles from non-writer must panic in debug builds")
+			}
+			err, ok := r.(error)
+			if !ok || !errors.Is(err, vectra.ErrNotWriter) {
+				t.Fatalf("Cycles panic = %#v, want an error wrapping ErrNotWriter", r)
+			}
+		}()
+		_ = g.Cycles()
+	}()
+
+	// the writer path itself still seals (Handle.Close runs the final Seal
+	// on the writer goroutine — it must not trip the assertion)
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close (writer-goroutine Seal): %v", err)
+	}
+
+	// direct mode restored: all three are plain calls again
+	if err := g.Seal(); err != nil {
+		t.Fatalf("Seal after yield: %v", err)
+	}
+	if err := g.Compact(); err != nil {
+		t.Fatalf("Compact after yield: %v", err)
+	}
+	if cs := g.Cycles(); len(cs) != 0 {
+		t.Fatalf("Cycles after yield = %d cycles, want 0", len(cs))
+	}
+}
+
 func TestErrNotWriter(t *testing.T) {
 	g := vectra.New()
 	h := writer.Attach(g, writer.Config{})

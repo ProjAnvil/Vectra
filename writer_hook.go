@@ -3,6 +3,7 @@
 package vectra
 
 import (
+	"fmt"
 	"runtime"
 	"strconv"
 	"strings"
@@ -37,6 +38,16 @@ func (g *Graph) checkWriter() error {
 		return ErrNotWriter
 	}
 	return nil
+}
+
+// assertWriter is checkWriter's panic variant for write-path methods whose
+// signatures cannot carry an error (Cycles): debug builds fail fast instead
+// of silently racing the writer's private mirrors. Release builds compile
+// it away (writer_hook_release.go) — the documented discipline applies.
+func (g *Graph) assertWriter() {
+	if err := g.checkWriter(); err != nil {
+		panic(fmt.Errorf("%w — this method rewrites writer-private state; run it on the writer goroutine (or with writes quiescent)", err))
+	}
 }
 
 // goroutineToken parses this goroutine's id from runtime.Stack's header

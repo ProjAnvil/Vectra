@@ -18,3 +18,6 @@ func (g *Graph) YieldWriter() {}
 
 // checkWriter never rejects in release builds; see writer_hook.go.
 func (g *Graph) checkWriter() error { return nil }
+
+// assertWriter is a no-op in release builds; see writer_hook.go.
+func (g *Graph) assertWriter() {}

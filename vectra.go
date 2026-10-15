@@ -1435,9 +1435,15 @@ func (g *Graph) forceMerge() error {
 // checkpoint follows (watermark snapshot + manifest + WAL reset). Idempotent:
 // on an already-merged graph it is at most a checkpoint. Writes after Seal
 // are legal (they open a new generation); this method no longer makes the
-// graph read-only. Seal is a write-path method: run it on the writer
-// goroutine (or with writes quiescent) — it rebuilds writer-private state.
+// graph read-only. Seal is a write-path method guarded by the writer
+// discipline: in wrapper mode it must run on the writer goroutine (debug
+// builds return ErrNotWriter otherwise), and concurrent-safe only via the
+// writer handle or single-goroutine discipline — it rebuilds writer-private
+// state.
 func (g *Graph) Seal() error {
+	if err := g.checkWriter(); err != nil {
+		return err
+	}
 	if g.wal != nil {
 		if err := g.flushPending(); err != nil {
 			return err
@@ -1458,8 +1464,10 @@ func (g *Graph) Seal() error {
 // "deep compaction renumbering" is absorbed by the merge itself: folding
 // already rebuilds node and edge IDs densely (R1), so Compact runs the
 // exact same pipeline as Seal and the two are semantically equivalent.
-// Like Seal it is a write-path method: run it on the writer goroutine (or
-// with writes quiescent) — it rebuilds writer-private state.
+// Like Seal it is a write-path method guarded by the writer discipline
+// (ErrNotWriter off-writer in debug builds): concurrent-safe only via the
+// writer handle or single-goroutine discipline — it rebuilds
+// writer-private state.
 func (g *Graph) Compact() error {
 	return g.Seal()
 }

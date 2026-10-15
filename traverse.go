@@ -322,9 +322,13 @@ func (c Cycle) Len() int { return len(c.Nodes) }
 // v0.7 (spec §3.2): Cycles is the traversal-family exception — unmerged
 // layers are force-merged first (SCC structures only exist on a merged
 // base), so the answer is always strongly consistent. The forced merge
-// rewrites writer-private state: like Seal, Cycles must run on the writer
-// goroutine (or with writes quiescent); every other query is lock-free.
+// rewrites writer-private state, so although Cycles answers a query it
+// walks the write path: concurrent-safe only via the writer handle (Submit
+// sessions) or single-goroutine discipline. In wrapper mode, debug builds
+// panic with ErrNotWriter when called off the writer goroutine; release
+// builds rely on this documented contract. Every other query is lock-free.
 func (g *Graph) Cycles() []Cycle {
+	g.assertWriter()
 	v := g.view.Load()
 	if len(v.layers) > 0 {
 		if g.forceMerge() != nil {
