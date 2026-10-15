@@ -62,14 +62,16 @@ type TxnGuard struct {
 //
 // Wire-compatibility note (deviation from the v0.7 spec's stated mechanism,
 // same contract): the spec proposed `struct { vectra.Changeset; Txn }`
-// embedding, but encoding/gob — unlike encoding/json — does NOT flatten
-// embedded structs: the embedded value would go out as a single nested
-// field and raft logs would no longer decode across versions. gob matches
+// embedding, but encoding/gob's encoder — unlike encoding/json — does NOT
+// flatten embedded structs: the embedded value goes out as a single nested
+// field, which would break raft logs for every old binary (the decoder side
+// can match flat wire fields into promoted fields recursively, but that
+// asymmetry makes any embed shape one-directional at best). gob matches
 // structurally by field name, so Batch keeps the flat legacy field list with
 // the item types aliased to the core ones (same shapes, same names) — the
 // wire format is identical to pre-0.7 logs in both directions, verified by
-// TestBatchEmbedGobLegacyRoundtrip. Converting to/from a core
-// vectra.Changeset is field-by-field assignment (see ChangesetOf).
+// TestBatchGobLegacyRoundtrip. Converting to/from a core vectra.Changeset is
+// field-by-field assignment (see ChangesetOf).
 type Batch struct {
 	Version     int
 	Nodes       []NodeUpsert

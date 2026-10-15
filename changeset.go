@@ -15,11 +15,17 @@ import "github.com/projanvil/vectra/internal/wal"
 // must not depend on them. Node deletes cascade edges.
 //
 // The struct fields and json tags are a wire contract shared by two formats:
-// the embedded WAL's whole-frame JSON, and the server module's raft Batch —
-// server.Batch embeds Changeset, and gob flattens embedded structs to the
-// same field names the pre-0.7 flat Batch used, keeping old raft logs
-// decodable (gob ignores unknown fields, matches by name). Add fields only;
-// never rename or retype existing ones.
+// the embedded WAL's whole-frame JSON, and the server module's raft Batch.
+// Wire note (verified empirically): encoding/gob does NOT flatten embedded
+// structs on the encoder side — an embedded value goes out as a single
+// nested field, which would immediately break old-binary decoders — while
+// the decoder side CAN match flat wire fields into promoted (embedded)
+// fields recursively. That asymmetry makes any embed shape one-directional
+// at best, so the server keeps the flat legacy field list with its item
+// types aliased to these; gob matches structurally by field name, which
+// keeps raft logs two-directionally compatible (pinned by
+// TestBatchGobLegacyRoundtrip). Evolution rule for either format: add
+// fields only; never rename or retype existing ones.
 //
 // Definition-site note: the types are physically defined in internal/wal
 // (the dependency leaf) and re-exported here as type aliases, so the public

@@ -1,8 +1,10 @@
 package vectra_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/projanvil/vectra"
@@ -314,8 +316,8 @@ func TestManifestReconciliationRoot(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("manifest after Close: ok=%v err=%v", ok, err)
 	}
-	if man.Snapshot != filepath.Base(db) {
-		t.Fatalf("manifest snapshot = %q, want %q", man.Snapshot, filepath.Base(db))
+	if man.Snapshot != filepath.Base(watermarkSnapshot(db, man.LSN)) {
+		t.Fatalf("manifest snapshot = %q, want watermark name %q", man.Snapshot, filepath.Base(watermarkSnapshot(db, man.LSN)))
 	}
 
 	// Reopen (replays nothing: all frames are in the checkpoint), add exactly
@@ -353,10 +355,11 @@ func TestCloseCheckpointFailureKeepsWAL(t *testing.T) {
 	g.AddNode("b", "Svc", nil)
 	g.UpsertEdge("a", "b", "CALLS", nil)
 
-	// Sabotage the checkpoint's atomic rename: the snapshot target becomes a
-	// directory, so SaveFile fails at rename — after Seal and before the
-	// manifest/Reset. Close must fail WITHOUT deleting the WAL.
-	if err := os.Mkdir(db, 0o755); err != nil {
+	// Sabotage the checkpoint's atomic rename: the watermark snapshot target
+	// becomes a directory, so SaveFile fails at rename — after Seal and
+	// before the manifest/Reset. Close must fail WITHOUT deleting the WAL.
+	_, _, lsn := replayStats(t, walDir)
+	if err := os.Mkdir(watermarkSnapshot(db, lsn), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := g.Close(); err == nil {
@@ -379,13 +382,18 @@ func TestCloseCheckpointFailureKeepsWAL(t *testing.T) {
 func TestOpenManifestSnapshotMissing(t *testing.T) {
 	dir := t.TempDir()
 	db := filepath.Join(dir, "graph.db")
+	walDir := db + ".wal"
 
 	g := mustOpen(t, db, vectra.ModeAlways)
 	g.AddNode("a", "Svc", nil)
 	if err := g.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(db); err != nil {
+	man, ok, err := wal.ReadManifest(walDir)
+	if err != nil || !ok {
+		t.Fatalf("manifest after Close: ok=%v err=%v", ok, err)
+	}
+	if err := os.Remove(filepath.Join(dir, man.Snapshot)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := vectra.Open(db, vectra.Options{WALMode: vectra.ModeAlways}); err == nil {
@@ -422,5 +430,179 @@ func TestOpenAdoptsV06Snapshot(t *testing.T) {
 	g2 := mustOpen(t, db, vectra.ModeAlways)
 	if g2.NodeCount() != 2 {
 		t.Fatalf("post-checkpoint nodes = %d, want 2", g2.NodeCount())
+	}
+}
+
+// --- watermark snapshots (checkpoint crash window) ---------------------------
+
+// watermarkSnapshot mirrors the checkpoint's snapshot naming contract:
+// <path-without-ext>-<lsn>.db next to the session path.
+func watermarkSnapshot(path string, lsn uint64) string {
+	base := strings.TrimSuffix(path, filepath.Ext(path))
+	return fmt.Sprintf("%s-%d.db", base, lsn)
+}
+
+func countWatermarkSnapshots(t *testing.T, dir, base string) int {
+	t.Helper()
+	prefix := base + "-"
+	es, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range es {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), prefix) && strings.HasSuffix(e.Name(), ".db") {
+			n++
+		}
+	}
+	return n
+}
+
+func TestCheckpointUsesWatermarkSnapshots(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "graph.db")
+	walDir := db + ".wal"
+
+	g := mustOpen(t, db, vectra.ModeAlways)
+	g.AddNode("a", "Svc", nil)
+	g.AddNode("b", "Svc", nil)
+	if err := g.Close(); err != nil {
+		t.Fatal(err)
+	}
+	man1, ok, err := wal.ReadManifest(walDir)
+	if err != nil || !ok {
+		t.Fatalf("manifest after Close: ok=%v err=%v", ok, err)
+	}
+	want := "graph-2.db" // 2 single-write frames -> lsn 2
+	if man1.Snapshot != want {
+		t.Fatalf("manifest.Snapshot = %q, want watermark name %q", man1.Snapshot, want)
+	}
+	if _, err := os.Stat(filepath.Join(dir, want)); err != nil {
+		t.Fatalf("watermark snapshot missing: %v", err)
+	}
+	if _, err := os.Stat(db); !os.IsNotExist(err) {
+		t.Fatal("Close must never write the session path in place (that is the crash-window hazard)")
+	}
+
+	// The next checkpoint rolls the watermark and deletes the previous one.
+	g2 := mustOpen(t, db, vectra.ModeAlways)
+	g2.AddNode("c", "Svc", nil)
+	if err := g2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	man2, ok, err := wal.ReadManifest(walDir)
+	if err != nil || !ok {
+		t.Fatalf("manifest after second Close: ok=%v err=%v", ok, err)
+	}
+	if man2.Snapshot != "graph-3.db" || man2.LSN != man1.LSN+1 {
+		t.Fatalf("manifest2 = %+v, want snapshot graph-3.db at lsn %d", man2, man1.LSN+1)
+	}
+	if n := countWatermarkSnapshots(t, dir, "graph"); n != 1 {
+		t.Fatalf("watermark snapshots after second checkpoint = %d, want exactly the current one", n)
+	}
+}
+
+// TestCheckpointCrashWindowParallelNotDoubled is reviewer variant A: a crash
+// after SaveFile but before the manifest lands must not double-apply
+// non-idempotent frames (AllowParallel appends) on recovery.
+func TestCheckpointCrashWindowParallelNotDoubled(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "graph.db")
+	walDir := db + ".wal"
+
+	g := mustOpen(t, db, vectra.ModeAlways)
+	g.AddNode("a", "Svc", nil)
+	g.AddNode("b", "Svc", nil)
+	g.AddEdge("a", "b", "P", nil) // parallel #1
+	if err := g.Close(); err != nil {
+		t.Fatal(err)
+	}
+	man1, ok, err := wal.ReadManifest(walDir)
+	if err != nil || !ok {
+		t.Fatalf("manifest after Close: ok=%v err=%v", ok, err)
+	}
+
+	// Session 2 recovers from the checkpoint and adds parallel #2
+	// (frame man1.LSN+1).
+	g2 := mustOpen(t, db, vectra.ModeAlways)
+	if g2.EdgeCount() != 1 {
+		t.Fatalf("session 2 edges = %d, want 1", g2.EdgeCount())
+	}
+	if _, err := g2.AddEdge("a", "b", "P", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Crash inside the checkpoint window: the new watermark snapshot is
+	// saved, the manifest is NOT yet written, the WAL is NOT reset.
+	next := man1.LSN + 1
+	if err := g2.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	if err := g2.SaveFile(watermarkSnapshot(db, next)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Recovery loads the manifest-named (older, untouched) snapshot and
+	// replays the frame exactly once.
+	g3 := mustOpen(t, db, vectra.ModeAlways)
+	if n := g3.EdgeCount(); n != 2 {
+		t.Fatalf("recovered parallel edges = %d, want exactly 2 (no double-apply)", n)
+	}
+
+	// The next checkpoint overwrites the stale window file and cleans up.
+	if err := g3.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n := countWatermarkSnapshots(t, dir, "graph"); n != 1 {
+		t.Fatalf("watermark snapshots after cleanup = %d, want 1", n)
+	}
+}
+
+// TestCheckpointCrashWindowDeleteNodeClean is reviewer variant B: a crash in
+// the same window after a DeleteNode must leave Open succeeding with the node
+// deleted (the old in-place snapshot made replay hit ErrNodeNotFound and
+// wedged Open forever).
+func TestCheckpointCrashWindowDeleteNodeClean(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "graph.db")
+	walDir := db + ".wal"
+
+	g := mustOpen(t, db, vectra.ModeAlways)
+	g.AddNode("x", "Svc", nil)
+	g.AddNode("y", "Svc", nil)
+	g.UpsertEdge("x", "y", "CALLS", nil)
+	if err := g.Close(); err != nil {
+		t.Fatal(err)
+	}
+	man1, ok, err := wal.ReadManifest(walDir)
+	if err != nil || !ok {
+		t.Fatalf("manifest after Close: ok=%v err=%v", ok, err)
+	}
+
+	// Session 2 deletes y, then dies inside the checkpoint window.
+	g2 := mustOpen(t, db, vectra.ModeAlways)
+	if _, err := g2.DeleteNode("y"); err != nil {
+		t.Fatal(err)
+	}
+	next := man1.LSN + 1
+	if err := g2.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	if err := g2.SaveFile(watermarkSnapshot(db, next)); err != nil {
+		t.Fatal(err)
+	}
+
+	g3, err := vectra.Open(db, vectra.Options{WALMode: vectra.ModeAlways})
+	if err != nil {
+		t.Fatalf("Open after window crash must succeed: %v", err)
+	}
+	if g3.NodeCount() != 1 {
+		t.Fatalf("recovered nodes = %d, want 1 (y deleted)", g3.NodeCount())
+	}
+	if _, ok := g3.NodeByKey("y"); ok {
+		t.Fatal("deleted node y resurrected")
+	}
+	if _, ok := g3.NodeByKey("x"); !ok {
+		t.Fatal("node x lost")
 	}
 }

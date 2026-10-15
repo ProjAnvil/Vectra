@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/projanvil/vectra/internal/engine"
 	"github.com/projanvil/vectra/internal/store"
@@ -112,7 +113,7 @@ type Graph struct {
 	// WAL session state (all zero for New()/Load() graphs — v0.6 behavior).
 	wal      *wal.WAL // nil = no recording
 	walDir   string   // checkpoint manifest location
-	snapPath string   // checkpoint snapshot target
+	dbPath   string   // session path; checkpoints write <dbPath minus ext>-<lsn>.db next to it
 	pendOps  []pendOp // recorded-but-unflushed ops (inside Batch, or single writes mid-record)
 	batching bool     // inside Batch: records accumulate instead of flushing
 	closed   bool     // after Close: writes fail with ErrClosed, queries legal
@@ -360,6 +361,14 @@ func (g *Graph) DeleteNode(key string) (int, error) {
 // sequence at every kind regression and emits one frame per kind-ordered run
 // — replaying the frames reproduces the original op order exactly. Normal
 // batches stay a single frame (one fsync).
+//
+// Append/fsync failure discipline: a write method (or Batch/Close flush)
+// that returns a WAL error must be retried or the graph abandoned — never
+// silently continued. A failed Append may still have put the frame on disk
+// (a write/fsync can fail after partial success), and any ops it did not
+// persist stay buffered in pendOps, so the next flush (Batch boundary, or
+// Close) re-attempts exactly those; continuing to write without a
+// successful flush risks losing the earlier ops.
 
 func (g *Graph) recordNode(key, label string, props map[string]any) error {
 	if g.wal == nil {
@@ -512,9 +521,18 @@ func (g *Graph) Batch(fn func(*Graph)) error {
 // WAL frames replayed in LSN order above the checkpoint boundary, with no
 // recording during replay. Sealing is deferred to the checkpoint at Close.
 //
+// Checkpoints never write `path` in place: each one writes a watermark
+// snapshot <path minus ext>-<lsn>.db next to path and atomically points the
+// manifest at it (old watermarks are deleted only after the new manifest
+// lands). A crash between SaveFile and the manifest write therefore recovers
+// from the previous, untouched watermark plus a full WAL replay — already
+// checkpointed frames can never be applied twice (AllowParallel appends and
+// deletes are not idempotent).
+//
 // Recovery rules:
-//   - manifest present: the snapshot at path is the base; frames with lsn >
-//     manifest.lsn replay on top. A missing snapshot file is an error.
+//   - manifest present: load the snapshot file it names (resolved next to
+//     path); frames with lsn > manifest.lsn replay on top. A missing
+//     snapshot file is an error.
 //   - no manifest, no WAL segments, snapshot present (first WAL-mode Open
 //     next to a v0.6 file): the snapshot is adopted.
 //   - no manifest, WAL segments present (checkpoint manifest lost, or a
@@ -543,15 +561,14 @@ func Open(path string, opts Options) (*Graph, error) {
 	if err != nil {
 		return nil, err
 	}
-	_ = man // the WAL itself reads the manifest back in Open for replay gating
 	hasSegs, err := wal.HasSegments(walDir)
 	if err != nil {
 		return nil, err
 	}
 
 	g := New()
-	loadSnapshot := func() error {
-		f, err := os.Open(path)
+	loadSnapshot := func(p string) error {
+		f, err := os.Open(p)
 		if err != nil {
 			return err
 		}
@@ -565,14 +582,17 @@ func Open(path string, opts Options) (*Graph, error) {
 	}
 	switch {
 	case hasMan:
-		if err := loadSnapshot(); err != nil {
-			return nil, fmt.Errorf("vectra: manifest at %s references snapshot %s: %w", walDir, path, err)
+		// The manifest names the exact watermark snapshot this session
+		// continues from; `path` itself is never the checkpoint target.
+		snap := filepath.Join(filepath.Dir(path), man.Snapshot)
+		if err := loadSnapshot(snap); err != nil {
+			return nil, fmt.Errorf("vectra: manifest at %s references snapshot %s: %w", walDir, snap, err)
 		}
 	case hasSegs:
 		// WAL-only recovery: start empty, replay everything below.
 	default:
 		if _, err := os.Stat(path); err == nil {
-			if err := loadSnapshot(); err != nil {
+			if err := loadSnapshot(path); err != nil {
 				return nil, err
 			}
 		} else if !errors.Is(err, fs.ErrNotExist) {
@@ -590,16 +610,59 @@ func Open(path string, opts Options) (*Graph, error) {
 		w.Close()
 		return nil, err
 	}
-	g.wal, g.walDir, g.snapPath = w, walDir, path
+	g.wal, g.walDir, g.dbPath = w, walDir, path
 	return g, nil
 }
 
+// snapshotFile is the checkpoint target for a given watermark: <dbPath minus
+// ext>-<lsn>.db in the same directory. The LSN in the name is what closes
+// the checkpoint crash window — a snapshot is only ever referenced by a
+// manifest that names it exactly, and files are never overwritten in place
+// across checkpoints.
+func (g *Graph) snapshotFile(lsn uint64) string {
+	return fmt.Sprintf("%s-%d.db", strings.TrimSuffix(g.dbPath, filepath.Ext(g.dbPath)), lsn)
+}
+
+// cleanupSnapshots deletes watermark snapshots from older checkpoints (best
+// effort: leftovers are ignored by recovery — the manifest only ever names
+// one — and the next checkpoint retries the cleanup).
+func (g *Graph) cleanupSnapshots(keep string) {
+	namePrefix := filepath.Base(strings.TrimSuffix(g.dbPath, filepath.Ext(g.dbPath)) + "-")
+	dir := filepath.Dir(g.dbPath)
+	es, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range es {
+		if e.IsDir() || e.Name() == keep {
+			continue
+		}
+		if strings.HasPrefix(e.Name(), namePrefix) && strings.HasSuffix(e.Name(), ".db") {
+			os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
+}
+
 // Close ends a session. With a WAL attached, Close is a mandatory checkpoint:
-// flush pending frames + fsync → Seal → SaveFile → manifest → WAL reset.
-// Any failure returns the error WITHOUT deleting the WAL — the next Open
-// recovers from it (memory already holds every write). Close is idempotent
-// and retryable: a failed checkpoint can be re-attempted (Seal and SaveFile
-// are safe on an already-sealed graph).
+// flush pending frames + fsync → Seal → SaveFile(<dbPath minus ext>-<lsn>.db)
+// → manifest (atomically pointing at that watermark) → WAL reset → delete
+// older watermark snapshots.
+//
+// Failure semantics:
+//   - before the manifest lands, any failure returns the error WITHOUT
+//     deleting the WAL — the next Open recovers from it, and Close can be
+//     retried (Seal and SaveFile are safe on an already-sealed graph);
+//   - once the manifest has landed the checkpoint is committed: later
+//     failures (segment rollover, fd close) are surfaced but the session is
+//     already closed, so a retry is a clean no-op — it can never wedge;
+//   - a WAL handle that died mid-checkpoint (wal.ErrClosed from Sync/Reset/
+//     Close) is treated as benign: the manifest gates the un-reset segments.
+//
+// Append/fsync failure discipline (see the op-recorder comment): if a frame
+// Append ever returned an error, the caller must retry the flush (Batch/
+// Close) or abandon the graph — buffered ops stay in pendOps and are
+// re-attempted by the next flush, because a frame whose fsync reported
+// failure may still be on disk.
 //
 // WALOff sessions: Close only flips to closed (writes then return ErrClosed;
 // durability was the caller's job, v0.6 style). In both modes queries stay
@@ -615,31 +678,39 @@ func (g *Graph) Close() error {
 	if err := g.flushPending(); err != nil {
 		return err
 	}
-	if err := g.wal.Sync(); err != nil {
+	if err := g.wal.Sync(); err != nil && !errors.Is(err, wal.ErrClosed) {
 		return err
 	}
 	lsn := g.wal.LastLSN()
 	if err := g.Seal(); err != nil {
 		return err
 	}
-	if err := g.SaveFile(g.snapPath); err != nil {
+	snap := g.snapshotFile(lsn)
+	if err := g.SaveFile(snap); err != nil {
 		return err
 	}
 	if err := wal.WriteManifest(g.walDir, wal.Manifest{
-		Snapshot: filepath.Base(g.snapPath),
+		Snapshot: filepath.Base(snap),
 		Segment:  g.wal.Segment(),
 		LSN:      lsn,
 	}); err != nil {
 		return err
 	}
-	if err := g.wal.Reset(lsn); err != nil {
+	// The manifest has landed: this checkpoint is committed. From here on a
+	// failure is surfaced but must never leave the session retryable-but-
+	// unwritable — mark closed so a retry is a clean no-op.
+	g.closed = true
+	if err := g.wal.Reset(lsn); err != nil && !errors.Is(err, wal.ErrClosed) {
+		g.wal.Close()
+		g.wal = nil
 		return err
 	}
-	if err := g.wal.Close(); err != nil {
+	if err := g.wal.Close(); err != nil && !errors.Is(err, wal.ErrClosed) {
+		g.wal = nil
 		return err
 	}
 	g.wal = nil
-	g.closed = true
+	g.cleanupSnapshots(filepath.Base(snap))
 	return nil
 }
 
