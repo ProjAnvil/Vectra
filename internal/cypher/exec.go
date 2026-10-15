@@ -76,9 +76,14 @@ func RunView(src Source, q string) (*Result, error) {
 		return nil, err
 	}
 	ex := &executor{src: src}
-	if adjF, ok := src.FastAdjacency(0); ok {
-		ex.adjF, ex.fastAdj = adjF, true
-		ex.adjR, _ = src.FastAdjacency(1)
+	// The CSR fast path requires BOTH directions: taking it on adjF alone
+	// would leave a zero-value adjR readable with fastAdj set (expansion
+	// would silently read empty reverse rows). Current sources decide
+	// symmetrically, but the interface does not promise it — gate on both.
+	if adjF, okF := src.FastAdjacency(0); okF {
+		if adjR, okR := src.FastAdjacency(1); okR {
+			ex.adjF, ex.adjR, ex.fastAdj = adjF, adjR, true
+		}
 	}
 	return runStatement(ex, ast)
 }

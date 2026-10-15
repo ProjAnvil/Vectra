@@ -76,6 +76,18 @@ var (
 	// ErrClosed is returned by write methods after Close. Queries remain
 	// legal on a closed graph (it reads the last checkpointed state).
 	ErrClosed = errors.New("vectra: graph closed, mutation rejected")
+
+	// ErrNotWriter enforces wrapper-mode single-writer discipline (spec
+	// §2.3 R7): after internal/writer.Attach claims the graph, write
+	// methods (AddNode/AddEdge/UpsertEdge/DeleteEdge/DeleteNode/Batch)
+	// called from any goroutine other than the attached writer are
+	// rejected. Detection is goroutine-token based and only compiled into
+	// non-release builds (build tag "release" compiles it away — release
+	// builds rely on documentation instead; concurrent misuse there is a
+	// data race regardless). IndexProperty is writer-private state too:
+	// keep it on the writer goroutine as well (its signature predates this
+	// check and cannot carry an error).
+	ErrNotWriter = errors.New("vectra: mutation rejected: not the attached writer")
 )
 
 type Node struct {
@@ -143,7 +155,16 @@ func (v *genView) nodeWinner(key string) (Node, bool) {
 	return Node{}, false
 }
 
-// nodeIDOf returns the winner id for key (caller guarantees existence).
+// nodeIDOf resolves key to its winner id for the endpoint fields of layer
+// edge records (EdgesOf, edgeByID).
+//
+// Invariant: a live layer edge never references a dead endpoint — AddEdge/
+// UpsertEdge validate endpoints via checkLiveNodes, and DeleteNode cascade-
+// tombstones every incident edge — so callers only reach the fallback
+// through a broken invariant upstream, never through user input. The
+// fallback returns 0 rather than panicking because the signatures cannot
+// error and queries must stay total; a 0 here means "consistency bug to
+// investigate", not a legitimate miss.
 func (v *genView) nodeIDOf(key string) NodeID {
 	if n, ok := v.nodeWinner(key); ok {
 		return n.ID
@@ -247,6 +268,13 @@ type Graph struct {
 	pendOps  []pendOp // recorded-but-unflushed ops (inside Batch, or single writes mid-record)
 	batching bool     // inside Batch: records accumulate instead of flushing
 	closed   bool     // after Close: writes fail with ErrClosed, queries legal
+
+	// writerTok is the wrapper-mode writer discipline hook (spec §2.3 R7):
+	// 0 = direct mode (all writes legal); non-zero = the goroutine token
+	// recorded by ClaimWriter. Checked by checkWriter at write-method entry
+	// (debug builds only; release builds compile the check away). Only the
+	// hook pair in writer_hook*.go touches it.
+	writerTok atomic.Uint64
 }
 
 // opKind orders pendOp entries exactly like the Changeset apply order:
@@ -495,6 +523,9 @@ func (g *Graph) AddNode(key, label string, props map[string]any) (NodeID, error)
 	if g.closed {
 		return 0, ErrClosed
 	}
+	if err := g.checkWriter(); err != nil {
+		return 0, err
+	}
 	if err := g.recordNode(key, label, props); err != nil {
 		return 0, err
 	}
@@ -521,6 +552,9 @@ func (g *Graph) AddNode(key, label string, props map[string]any) (NodeID, error)
 func (g *Graph) AddEdge(srcKey, dstKey, label string, props map[string]any) (EdgeID, error) {
 	if g.closed {
 		return 0, ErrClosed
+	}
+	if err := g.checkWriter(); err != nil {
+		return 0, err
 	}
 	if err := g.checkLiveNodes(srcKey, dstKey); err != nil {
 		return 0, err
@@ -553,6 +587,9 @@ func (g *Graph) AddEdge(srcKey, dstKey, label string, props map[string]any) (Edg
 func (g *Graph) UpsertEdge(srcKey, dstKey, label string, props map[string]any) (EdgeID, error) {
 	if g.closed {
 		return 0, ErrClosed
+	}
+	if err := g.checkWriter(); err != nil {
+		return 0, err
 	}
 	if err := g.checkLiveNodes(srcKey, dstKey); err != nil {
 		return 0, err
@@ -596,6 +633,9 @@ func (g *Graph) DeleteEdge(srcKey, dstKey, label string) (int, error) {
 	if g.closed {
 		return 0, ErrClosed
 	}
+	if err := g.checkWriter(); err != nil {
+		return 0, err
+	}
 	if err := g.checkLiveNodes(srcKey, dstKey); err != nil {
 		return 0, err
 	}
@@ -629,6 +669,9 @@ func (g *Graph) DeleteEdge(srcKey, dstKey, label string) (int, error) {
 func (g *Graph) DeleteNode(key string) (int, error) {
 	if g.closed {
 		return 0, ErrClosed
+	}
+	if err := g.checkWriter(); err != nil {
+		return 0, err
 	}
 	if !g.nodeLive(key) {
 		return 0, ErrNodeNotFound
@@ -833,6 +876,9 @@ func (g *Graph) applyChangeset(cs Changeset) error {
 func (g *Graph) Batch(fn func(*Graph)) error {
 	if g.closed {
 		return ErrClosed
+	}
+	if err := g.checkWriter(); err != nil {
+		return err
 	}
 	if g.batching {
 		fn(g) // nested: absorbed into the outer boundary
@@ -1191,16 +1237,25 @@ func (g *Graph) Stats() Stats {
 
 // ---- merge pipeline ----------------------------------------------------------
 
-// unionRecords computes the logical view of the whole generation as raw
-// engine records: the base with all layer tombstones applied, overlaid by
-// layer records oldest→newest (node override by key, edge append), labels
-// merged (base dictionary first — base LabelIDs stay valid), and pending
-// index declarations harvested. Deterministic order: base records first,
-// then layer records in (layer, index) order. Shared by forceMerge, Save,
+// unionRecords computes the logical view of the CURRENT generation (see the
+// genView method for the folding rules). Used by forceMerge, Save,
 // ExportSnapshot and Clone (merge-on-demand without publishing).
 func (g *Graph) unionRecords() ([]engine.NodeRec, []engine.EdgeRec, []string, []string) {
-	v := g.view.Load()
+	return g.view.Load().unionRecords()
+}
 
+// unionRecords computes the logical view of this generation as raw engine
+// records: the base with all layer tombstones applied, overlaid by layer
+// records oldest→newest (node override by key, edge append), labels merged
+// (base dictionary first — base LabelIDs stay valid), and pending index
+// declarations harvested. Deterministic order: base records first, then
+// layer records in (layer, index) order.
+//
+// Purity: the function reads only the pinned generation (base + layers),
+// never writer-private state — that is what lets the background merger
+// (internal/writer) run it against a captured prefix while the writer
+// keeps publishing newer layers (spec §2.3 two-writer publish protocol).
+func (v *genView) unionRecords() ([]engine.NodeRec, []engine.EdgeRec, []string, []string) {
 	labels := make([]string, 0, v.base.LabelCount())
 	labID := make(map[string]uint32, v.base.LabelCount())
 	intern := func(name string) uint32 {
@@ -1395,6 +1450,18 @@ func (g *Graph) Seal() error {
 		return nil
 	}
 	return g.checkpoint(g.wal.LastLSN())
+}
+
+// Compact is the explicit compaction entry point (spec §6): fold every
+// unmerged layer into a fresh immutable base and — when a WAL is attached —
+// checkpoint (watermark snapshot + manifest + WAL reset). Spec §3.1's
+// "deep compaction renumbering" is absorbed by the merge itself: folding
+// already rebuilds node and edge IDs densely (R1), so Compact runs the
+// exact same pipeline as Seal and the two are semantically equivalent.
+// Like Seal it is a write-path method: run it on the writer goroutine (or
+// with writes quiescent) — it rebuilds writer-private state.
+func (g *Graph) Compact() error {
+	return g.Seal()
 }
 
 // checkpoint persists the merged state: watermark snapshot + atomic manifest

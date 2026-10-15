@@ -104,7 +104,13 @@ func TestWriteAfterSealImmediatelyVisible(t *testing.T) {
 		t.Fatalf("base edge not shadowed: %+v", es)
 	}
 
-	// deleting a node cascades across sources and revive reuses the ID
+	// deleting a node cascades across sources and revive reuses the ID. The
+	// original id must be captured BEFORE the delete: comparing the revived
+	// id against a post-revive lookup would compare the node with itself.
+	origLedger, err := mustBuildID(t, g, "ledger")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if n, err := g.DeleteNode("ledger"); err != nil || n != 2 {
 		t.Fatalf("DeleteNode(ledger) = %d, %v; want 2 cascaded (db QUERY + gateway CALLS)", n, err)
 	}
@@ -115,10 +121,8 @@ func TestWriteAfterSealImmediatelyVisible(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l0, _ := mustBuildID(t, g, "ledger")
-	_ = l0
-	if rid != l0 {
-		t.Fatalf("revive id = %d, want original %d", rid, l0)
+	if rid != origLedger {
+		t.Fatalf("revive id = %d, want original %d", rid, origLedger)
 	}
 }
 

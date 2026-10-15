@@ -1,0 +1,56 @@
+//go:build !release
+
+package vectra
+
+import (
+	"runtime"
+	"strconv"
+	"strings"
+)
+
+// Wrapper-mode writer discipline (spec §2.3 R7), debug implementation.
+//
+// ClaimWriter records the calling goroutine's token (its runtime goroutine
+// id, parsed from a runtime.Stack snapshot — the only portable source).
+// Every write-method entry then asserts the caller is either that
+// goroutine or that nobody has claimed the graph at all (direct mode).
+// The check costs one atomic load plus, on graphs with a live claim, a
+// ~300-byte stack snapshot per write call — acceptable for debug builds,
+// compiled away entirely under the "release" tag (writer_hook_release.go).
+
+// ClaimWriter marks the calling goroutine as the graph's single writer.
+// It is called by internal/writer.Attach's writer loop before it starts
+// serving Submits; calling it twice re-claims for the newer caller.
+func (g *Graph) ClaimWriter() {
+	g.writerTok.Store(goroutineToken())
+}
+
+// YieldWriter releases the writer claim: writes from any goroutine are
+// legal again (direct mode resumes, e.g. after Handle.Close).
+func (g *Graph) YieldWriter() {
+	g.writerTok.Store(0)
+}
+
+// checkWriter is the write-method entry assertion; see ErrNotWriter.
+func (g *Graph) checkWriter() error {
+	if tok := g.writerTok.Load(); tok != 0 && tok != goroutineToken() {
+		return ErrNotWriter
+	}
+	return nil
+}
+
+// goroutineToken parses this goroutine's id from runtime.Stack's header
+// line ("goroutine 17 [running]:"). A parse failure returns 0, which the
+// claim check reads as "unclaimed" — fail-open, matching release builds.
+func goroutineToken() uint64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	s := strings.TrimSpace(string(buf[:n]))
+	s = strings.TrimPrefix(s, "goroutine ")
+	id, _, _ := strings.Cut(s, " ")
+	v, err := strconv.ParseUint(id, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
