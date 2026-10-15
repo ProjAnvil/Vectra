@@ -705,3 +705,98 @@ func TestBuildEmpty(t *testing.T) {
 		t.Fatalf("LookupNode on empty layer must miss")
 	}
 }
+
+// ---- writer-assigned record IDs (T3b: BuildWithIDs) ----
+
+// TestBuildWithIDsCarriesIDsOntoLiveRecords pins the ID plumbing the
+// generation view depends on: writer-assigned IDs (ratchet or transferred)
+// must land on exactly the surviving records — folded and deleted slots drop
+// out together with their IDs.
+func TestBuildWithIDsCarriesIDsOntoLiveRecords(t *testing.T) {
+	b := delta.NewBuilder()
+	_ = b.UpsertNode("a", "L", nil)                             // slot 0 -> live
+	_ = b.UpsertNode("x", "L", nil)                             // slot 1 -> deleted below
+	_ = b.UpsertNode("b", "L", nil)                             // slot 2 -> live
+	_ = b.AddEdge("a", "b", "E", map[string]any{"i": 1})        // edge slot 0 -> live
+	_ = b.AddEdge("a", "b", "E", map[string]any{"i": 2})        // edge slot 1 -> live
+	_ = b.UpsertEdgeFold("a", "b", "E", map[string]any{"i": 3}) // folds slot1: stays
+	_, _ = b.DeleteNode("x", nil)
+
+	l := b.BuildWithIDs(map[string]uint32{"a": 10, "x": 11, "b": 12}, []uint32{100, 101})
+	if len(l.Nodes()) != 2 {
+		t.Fatalf("live nodes = %d, want 2", len(l.Nodes()))
+	}
+	if id, ok := l.LookupNodeID("a"); !ok || id != 10 {
+		t.Fatalf("LookupNodeID(a) = %d, %v; want 10", id, ok)
+	}
+	if id, ok := l.LookupNodeID("b"); !ok || id != 12 {
+		t.Fatalf("LookupNodeID(b) = %d, %v; want 12", id, ok)
+	}
+	if _, ok := l.LookupNodeID("x"); ok {
+		t.Fatal("deleted node's ID must not surface")
+	}
+	// live edges after fold: slot 1 only — its ID survives, slot 0's drops.
+	if len(l.Edges()) != 1 {
+		t.Fatalf("live edges = %d, want 1 (fold keeps the newest parallel)", len(l.Edges()))
+	}
+	if id := l.EdgeIDAt(0); id != 101 {
+		t.Fatalf("EdgeIDAt(0) = %d, want 101 (fold-kept slot)", id)
+	}
+	if i, ok := l.FindEdgeID(101); !ok || i != 0 {
+		t.Fatalf("FindEdgeID(101) = %d, %v; want 0", i, ok)
+	}
+	if _, ok := l.FindEdgeID(100); ok {
+		t.Fatal("folded-away edge ID must not be findable")
+	}
+	if i, ok := l.FindNodeID(12); !ok || i != 1 {
+		t.Fatalf("FindNodeID(12) = %d, %v; want index 1", i, ok)
+	}
+	if _, ok := l.FindNodeID(11); ok {
+		t.Fatal("deleted node's ID must not be findable")
+	}
+}
+
+// TestBuildWithoutIDsHasNoIDIndex: plain Build keeps the 3a behavior — no ID
+// structures, all lookups miss (the root facade always uses BuildWithIDs).
+func TestBuildWithoutIDsHasNoIDIndex(t *testing.T) {
+	b := delta.NewBuilder()
+	_ = b.UpsertNode("a", "L", nil)
+	_ = b.AddEdge("a", "a", "E", nil)
+	l := b.Build()
+	if _, ok := l.LookupNodeID("a"); ok {
+		t.Fatal("plain Build must not expose node IDs")
+	}
+	if _, ok := l.FindNodeID(0); ok {
+		t.Fatal("plain Build must not expose node ID lookup")
+	}
+	if _, ok := l.FindEdgeID(0); ok {
+		t.Fatal("plain Build must not expose edge ID lookup")
+	}
+}
+
+// TestBuildWithIDsMisalignedPanics: a slot-misaligned edge-ID slice is a
+// programmer error and must panic at Build, not corrupt the layer.
+func TestBuildWithIDsMisalignedPanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("misaligned edgeIDs must panic")
+		}
+	}()
+	b := delta.NewBuilder()
+	_ = b.UpsertNode("a", "L", nil)
+	_ = b.AddEdge("a", "a", "E", nil)
+	b.BuildWithIDs(map[string]uint32{"a": 1}, []uint32{1, 2}) // two IDs for one slot
+}
+
+// TestBuildWithIDsMissingNodeKeyPanics: every live node key must carry an
+// assigned ID.
+func TestBuildWithIDsMissingNodeKeyPanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("missing node ID must panic")
+		}
+	}()
+	b := delta.NewBuilder()
+	_ = b.UpsertNode("a", "L", nil)
+	b.BuildWithIDs(map[string]uint32{}, nil)
+}

@@ -1,6 +1,7 @@
 package vectra
 
 import (
+	"github.com/projanvil/vectra/internal/engine"
 	tr "github.com/projanvil/vectra/internal/traverse"
 )
 
@@ -85,21 +86,24 @@ func WithLabels(names ...string) BFSOption {
 // at depth 0, each layer expanded wholesale. Level synchronization is the
 // basis for parallelism — the frontier is a flat array, chunked across
 // goroutines once it crosses a threshold.
+//
+// v0.7 traversal family (spec §3.2): BFS runs against the merged base of
+// the current generation. Layer-resident nodes/edges become visible to
+// traversal only after a merge (Seal) — the three-source adjacency View is
+// Task 4. TODO(Task4): route through the generation View.
 func (g *Graph) BFS(starts []NodeID, opts ...BFSOption) (*BFSResult, error) {
-	if !g.sealed {
-		return nil, ErrNotSealed
-	}
-	n := uint32(g.snap.NodeCount())
+	snap := g.view.Load().base
+	n := uint32(snap.NodeCount())
 	for _, s := range starts {
 		if uint32(s) >= n {
 			return nil, ErrNodeNotFound
 		}
 	}
-	res := tr.BFS(g.snap, toU32s(starts), g.traverseConfig(opts...))
+	res := tr.BFS(snap, toU32s(starts), g.traverseConfig(snap, opts...))
 	return &BFSResult{Layers: toNodeIDLayers(res.Layers), depth: res.DepthRaw()}, nil
 }
 
-func (g *Graph) traverseConfig(opts ...BFSOption) tr.Config {
+func (g *Graph) traverseConfig(snap *engine.Snapshot, opts ...BFSOption) tr.Config {
 	cfg := bfsConfig{maxDepth: ^uint32(0), parallelThr: tr.DefaultParallelThreshold, direction: DirOut}
 	for _, o := range opts {
 		o(&cfg)
@@ -110,10 +114,9 @@ func (g *Graph) traverseConfig(opts ...BFSOption) tr.Config {
 		ParallelThreshold: cfg.parallelThr,
 	}
 	if len(cfg.labelNames) > 0 {
-		tc.LabelMask = g.labelMask(cfg.labelNames)
+		tc.LabelMask = labelMaskOf(snap, cfg.labelNames)
 	}
 	if cfg.nodeFilter != nil {
-		snap := g.snap
 		tc.NodeFilter = func(id uint32) bool {
 			rec, _ := snap.NodeInfo(id)
 			return cfg.nodeFilter(Node{ID: NodeID(id), Key: rec.Key, Label: rec.Label, Props: rec.Props})
@@ -122,15 +125,15 @@ func (g *Graph) traverseConfig(opts ...BFSOption) tr.Config {
 	return tc
 }
 
-// labelMask turns a set of label names into a boolean mask indexed by
-// labelID; empty names returns nil (no filtering).
-func (g *Graph) labelMask(names []string) []bool {
+// labelMaskOf turns a set of label names into a boolean mask indexed by the
+// base snapshot's labelIDs; empty names returns nil (no filtering).
+func labelMaskOf(snap *engine.Snapshot, names []string) []bool {
 	if len(names) == 0 {
 		return nil
 	}
-	mask := make([]bool, len(g.labels))
+	mask := make([]bool, snap.LabelCount())
 	for _, n := range names {
-		if id, ok := g.labIDs[n]; ok {
+		if id, ok := snap.LabelID(n); ok {
 			mask[id] = true
 		}
 	}
@@ -175,11 +178,12 @@ func ReachWithDirection(d Direction) ReachOption {
 // SCC condensation DAG (the query-facing graph is acyclic; each visited bit
 // corresponds to one component); with a filter it falls back to strict
 // node-level traversal.
+//
+// v0.7 traversal family: reads the merged base (spec §3.2; Task 4 wires the
+// three-source View). TODO(Task4).
 func (g *Graph) ReachableIDs(start NodeID, opts ...ReachOption) ([]NodeID, error) {
-	if !g.sealed {
-		return nil, ErrNotSealed
-	}
-	if uint32(start) >= uint32(g.snap.NodeCount()) {
+	snap := g.view.Load().base
+	if uint32(start) >= uint32(snap.NodeCount()) {
 		return nil, ErrNodeNotFound
 	}
 	cfg := reachConfig{direction: DirOut}
@@ -188,9 +192,9 @@ func (g *Graph) ReachableIDs(start NodeID, opts ...ReachOption) ([]NodeID, error
 	}
 	tc := tr.Config{Direction: tr.Direction(cfg.direction)}
 	if len(cfg.labelNames) > 0 {
-		tc.LabelMask = g.labelMask(cfg.labelNames)
+		tc.LabelMask = labelMaskOf(snap, cfg.labelNames)
 	}
-	ids := tr.Reachable(g.snap, uint32(start), tc)
+	ids := tr.Reachable(snap, uint32(start), tc)
 	out := make([]NodeID, len(ids))
 	for i, id := range ids {
 		out[i] = NodeID(id)
@@ -228,14 +232,15 @@ func (p Path) Len() int { return len(p.Edges) }
 // ShortestPathIDs is bidirectional BFS shortest path: always expands the
 // whole layer of the smaller side's frontier, checks the opposite side's
 // visited when marking; the first meeting point yields the optimal distance.
+//
+// v0.7 traversal family: reads the merged base (spec §3.2; Task 4 wires the
+// three-source View). TODO(Task4).
 func (g *Graph) ShortestPathIDs(from, to NodeID) (Path, bool, error) {
-	if !g.sealed {
-		return Path{}, false, ErrNotSealed
-	}
-	if uint32(from) >= uint32(g.snap.NodeCount()) || uint32(to) >= uint32(g.snap.NodeCount()) {
+	snap := g.view.Load().base
+	if uint32(from) >= uint32(snap.NodeCount()) || uint32(to) >= uint32(snap.NodeCount()) {
 		return Path{}, false, ErrNodeNotFound
 	}
-	nodes, edges, found := tr.ShortestPath(g.snap, uint32(from), uint32(to))
+	nodes, edges, found := tr.ShortestPath(snap, uint32(from), uint32(to))
 	if !found {
 		return Path{}, false, nil
 	}
@@ -279,11 +284,21 @@ func (c Cycle) Len() int { return len(c.Nodes) }
 // count descending, then by smallest member ID ascending. It is a byproduct
 // of write-side SCC compression: the defensive "cycle blocking" mechanism
 // becomes the diagnostic "cycle discovery" capability.
+//
+// v0.7 (spec §3.2): Cycles is the traversal-family exception — unmerged
+// layers are force-merged first (SCC structures only exist on a merged
+// base), so the answer is always strongly consistent. The forced merge
+// rewrites writer-private state: like Seal, Cycles must run on the writer
+// goroutine (or with writes quiescent); every other query is lock-free.
 func (g *Graph) Cycles() []Cycle {
-	if !g.sealed {
-		return nil
+	v := g.view.Load()
+	if len(v.layers) > 0 {
+		if g.forceMerge() != nil {
+			return nil
+		}
+		v = g.view.Load()
 	}
-	raw := tr.Cycles(g.snap)
+	raw := tr.Cycles(v.base)
 	out := make([]Cycle, len(raw))
 	for i, c := range raw {
 		out[i] = Cycle{Nodes: make([]NodeID, len(c.Nodes))}

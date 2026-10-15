@@ -177,19 +177,24 @@ func TestWALOffMatchesV06(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Open with ModeOff on an existing snapshot: LoadFile semantics (sealed).
+	// Open with ModeOff on an existing snapshot: LoadFile semantics (merged base).
 	g3, err := vectra.Open(db, vectra.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !g3.Sealed() {
-		t.Fatal("ModeOff Open on existing snapshot must load sealed (v0.6)")
+		t.Fatal("ModeOff Open on existing snapshot must load merged (v0.6)")
 	}
 	if g3.NodeCount() != 2 {
 		t.Fatalf("loaded nodes = %d, want 2", g3.NodeCount())
 	}
-	if _, err := g3.AddNode("z", "Z", nil); err != vectra.ErrSealed {
-		t.Fatalf("write on sealed v0.6 graph: %v, want ErrSealed", err)
+	// v0.7: the sealed gate is dissolved — the loaded graph keeps taking
+	// writes (they open a new generation; durability stays caller-owned).
+	if _, err := g3.AddNode("z", "Z", nil); err != nil {
+		t.Fatalf("write on sealed v0.6 graph: %v", err)
+	}
+	if g3.NodeCount() != 3 {
+		t.Fatalf("post-Seal write invisible: %d", g3.NodeCount())
 	}
 }
 

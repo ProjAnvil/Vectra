@@ -69,11 +69,19 @@ func TestLookupTypedSurvivesJSONRoundTrip(t *testing.T) {
 	}
 }
 
-func TestLookupTypedUnsealedReturnsFalse(t *testing.T) {
+func TestLookupTypedPendingBeforeMerge(t *testing.T) {
 	g := New()
 	g.IndexProperty("w")
 	_, _ = g.AddNode("a", "L", map[string]any{"w": 1})
-	if _, ok := g.LookupByNumber("w", 1); ok {
-		t.Fatal("unsealed graph must return ok=false (same contract as LookupByProperty)")
+	// pending declarations answer via line scan (R14) — ok=true with hits
+	ns, ok := g.LookupByNumber("w", 1)
+	if !ok || len(ns) != 1 || ns[0].Key != "a" {
+		t.Fatalf("pending number lookup = %+v ok=%v, want [a]/true", ns, ok)
+	}
+	if _, ok := g.LookupByBool("w", true); !ok {
+		t.Fatal("registered-but-empty pending key must answer ok=true")
+	}
+	if _, ok := g.LookupByNumber("absent", 1); ok {
+		t.Fatal("never-declared key must return ok=false")
 	}
 }

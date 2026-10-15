@@ -26,7 +26,7 @@ func TestClonePreSealIndependentEvolution(t *testing.T) {
 		t.Errorf("writes on cloned graph failed: %d/%d, want 5/5", c.NodeCount(), c.EdgeCount())
 	}
 	if c.Sealed() {
-		t.Error("clone should be unsealed")
+		t.Error("clone's writes must leave unmerged layers (Sealed()==false)")
 	}
 }
 
@@ -37,9 +37,10 @@ func TestCloneSealedGraphIsMutableAgain(t *testing.T) {
 	}
 	r1, _ := g.Reachable("gateway")
 	c := g.Clone()
-	if c.Sealed() {
-		t.Fatal("clone of a sealed graph should return to unsealed state (writable again)")
+	if !c.Sealed() {
+		t.Fatal("clone starts fully merged (union built into a fresh base)")
 	}
+	// writable regardless: the sealed gate is dissolved
 	if _, err := c.AddNode("kafka", "Bus", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -149,10 +150,17 @@ func TestIndexPropertyLookup(t *testing.T) {
 	if nodes, ok := g.LookupByProperty("env", "staging"); !ok || len(nodes) != 0 {
 		t.Errorf("no-match value should return empty set + ok=true, got %d/%v", len(nodes), ok)
 	}
-	// registering after Seal is a no-op
+	// registering after Seal is pending until the next merge (R14): it
+	// answers ok=true via the delta line scan, and Seal harvests it
 	g.IndexProperty("team")
-	if _, ok := g.LookupByProperty("team", "x"); ok {
-		t.Error("registration after Seal should not take effect")
+	if _, ok := g.LookupByProperty("team", "x"); !ok {
+		t.Error("pending registration must answer ok=true (line-scan semantics)")
+	}
+	if _, err := g.AddNode("t", "S", map[string]any{"team": "core"}); err != nil {
+		t.Fatal(err)
+	}
+	if ns, _ := g.LookupByProperty("team", "core"); len(ns) != 1 || ns[0].Key != "t" {
+		t.Errorf("pending lookup hits = %+v, want [t]", ns)
 	}
 	// query before Seal
 	g2 := vectra.New()
@@ -172,10 +180,10 @@ func TestExportImportSnapshotUnsealed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if g2.Sealed() {
-		t.Error("ImportSnapshot should return an unsealed graph (writable again)")
+	if !g2.Sealed() {
+		t.Error("ImportSnapshot merges into the initial base (no unmerged layers)")
 	}
-	if _, err := g2.AddNode("extra", "Svc", nil); err != nil {
+	if _, err := g2.AddNode("extra", "Svc", nil); err != nil { // writable regardless (gates dissolved)
 		t.Fatal(err)
 	}
 	if g2.NodeCount() != 5 {

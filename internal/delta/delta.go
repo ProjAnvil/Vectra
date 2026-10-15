@@ -30,7 +30,10 @@
 // goroutines, channels, or locks (v0.7 decisions D4/D5, acceptance A8).
 package delta
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // EdgeKey is the logical identity of an edge: the (src, dst, label) triple
 // addressed by string keys. Layer records are self-contained — no base
@@ -77,6 +80,12 @@ var (
 // internal references and must be treated as read-only (same sharing
 // contract as a sealed vectra graph). Tombstones shadow the BASE only; live
 // layer records win over the layer's own tombstones (package doc).
+//
+// Writer-assigned IDs: a Layer built via BuildWithIDs additionally carries
+// one ID per live record (spec §3.1 EdgeID ratchet — the writer's numbering
+// space, transferred onto override records and never reused for a new
+// record). ID structures are nil for plain-Build layers; all ID accessors
+// miss there.
 type Layer struct {
 	nodes     []NodeRec         // live nodes, first-write slot order
 	nodeIdx   map[string]int    // key -> index into nodes
@@ -86,6 +95,11 @@ type Layer struct {
 	edgeTomb  map[EdgeKey]bool  // base edge keys to shadow
 	labels    []string          // labels introduced this layer, dedup, stable
 	indexKeys []string          // pending index declarations
+
+	nodeIDs   map[string]uint32 // key -> writer-assigned ID (BuildWithIDs only)
+	nodeIDIdx map[uint32]int    // writer-assigned ID -> index into nodes
+	edgeIDs   []uint32          // writer-assigned ID per live edge, append order
+	edgeIDIdx map[uint32]int    // writer-assigned ID -> index into edges
 }
 
 // LookupNode returns the layer's live record for key. Base shadowing and
@@ -128,6 +142,35 @@ func (l *Layer) NodeCount() int { return len(l.nodes) }
 
 // EdgeCount returns the number of live edge records.
 func (l *Layer) EdgeCount() int { return len(l.edges) }
+
+// LookupNodeID returns the writer-assigned ID of key's live record (misses
+// on plain-Build layers and on keys not live in this layer).
+func (l *Layer) LookupNodeID(key string) (uint32, bool) {
+	id, ok := l.nodeIDs[key]
+	return id, ok
+}
+
+// NodeIDAt returns the writer-assigned ID of the live node at index i
+// (aligned with Nodes(); panics on plain-Build layers — the root facade
+// always builds with IDs).
+func (l *Layer) NodeIDAt(i int) uint32 { return l.nodeIDs[l.nodes[i].Key] }
+
+// FindNodeID resolves a writer-assigned node ID to its index into Nodes().
+func (l *Layer) FindNodeID(id uint32) (int, bool) {
+	i, ok := l.nodeIDIdx[id]
+	return i, ok
+}
+
+// EdgeIDAt returns the writer-assigned ID of the live edge at index i
+// (aligned with Edges(); panics on plain-Build layers — the root facade
+// always builds with IDs).
+func (l *Layer) EdgeIDAt(i int) uint32 { return l.edgeIDs[i] }
+
+// FindEdgeID resolves a writer-assigned edge ID to its index into Edges().
+func (l *Layer) FindEdgeID(id uint32) (int, bool) {
+	i, ok := l.edgeIDIdx[id]
+	return i, ok
+}
 
 // nodeState is one node slot in the Builder's append-only node area. A
 // deleted slot keeps its position: UpsertNode on the same key revives it in
@@ -387,9 +430,23 @@ func (b *Builder) IndexProperty(key string) {
 // over the live records, and the base tombstone sets move into the Layer.
 // The Builder is unusable afterwards — write methods return ErrSealed and a
 // second Build panics (programmer error: Build has no error return).
-func (b *Builder) Build() *Layer {
+func (b *Builder) Build() *Layer { return b.BuildWithIDs(nil, nil) }
+
+// BuildWithIDs is Build carrying the writer's per-record IDs onto the live
+// records: nodeIDs maps every node key ever written in this batch to its
+// assigned ID (a live record whose key is missing is a programmer error and
+// panics); edgeIDs holds one ID per edge SLOT in append order — every edge
+// write that appends a slot consumes exactly one entry, folds reuse the
+// surviving slot's entry — so len(edgeIDs) must equal the Builder's edge
+// slot count (misalignment panics). Dead slots drop out together with their
+// IDs; the surviving records' IDs are exposed via the Layer ID accessors.
+// nil nodeIDs/edgeIDs build an ID-less Layer (plain Build).
+func (b *Builder) BuildWithIDs(nodeIDs map[string]uint32, edgeIDs []uint32) *Layer {
 	if b.built {
 		panic("delta: Builder.Build called twice")
+	}
+	if edgeIDs != nil && len(edgeIDs) != len(b.edges) {
+		panic(fmt.Sprintf("delta: edgeIDs misaligned: %d ids for %d edge slots", len(edgeIDs), len(b.edges)))
 	}
 	b.built = true
 	l := &Layer{
@@ -408,14 +465,48 @@ func (b *Builder) Build() *Layer {
 		l.nodeIdx[ns.rec.Key] = len(l.nodes)
 		l.nodes = append(l.nodes, ns.rec)
 	}
+	var slot2live []int
+	if edgeIDs != nil {
+		slot2live = make([]int, len(b.edges))
+	}
 	l.edges = make([]EdgeRec, 0, len(b.edges)-b.deadE)
-	for _, es := range b.edges {
+	for i, es := range b.edges {
 		if es.deleted {
+			if slot2live != nil {
+				slot2live[i] = -1
+			}
 			continue
 		}
 		k := EdgeKey{SrcKey: es.rec.SrcKey, DstKey: es.rec.DstKey, Label: es.rec.Label}
 		l.edgeIdx[k] = append(l.edgeIdx[k], len(l.edges))
+		if slot2live != nil {
+			slot2live[i] = len(l.edges)
+		}
 		l.edges = append(l.edges, es.rec)
+	}
+	if nodeIDs != nil {
+		l.nodeIDs = make(map[string]uint32, len(l.nodes))
+		l.nodeIDIdx = make(map[uint32]int, len(l.nodes))
+		for i, rec := range l.nodes {
+			id, ok := nodeIDs[rec.Key]
+			if !ok {
+				panic(fmt.Sprintf("delta: nodeIDs missing live key %q", rec.Key))
+			}
+			l.nodeIDs[rec.Key] = id
+			l.nodeIDIdx[id] = i
+		}
+	}
+	if edgeIDs != nil {
+		l.edgeIDs = make([]uint32, len(l.edges))
+		l.edgeIDIdx = make(map[uint32]int, len(l.edges))
+		for slot, live := range slot2live {
+			if live < 0 {
+				continue
+			}
+			id := edgeIDs[slot]
+			l.edgeIDs[live] = id
+			l.edgeIDIdx[id] = live
+		}
 	}
 	return l
 }

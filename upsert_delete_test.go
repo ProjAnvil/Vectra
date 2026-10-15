@@ -117,19 +117,34 @@ func TestDeleteNodeCascadesAndResurrects(t *testing.T) {
 	}
 }
 
-func TestMutationAfterSealRejected(t *testing.T) {
+// TestMutationAfterSealAccepted: the sealed gate is dissolved — writes after
+// Seal succeed, land in a new micro-layer generation, and are immediately
+// visible to point queries.
+func TestMutationAfterSealAccepted(t *testing.T) {
 	g := mustBuild(t)
 	if err := g.Seal(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := g.UpsertEdge("gateway", "auth", "CALLS", nil); !errors.Is(err, vectra.ErrSealed) {
-		t.Errorf("UpsertEdge after seal: %v", err)
+	if _, err := g.UpsertEdge("gateway", "auth", "CALLS", map[string]any{"w": 5}); err != nil {
+		t.Fatalf("UpsertEdge after seal: %v", err)
 	}
-	if _, err := g.DeleteEdge("gateway", "auth", "CALLS"); !errors.Is(err, vectra.ErrSealed) {
-		t.Errorf("DeleteEdge after seal: %v", err)
+	if e, ok := g.EdgeByID(0); !ok || e.Props["w"] != 5 {
+		t.Fatalf("fold after seal = %+v ok=%v", e, ok)
 	}
-	if _, err := g.DeleteNode("gateway"); !errors.Is(err, vectra.ErrSealed) {
-		t.Errorf("DeleteNode after seal: %v", err)
+	if n, err := g.DeleteEdge("gateway", "ledger", "CALLS"); err != nil || n != 1 {
+		t.Fatalf("DeleteEdge after seal = %d, %v", n, err)
+	}
+	if n, err := g.DeleteNode("db"); err != nil || n != 2 {
+		t.Fatalf("DeleteNode after seal = %d, %v; want 2 cascaded", n, err)
+	}
+	if g.NodeCount() != 3 || g.EdgeCount() != 1 {
+		t.Fatalf("counts = %d/%d, want 3/1", g.NodeCount(), g.EdgeCount())
+	}
+	if err := g.Seal(); err != nil { // merges the post-Seal writes
+		t.Fatal(err)
+	}
+	if st := g.Stats(); st.Nodes != 3 || st.Edges != 1 {
+		t.Fatalf("post-merge stats = %+v", st)
 	}
 }
 
