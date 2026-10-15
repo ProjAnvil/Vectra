@@ -13,8 +13,8 @@ Vectra ships first-class [Model Context Protocol](https://modelcontextprotocol.i
 | Tool | Kind | Description |
 |---|---|---|
 | `inject_batch` | write | Upsert nodes/edges (props supported); `allowParallel: true` on an edge appends a parallel edge instead of upsert-collapse |
-| `seal` (Go only) | write | Build query indexes; graph becomes queryable |
-| `stats` | read | nodes/edges/SCCs/cyclic-nodes |
+| `seal` (Go only) | write | Merge micro-layers + checkpoint (auto-indexes injected property keys); maintenance — queries never require it |
+| `stats` | read | nodes/edges/SCCs/cyclic-nodes; `sealed` = no unmerged micro-layers |
 | `get_node` | read | Node by key |
 | `neighbors` | read | One-hop (direction + label filter) |
 | `bfs` | read | **Multi-hop** (1..maxDepth, 0 = unlimited), returns per-node depth |
@@ -29,7 +29,8 @@ Vectra ships first-class [Model Context Protocol](https://modelcontextprotocol.i
 cd mcp && go build -o vectra-mcp ./cmd/vectra-mcp
 ./vectra-mcp                       # stdio
 ./vectra-mcp -http :8080           # Streamable HTTP at /mcp
-./vectra-mcp -snapshot deps.vg     # persist across restarts
+./vectra-mcp -snapshot deps.vg     # persist across restarts (snapshot mode)
+./vectra-mcp -wal deps.wal         # durable WAL session (see below)
 ```
 
 Claude Code:
@@ -48,7 +49,9 @@ Claude Desktop (`claude_desktop_config.json`):
 }
 ```
 
-Writes accumulate; call `seal` once after `inject_batch` to make the graph queryable (the tool error message reminds the agent if it forgets). Property keys seen during injection are auto-indexed at seal time, and the snapshot file (store v3) persists index declarations — `lookup_property` works immediately after a `-snapshot` restart, no re-injection needed. Post-restart injections extend the persisted graph; each `seal` re-saves the file. Writing again after a seal re-opens a writable copy of the published state: until the next seal, queries keep serving the previous published view (bounded-stale reads, the same model as the server module).
+v0.7 continuous-write model: every applied write is **immediately visible** to all query tools — no seal required (the sealed gate is gone). `seal` is maintenance: it folds unmerged micro-layers into the sealed base, auto-indexes the property keys seen since the last seal, and checkpoints. The graph stays writable afterwards (writes open a new generation). In `-snapshot` mode a seal also re-saves the file; the store v3 format persists index declarations, so `lookup_property` works immediately after a restart.
+
+`-wal <dir>` switches to a durable session: every batch is WAL-logged (fsync per batch), `seal` writes the checkpoint (watermark snapshot + manifest + log reset), and a restart on the same directory recovers everything — checkpointed state plus the log tail. `-wal` takes precedence over `-snapshot` (a given `-snapshot` path then names the db file; omitted, it defaults to `<wal>/graph.db`).
 
 **Parameter naming convention** (spelled out because agents guess on first call): a single node is `key`; traversal endpoints are `from`/`to` (`bfs` takes a list in `from`); property lookup uses the `propKey`/`propValue` pair; shared controls are `direction` (`"out"` default | `"in"`), `label`/`labels`, `limit` (default 1000), `maxDepth` (0 = unlimited).
 
