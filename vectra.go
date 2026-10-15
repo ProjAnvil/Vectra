@@ -1214,6 +1214,15 @@ func (g *Graph) EdgeCount() int { return g.view.Load().edges }
 // false with the first write after a merge and back on Seal/forceMerge.
 func (g *Graph) Sealed() bool { return len(g.view.Load().layers) == 0 }
 
+// WALSize reports the valid WAL frame bytes logged since the last checkpoint
+// (0 when no WAL is attached) — the volume input for checkpoint triggers.
+func (g *Graph) WALSize() int64 {
+	if g.wal == nil {
+		return 0
+	}
+	return g.wal.Size()
+}
+
 // Stats reports graph size and, when the generation is fully merged, the
 // SCC compression results of the base. With unmerged layers present only the
 // counts are reported (SCC structures exist on the merged base only).

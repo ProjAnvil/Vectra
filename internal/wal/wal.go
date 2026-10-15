@@ -41,6 +41,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 // NodeUpsert / EdgeUpsert / EdgeDelete are the atomic items of a Changeset.
@@ -149,6 +150,11 @@ type WAL struct {
 
 	baseLSN  uint64 // from manifest: frames with lsn <= this are skipped on replay
 	startSeg int    // from manifest: segments below this number are ignored
+
+	// bytes counts VALID frame bytes across the lineage since the last
+	// Reset (preallocated zero tails are not frames). Atomic so Size is
+	// safe to call from any goroutine; only the single writer mutates it.
+	bytes atomic.Int64
 }
 
 // --- manifest --------------------------------------------------------------
@@ -350,8 +356,9 @@ func Open(dir string, mode Mode) (*WAL, error) {
 	// the write head. Anything past the first break is tail damage.
 	prev := -1
 	var (
-		head    *segScan
-		headSeg int
+		head       *segScan
+		headSeg    int
+		chainBytes int64
 	)
 	for _, s := range segs {
 		if s < w.startSeg {
@@ -372,6 +379,7 @@ func Open(dir string, mode Mode) (*WAL, error) {
 		}
 		prev = s
 		head, headSeg = &sc, s
+		chainBytes += sc.valid
 	}
 
 	if head != nil {
@@ -384,6 +392,7 @@ func Open(dir string, mode Mode) (*WAL, error) {
 		if w.lsn < w.baseLSN {
 			w.lsn = w.baseLSN // manifest ahead of the files: never reuse an LSN
 		}
+		w.bytes.Store(chainBytes)
 		return w, nil
 	}
 
@@ -421,6 +430,7 @@ func (w *WAL) Append(cs Changeset) (uint64, error) {
 		return 0, err
 	}
 	w.off += int64(len(frame))
+	w.bytes.Add(int64(len(frame)))
 	w.lsn++
 	if w.mode == ModeAlways {
 		if err := w.f.Sync(); err != nil {
@@ -542,6 +552,7 @@ func (w *WAL) Reset(baseLSN uint64) error {
 		return err
 	}
 	w.lsn = baseLSN
+	w.bytes.Store(0) // the checkpoint owns everything logged so far
 	segs, err := listSegments(w.dir)
 	if err != nil {
 		return err
@@ -572,6 +583,12 @@ func (w *WAL) LastLSN() uint64 { return w.lsn }
 
 // Segment reports the current segment number.
 func (w *WAL) Segment() int { return w.segment }
+
+// Size reports the valid frame bytes logged since the last checkpoint
+// (Reset): the input for volume-triggered checkpoints (spec §4's "WAL ≥4MB"
+// trigger). Preallocated zero tails never count; recovery initializes it
+// from the segment chain's valid prefix.
+func (w *WAL) Size() int64 { return w.bytes.Load() }
 
 // --- frame codec -------------------------------------------------------------
 

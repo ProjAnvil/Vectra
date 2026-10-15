@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -646,5 +647,51 @@ func TestGCTuneSmoke(t *testing.T) {
 	}
 	if got := g.NodeCount(); got != 30 {
 		t.Fatalf("NodeCount = %d, want 30", got)
+	}
+}
+
+// TestVolumeCheckpointBoundsWAL: spec §4's WAL volume trigger. With a small
+// CheckpointBytes the writer's post-batch hook runs the full Seal pipeline
+// (merge + watermark + manifest + WAL reset) on its own — no explicit
+// Compact/Close — so the manifest exists and the log drops back under the
+// threshold while the session is still live, and the data survives a reopen.
+func TestVolumeCheckpointBoundsWAL(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "db")
+	const threshold = 8 << 10 // 8 KiB of frames
+	g, err := vectra.Open(db, vectra.Options{WALMode: vectra.ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := writer.Attach(g, writer.Config{CheckpointBytes: threshold})
+
+	for i := 0; i < 160; i++ { // ~16 KiB of JSON frames, well past the trigger
+		if err := h.Submit(nodeCS(fmt.Sprintf("n%04d", i), "N", map[string]any{"k": fmt.Sprintf("value-%04d", i)})); err != nil {
+			t.Fatalf("Submit %d: %v", i, err)
+		}
+	}
+
+	// BEFORE any Close: the volume checkpoint must have landed a manifest
+	// and reset the log below the threshold.
+	if _, err := os.Stat(filepath.Join(db+".wal", "manifest.json")); err != nil {
+		t.Fatalf("volume checkpoint did not fire (no manifest): %v", err)
+	}
+	if sz := g.WALSize(); sz >= threshold {
+		t.Fatalf("WALSize after volume checkpoint = %d, want < threshold %d", sz, threshold)
+	}
+	if got := g.NodeCount(); got != 160 {
+		t.Fatalf("NodeCount = %d, want 160", got)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// reopen: every volume-checkpointed write is durable
+	g2, err := vectra.Open(db, vectra.Options{WALMode: vectra.ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := g2.NodeCount(); got != 160 {
+		t.Fatalf("reopened NodeCount = %d, want 160", got)
 	}
 }

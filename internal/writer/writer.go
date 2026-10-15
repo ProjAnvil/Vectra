@@ -15,6 +15,8 @@
 package writer
 
 import (
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,6 +39,17 @@ type Config struct {
 	// background merge (delta-volume threshold, spec §3.1). Default 64K.
 	// It never stalls the writer on its own.
 	MergeEdges int
+
+	// CheckpointBytes is spec §4's WAL volume trigger: once the log holds
+	// this many valid frame bytes since the last checkpoint, the writer's
+	// post-batch hook runs the full Seal pipeline (merge + watermark
+	// snapshot + manifest + WAL reset) on the writer goroutine. Queries
+	// stay lock-free throughout; Submits observe a checkpoint-shaped
+	// pause. Default 4 MiB; negative disables the volume trigger (explicit
+	// Seal/Compact/Close only). A failed volume checkpoint is sticky: the
+	// error surfaces from Close and the trigger disables itself — an
+	// ailing disk must not turn every batch into a retry storm.
+	CheckpointBytes int64
 
 	// MergeDelay is a test injection: the merger sleeps this long between
 	// capturing the generation prefix and sealing it, widening the window
@@ -64,6 +77,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.MergeEdges <= 0 {
 		c.MergeEdges = 65536
+	}
+	if c.CheckpointBytes == 0 {
+		c.CheckpointBytes = 4 << 20 // spec §4: WAL ≥4MB since last checkpoint
 	}
 	return c
 }
@@ -110,6 +126,9 @@ type Handle struct {
 	needSync atomic.Bool  // merger gave up: the writer must fold synchronously
 	fails    atomic.Int32 // consecutive background merge failures (reset on success)
 	failN    atomic.Int32 // FailMerge injection counter (background attempts)
+
+	cpOff atomic.Bool           // volume checkpoint disabled (failed once)
+	cpErr atomic.Pointer[error] // that failure, surfaced by Close
 
 	finalErr error // Close's final g.Seal outcome (published via loopDone)
 }
@@ -174,7 +193,8 @@ func (h *Handle) send(r request) error {
 // claim is yielded (direct mode is legal again). The underlying graph is
 // NOT closed — queries stay legal and Graph.Close remains the caller's
 // when the WAL handle should be torn down (Seal already checkpointed, so a
-// following Graph.Close re-checkpoints cheaply).
+// following Graph.Close re-checkpoints cheaply). A volume-checkpoint
+// failure recorded mid-session is joined into the returned error.
 func (h *Handle) Close() error {
 	h.closeOnce.Do(func() {
 		h.sendMu.Lock()
@@ -185,6 +205,9 @@ func (h *Handle) Close() error {
 	<-h.loopDone // drained + final Seal done + claim yielded
 	h.mergerOnce.Do(func() { close(h.quit) })
 	<-h.mergerDone
+	if cp := h.cpErr.Load(); cp != nil {
+		return errors.Join(*cp, h.finalErr)
+	}
 	return h.finalErr
 }
 
@@ -247,10 +270,14 @@ func (h *Handle) applyBatch(pending []request) {
 // A merger handoff (3 consecutive failures) is consumed BEFORE the stall
 // check: folding synchronously first usually drops the stack below the
 // cap, and stalling on a merger that just gave up would only pay its
-// backoff ladder for nothing.
+// backoff ladder for nothing. The §4 WAL volume checkpoint runs before
+// the layer triggers — a Seal folds every layer, so it subsumes them.
 func (h *Handle) afterBatch() {
 	if h.needSync.Load() {
 		h.syncMerge()
+	}
+	if h.volumeCheckpoint() {
+		return // sealed + checkpointed: layer pressure is already reset
 	}
 	layers, layerEdges := h.g.LayerPressure()
 	if layers >= h.cfg.MaxLayers || layerEdges >= h.cfg.MergeEdges {
@@ -260,6 +287,30 @@ func (h *Handle) afterBatch() {
 			h.signalMerge()
 		}
 	}
+}
+
+// volumeCheckpoint implements spec §4's "WAL ≥4MB since last checkpoint"
+// trigger: at or above CheckpointBytes of valid frame bytes the writer runs
+// the full Seal pipeline (flush + merge + watermark snapshot + manifest +
+// WAL reset) on its own goroutine — a checkpoint-shaped write pause that is
+// invisible to lock-free readers. It reports whether a checkpoint ran (so
+// the caller can skip the layer triggers Seal already satisfied).
+func (h *Handle) volumeCheckpoint() bool {
+	if h.cfg.CheckpointBytes <= 0 || h.cpOff.Load() {
+		return false
+	}
+	if h.g.WALSize() < h.cfg.CheckpointBytes {
+		return false
+	}
+	h.pubMu.Lock()
+	err := h.g.Seal()
+	h.pubMu.Unlock()
+	if err != nil {
+		cpErr := fmt.Errorf("vectra/writer: volume checkpoint: %w", err)
+		h.cpErr.Store(&cpErr)
+		h.cpOff.Store(true) // sticky: surfaced by Close; explicit Compact still available
+	}
+	return true
 }
 
 // applyChangeset applies one submitted changeset with the write-method
