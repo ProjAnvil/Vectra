@@ -104,6 +104,16 @@ func (p *parser) parseQuery() (*Query, error) {
 	if p.at(TStar) {
 		p.next()
 		q.Return.Star = true
+		// Items may follow ("*, count(*)") so validate() can report the
+		// combination precisely instead of a generic syntax error.
+		for p.at(TComma) {
+			p.next()
+			item, err := p.parseReturnItem()
+			if err != nil {
+				return nil, err
+			}
+			q.Return.Items = append(q.Return.Items, item)
+		}
 	} else {
 		item, err := p.parseReturnItem()
 		if err != nil {
@@ -380,10 +390,15 @@ func (p *parser) parseLiteral() (any, error) {
 	return nil, p.errf("expected literal, got %s", describe(t))
 }
 
+// parseReturnItem parses one RETURN item: var[.prop], an aggregation call
+// count(*) or fn([DISTINCT] var[.prop]), each with an optional AS alias.
 func (p *parser) parseReturnItem() (*ReturnItem, error) {
 	v, err := p.expect(TIdent, "variable")
 	if err != nil {
 		return nil, err
+	}
+	if p.at(TParenL) { // aggregation call: ident "(" ...
+		return p.parseAggItem(v)
 	}
 	item := &ReturnItem{Var: v.Text, Name: v.Text}
 	if p.at(TDot) {
@@ -395,13 +410,101 @@ func (p *parser) parseReturnItem() (*ReturnItem, error) {
 		item.Prop = prop.Text
 		item.Name = v.Text + "." + prop.Text
 	}
+	return p.parseAlias(item)
+}
+
+// parseAlias applies an optional "AS name" suffix; the alias becomes the
+// item's display Name.
+func (p *parser) parseAlias(item *ReturnItem) (*ReturnItem, error) {
+	if p.kw("AS") {
+		p.next()
+		a, err := p.expect(TIdent, "alias name")
+		if err != nil {
+			return nil, err
+		}
+		item.Alias = a.Text
+		item.Name = a.Text
+	}
 	return item, nil
+}
+
+// aggFuncs is the supported aggregation function set.
+var aggFuncs = map[string]bool{
+	"count": true, "sum": true, "avg": true, "min": true, "max": true, "collect": true,
+}
+
+// parseAggItem parses the rest of an aggregation item after its function
+// ident: "(" [DISTINCT] ( * | var[.prop] ) ")" [AS alias]. The opening
+// parenthesis is still unconsumed. Nested calls and expression arguments
+// are rejected with a positioned error.
+func (p *parser) parseAggItem(fn Token) (*ReturnItem, error) {
+	name := strings.ToLower(fn.Text)
+	if !aggFuncs[name] {
+		return nil, &Error{fn.Line, fn.Col,
+			fmt.Sprintf("unknown function %q; supported aggregations: count, sum, avg, min, max, collect", fn.Text)}
+	}
+	p.next() // (
+	call := AggCall{Func: name}
+	if p.kw("DISTINCT") {
+		p.next()
+		call.Distinct = true
+	}
+	switch {
+	case p.at(TStar):
+		if name != "count" {
+			return nil, p.errf("%s(*) is not supported; only count accepts *", name)
+		}
+		if call.Distinct {
+			return nil, p.errf("count(DISTINCT *) is not supported")
+		}
+		p.next()
+		call.Star = true
+	default:
+		v, err := p.expect(TIdent, "variable")
+		if err != nil {
+			return nil, err
+		}
+		if p.at(TParenL) { // e.g. sum(count(x)): no nested aggregations
+			return nil, p.errf("nested aggregation %s(%s(...)) is not supported", name, v.Text)
+		}
+		arg := &ReturnItem{Var: v.Text, Name: v.Text}
+		if p.at(TDot) {
+			p.next()
+			prop, err := p.expect(TIdent, "property name")
+			if err != nil {
+				return nil, err
+			}
+			arg.Prop = prop.Text
+			arg.Name = v.Text + "." + prop.Text
+		}
+		call.Arg = arg
+	}
+	if _, err := p.expect(TParenR, "\")\""); err != nil {
+		return nil, err
+	}
+	item := &ReturnItem{Agg: call, Name: aggText(call)}
+	return p.parseAlias(item)
+}
+
+// aggText renders the canonical display name of an aggregation call.
+func aggText(c AggCall) string {
+	if c.Star {
+		return c.Func + "(*)"
+	}
+	arg := c.Arg.Name
+	if c.Distinct {
+		arg = "DISTINCT " + arg
+	}
+	return c.Func + "(" + arg + ")"
 }
 
 func (p *parser) parseOrderKey() (OrderKey, error) {
 	v, err := p.expect(TIdent, "variable")
 	if err != nil {
 		return OrderKey{}, err
+	}
+	if p.at(TParenL) { // e.g. ORDER BY count(*): bare aggregation is not allowed
+		return OrderKey{}, p.errf("aggregation is not allowed in ORDER BY; assign it an alias in RETURN (AS) and order by the alias")
 	}
 	name := v.Text
 	if p.at(TDot) {
@@ -628,7 +731,19 @@ func (q *Query) validate() error {
 	}
 
 	items := q.Return.Items
+	aggQuery := false
+	for _, it := range items {
+		if it.Agg.Func != "" {
+			aggQuery = true
+		}
+	}
 	if q.Return.Star {
+		if aggQuery {
+			return &Error{1, 1, "RETURN * cannot be combined with aggregation"}
+		}
+		if len(items) > 0 {
+			return &Error{1, 1, "RETURN * cannot be combined with other RETURN items"}
+		}
 		if len(nodeVars)+len(edgeVars) == 0 {
 			return &Error{1, 1, "RETURN * with no named variables in the pattern"}
 		}
@@ -639,20 +754,34 @@ func (q *Query) validate() error {
 	}
 	names := map[string]bool{}
 	for _, it := range items {
-		if !declared(it.Var) {
-			return &Error{1, 1, fmt.Sprintf("variable %q is not declared in the pattern", it.Var)}
+		v := it.Var // aggregations declare no variable of their own
+		if it.Agg.Func != "" && !it.Agg.Star {
+			v = it.Agg.Arg.Var
 		}
-		if ep := edgeVars[it.Var]; ep != nil && (ep.MinHops != 1 || ep.MaxHops != 1) {
-			return &Error{1, 1, fmt.Sprintf("edge variable %q is on a variable-length edge and cannot be referenced (node-pair semantics)", it.Var)}
+		if v != "" {
+			if !declared(v) {
+				return &Error{1, 1, fmt.Sprintf("variable %q is not declared in the pattern", v)}
+			}
+			if ep := edgeVars[v]; ep != nil && (ep.MinHops != 1 || ep.MaxHops != 1) {
+				return &Error{1, 1, fmt.Sprintf("edge variable %q is on a variable-length edge and cannot be referenced (node-pair semantics)", v)}
+			}
 		}
 		names[it.Name] = true
 	}
 	for _, k := range q.Return.OrderBy {
+		if aggQuery {
+			// After aggregation only projected columns exist: the key must
+			// match a RETURN item name (aliases included).
+			if !names[k.Name] {
+				return &Error{1, 1, fmt.Sprintf("ORDER BY name %q must appear in RETURN when aggregating; use an AS alias", k.Name)}
+			}
+			continue
+		}
 		varPart := k.Name
 		if i := strings.Index(varPart, "."); i >= 0 {
 			varPart = varPart[:i]
 		}
-		if !declared(varPart) {
+		if !declared(varPart) && !names[k.Name] {
 			return &Error{1, 1, fmt.Sprintf("ORDER BY variable %q is not declared in the pattern", varPart)}
 		}
 		if ep := edgeVars[varPart]; ep != nil && (ep.MinHops != 1 || ep.MaxHops != 1) {
