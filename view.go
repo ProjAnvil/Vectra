@@ -49,12 +49,14 @@ func (s snapRows) Rows(u uint32, dir int) []csr.AdjRow {
 
 // rows returns the traversal row source of this generation: the base itself
 // when nothing is unmerged (A1: zero View construction on the hot path), or
-// the three-source engine.View otherwise.
-func (v *genView) rows() tr.RowSource {
+// the three-source engine.View otherwise — routed through the graph's
+// per-generation View cache so repeated queries over one generation build
+// it once (see Graph.viewCache).
+func (g *Graph) rowsOf(v *genView) tr.RowSource {
 	if len(v.layers) == 0 {
 		return snapRows{base: v.base}
 	}
-	return v.engineView()
+	return g.engineViewOf(v)
 }
 
 // layerSource adapts one immutable micro-layer into an engine.DeltaSource:
@@ -251,12 +253,13 @@ func nodesToIDs(ns []Node) []uint32 {
 	return ids
 }
 
-// cypherRunView returns the execution source for this generation: the base
+// cypherRunViewOf returns the execution source for this generation: the base
 // snapshot itself keeps Run's zero-indirection hot path; a generation with
-// unmerged layers executes through RunView over the three-source View.
-func (v *genView) cypherRunView() (runView bool, src cypherSource) {
+// unmerged layers executes through RunView over the cached three-source
+// View (see Graph.viewCache).
+func (g *Graph) cypherRunViewOf(v *genView) (runView bool, src cypherSource) {
 	if len(v.layers) == 0 {
 		return false, cypherSource{}
 	}
-	return true, cypherSource{gv: v, ev: v.engineView()}
+	return true, cypherSource{gv: v, ev: g.engineViewOf(v)}
 }

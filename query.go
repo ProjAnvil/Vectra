@@ -70,12 +70,12 @@ func (q *Query) Run() (*BFSResult, error) {
 // rows, so writes are visible immediately. With nothing unmerged the plain
 // CSR row zip runs (FastAdjacency hot path).
 func (g *Graph) NeighborsOf(key string, dir Direction, labels ...string) ([]Node, error) {
-	n, ok := g.NodeByKey(key)
+	n, ok := g.NodeByKey(key) // materializes the caller's absorption window
 	if !ok {
 		return nil, ErrNodeNotFound
 	}
 	v := g.view.Load()
-	src := v.rows()
+	src := g.rowsOf(v)
 	lr := labelResolver(v.base)
 	if view, ok := src.(*engine.View); ok { // joint label table
 		lr = view
@@ -133,6 +133,7 @@ func (g *Graph) NeighborsOf(key string, dir Direction, labels ...string) ([]Node
 // layer incidents from a record scan (newer-tombstone-filtered); results are
 // sorted by EdgeID ascending. A deleted node key yields ErrNodeNotFound.
 func (g *Graph) EdgesOf(key string, dir Direction, labels ...string) ([]Edge, error) {
+	g.flushPend()
 	v := g.view.Load()
 	_, ok := v.nodeWinner(key)
 	if !ok {

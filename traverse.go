@@ -92,8 +92,9 @@ func WithLabels(names ...string) BFSOption {
 // immediately. With nothing unmerged the View IS the base CSR and the
 // slice-zip hot path runs untouched (FastAdjacency).
 func (g *Graph) BFS(starts []NodeID, opts ...BFSOption) (*BFSResult, error) {
+	g.flushPend()
 	v := g.view.Load()
-	src := v.rows()
+	src := g.rowsOf(v)
 	n := uint32(src.NodeCount())
 	for _, s := range starts {
 		if uint32(s) >= n {
@@ -197,6 +198,7 @@ func ReachWithDirection(d Direction) ReachOption {
 // or unmerged delta layers fall back to strict node-level traversal over
 // the three-source View.
 func (g *Graph) ReachableIDs(start NodeID, opts ...ReachOption) ([]NodeID, error) {
+	g.flushPend()
 	v := g.view.Load()
 	cfg := reachConfig{direction: DirOut}
 	for _, o := range opts {
@@ -217,7 +219,7 @@ func (g *Graph) ReachableIDs(start NodeID, opts ...ReachOption) ([]NodeID, error
 		}
 		return out, nil
 	}
-	src := v.rows()
+	src := g.rowsOf(v)
 	if uint32(start) >= uint32(src.NodeCount()) {
 		return nil, ErrNodeNotFound
 	}
@@ -269,8 +271,9 @@ func (p Path) Len() int { return len(p.Edges) }
 // View — paths may cross base and layer edges alike; with nothing unmerged
 // it is the plain CSR bidirectional BFS (FastAdjacency hot path).
 func (g *Graph) ShortestPathIDs(from, to NodeID) (Path, bool, error) {
+	g.flushPend()
 	v := g.view.Load()
-	src := v.rows()
+	src := g.rowsOf(v)
 	if uint32(from) >= uint32(src.NodeCount()) || uint32(to) >= uint32(src.NodeCount()) {
 		return Path{}, false, ErrNodeNotFound
 	}
@@ -329,6 +332,7 @@ func (c Cycle) Len() int { return len(c.Nodes) }
 // builds rely on this documented contract. Every other query is lock-free.
 func (g *Graph) Cycles() []Cycle {
 	g.assertWriter()
+	g.flushPend() // the absorbed window must land before the forced merge decides
 	v := g.view.Load()
 	if len(v.layers) > 0 {
 		if g.forceMerge() != nil {

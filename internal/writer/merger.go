@@ -91,8 +91,9 @@ func (h *Handle) resolveFlight() {
 	}()
 
 	// Re-check pressure: the trigger may already be satisfied by a fold
-	// that happened between signal and here (e.g. the sync fallback).
-	if layers, edges := h.g.LayerPressure(); layers < h.cfg.MaxLayers && edges < h.cfg.MergeEdges {
+	// that happened between signal and here (e.g. the sync fallback), and
+	// the volume rule is base-proportional (see mergeEdgeThreshold).
+	if layers, edges := h.g.LayerPressure(); layers < h.cfg.MaxLayers && edges < h.mergeEdgeThreshold() {
 		return
 	}
 

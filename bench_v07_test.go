@@ -209,6 +209,10 @@ func TestV07A2QueryDuringMerge(t *testing.T) {
 		}
 		return float64(b) / float64(a)
 	}
+	// Acceptance (hardening re-read of the line, idle口径): a query during
+	// the merge window stays within 2x the merged-base floor. The
+	// steady-write ratio (merge/writes) is reported alongside — merges are
+	// what bound the stack the steady state would otherwise grow unbounded.
 	for _, tc := range []struct {
 		name            string
 		idle, quiet, mg time.Duration
@@ -217,11 +221,10 @@ func TestV07A2QueryDuringMerge(t *testing.T) {
 		{"shortest-path-p99", iSP99, qSP99, mSP99},
 		{"point-p99", iPT99, qPT99, mPT99},
 	} {
-		r := ratio(tc.quiet, tc.mg)
-		t.Logf("A2 ratio %s: merge-storm/writes = %.2fx (line ≤2x) | attribution: writes/idle %.2fx, merge-storm/idle %.2fx",
-			tc.name, r, ratio(tc.idle, tc.quiet), ratio(tc.idle, tc.mg))
-		if r > 2.0 {
-			t.Errorf("A2 FAIL: %s merge-storm p99 %.2fx the steady-write p99 (line: ≤2x)", tc.name, r)
+		t.Logf("A2 ratio %s: merge-storm/idle = %.2fx (line ≤2x) | steady口径: merge-storm/writes %.2fx, writes/idle %.2fx",
+			tc.name, ratio(tc.idle, tc.mg), ratio(tc.quiet, tc.mg), ratio(tc.idle, tc.quiet))
+		if r := ratio(tc.idle, tc.mg); r > 2.0 {
+			t.Errorf("A2 FAIL: %s merge-window p99 %.2fx the idle p99 (line: ≤2x)", tc.name, r)
 		}
 	}
 }
@@ -455,8 +458,8 @@ func TestV07A6MergeAmortization(t *testing.T) {
 	if v07RaceBuild {
 		totalEdges = 12_500
 	}
-	run := func(cfg writer.Config) (writeWall, closeFold time.Duration) {
-		g := buildGraph(t, 100_000, 1_000_000)
+	run := func(nodes, edges int, cfg writer.Config) (writeWall, closeFold time.Duration) {
+		g := buildGraph(t, nodes, edges)
 		h := writer.Attach(g, cfg)
 		rng := rand.New(rand.NewSource(13))
 		t0 := time.Now()
@@ -464,8 +467,8 @@ func TestV07A6MergeAmortization(t *testing.T) {
 			cs := vectra.Changeset{Edges: make([]vectra.EdgeUpsert, 50)}
 			for j := range cs.Edges {
 				cs.Edges[j] = vectra.EdgeUpsert{
-					SrcKey: fmt.Sprintf("n%08d", rng.Intn(100_000)),
-					DstKey: fmt.Sprintf("n%08d", rng.Intn(100_000)),
+					SrcKey: fmt.Sprintf("n%08d", rng.Intn(nodes)),
+					DstKey: fmt.Sprintf("n%08d", rng.Intn(nodes)),
 					Label:  "CALLS",
 				}
 			}
@@ -481,33 +484,42 @@ func TestV07A6MergeAmortization(t *testing.T) {
 		closeFold = time.Since(t1)
 		return writeWall, closeFold
 	}
-
-	// zero-merge reference: thresholds beyond the workload (writes + one
-	// final fold) — the floor both regimes are compared against.
-	baseW, baseC := run(writer.Config{MaxLayers: 1 << 30, MergeEdges: 1 << 30})
-	baseline := baseW + baseC
-
-	// regime 1 — spec defaults: the layer cap binds for small changesets
-	// (64 layers × 50 edges = one O(base) fold every 3200 edges).
-	defW, defC := run(writer.Config{})
-	defShare := float64(defW+defC-baseline) / float64(defW+defC)
-
-	// regime 2 — volume-bound: cap disabled, the default 64K-edge interval
-	// governs (this 50K-edge workload never reaches it: no background fold).
-	volW, volC := run(writer.Config{MaxLayers: 1 << 30})
-	volShare := float64(volW+volC-baseline) / float64(volW+volC)
-
-	t.Logf("A6[b]: zero-merge reference: %s for %d edges (incl. final fold %s)",
-		fmtDur(baseline), totalEdges, fmtDur(baseC))
-	t.Logf("A6[b]: defaults (64 layers + 64K edges): wall=%s + final fold %s | merge overhead share=%.1f%%",
-		fmtDur(defW), fmtDur(defC), defShare*100)
-	t.Logf("A6[b]: volume-bound (cap off, 64K edges): wall=%s + final fold %s | merge overhead share=%.1f%% (line <10%%)",
-		fmtDur(volW), fmtDur(volC), volShare*100)
-	if defShare >= 0.10 {
-		t.Logf("A6 VERDICT: default thresholds MISS the <10%% line at the 100K/1M tier (%.1f%%) — small changesets + a 1M-edge base make every layer-cap fold cost O(base); recorded in the report", defShare*100)
+	amortized := func(tag string, nodes, edges int, cfg writer.Config) (share float64, wall time.Duration) {
+		// zero-merge reference per tier: thresholds beyond the workload
+		// (writes + one final fold) — the floor both regimes compare against
+		baseW, baseC := run(nodes, edges, writer.Config{MaxLayers: 1 << 30, MergeEdges: 1 << 30})
+		baseline := baseW + baseC
+		w, c := run(nodes, edges, cfg)
+		share = float64(w+c-baseline) / float64(w+c)
+		t.Logf("A6[b][%s @%d/%d]: wall=%s + final fold %s | merge overhead share=%.1f%% (line <10%%; zero-merge ref %s)",
+			tag, nodes, edges, fmtDur(w), fmtDur(c), share*100, fmtDur(baseline))
+		return share, w + c
 	}
-	if volShare >= defShare {
-		t.Errorf("A6 FAIL: volume-bound share %.1f%% not below default %.1f%% — the tuning lever is broken", volShare*100, defShare*100)
+
+	// regime 1 — hardening defaults: the volume-proportional rule (fold at
+	// max(64K, base) layer edges) + the 2048-layer backstop. The 50K-edge
+	// workload never reaches a base-sized interval: no mid-workload fold.
+	def100Share, _ := amortized("defaults", 100_000, 1_000_000, writer.Config{})
+
+	// regime 2 — the pre-hardening default shape (fixed 64-layer cap as the
+	// de-facto trigger): demonstrates the structural miss the proportional
+	// rule removes (a fold every 64 × 50 edges, each O(base)).
+	cap64Share, _ := amortized("cap-64", 100_000, 1_000_000, writer.Config{MaxLayers: 64})
+
+	if def100Share >= 0.10 {
+		t.Errorf("A6 FAIL: default-threshold share %.1f%% ≥ 10%% at the 100K/1M tier — the proportional rule is broken", def100Share*100)
+	}
+	if def100Share >= cap64Share {
+		t.Errorf("A6 FAIL: defaults share %.1f%% not below the fixed-cap regime %.1f%% — the threshold lever is inverted", def100Share*100, cap64Share*100)
+	}
+
+	// the 1M/10M tier (race builds skip it: the detector multiplies the
+	// 10M-edge graph work past the timeout; full-scale numbers are recorded
+	// from non-race runs)
+	if !v07RaceBuild {
+		if def1MShare, _ := amortized("defaults", 1_000_000, 10_000_000, writer.Config{}); def1MShare >= 0.10 {
+			t.Errorf("A6 FAIL: default-threshold share %.1f%% ≥ 10%% at the 1M/10M tier", def1MShare*100)
+		}
 	}
 }
 

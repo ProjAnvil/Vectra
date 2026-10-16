@@ -29,9 +29,10 @@ type CypherResult struct {
 // nodes, and pattern anchors alike). With nothing unmerged the merged-base
 // hot path runs unchanged.
 func (g *Graph) Cypher(query string) (*CypherResult, error) {
+	g.flushPend()
 	v := g.view.Load()
 	var res *cypher.Result
-	if runView, src := v.cypherRunView(); runView {
+	if runView, src := g.cypherRunViewOf(v); runView {
 		r, err := cypher.RunView(src, query)
 		if err != nil {
 			return nil, err

@@ -30,14 +30,27 @@ type Config struct {
 	// (backpressure). Default 4096.
 	ChanCap int
 
-	// MaxLayers is the layer-count merge trigger AND the write-stall line:
-	// once a batch leaves the stack at or above the cap, the writer waits
-	// for the in-flight fold before its next batch. Default 64.
+	// MaxLayers is the layer-count hard cap and the write-stall line: once
+	// a batch leaves the stack at or above the cap, the writer forces a
+	// fold and WAITS for it (the deep-stack backstop — read amplification
+	// over the live stack is bounded here; the per-generation View cache
+	// keeps construction cost off the query path while stacks run deep).
+	// Background folds otherwise fire on the volume rule (MergeEdges), so
+	// the cap should sit well above the layer count a base-proportional
+	// interval would naturally produce: a small cap re-introduces the A6
+	// miss (a fold every cap × changeset-size edges, each costing O(base)).
+	// Default 2048.
 	MaxLayers int
 
-	// MergeEdges is the cumulative layer edge-record count that triggers a
-	// background merge (delta-volume threshold, spec §3.1). Default 64K.
-	// It never stalls the writer on its own.
+	// MergeEdges is the FLOOR of the volume-proportional background-merge
+	// trigger: a fold fires when the unmerged layer stack carries at least
+	// max(MergeEdges, base.EdgeCount) edge records (v0.7 hardening: the fold
+	// interval stays proportional to the base — every fold costs
+	// O(base + layers), so intervals carrying base-comparable volume
+	// amortize to a bounded share, while any fixed interval eventually
+	// re-introduces the A6 miss as the base grows). The floor keeps small
+	// graphs folding. It never stalls the writer on its own; the layer cap
+	// is the stall path. Default 64K.
 	MergeEdges int
 
 	// CheckpointBytes is spec §4's WAL volume trigger: once the log holds
@@ -73,7 +86,7 @@ func (c Config) withDefaults() Config {
 		c.ChanCap = 4096
 	}
 	if c.MaxLayers <= 0 {
-		c.MaxLayers = 64
+		c.MaxLayers = 2048
 	}
 	if c.MergeEdges <= 0 {
 		c.MergeEdges = 65536
@@ -274,14 +287,17 @@ func (h *Handle) applyBatch(pending []request) {
 	h.afterBatch()
 }
 
-// afterBatch runs the spec §3.1 triggers: signal a merge on either
-// threshold; at the layer cap the writer additionally WAITS for the fold
-// (write stall, §2.3) — the only place the writer blocks on the merger.
-// A merger handoff (3 consecutive failures) is consumed BEFORE the stall
-// check: folding synchronously first usually drops the stack below the
-// cap, and stalling on a merger that just gave up would only pay its
-// backoff ladder for nothing. The §4 WAL volume checkpoint runs before
-// the layer triggers — a Seal folds every layer, so it subsumes them.
+// afterBatch runs the spec §3.1 triggers: the volume-proportional fold rule
+// (unmerged layer edges ≥ max(MergeEdges, base edges) — the interval stays
+// proportional to the base, A6's structural contract) signals a background
+// merge; at the layer cap the writer additionally WAITS for the fold (write
+// stall, §2.3 — the deep-stack backstop, and the only place the writer
+// blocks on the merger). A merger handoff (3 consecutive failures) is
+// consumed BEFORE the stall check: folding synchronously first usually
+// drops the stack below the cap, and stalling on a merger that just gave up
+// would only pay its backoff ladder for nothing. The §4 WAL volume
+// checkpoint runs before the layer triggers — a Seal folds every layer, so
+// it subsumes them.
 func (h *Handle) afterBatch() {
 	if h.needSync.Load() {
 		h.syncMerge()
@@ -290,13 +306,24 @@ func (h *Handle) afterBatch() {
 		return // sealed + checkpointed: layer pressure is already reset
 	}
 	layers, layerEdges := h.g.LayerPressure()
-	if layers >= h.cfg.MaxLayers || layerEdges >= h.cfg.MergeEdges {
-		if layers >= h.cfg.MaxLayers {
-			<-h.signalMerge() // write stall: wait for the in-flight fold
-		} else {
-			h.signalMerge()
-		}
+	switch {
+	case layers >= h.cfg.MaxLayers:
+		<-h.signalMerge() // write stall: the deep-stack backstop forces a fold
+	case layerEdges >= h.mergeEdgeThreshold():
+		h.signalMerge()
 	}
+}
+
+// mergeEdgeThreshold is the volume-proportional fold trigger: the unmerged
+// stack must carry edges comparable to the merged base before a background
+// fold is worth its O(base) cost. MergeEdges is the floor, so small graphs
+// still fold at the configured quantum.
+func (h *Handle) mergeEdgeThreshold() int {
+	t := h.cfg.MergeEdges
+	if base := h.g.BaseEdgeCount(); base > t {
+		t = base
+	}
+	return t
 }
 
 // volumeCheckpoint implements spec §4's "WAL ≥4MB since last checkpoint"

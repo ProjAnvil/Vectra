@@ -87,6 +87,14 @@ func (g *Graph) LayerPressure() (layers int, layerEdges int) {
 	return len(v.layers), layerEdges
 }
 
+// BaseEdgeCount reports the merged base's edge count — the size input of
+// the volume-proportional merge threshold (internal/writer folds when the
+// unmerged stack carries max(MergeEdges, BaseEdgeCount) edges, keeping the
+// fold interval proportional to the base). Safe from any goroutine.
+func (g *Graph) BaseEdgeCount() int {
+	return g.view.Load().base.EdgeCount()
+}
+
 // Seal folds the captured prefix into a fresh immutable base. Pure: no
 // Graph state, no locks, no writer-private mirrors — the caller may run it
 // on any goroutine while the writer continues. The result carries the new
