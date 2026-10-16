@@ -32,7 +32,7 @@ import (
 // The Makefile build target injects `git describe --tags --always --dirty`.
 // The source default still gets bumped at release (chore(release) commits),
 // so unbuilt checkouts and `go install` from a tag report a truthful value.
-var Version = "0.7.0"
+var Version = "0.7.1"
 
 // defaultLimit is the default cap on nodes returned by bfs/reachable
 // (results are capped; the total field still reflects the true size,
