@@ -18,18 +18,20 @@ import (
 // The check costs one atomic load plus, on graphs with a live claim, a
 // ~300-byte stack snapshot per write call — acceptable for debug builds,
 // compiled away entirely under the "release" tag (writer_hook_release.go).
-
-// ClaimWriter marks the calling goroutine as the graph's single writer.
-// It is called by internal/writer.Attach's writer loop before it starts
-// serving Submits; calling it twice re-claims for the newer caller.
+//
+// It also sets writerAttached (in BOTH builds — see the release twin): the
+// absorption window's read-side flush skips wrapper-mode graphs, whose
+// readers are never the writer.
 func (g *Graph) ClaimWriter() {
 	g.writerTok.Store(goroutineToken())
+	g.writerAttached.Store(true)
 }
 
 // YieldWriter releases the writer claim: writes from any goroutine are
 // legal again (direct mode resumes, e.g. after Handle.Close).
 func (g *Graph) YieldWriter() {
 	g.writerTok.Store(0)
+	g.writerAttached.Store(false)
 }
 
 // checkWriter is the write-method entry assertion; see ErrNotWriter.

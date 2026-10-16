@@ -5,10 +5,12 @@
 // concurrent reads, disk used only for snapshot recovery / WAL replay.
 //
 // v0.7 write model (spec §2.3, micro-layer generations): every write batch
-// (a single public write, or one Batch(fn) boundary) is materialized into an
-// immutable micro-layer and published as a new generation
-// {base, layers[]} through an atomic.Pointer — readers never lock. Queries
-// are always legal and every family is immediately consistent:
+// (one Batch(fn) boundary, or the direct-mode absorption window — a run of
+// unbatched per-op writes closed by the next read, boundary, or capacity
+// cap) is materialized into an immutable micro-layer and published as a new
+// generation {base, layers[]} through an atomic.Pointer — readers never
+// lock. Queries are always legal and every family is immediately
+// consistent:
 //
 //   - Point-query family (NodeByKey/NodeByID/EdgeByID/NodeCount/EdgeCount/
 //     EdgesOf/LookupBy*) reads the three sources base ∪ layers with
@@ -233,12 +235,23 @@ type edgeRef struct {
 // Writer-private mirrors (nodes/edges/labels/batch state) are only touched
 // by the writer and are never read by query paths.
 //
+// Direct-mode absorption window: unbatched per-op writes accumulate in one
+// open builder and materialize as ONE micro-layer per flush — flushed by
+// the next read API entry from the writing goroutine (write-then-read is
+// immediate), a Batch/Seal/Compact/Close/Cycles boundary, or the capacity
+// caps (4096 ops / 64K edge records). Concurrent reader goroutines that are
+// not the writer see the last published generation, exactly as mid-Batch
+// readers always have. The wrapper (internal/writer) never opens a window:
+// its writer batches, and its readers skip flushing.
+//
 // WAL sessions (see Open): every successful write method is recorded as
 // Changeset entries; writes outside Batch flush one frame (one fsync in
-// ModeAlways) per write and materialize one one-op micro-layer, Batch
-// flushes one frame per boundary and materializes one layer per boundary —
-// frames and layers are 1:1 at Builder boundaries (a kind-regressing batch
-// splits into frames, replay is order-faithful either way).
+// ModeAlways) per write — the durability contract is per-op regardless of
+// layer absorption — while the layer side absorbs (N frames may share one
+// materialized layer; the layer's lsn is the greatest frame lsn recorded at
+// flush time, so a checkpoint's snapshot always contains every frame ≤ its
+// watermark lsn). Batch flushes one frame per boundary (kind-regressing
+// batches split) and materializes one layer per boundary.
 type Graph struct {
 	view atomic.Pointer[genView]
 
@@ -251,13 +264,15 @@ type Graph struct {
 	nextEdge  EdgeID
 	labels    map[string]bool // label strings known to have been used
 
-	// active batch (a single write is a batch of one)
+	// active batch (a single write is a batch of one). bNodeIDs/bLiveNodes
+	// double as the carried endpoint registry: mid-burst window cuts keep
+	// them warm so published endpoints stay one lookup (the re-lift was the
+	// absorption window's residual per-op cost); full closes (Batch
+	// boundary, Seal/forceMerge, Close) reset them.
 	builder    *delta.Builder
-	bNodeIDs   map[string]uint32 // key -> assigned id (this batch)
-	bEdgeIDs   []uint32          // one id per edge slot appended (this batch)
-	bLiveNodes map[string]bool   // keys live in the builder
-	bEdgeWin   map[delta.EdgeKey]EdgeID
-	bEdgeN     map[delta.EdgeKey]int
+	bNodeIDs   map[string]uint32      // key -> assigned id (written or lifted)
+	bEdgeIDs   []uint32               // one id per edge slot appended (this batch)
+	bLiveNodes map[string]bool        // keys live in the builder or published-and-lifted
 	bKilled    map[delta.EdgeKey]bool // keys tombstoned within the batch
 	bIndex     []string               // pending index declarations (this batch)
 
@@ -285,7 +300,82 @@ type Graph struct {
 	// merger goroutine sets it (under the caller's publication mutex) while
 	// the writer goroutine reads it. Direct mode never sets it.
 	rebaseHappened atomic.Bool
+
+	// ---- direct-mode write absorption window (task 7 / A4) -------------------
+	//
+	// Unbatched per-op writes used to materialize one micro-layer per op —
+	// the A4 throughput regression. They now accumulate in the open builder
+	// ("the pend") and materialize as ONE layer per flush. Flushes fire at
+	// read-API entries (write-then-read stays immediate: in direct mode the
+	// reader IS the writer), at Batch/Seal/Close boundaries, and at the
+	// capacity cap below. The WAL recorder is NOT deferred — per-op frames
+	// (and their fsyncs) stay per-op; only layer materialization is absorbed.
+	//
+	// Concurrency: pend is an atomic pointer so concurrent readers can check
+	// for an open window without a data race; they only read the pointer and
+	// the owner token (immutable after the Store), never the builder. Only
+	// the goroutine that opened the window (pendWindow.owner) may publish
+	// it; wrapper-mode graphs skip flushing entirely (writerAttached — the
+	// wrapper's readers are never the writer, and its writer batches).
+	writerAttached atomic.Bool
+	pend           atomic.Pointer[pendWindow]
+
+	// viewCache memoizes the three-source engine.View of the latest
+	// generation, keyed by the genView pointer (v0.7 hardening, task 7 / A2):
+	// the first traversal/cypher query after a publish pays the
+	// O(unmerged-delta) assembly, every later query over the same generation
+	// reuses it — T4's deferred per-query cost, gone. Single slot: writes
+	// advance the generation monotonically, so the newest entry always wins;
+	// a racing reader may briefly pin one stale generation (bounded, GC'd).
+	// All access via the atomic pointer; entries are immutable.
+	viewCache atomic.Pointer[viewCacheEntry]
 }
+
+// viewCacheEntry is one memoized (generation, View) pair; see Graph.viewCache.
+type viewCacheEntry struct {
+	gen  *genView
+	view *engine.View
+}
+
+// engineViewOf returns v's three-source View through the per-generation
+// cache. Concurrent first-readers may each build (engineView reads
+// immutable state only, so racing builds are safe); the Store publishes one
+// and the losers' copies become garbage.
+func (g *Graph) engineViewOf(v *genView) *engine.View {
+	if c := g.viewCache.Load(); c != nil && c.gen == v {
+		return c.view
+	}
+	ev := v.engineView()
+	g.viewCache.Store(&viewCacheEntry{gen: v, view: ev})
+	return ev
+}
+
+// pendWindow is the metadata of one open absorption window. owner is the
+// goroutine token that opened it (written once before the atomic Store,
+// read-only afterwards); ops/edges count write-method completions for the
+// capacity caps. All three are writer-private state — readers only touch
+// owner.
+type pendWindow struct {
+	owner uint64
+	ops   int
+	edges int
+}
+
+// Capacity caps of the absorption window: an unqueried write burst
+// materializes at most this much per layer, bounding the window's memory
+// (~5MB for a pure edge burst). Edge-appending ops count toward the edge
+// cap; every other op (nodes, deletes, folds that append nothing) counts
+// toward the op cap — a pure AddEdge burst is bounded by the edge cap
+// alone, which amortizes the layer build far below the per-op cost while
+// keeping mid-burst queries cheap.
+const (
+	pendMaxOps   = 4096
+	pendMaxEdges = 1 << 16 // 64K edge records
+	// pendLiftBudget caps endpoint materialization per window (see
+	// materializeEndpoint): small/read-adjacent windows lift fully, bulk
+	// import windows stop past the budget.
+	pendLiftBudget = 512
+)
 
 // opKind orders pendOp entries exactly like the Changeset apply order:
 // node upserts → edge upserts → edge deletes → node deletes.
@@ -337,29 +427,83 @@ func copyProps(props map[string]any) map[string]any {
 
 // ---- writer-side batch plumbing ---------------------------------------------
 
-// ensureBuilder opens the batch state if none is active.
+// ensureBuilder opens the batch state if none is active. Outside Batch the
+// builder doubles as the absorption window: an atomically-published
+// pendWindow marks it open, and finishOp/flushPend decide when it
+// materializes.
 func (g *Graph) ensureBuilder() {
 	if g.builder != nil {
 		return
 	}
 	g.builder = delta.NewBuilder()
-	g.bNodeIDs = map[string]uint32{}
-	g.bLiveNodes = map[string]bool{}
-	g.bEdgeWin = map[delta.EdgeKey]EdgeID{}
-	g.bEdgeN = map[delta.EdgeKey]int{}
-	g.bKilled = map[delta.EdgeKey]bool{}
+	// the endpoint registry survives window cuts (cutLayer restores it) —
+	// only a full close leaves it nil here
+	if g.bNodeIDs == nil {
+		g.bNodeIDs = map[string]uint32{}
+		g.bLiveNodes = map[string]bool{}
+	}
+	if g.bKilled == nil {
+		g.bKilled = map[delta.EdgeKey]bool{}
+	}
 	g.bEdgeIDs = nil
 	g.bIndex = nil
+	if !g.batching {
+		g.pend.Store(&pendWindow{owner: goroutineToken()})
+	}
 }
 
-// finishOp closes a single write: outside Batch the op's frame is already on
-// the WAL (log-first recording), so only the layer publication remains.
-func (g *Graph) finishOp() error {
-	if !g.batching {
-		g.publishLayer()
+// finishOp closes a single write: inside Batch the boundary owns
+// publication; outside it the op is absorbed into the open window, flushing
+// only when a capacity cap fires (read entries, Batch/Seal/Close and the
+// caps are the window's flush triggers). edges is the number of edge
+// records the op appended into the window (0 for non-edge ops): an
+// edge-appending op counts only toward the edge cap, everything else only
+// toward the op cap.
+func (g *Graph) finishOp(edges int) error {
+	if g.batching {
+		return nil
+	}
+	if p := g.pend.Load(); p != nil {
+		if edges > 0 {
+			p.edges += edges
+		} else {
+			p.ops++
+		}
+		if p.ops >= pendMaxOps || p.edges >= pendMaxEdges {
+			g.cutLayer()
+		}
 	}
 	return nil
 }
+
+// flushPend materializes the caller's absorption window, if one is open and
+// the caller is its writer (direct mode: the reader IS the writer, so
+// write-then-read stays immediate). Concurrent readers that are not the
+// window's owner — and every reader of a wrapper-attached graph, whose
+// writer only ever publishes at Batch boundaries — skip the flush and keep
+// reading the last published generation. The owner-token read and the
+// g.batching read are both reached only from the writer's goroutine, so no
+// plain field is ever read across goroutines.
+func (g *Graph) flushPend() {
+	p := g.pend.Load()
+	if p == nil {
+		return
+	}
+	if g.writerAttached.Load() || p.owner != goroutineToken() {
+		return
+	}
+	if g.batching { // mid-Batch reads see the pre-batch generation (atomicity)
+		return
+	}
+	g.cutLayer()
+}
+
+// FlushPend materializes the caller's direct-mode absorption window (a
+// no-op when none is open, when another goroutine owns it, or in wrapper
+// mode). Useful before handing a graph to another goroutine or reading it
+// from one: unflushed absorbed writes are invisible to readers until the
+// writer flushes (its next query, boundary, or cap).
+func (g *Graph) FlushPend() { g.flushPend() }
 
 // nodeLive answers "is key a visible node right now" for endpoint
 // validation, consulting both the batch and the published mirrors.
@@ -383,10 +527,19 @@ func (g *Graph) checkLiveNodes(srcKey, dstKey string) error {
 
 // materializeEndpoint lifts a published (base- or older-layer-resident)
 // node into the active builder as an override record carrying its current
-// id and state, so builder-side edge ops can validate endpoints (internal/
-// delta D4: the layer cannot see the base; the writer must materialize).
+// id and state. Read locality: the layer that just absorbed a burst carries
+// its endpoints' records, so a post-write NodeByKey hits the newest layer
+// instead of miss-scanning the whole stack down to the base. The lift is
+// budgeted per window (pendLiftBudget): read-adjacent windows — every write
+// followed by a query, the write-then-read contract's hot shape — lift
+// fully, while bulk-import windows past the budget stop paying the
+// per-endpoint materialization (their reads fall through to the base or an
+// older layer; a merge or the next small window restores top-layer hits).
 func (g *Graph) materializeEndpoint(key string) {
-	if g.bLiveNodes[key] {
+	if g.builder.HasNode(key) {
+		return
+	}
+	if p := g.pend.Load(); p != nil && p.ops+p.edges >= pendLiftBudget {
 		return
 	}
 	ref, ok := g.nodes[key]
@@ -458,16 +611,28 @@ func (g *Graph) olderIncidentEdges(key string) []delta.EdgeKey {
 // index declarations) is dropped — it must not flip Sealed() or grow the
 // stack. The layers slice is extended by plain append: safe under the single
 // writer because older generations only ever read their own shorter prefix
-// (append either writes past the old len or reallocates).
+// (append either writes past the old len or reallocates). Full close: the
+// builder, the absorption window and the endpoint registry all reset — the
+// registry reset must happen even when the builder is already closed (a
+// window cut by an earlier read), or IDs from before a renumbering merge
+// would survive it (cutLayer restores the registry after this reset).
 func (g *Graph) publishLayer() {
+	g.pend.Store(nil)
 	b := g.builder
-	if b == nil {
-		return
+	var l *delta.Layer
+	if b != nil {
+		l = b.BuildWithIDs(g.bNodeIDs, g.bEdgeIDs)
 	}
-	l := b.BuildWithIDs(g.bNodeIDs, g.bEdgeIDs)
+	// full-close reset — unconditionally: a merge may have renumbered the
+	// base while the registry still holds pre-merge IDs (the window was cut
+	// by an earlier read, leaving no builder), and cutLayer restores the
+	// registry afterwards for continued bursts
 	g.builder = nil
 	g.bNodeIDs, g.bEdgeIDs = nil, nil
-	g.bLiveNodes, g.bEdgeWin, g.bEdgeN, g.bKilled, g.bIndex = nil, nil, nil, nil, nil
+	g.bLiveNodes, g.bKilled, g.bIndex = nil, nil, nil
+	if l == nil {
+		return
+	}
 
 	if l.NodeCount() == 0 && l.EdgeCount() == 0 &&
 		len(l.NodeTombstones()) == 0 && len(l.EdgeTombstones()) == 0 && len(l.IndexKeys()) == 0 {
@@ -519,6 +684,22 @@ func (g *Graph) publishLayer() {
 	})
 }
 
+// cutLayer is the mid-burst window flush: publishLayer, but the endpoint
+// registry (bNodeIDs/bLiveNodes) survives the cut. Without the carry, every
+// new window re-lifts each published endpoint its edges touch — one map
+// insert per first touch plus registry regrowth, which dominated the
+// per-op cost of write bursts. The registry stays coherent across cuts
+// because every write mutates it exactly as it mutates the published
+// mirrors. The next write's ensureBuilder reopens a fresh window counter.
+func (g *Graph) cutLayer() {
+	if g.builder == nil {
+		return
+	}
+	keepIDs, keepLive := g.bNodeIDs, g.bLiveNodes
+	g.publishLayer()
+	g.bNodeIDs, g.bLiveNodes = keepIDs, keepLive
+}
+
 // ---- public write path ------------------------------------------------------
 
 // AddNode idempotently writes a node: if the key already exists it updates
@@ -554,7 +735,7 @@ func (g *Graph) AddNode(key, label string, props map[string]any) (NodeID, error)
 	if err := g.builder.UpsertNode(key, label, props); err != nil {
 		return 0, err // unreachable for a fresh builder; surfaced anyway
 	}
-	return NodeID(id), g.finishOp()
+	return NodeID(id), g.finishOp(0)
 }
 
 // AddEdge appends a directed edge (multi-edges/self-loops both allowed).
@@ -577,18 +758,15 @@ func (g *Graph) AddEdge(srcKey, dstKey, label string, props map[string]any) (Edg
 	g.materializeEndpoint(dstKey)
 	g.labels[label] = true
 	id := g.newEdgeSlotID()
-	k := delta.EdgeKey{SrcKey: srcKey, DstKey: dstKey, Label: label}
-	g.bEdgeWin[k] = id
-	g.bEdgeN[k]++
-	delete(g.bKilled, k)
-	if err := g.builder.AddEdge(srcKey, dstKey, label, props); err != nil {
+	delete(g.bKilled, delta.EdgeKey{SrcKey: srcKey, DstKey: dstKey, Label: label})
+	if err := g.builder.AddEdgeValidated(srcKey, dstKey, label, props); err != nil {
 		return 0, err
 	}
-	return id, g.finishOp()
+	return id, g.finishOp(1)
 }
 
 // UpsertEdge replaces-by-key: if live edges with the same (src, dst, label)
-// exist anywhere in the visible state (base or layers), the triple collapses
+// triple exist anywhere in the visible state (base or layers), the triple collapses
 // onto one edge — the visible edge keeps its EdgeID and its Props are
 // replaced wholesale; otherwise a new edge is appended. Unlike AddEdge (pure
 // append, multigraph semantics) this method guarantees the triple is unique
@@ -613,8 +791,8 @@ func (g *Graph) UpsertEdge(srcKey, dstKey, label string, props map[string]any) (
 	g.labels[label] = true
 	k := delta.EdgeKey{SrcKey: srcKey, DstKey: dstKey, Label: label}
 	var id EdgeID
-	if g.bEdgeN[k] > 0 {
-		id = g.bEdgeWin[k] // fold onto this batch's most recent parallel (in place)
+	if _, last, live := g.builder.EdgeSlots(k); live {
+		id = EdgeID(g.bEdgeIDs[last]) // fold onto this batch's most recent parallel (in place)
 	} else {
 		// the fold appends a slot in this layer: it carries either the
 		// transferred winner ID (visible edge keeps its ID) or a fresh one
@@ -626,13 +804,11 @@ func (g *Graph) UpsertEdge(srcKey, dstKey, label string, props map[string]any) (
 		}
 		g.bEdgeIDs = append(g.bEdgeIDs, uint32(id))
 	}
-	if err := g.builder.UpsertEdgeFold(srcKey, dstKey, label, props); err != nil {
+	if err := g.builder.UpsertEdgeFoldValidated(srcKey, dstKey, label, props); err != nil {
 		return 0, err
 	}
-	g.bEdgeWin[k] = id
-	g.bEdgeN[k] = 1 // the fold guarantees triple uniqueness within the batch
 	delete(g.bKilled, k)
-	return id, g.finishOp()
+	return id, g.finishOp(1)
 }
 
 // DeleteEdge removes every live parallel edge with the given (src, dst,
@@ -653,7 +829,12 @@ func (g *Graph) DeleteEdge(srcKey, dstKey, label string) (int, error) {
 		return 0, nil // label never used by an edge: no match possible, idempotent success
 	}
 	k := delta.EdgeKey{SrcKey: srcKey, DstKey: dstKey, Label: label}
-	n := g.bEdgeN[k]
+	n := 0
+	if g.builder != nil {
+		if c, _, live := g.builder.EdgeSlots(k); live {
+			n = c // this batch's parallels
+		}
+	}
 	if !g.bKilled[k] {
 		n += g.edges[k].n // published parallels (base + older layers)
 	}
@@ -665,9 +846,7 @@ func (g *Graph) DeleteEdge(srcKey, dstKey, label string) (int, error) {
 		return 0, err
 	}
 	g.bKilled[k] = true
-	g.bEdgeN[k] = 0
-	delete(g.bEdgeWin, k)
-	return n, g.finishOp()
+	return n, g.finishOp(0)
 }
 
 // DeleteNode removes a node and cascade-deletes all its incident edges
@@ -699,19 +878,14 @@ func (g *Graph) DeleteNode(key string) (int, error) {
 		return 0, err
 	}
 	g.bLiveNodes[key] = false
-	for k := range g.bEdgeN {
-		if k.SrcKey == key || k.DstKey == key {
-			g.bEdgeN[k] = 0
-			g.bKilled[k] = true
-			delete(g.bEdgeWin, k)
-		}
-	}
 	for _, k := range hookKeys {
+		// mark published parallels killed so later same-batch upserts draw
+		// fresh IDs (ratchet discipline) and DeleteNode's own hook skips
+		// re-counting them; the builder's cascade already tombstoned the
+		// in-window parallels.
 		g.bKilled[k] = true
-		g.bEdgeN[k] = 0
-		delete(g.bEdgeWin, k)
 	}
-	return n, g.finishOp()
+	return n, g.finishOp(0)
 }
 
 // --- WAL op recorder ---------------------------------------------------------
@@ -903,7 +1077,7 @@ func (g *Graph) Batch(fn func(*Graph)) error {
 			// in pendOps for the next flush, T2 discipline).
 			g.builder = nil
 			g.bNodeIDs, g.bEdgeIDs = nil, nil
-			g.bLiveNodes, g.bEdgeWin, g.bEdgeN, g.bKilled, g.bIndex = nil, nil, nil, nil, nil
+			g.bLiveNodes, g.bKilled, g.bIndex = nil, nil, nil
 		}
 	}()
 	fn(g)
@@ -1077,14 +1251,16 @@ func (g *Graph) cleanupSnapshots(keep string) {
 // re-attempted by the next flush, because a frame whose fsync reported
 // failure may still be on disk.
 //
-// WALOff sessions: Close only flips to closed (writes then return ErrClosed;
-// durability was the caller's job, v0.6 style). In both modes queries stay
-// legal after Close.
+// WALOff sessions: materialize any open absorption window (queries must
+// keep seeing every write after Close) and flip to closed (writes then
+// return ErrClosed; durability was the caller's job, v0.6 style). In both
+// modes queries stay legal after Close.
 func (g *Graph) Close() error {
 	if g.closed {
 		return nil
 	}
 	if g.wal == nil {
+		g.publishLayer()
 		g.closed = true
 		return nil
 	}
@@ -1130,14 +1306,17 @@ func (g *Graph) Close() error {
 // ---- point queries (three-source: layers new→old + base, tombstones) --------
 
 // NodeByKey finds the winning (newest live) record for key across base and
-// layers; tombstoned keys are invisible.
+// layers; tombstoned keys are invisible. The entry materializes the caller's
+// absorption window first (direct mode: write-then-read is immediate).
 func (g *Graph) NodeByKey(key string) (Node, bool) {
+	g.flushPend()
 	return g.view.Load().nodeWinner(key)
 }
 
 // NodeByID resolves an ID to its visible record. Overridden/deleted records
 // (whose IDs may still be listed by older layers) do not resolve.
 func (g *Graph) NodeByID(id NodeID) (Node, bool) {
+	g.flushPend()
 	return g.view.Load().nodeByID(id)
 }
 
@@ -1179,6 +1358,7 @@ func (v *genView) nodeByID(id NodeID) (Node, bool) {
 // resolved first (a fold transfers the winner ID onto the newer record);
 // base records resolve unless a layer tombstones their key.
 func (g *Graph) EdgeByID(id EdgeID) (Edge, bool) {
+	g.flushPend()
 	return g.view.Load().edgeByID(id)
 }
 
@@ -1215,14 +1395,15 @@ func (v *genView) edgeByID(id EdgeID) (Edge, bool) {
 }
 
 // NodeCount/EdgeCount report the visible size of the whole generation
-// (base minus tombstoned plus visible layer records).
-func (g *Graph) NodeCount() int { return g.view.Load().nodes }
+// (base minus tombstoned plus visible layer records). Both materialize the
+// caller's absorption window first.
+func (g *Graph) NodeCount() int { g.flushPend(); return g.view.Load().nodes }
 
-func (g *Graph) EdgeCount() int { return g.view.Load().edges }
+func (g *Graph) EdgeCount() int { g.flushPend(); return g.view.Load().edges }
 
 // Sealed reports whether the graph has no unmerged micro-layers. It flips to
 // false with the first write after a merge and back on Seal/forceMerge.
-func (g *Graph) Sealed() bool { return len(g.view.Load().layers) == 0 }
+func (g *Graph) Sealed() bool { g.flushPend(); return len(g.view.Load().layers) == 0 }
 
 // WALSize reports the valid WAL frame bytes logged since the last checkpoint
 // (0 when no WAL is attached) — the volume input for checkpoint triggers.
@@ -1237,6 +1418,7 @@ func (g *Graph) WALSize() int64 {
 // SCC compression results of the base. With unmerged layers present only the
 // counts are reported (SCC structures exist on the merged base only).
 func (g *Graph) Stats() Stats {
+	g.flushPend()
 	v := g.view.Load()
 	if len(v.layers) > 0 {
 		return Stats{Nodes: v.nodes, Edges: v.edges}
@@ -1406,9 +1588,12 @@ func (v *genView) baseEdgeKeyFrom(er engine.EdgeRec) delta.EdgeKey {
 // The old generation stays readable for concurrent holders; memory is
 // reclaimed by GC. Cycles() uses this before answering (spec §3.2).
 func (g *Graph) forceMerge() error {
-	if g.builder != nil {
-		g.publishLayer() // a mid-batch Seal flushes the pending batch first
-	}
+	// unconditional: a mid-batch Seal flushes the pending batch, and even
+	// with the builder already closed (window cut by an earlier read) the
+	// endpoint registry must be dropped — the merge below renumbers IDs, and
+	// a surviving registry entry would stamp a pre-merge ID onto a post-
+	// merge record (two live nodes sharing one ID).
+	g.publishLayer()
 	v := g.view.Load()
 	if len(v.layers) == 0 && !g.rebaseHappened.Load() {
 		return nil
@@ -1521,8 +1706,10 @@ func (g *Graph) checkpoint(lsn uint64) error {
 // logical view (base ∪ layers, tombstones applied — merge-on-demand into a
 // temporary record set, nothing published). Property-index declarations —
 // effective and pending — are persisted too (store v3), so Load restores
-// both the graph and its lookup indexes.
+// both the graph and its lookup indexes. The entry materializes the
+// caller's absorption window first.
 func (g *Graph) Save(w io.Writer) error {
+	g.flushPend()
 	nodes, edges, labels, indexKeys := g.unionRecords()
 	sn := make([]store.Node, len(nodes))
 	for i, n := range nodes {
@@ -1688,9 +1875,7 @@ func (g *Graph) IndexProperty(key string) *Graph {
 	g.ensureBuilder()
 	g.builder.IndexProperty(key)
 	g.bIndex = append(g.bIndex, key)
-	if !g.batching {
-		g.publishLayer()
-	}
+	g.finishOp(0) // absorbed like any other unbatched write (cap-checked)
 	return g
 }
 
@@ -1715,10 +1900,13 @@ func (g *Graph) indexDeclared(key string) bool {
 // base's effective keys plus pending declarations from unmerged layers
 // (sorted; nil when none). It answers from the published generation only —
 // a declaration made inside a running Batch becomes visible at its boundary
-// like every other batch write — which keeps it lock-free. Consumers that
-// persist or hand over a graph (snapshot services, clone-and-extend flows)
-// use it to preserve index configuration.
+// like every other batch write — which keeps it lock-free. The entry
+// materializes the caller's absorption window first (a declaration absorbed
+// mid-window is included). Consumers that persist or hand over a graph
+// (snapshot services, clone-and-extend flows) use it to preserve index
+// configuration.
 func (g *Graph) IndexedPropertyKeys() []string {
+	g.flushPend()
 	v := g.view.Load()
 	seen := make(map[string]bool)
 	var out []string
@@ -1744,8 +1932,10 @@ func (g *Graph) IndexedPropertyKeys() []string {
 // records (base ∪ layers) build the clone's fresh base, so the clone starts
 // fully merged and writable. Props maps share references per the sharing
 // contract (relies on "replace, don't mutate" discipline). The server
-// module's hot-swap publisher uses it to clone the live graph.
+// module's hot-swap publisher uses it to clone the live graph. The entry
+// materializes the caller's absorption window first.
 func (g *Graph) Clone() *Graph {
+	g.flushPend()
 	nodes, edges, labels, indexKeys := g.unionRecords()
 	c, err := graphFromEngine(nodes, edges, labels, indexKeys)
 	if err != nil { // engine.Seal of valid records cannot fail; fail loud over corrupt state
@@ -1815,8 +2005,10 @@ func (g *Graph) LookupByBool(key string, v bool) ([]Node, bool) {
 // lookupNodes is the shared three-source lookup: base hits (from the index
 // when effective, or a full base scan for pending keys) overridden by layer
 // records and carved by layer tombstones, then filtered by match over the
-// winner's props.
+// winner's props. The entry materializes the caller's absorption window
+// (every LookupBy* passes through here).
 func (g *Graph) lookupNodes(key string, baseIndex func(*genView) ([]uint32, bool), match func(map[string]any) bool) ([]Node, bool) {
+	g.flushPend()
 	return lookupNodesOf(g.view.Load(), key, baseIndex, match)
 }
 

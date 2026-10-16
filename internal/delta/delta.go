@@ -33,6 +33,7 @@ package delta
 import (
 	"errors"
 	"fmt"
+	"sync/atomic" // atomic.Pointer only — the lazy Layer edge-ID index (A8 allows atomics)
 )
 
 // EdgeKey is the logical identity of an edge: the (src, dst, label) triple
@@ -87,19 +88,22 @@ var (
 // record). ID structures are nil for plain-Build layers; all ID accessors
 // miss there.
 type Layer struct {
-	nodes     []NodeRec         // live nodes, first-write slot order
-	nodeIdx   map[string]int    // key -> index into nodes
-	edges     []EdgeRec         // live edges, append order (dead slots dropped)
-	edgeIdx   map[EdgeKey][]int // live edge indices per key, append order
-	nodeTomb  map[string]bool   // base node keys to shadow
-	edgeTomb  map[EdgeKey]bool  // base edge keys to shadow
-	labels    []string          // labels introduced this layer, dedup, stable
-	indexKeys []string          // pending index declarations
+	nodes     []NodeRec        // live nodes, first-write slot order
+	nodeIdx   map[string]int   // key -> index into nodes
+	edges     []EdgeRec        // live edges, append order (dead slots dropped)
+	nodeTomb  map[string]bool  // base node keys to shadow
+	edgeTomb  map[EdgeKey]bool // base edge keys to shadow
+	labels    []string         // labels introduced this layer, dedup, stable
+	indexKeys []string         // pending index declarations
 
 	nodeIDs   map[string]uint32 // key -> writer-assigned ID (BuildWithIDs only)
 	nodeIDIdx map[uint32]int    // writer-assigned ID -> index into nodes
 	edgeIDs   []uint32          // writer-assigned ID per live edge, append order
-	edgeIDIdx map[uint32]int    // writer-assigned ID -> index into edges
+	// edgeIDIdx maps writer-assigned edge ID -> index into edges, built
+	// lazily on the first FindEdgeID: write bursts cut layer after layer
+	// without ever resolving an edge by ID, and concurrent first-readers
+	// racing the build produce identical maps (atomic publish, no locks).
+	edgeIDIdx atomic.Pointer[map[uint32]int]
 }
 
 // LookupNode returns the layer's live record for key. Base shadowing and
@@ -167,8 +171,22 @@ func (l *Layer) FindNodeID(id uint32) (int, bool) {
 func (l *Layer) EdgeIDAt(i int) uint32 { return l.edgeIDs[i] }
 
 // FindEdgeID resolves a writer-assigned edge ID to its index into Edges().
+// The ID index is built on first use (see the edgeIDIdx field note); misses
+// on plain-Build layers.
 func (l *Layer) FindEdgeID(id uint32) (int, bool) {
-	i, ok := l.edgeIDIdx[id]
+	m := l.edgeIDIdx.Load()
+	if m == nil {
+		if l.edgeIDs == nil {
+			return 0, false
+		}
+		built := make(map[uint32]int, len(l.edgeIDs))
+		for i, eid := range l.edgeIDs {
+			built[eid] = i
+		}
+		l.edgeIDIdx.Store(&built)
+		m = &built
+	}
+	i, ok := (*m)[id]
 	return i, ok
 }
 
@@ -180,27 +198,25 @@ type nodeState struct {
 	deleted bool // in-layer tombstone, revivable
 }
 
-// edgeState is one edge slot in the Builder's append-only edge area.
-// deleted=true is an in-layer tombstone (folded parallels, DeleteEdge,
-// DeleteNode cascade); Build drops the slot — in-layer tombstones never
-// surface, only base tombstones do.
-type edgeState struct {
-	rec     EdgeRec
-	deleted bool
-}
-
 // Builder accumulates one write batch (a future micro-layer). It is private
 // to the single writer (spec D5) and not safe for concurrent use. Every
 // method copies incoming props maps, so callers may reuse their maps
 // afterwards. After Build the Builder is frozen: write methods return
 // ErrSealed and a second Build panics. Builders come from NewBuilder.
+//
+// The edge area is a pair of parallel arrays — records plus a dead bitmap —
+// instead of a flagged struct: Build's no-dead-slots fast path can then
+// adopt the record slice wholesale (types already match), which keeps
+// append-only batches copy-free.
 type Builder struct {
-	nodes   []nodeState
-	byKey   map[string]int // node key -> slot in nodes
-	deadN   int            // deleted node slots (live = len(nodes)-deadN)
-	edges   []edgeState
-	edgeIdx map[EdgeKey][]int // live edge slots per key, append order
-	deadE   int               // deleted edge slots
+	nodes        []nodeState
+	byKey        map[string]int    // node key -> slot in nodes
+	deadN        int               // deleted node slots (live = len(nodes)-deadN)
+	edges        []EdgeRec         // append order; dead slots keep their positions
+	edgeDead     []bool            // parallel to edges: in-layer tombstone (fold, delete, cascade)
+	edgeIdx      map[EdgeKey][]int // live edge slots per key, append order
+	edgeIdxBuilt bool              // false while only appends happened (lazy index)
+	deadE        int               // deleted edge slots
 
 	labels    []string // first-seen order, deduped (nodes and edges)
 	labelSeen map[string]bool
@@ -220,6 +236,26 @@ func NewBuilder() *Builder {
 		labelSeen: map[string]bool{},
 		nodeTomb:  map[string]bool{},
 		edgeTomb:  map[EdgeKey]bool{},
+	}
+}
+
+// ensureEdgeIdx materializes the per-key index over the current live edge
+// slots. appendEdge skips index maintenance while nothing needs it — the
+// index (a map insert plus a small allocation per key) dominated the per-op
+// cost of append-only batches — so it is built lazily on the first
+// fold/delete/slots use and maintained eagerly afterwards.
+func (b *Builder) ensureEdgeIdx() {
+	if b.edgeIdxBuilt {
+		return
+	}
+	b.edgeIdxBuilt = true
+	for i := range b.edges {
+		if b.edgeDead[i] {
+			continue
+		}
+		r := b.edges[i]
+		k := EdgeKey{SrcKey: r.SrcKey, DstKey: r.DstKey, Label: r.Label}
+		b.edgeIdx[k] = append(b.edgeIdx[k], i)
 	}
 }
 
@@ -252,11 +288,15 @@ func (b *Builder) nodeLive(key string) bool {
 }
 
 // appendEdge is the shared tail of AddEdge/UpsertEdgeFold
-// (vectra.appendEdge): append the record and register it under its key.
+// (vectra.appendEdge): append the record and register it under its key
+// (index maintenance is skipped while the lazy index is unbuilt).
 func (b *Builder) appendEdge(srcKey, dstKey, label string, props map[string]any) {
-	b.edges = append(b.edges, edgeState{rec: EdgeRec{SrcKey: srcKey, DstKey: dstKey, Label: label, Props: copyProps(props)}})
-	k := EdgeKey{SrcKey: srcKey, DstKey: dstKey, Label: label}
-	b.edgeIdx[k] = append(b.edgeIdx[k], len(b.edges)-1)
+	b.edges = append(b.edges, EdgeRec{SrcKey: srcKey, DstKey: dstKey, Label: label, Props: copyProps(props)})
+	b.edgeDead = append(b.edgeDead, false)
+	if b.edgeIdxBuilt {
+		k := EdgeKey{SrcKey: srcKey, DstKey: dstKey, Label: label}
+		b.edgeIdx[k] = append(b.edgeIdx[k], len(b.edges)-1)
+	}
 }
 
 // UpsertNode is vectra.AddNode: a new key appends; an existing key
@@ -300,6 +340,42 @@ func (b *Builder) AddEdge(srcKey, dstKey, label string, props map[string]any) er
 	return nil
 }
 
+// AddEdgeValidated is AddEdge for endpoints the CALLER has already validated
+// against the whole visible state (the root facade does, per the package
+// doc): the record is appended without consulting this builder's node
+// registry. The root uses it so published-resident endpoints need not be
+// materialized into the layer — edge records are self-contained (string
+// endpoints), resolution happens at read time, so the lift would only
+// duplicate published state and cost a map insert per first touch.
+func (b *Builder) AddEdgeValidated(srcKey, dstKey, label string, props map[string]any) error {
+	if b.built {
+		return ErrSealed
+	}
+	b.internLabel(label)
+	b.appendEdge(srcKey, dstKey, label, props)
+	return nil
+}
+
+// HasNode reports whether key is a live node of this builder (written or
+// materialized this window). The root uses it to lift each published-
+// resident endpoint at most once per builder.
+func (b *Builder) HasNode(key string) bool {
+	i, ok := b.byKey[key]
+	return ok && !b.nodes[i].deleted
+}
+
+// EdgeSlots reports the live in-builder parallels of k: how many and the
+// slot index of the most recent one (the fold target). Dead slots are not
+// counted — deletes and folds drop them from the index.
+func (b *Builder) EdgeSlots(k EdgeKey) (n, last int, ok bool) {
+	b.ensureEdgeIdx()
+	ids := b.edgeIdx[k]
+	if len(ids) == 0 {
+		return 0, 0, false
+	}
+	return len(ids), ids[len(ids)-1], true
+}
+
 // UpsertEdgeFold is vectra.UpsertEdge: guarantees the (src, dst, label)
 // triple is unique in the visible state. Live layer parallels of the key
 // collapse onto the most recent one — props replaced wholesale, extra
@@ -316,18 +392,32 @@ func (b *Builder) UpsertEdgeFold(srcKey, dstKey, label string, props map[string]
 	if !b.nodeLive(srcKey) || !b.nodeLive(dstKey) {
 		return ErrNodeNotFound
 	}
+	return b.upsertEdgeFold(srcKey, dstKey, label, props)
+}
+
+// UpsertEdgeFoldValidated is UpsertEdgeFold for pre-validated endpoints
+// (see AddEdgeValidated).
+func (b *Builder) UpsertEdgeFoldValidated(srcKey, dstKey, label string, props map[string]any) error {
+	if b.built {
+		return ErrSealed
+	}
+	return b.upsertEdgeFold(srcKey, dstKey, label, props)
+}
+
+func (b *Builder) upsertEdgeFold(srcKey, dstKey, label string, props map[string]any) error {
 	b.internLabel(label)
 	k := EdgeKey{SrcKey: srcKey, DstKey: dstKey, Label: label}
+	b.ensureEdgeIdx()
 	ids := b.edgeIdx[k]
 	if len(ids) == 0 {
 		b.appendEdge(srcKey, dstKey, label, props)
 	} else {
 		for _, id := range ids[:len(ids)-1] { // drop extra parallels, keep the most recent
-			b.edges[id].deleted = true
+			b.edgeDead[id] = true
 			b.deadE++
 		}
 		keep := ids[len(ids)-1]
-		b.edges[keep].rec.Props = copyProps(props) // wholesale replacement
+		b.edges[keep].Props = copyProps(props) // wholesale replacement
 		b.edgeIdx[k] = []int{keep}
 	}
 	b.edgeTomb[k] = true
@@ -345,10 +435,11 @@ func (b *Builder) DeleteEdge(k EdgeKey) (int, error) {
 	if b.built {
 		return 0, ErrSealed
 	}
+	b.ensureEdgeIdx()
 	n := 0
 	if ids, ok := b.edgeIdx[k]; ok {
 		for _, id := range ids {
-			b.edges[id].deleted = true
+			b.edgeDead[id] = true
 		}
 		n = len(ids)
 		b.deadE += n
@@ -381,20 +472,25 @@ func (b *Builder) DeleteNode(key string, baseEdges func(key string) []EdgeKey) (
 	if b.built {
 		return 0, ErrSealed
 	}
+	b.ensureEdgeIdx()
 	removed := 0
-	if i, ok := b.byKey[key]; ok && !b.nodes[i].deleted {
-		for k, ids := range b.edgeIdx { // deleting during range is safe in Go
-			if k.SrcKey != key && k.DstKey != key {
-				continue
-			}
-			for _, id := range ids {
-				b.edges[id].deleted = true
-			}
-			b.deadE += len(ids)
-			removed += len(ids)
-			b.edgeTomb[k] = true // base may hold a copy of this key
-			delete(b.edgeIdx, k)
+	// The edge cascade runs whether or not key was written in this builder:
+	// endpoints may be published-resident and unmaterialized (AddEdgeValidated
+	// deliberately skips materializing them), yet their in-builder edges must
+	// still die with the node.
+	for k, ids := range b.edgeIdx { // deleting during range is safe in Go
+		if k.SrcKey != key && k.DstKey != key {
+			continue
 		}
+		for _, id := range ids {
+			b.edgeDead[id] = true
+		}
+		b.deadE += len(ids)
+		removed += len(ids)
+		b.edgeTomb[k] = true // base may hold a copy of this key
+		delete(b.edgeIdx, k)
+	}
+	if i, ok := b.byKey[key]; ok && !b.nodes[i].deleted {
 		b.nodes[i].deleted = true
 		b.deadN++
 	}
@@ -441,6 +537,13 @@ func (b *Builder) Build() *Layer { return b.BuildWithIDs(nil, nil) }
 // slot count (misalignment panics). Dead slots drop out together with their
 // IDs; the surviving records' IDs are exposed via the Layer ID accessors.
 // nil nodeIDs/edgeIDs build an ID-less Layer (plain Build).
+//
+// Fast path: a batch whose edge area has no dead slots adopts the builder's
+// record slice and the caller's edgeIDs slice wholesale (slots are already
+// live-aligned, and both builders and ID slices are single-use) — no
+// per-record copy, no slot remap. The ID→index lookup maps build lazily on
+// first use instead of per layer: write bursts cut layer after layer
+// without ever resolving an edge by ID.
 func (b *Builder) BuildWithIDs(nodeIDs map[string]uint32, edgeIDs []uint32) *Layer {
 	if b.built {
 		panic("delta: Builder.Build called twice")
@@ -451,7 +554,6 @@ func (b *Builder) BuildWithIDs(nodeIDs map[string]uint32, edgeIDs []uint32) *Lay
 	b.built = true
 	l := &Layer{
 		nodeIdx:   make(map[string]int, len(b.nodes)-b.deadN),
-		edgeIdx:   make(map[EdgeKey][]int, len(b.edgeIdx)),
 		nodeTomb:  b.nodeTomb,
 		edgeTomb:  b.edgeTomb,
 		labels:    b.labels,
@@ -465,24 +567,38 @@ func (b *Builder) BuildWithIDs(nodeIDs map[string]uint32, edgeIDs []uint32) *Lay
 		l.nodeIdx[ns.rec.Key] = len(l.nodes)
 		l.nodes = append(l.nodes, ns.rec)
 	}
-	var slot2live []int
-	if edgeIDs != nil {
-		slot2live = make([]int, len(b.edges))
-	}
-	l.edges = make([]EdgeRec, 0, len(b.edges)-b.deadE)
-	for i, es := range b.edges {
-		if es.deleted {
-			if slot2live != nil {
-				slot2live[i] = -1
+	if b.deadE == 0 {
+		// adopt: every slot is live, so the builder's records and the
+		// caller's per-slot IDs are already the layer's arrays
+		l.edges = b.edges
+		l.edgeIDs = edgeIDs
+	} else {
+		var slot2live []int
+		if edgeIDs != nil {
+			slot2live = make([]int, len(b.edges))
+		}
+		l.edges = make([]EdgeRec, 0, len(b.edges)-b.deadE)
+		for i := range b.edges {
+			if b.edgeDead[i] {
+				if slot2live != nil {
+					slot2live[i] = -1
+				}
+				continue
 			}
-			continue
+			if slot2live != nil {
+				slot2live[i] = len(l.edges)
+			}
+			l.edges = append(l.edges, b.edges[i])
 		}
-		k := EdgeKey{SrcKey: es.rec.SrcKey, DstKey: es.rec.DstKey, Label: es.rec.Label}
-		l.edgeIdx[k] = append(l.edgeIdx[k], len(l.edges))
-		if slot2live != nil {
-			slot2live[i] = len(l.edges)
+		if edgeIDs != nil {
+			l.edgeIDs = make([]uint32, len(l.edges))
+			for slot, live := range slot2live {
+				if live < 0 {
+					continue
+				}
+				l.edgeIDs[live] = edgeIDs[slot]
+			}
 		}
-		l.edges = append(l.edges, es.rec)
 	}
 	if nodeIDs != nil {
 		l.nodeIDs = make(map[string]uint32, len(l.nodes))
@@ -494,18 +610,6 @@ func (b *Builder) BuildWithIDs(nodeIDs map[string]uint32, edgeIDs []uint32) *Lay
 			}
 			l.nodeIDs[rec.Key] = id
 			l.nodeIDIdx[id] = i
-		}
-	}
-	if edgeIDs != nil {
-		l.edgeIDs = make([]uint32, len(l.edges))
-		l.edgeIDIdx = make(map[uint32]int, len(l.edges))
-		for slot, live := range slot2live {
-			if live < 0 {
-				continue
-			}
-			id := edgeIDs[slot]
-			l.edgeIDs[live] = id
-			l.edgeIDIdx[id] = live
 		}
 	}
 	return l

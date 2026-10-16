@@ -279,6 +279,59 @@ func TestV07A3PointQueryAfterWrite(t *testing.T) {
 	}
 }
 
+// ---- A4: WAL-Off unbatched direct-mode import throughput (hardening line) ----
+
+// TestV07A4DirectModeUnbatchedImport: the A4 hardening regression guard —
+// unbatched per-op direct writes (WAL off, the v0.6 idiom) at a floor of
+// 1.5M edges/s in the test process (4x the pre-fix 0.36-0.41M; the floor is
+// deliberately conservative against machine/thermal variance — losing the
+// absorption window costs ~10x, which it catches with huge margin). The
+// acceptance comparison itself — ≥0.9x the recorded v0.6.0 baseline (4.09M
+// edges/s) — is measured by the two-worktree `make bench SIZE=medium
+// MODE=engine` protocol (the standalone bench harness runs ~20% hotter than
+// a Go test binary; docs/benchmarks/2026-10-15-delta-wal.md records both
+// readings and the same-session ratio).
+func TestV07A4DirectModeUnbatchedImport(t *testing.T) {
+	dur := v07BenchSecs(t, 1) // -short guard + env plumbing
+	_ = dur
+	const nodes = 100_000
+	const edges = 1_000_000 // the medium harness shape (fixed count, no per-op clock)
+
+	g := vectra.New()
+	keys := make([]string, nodes)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("n%08d", i)
+	}
+	for i := 0; i < nodes; i += 10_000 {
+		_ = g.Batch(func(g *vectra.Graph) {
+			for j := i; j < i+10_000; j++ {
+				_, _ = g.AddNode(keys[j], "Svc", nil)
+			}
+		})
+	}
+	rng := rand.New(rand.NewSource(42))
+	t0 := time.Now()
+	for i := 0; i < edges; i++ {
+		_, _ = g.AddEdge(keys[rng.Intn(nodes)], keys[rng.Intn(nodes)], "CALLS", nil)
+	}
+	elapsed := time.Since(t0)
+	rate := float64(edges) / elapsed.Seconds()
+	t.Logf("A4: %d unbatched AddEdge in %s = %.0f edges/s (in-test floor ≥1.5M)",
+		edges, elapsed, rate)
+	if v07RaceBuild {
+		// -race multiplies the write path ~5-10x — the absolute floor is a
+		// non-race assertion (like A6's heavy tiers; full-scale numbers come
+		// from the non-race runs in docs/benchmarks)
+		t.Skipf("race build: measured %.0f edges/s, floor asserted in non-race builds only", rate)
+	}
+	if rate < 1.5e6 {
+		t.Errorf("A4 FAIL: unbatched direct-mode import %.0f edges/s — the absorption window regressed (floor 1.5M in-test)", rate)
+	}
+	if err := g.Seal(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // ---- A5: WAL Always + Batch group-commit throughput ---------------------------
 
 // TestV07A5WALGroupCommit: direct-mode Batch group commit — one frame + one
