@@ -47,17 +47,24 @@ func (g *Graph) Cypher(query string) (*CypherResult, error) {
 	}
 	out := &CypherResult{Columns: res.Columns, Rows: res.Rows}
 	// retype engine-facing values into the public Node/Edge types (resolved
-	// through the same generation the query ran on — layer records included)
+	// through the same generation the query ran on — layer records included).
+	// A resolution miss is impossible when query and retype share a
+	// generation; nil the cell rather than leak the internal value if the
+	// invariant ever breaks.
 	for _, r := range out.Rows {
 		for k, cell := range r {
 			switch tv := cell.(type) {
 			case cypher.NodeVal:
 				if n, ok := v.nodeByID(NodeID(tv.ID)); ok {
 					r[k] = Node{ID: n.ID, Key: n.Key, Label: n.Label, Props: n.Props}
+				} else {
+					r[k] = nil
 				}
 			case cypher.EdgeVal:
 				if e, ok := v.edgeByID(EdgeID(tv.ID)); ok {
 					r[k] = Edge{ID: e.ID, Src: e.Src, Dst: e.Dst, Label: e.Label, Props: e.Props}
+				} else {
+					r[k] = nil
 				}
 			}
 		}

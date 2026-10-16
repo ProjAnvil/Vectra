@@ -79,7 +79,7 @@ func NewView(base *Snapshot, sources []DeltaSource, nodeCount int) *View {
 		v.labels = append(v.labels, name)
 		return id
 	}
-	for i := 0; i < base.LabelCount(); i++ {
+	for i := range base.LabelCount() {
 		intern(base.LabelName(uint32(i)))
 	}
 	if len(sources) > 0 {

@@ -64,7 +64,7 @@ func TestLoadV2SnapshotHasNoIndexDeclarations(t *testing.T) {
 	body = binary.LittleEndian.AppendUint32(body, 4)
 	body = append(body, 'n', 'o', 'd', 'e') // key "node"
 	body = binary.LittleEndian.AppendUint32(body, 1)
-	body = append(body, 'L') // label "L"
+	body = append(body, 'L')                         // label "L"
 	body = binary.LittleEndian.AppendUint32(body, 0) // props nil
 	body = binary.LittleEndian.AppendUint32(body, crc32.ChecksumIEEE(body))
 

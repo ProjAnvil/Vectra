@@ -107,7 +107,7 @@ func (v *genView) engineView() *engine.View {
 	// base label name -> base LabelID (dead-base matching needs it: base rows
 	// carry LabelIDs, tombstones carry names)
 	baseLab := make(map[string]uint32, v.base.LabelCount())
-	for i := 0; i < v.base.LabelCount(); i++ {
+	for i := range v.base.LabelCount() {
 		baseLab[v.base.LabelName(uint32(i))] = uint32(i)
 	}
 	// cumulative live-record index: key -> record EdgeIDs indexed so far

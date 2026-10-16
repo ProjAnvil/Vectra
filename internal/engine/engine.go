@@ -11,6 +11,7 @@ package engine
 import (
 	"cmp"
 	"encoding/json"
+	"maps"
 	"slices"
 	"sort"
 
@@ -365,12 +366,7 @@ func (s *Snapshot) IndexedKeys() []string {
 	if len(s.indexes) == 0 {
 		return nil
 	}
-	keys := make([]string, 0, len(s.indexes))
-	for k := range s.indexes {
-		keys = append(keys, k)
-	}
-	slices.Sort(keys)
-	return keys
+	return slices.Sorted(maps.Keys(s.indexes))
 }
 
 // ExportNodes / ExportEdges return the raw record slices (shared references,

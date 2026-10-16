@@ -133,7 +133,7 @@ func BFS(src RowSource, starts []uint32, cfg Config) *Result {
 		}
 	}
 	if cfg.ParallelThreshold == 0 {
-		cfg.ParallelThreshold = 1 // 0 means force parallel: any non-empty layer goes parallel
+		cfg.ParallelThreshold = 1 // 0 behaves as 1; worker count is still chunk-sized (see expand*Parallel), so small layers stay serial
 	}
 	visited := visitedPool.acquire(wordsFor(int(n)))
 	defer visitedPool.release(visited)
@@ -155,6 +155,9 @@ func BFS(src RowSource, starts []uint32, cfg Config) *Result {
 			} else {
 				next = expandLayerSerial(adj, cfg, visited, frontier)
 			}
+			if len(next) == 0 {
+				break // exhausted: no trailing empty layer (MaxDepth cut has none either)
+			}
 			for _, v := range next {
 				res.depth[v] = depth
 			}
@@ -170,6 +173,9 @@ func BFS(src RowSource, starts []uint32, cfg Config) *Result {
 			next = expandRowsParallel(r, cfg, visited, frontier)
 		} else {
 			next = expandRowsSerial(r, cfg, visited, frontier)
+		}
+		if len(next) == 0 {
+			break // exhausted: no trailing empty layer (MaxDepth cut has none either)
 		}
 		for _, v := range next {
 			res.depth[v] = depth
@@ -228,15 +234,13 @@ func expandLayerParallel(adj csr.Adjacency, cfg Config, visited []uint32, fronti
 	chunk := (len(frontier) + workers - 1) / workers
 	locals := make([][]uint32, workers)
 	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		lo := w * chunk
 		if lo >= len(frontier) {
 			break
 		}
 		hi := min(lo+chunk, len(frontier))
-		wg.Add(1)
-		go func(w, lo, hi int) {
-			defer wg.Done()
+		wg.Go(func() {
 			local := make([]uint32, 0, (hi-lo)*2)
 			for _, u := range frontier[lo:hi] {
 				tg, _, lb := adj.Row(u)
@@ -256,7 +260,7 @@ func expandLayerParallel(adj csr.Adjacency, cfg Config, visited []uint32, fronti
 				}
 			}
 			locals[w] = local
-		}(w, lo, hi)
+		})
 	}
 	wg.Wait()
 	var next []uint32
@@ -292,15 +296,13 @@ func expandRowsParallel(r rower, cfg Config, visited []uint32, frontier []uint32
 	chunk := (len(frontier) + workers - 1) / workers
 	locals := make([][]uint32, workers)
 	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		lo := w * chunk
 		if lo >= len(frontier) {
 			break
 		}
 		hi := min(lo+chunk, len(frontier))
-		wg.Add(1)
-		go func(w, lo, hi int) {
-			defer wg.Done()
+		wg.Go(func() {
 			local := make([]uint32, 0, (hi-lo)*2)
 			for _, u := range frontier[lo:hi] {
 				tg, _, lb := r.Row(u)
@@ -320,7 +322,7 @@ func expandRowsParallel(r rower, cfg Config, visited []uint32, frontier []uint32
 				}
 			}
 			locals[w] = local
-		}(w, lo, hi)
+		})
 	}
 	wg.Wait()
 	var next []uint32
@@ -334,6 +336,8 @@ func expandRowsParallel(r rower, cfg Config, visited []uint32, frontier []uint32
 // ascending by ID, via strict node-level traversal over the row source —
 // always correct, and the only option when a label filter is set or delta
 // layers are unmerged (supernode structures exist only on a merged base).
+// Like ReachableSupernode it applies LabelMask but NOT Config.NodeFilter
+// (mark-and-traverse-through semantics would silently change reachability).
 // The SCC-supernode fast path is ReachableSupernode; the caller picks it
 // (no NodeFilter support there — the predicate conflicts with component
 // semantics).
@@ -694,6 +698,7 @@ func (bp *bitmapPool) acquire(words int) []uint32 {
 }
 
 func (bp *bitmapPool) release(b []uint32) {
+	b = b[:cap(b)] // keep the full allocation in the pool; acquire re-slices down
 	clear(b)
 	bp.p.Put(&b)
 }

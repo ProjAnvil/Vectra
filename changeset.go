@@ -37,6 +37,8 @@ type (
 	EdgeUpsert = wal.EdgeUpsert
 	EdgeDelete = wal.EdgeDelete
 	Changeset  = wal.Changeset
+	IndexDecl  = wal.IndexDecl
+	Frame      = wal.Frame
 )
 
 // changesetVersion is the core-native changeset format version recorded in

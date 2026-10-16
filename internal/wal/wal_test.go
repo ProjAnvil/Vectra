@@ -31,8 +31,10 @@ func collect(t *testing.T, dir string) (frames []Changeset, lsns []uint64, last 
 		t.Fatalf("open: %v", err)
 	}
 	defer w.Close()
-	last, err = w.replayLSN(func(lsn uint64, cs Changeset) error {
-		frames = append(frames, cs)
+	last, err = w.replayLSN(func(lsn uint64, fr Frame) error {
+		if fr.Changeset != nil {
+			frames = append(frames, *fr.Changeset)
+		}
 		lsns = append(lsns, lsn)
 		return nil
 	})
@@ -302,7 +304,7 @@ func TestReplayIdempotent(t *testing.T) {
 	}
 	run := func() int {
 		n := 0
-		if _, err := w.Replay(func(Changeset) error { n++; return nil }); err != nil {
+		if _, err := w.Replay(func(Frame) error { n++; return nil }); err != nil {
 			t.Fatal(err)
 		}
 		return n
@@ -425,5 +427,66 @@ func TestHasSegments(t *testing.T) {
 	defer w.Close()
 	if ok, err := HasSegments(dir); err != nil || !ok {
 		t.Fatalf("after open: ok=%v err=%v; want true, nil", ok, err)
+	}
+}
+
+func TestIndexDeclRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(dir, ModeAlways)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Append(testCS(1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.AppendIndex(IndexDecl{Keys: []string{"team", "region"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Append(testCS(2)); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.LastLSN(); got != 3 {
+		t.Fatalf("LastLSN = %d, want 3 (index frames consume LSNs)", got)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w2, err := Open(dir, ModeAlways)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	type seenFrame struct {
+		lsn  uint64
+		cs   bool
+		keys []string
+	}
+	var order []seenFrame
+	last, err := w2.Replay(func(fr Frame) error {
+		s := seenFrame{lsn: fr.LSN, keys: fr.IndexKeys}
+		s.cs = fr.Changeset != nil
+		order = append(order, s)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last != 3 || len(order) != 3 {
+		t.Fatalf("replayed %d frames to lsn %d, want 3 to 3", len(order), last)
+	}
+	if !order[0].cs || order[1].cs || len(order[1].keys) != 2 || !order[2].cs {
+		t.Fatalf("frame order wrong: %+v", order)
+	}
+	// the recovered write head must park AFTER the index frame — an Append
+	// continues the LSN sequence instead of overwriting it
+	if got := w2.LastLSN(); got != 3 {
+		t.Fatalf("recovered LastLSN = %d, want 3", got)
+	}
+	if _, err := w2.Append(testCS(9)); err != nil {
+		t.Fatal(err)
+	}
+	if got := w2.LastLSN(); got != 4 {
+		t.Fatalf("post-recovery LastLSN = %d, want 4 (index frame overwritten?)", got)
 	}
 }

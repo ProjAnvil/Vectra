@@ -69,7 +69,7 @@ func TestIndexKeysRoundtrip(t *testing.T) {
 // TestV2SnapshotStillReadable handcrafts a v2 file (no indexKey section, CRC
 // trailer) — pre-0.5.0 snapshots must keep loading, with no index keys.
 func TestV2SnapshotStillReadable(t *testing.T) {
-	body := []byte{'V', 'C', 'T', 'R', 2, 0} // magic + version 2
+	body := []byte{'V', 'C', 'T', 'R', 2, 0}         // magic + version 2
 	body = binary.LittleEndian.AppendUint32(body, 1) // 1 node
 	body = binary.LittleEndian.AppendUint32(body, 0) // 0 edges
 	body = append(body, 1, 0, 0, 0, 'a')             // key "a"

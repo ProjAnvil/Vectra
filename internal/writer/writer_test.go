@@ -229,9 +229,7 @@ func TestConcurrentSubmitAndQueries(t *testing.T) {
 					t.Errorf("BFS: %v", err)
 					return
 				}
-				if _, ok := g.LookupByNumber("s", float64(r)); ok {
-					// index absent: ok=false expected; ignore either way
-				}
+				_, _ = g.LookupByNumber("s", float64(r)) // race smoke: index absent, result ignored
 			}
 		}()
 	}

@@ -270,19 +270,19 @@ type Graph struct {
 	// absorption window's residual per-op cost); full closes (Batch
 	// boundary, Seal/forceMerge, Close) reset them.
 	builder    *delta.Builder
-	bNodeIDs   map[string]uint32      // key -> assigned id (written or lifted)
-	bEdgeIDs   []uint32               // one id per edge slot appended (this batch)
-	bLiveNodes map[string]bool        // keys live in the builder or published-and-lifted
-	bKilled    map[delta.EdgeKey]bool // keys tombstoned within the batch
-	bIndex     []string               // pending index declarations (this batch)
+	bNodeIDs   map[string]uint32     // key -> assigned id (written or lifted)
+	bEdgeIDs   []uint32              // one id per edge slot appended (this batch)
+	bLiveNodes map[string]bool       // keys live in the builder or published-and-lifted
+	bKilled    map[delta.EdgeKey]int // per key: published parallels already tombstoned in this window (>0 also forces fresh IDs on revive)
+	bIndex     []string              // pending index declarations (this batch)
 
 	// WAL session state (all zero for New()/Load() graphs — v0.6 behavior).
-	wal      *wal.WAL // nil = no recording
-	walDir   string   // checkpoint manifest location
-	dbPath   string   // session path; checkpoints write <dbPath minus ext>-<lsn>.db next to it
-	pendOps  []pendOp // recorded-but-unflushed ops (inside Batch, or single writes mid-record)
-	batching bool     // inside Batch: records accumulate instead of flushing
-	closed   bool     // after Close: writes fail with ErrClosed, queries legal
+	wal      *wal.WAL    // nil = no recording
+	walDir   string      // checkpoint manifest location
+	dbPath   string      // session path; checkpoints write <dbPath minus ext>-<lsn>.db next to it
+	pendOps  []pendOp    // recorded-but-unflushed ops (inside Batch, or single writes mid-record)
+	batching bool        // inside Batch: records accumulate instead of flushing
+	closed   atomic.Bool // after Close: writes fail with ErrClosed, queries legal
 
 	// writerTok is the wrapper-mode writer discipline hook (spec §2.3 R7):
 	// 0 = direct mode (all writes legal); non-zero = the goroutine token
@@ -378,7 +378,9 @@ const (
 )
 
 // opKind orders pendOp entries exactly like the Changeset apply order:
-// node upserts → edge upserts → edge deletes → node deletes.
+// node upserts → edge upserts → edge deletes → node deletes. opIndex is
+// outside that order: it never enters a Changeset — flushPending emits each
+// run of index declarations as its own IndexDecl frame, preserving op order.
 type opKind int
 
 const (
@@ -386,6 +388,7 @@ const (
 	opEdge
 	opEdgeDelete
 	opNodeDelete
+	opIndex
 )
 
 // pendOp is one recorded write, kept in original order until flush.
@@ -395,6 +398,7 @@ type pendOp struct {
 	edge EdgeUpsert
 	edel EdgeDelete
 	ndel string
+	idx  string // opIndex: declared property key
 }
 
 // New returns an empty graph. The initial generation is an empty merged
@@ -408,7 +412,7 @@ func New() *Graph {
 	}
 	snap, err := engine.Seal(nil, nil, nil, nil)
 	if err != nil {
-		panic(fmt.Sprintf("vectra: sealing an empty base: %v", err))
+		panic(fmt.Errorf("vectra: sealing an empty base: %w", err))
 	}
 	g.view.Store(&genView{base: snap, baseKeys: map[string]NodeID{}})
 	return g
@@ -443,7 +447,7 @@ func (g *Graph) ensureBuilder() {
 		g.bLiveNodes = map[string]bool{}
 	}
 	if g.bKilled == nil {
-		g.bKilled = map[delta.EdgeKey]bool{}
+		g.bKilled = map[delta.EdgeKey]int{}
 	}
 	g.bEdgeIDs = nil
 	g.bIndex = nil
@@ -459,9 +463,9 @@ func (g *Graph) ensureBuilder() {
 // records the op appended into the window (0 for non-edge ops): an
 // edge-appending op counts only toward the edge cap, everything else only
 // toward the op cap.
-func (g *Graph) finishOp(edges int) error {
+func (g *Graph) finishOp(edges int) {
 	if g.batching {
-		return nil
+		return
 	}
 	if p := g.pend.Load(); p != nil {
 		if edges > 0 {
@@ -473,7 +477,6 @@ func (g *Graph) finishOp(edges int) error {
 			g.cutLayer()
 		}
 	}
-	return nil
 }
 
 // flushPend materializes the caller's absorption window, if one is open and
@@ -572,15 +575,14 @@ func (g *Graph) olderIncidentEdges(key string) []delta.EdgeKey {
 		if seen[k] {
 			return
 		}
-		n := 0
-		if !g.bKilled[k] { // batch-pending tombstones already own these
-			n = g.edges[k].n
-		}
-		if n == 0 {
+		// batch-pending tombstones already own killed parallels; only the
+		// not-yet-tombstoned published ones feed the cascade count
+		n := g.edges[k].n - g.bKilled[k]
+		if n <= 0 {
 			return
 		}
 		seen[k] = true
-		for i := 0; i < n; i++ {
+		for range n {
 			out = append(out, k)
 		}
 	}
@@ -711,7 +713,7 @@ func (g *Graph) cutLayer() {
 // replace them wholesale (AddNode/AddEdge again); in-place mutation is
 // forbidden.
 func (g *Graph) AddNode(key, label string, props map[string]any) (NodeID, error) {
-	if g.closed {
+	if g.closed.Load() {
 		return 0, ErrClosed
 	}
 	if err := g.checkWriter(); err != nil {
@@ -735,13 +737,14 @@ func (g *Graph) AddNode(key, label string, props map[string]any) (NodeID, error)
 	if err := g.builder.UpsertNode(key, label, props); err != nil {
 		return 0, err // unreachable for a fresh builder; surfaced anyway
 	}
-	return NodeID(id), g.finishOp(0)
+	g.finishOp(0)
+	return NodeID(id), nil
 }
 
 // AddEdge appends a directed edge (multi-edges/self-loops both allowed).
 // Immediately visible; new EdgeIDs come from the generation ratchet.
 func (g *Graph) AddEdge(srcKey, dstKey, label string, props map[string]any) (EdgeID, error) {
-	if g.closed {
+	if g.closed.Load() {
 		return 0, ErrClosed
 	}
 	if err := g.checkWriter(); err != nil {
@@ -758,11 +761,11 @@ func (g *Graph) AddEdge(srcKey, dstKey, label string, props map[string]any) (Edg
 	g.materializeEndpoint(dstKey)
 	g.labels[label] = true
 	id := g.newEdgeSlotID()
-	delete(g.bKilled, delta.EdgeKey{SrcKey: srcKey, DstKey: dstKey, Label: label})
 	if err := g.builder.AddEdgeValidated(srcKey, dstKey, label, props); err != nil {
 		return 0, err
 	}
-	return id, g.finishOp(1)
+	g.finishOp(1)
+	return id, nil
 }
 
 // UpsertEdge replaces-by-key: if live edges with the same (src, dst, label)
@@ -773,7 +776,7 @@ func (g *Graph) AddEdge(srcKey, dstKey, label string, props map[string]any) (Edg
 // — it is the entry point for updating weight-like props (relation
 // strength, event counts).
 func (g *Graph) UpsertEdge(srcKey, dstKey, label string, props map[string]any) (EdgeID, error) {
-	if g.closed {
+	if g.closed.Load() {
 		return 0, ErrClosed
 	}
 	if err := g.checkWriter(); err != nil {
@@ -796,7 +799,8 @@ func (g *Graph) UpsertEdge(srcKey, dstKey, label string, props map[string]any) (
 	} else {
 		// the fold appends a slot in this layer: it carries either the
 		// transferred winner ID (visible edge keeps its ID) or a fresh one
-		if ref, ok := g.edges[k]; ok && !g.bKilled[k] {
+		// (window-tombstoned parallels must not lend their IDs — ratchet)
+		if ref, ok := g.edges[k]; ok && g.bKilled[k] == 0 {
 			id = ref.winner
 		} else {
 			id = g.nextEdge
@@ -807,8 +811,8 @@ func (g *Graph) UpsertEdge(srcKey, dstKey, label string, props map[string]any) (
 	if err := g.builder.UpsertEdgeFoldValidated(srcKey, dstKey, label, props); err != nil {
 		return 0, err
 	}
-	delete(g.bKilled, k)
-	return id, g.finishOp(1)
+	g.finishOp(1)
+	return id, nil
 }
 
 // DeleteEdge removes every live parallel edge with the given (src, dst,
@@ -816,7 +820,7 @@ func (g *Graph) UpsertEdge(srcKey, dstKey, label string, props map[string]any) (
 // never existed succeeds with 0). Returns the number of edges actually
 // deleted. Immediately invisible afterwards.
 func (g *Graph) DeleteEdge(srcKey, dstKey, label string) (int, error) {
-	if g.closed {
+	if g.closed.Load() {
 		return 0, ErrClosed
 	}
 	if err := g.checkWriter(); err != nil {
@@ -835,8 +839,12 @@ func (g *Graph) DeleteEdge(srcKey, dstKey, label string) (int, error) {
 			n = c // this batch's parallels
 		}
 	}
-	if !g.bKilled[k] {
-		n += g.edges[k].n // published parallels (base + older layers)
+	// published parallels this window has not tombstoned yet (a delete →
+	// re-add → delete sequence must not re-count the first delete's kills:
+	// the mirror reconciles only at publishLayer)
+	pub := g.edges[k].n - g.bKilled[k]
+	if pub > 0 {
+		n += pub
 	}
 	if err := g.recordEdgeDelete(srcKey, dstKey, label); err != nil {
 		return 0, err
@@ -845,8 +853,9 @@ func (g *Graph) DeleteEdge(srcKey, dstKey, label string) (int, error) {
 	if _, err := g.builder.DeleteEdge(k); err != nil {
 		return 0, err
 	}
-	g.bKilled[k] = true
-	return n, g.finishOp(0)
+	g.bKilled[k] += pub
+	g.finishOp(0)
+	return n, nil
 }
 
 // DeleteNode removes a node and cascade-deletes all its incident edges
@@ -856,7 +865,7 @@ func (g *Graph) DeleteEdge(srcKey, dstKey, label string) (int, error) {
 // the same key via AddNode revives the node (ID reused) without resurrecting
 // the cascaded edges. Returns the number of cascaded edge deletions.
 func (g *Graph) DeleteNode(key string) (int, error) {
-	if g.closed {
+	if g.closed.Load() {
 		return 0, ErrClosed
 	}
 	if err := g.checkWriter(); err != nil {
@@ -879,13 +888,14 @@ func (g *Graph) DeleteNode(key string) (int, error) {
 	}
 	g.bLiveNodes[key] = false
 	for _, k := range hookKeys {
-		// mark published parallels killed so later same-batch upserts draw
-		// fresh IDs (ratchet discipline) and DeleteNode's own hook skips
-		// re-counting them; the builder's cascade already tombstoned the
-		// in-window parallels.
-		g.bKilled[k] = true
+		// mark the hook's published parallels killed (one per emitted copy) so
+		// later same-batch upserts draw fresh IDs (ratchet discipline) and
+		// later deletes/hooks skip re-counting them; the builder's cascade
+		// already tombstoned the in-window parallels.
+		g.bKilled[k]++
 	}
-	return n, g.finishOp(0)
+	g.finishOp(0)
+	return n, nil
 }
 
 // --- WAL op recorder ---------------------------------------------------------
@@ -949,6 +959,14 @@ func (g *Graph) recordNodeDelete(key string) error {
 	return g.maybeFlush()
 }
 
+func (g *Graph) recordIndexDecl(key string) error {
+	if g.wal == nil {
+		return nil
+	}
+	g.pendOps = append(g.pendOps, pendOp{kind: opIndex, idx: key})
+	return g.maybeFlush()
+}
+
 // maybeFlush flushes unless a Batch boundary is holding the buffer.
 func (g *Graph) maybeFlush() error {
 	if g.batching {
@@ -957,9 +975,10 @@ func (g *Graph) maybeFlush() error {
 	return g.flushPending()
 }
 
-// flushPending emits the buffered ops as one frame per kind-ordered run. On
-// error the unflushed ops stay buffered so a retry (e.g. a retried Close)
-// does not silently drop them.
+// flushPending emits the buffered ops as one frame per kind-ordered run;
+// consecutive index declarations coalesce into one IndexDecl frame at their
+// position in the op order. On error the unflushed ops stay buffered so a
+// retry (e.g. a retried Close) does not silently drop them.
 func (g *Graph) flushPending() error {
 	if g.wal == nil {
 		g.pendOps = nil
@@ -967,8 +986,23 @@ func (g *Graph) flushPending() error {
 	}
 	i := 0
 	for i < len(g.pendOps) {
+		if g.pendOps[i].kind == opIndex {
+			j := i
+			keys := make([]string, 0, 4)
+			for j < len(g.pendOps) && g.pendOps[j].kind == opIndex {
+				keys = append(keys, g.pendOps[j].idx)
+				j++
+			}
+			if _, err := g.wal.AppendIndex(IndexDecl{Keys: keys}); err != nil {
+				g.pendOps = append([]pendOp(nil), g.pendOps[i:]...)
+				return err
+			}
+			i = j
+			continue
+		}
 		j := i + 1
-		for j < len(g.pendOps) && g.pendOps[j].kind >= g.pendOps[j-1].kind {
+		for j < len(g.pendOps) && g.pendOps[j].kind != opIndex &&
+			g.pendOps[j].kind >= g.pendOps[j-1].kind {
 			j++
 		}
 		cs := Changeset{Version: changesetVersion}
@@ -1058,7 +1092,7 @@ func (g *Graph) applyChangeset(cs Changeset) error {
 // flush error at the boundary returns after fn's mutations already hit
 // memory — memory may be ahead of the log until the next successful flush.
 func (g *Graph) Batch(fn func(*Graph)) error {
-	if g.closed {
+	if g.closed.Load() {
 		return ErrClosed
 	}
 	if err := g.checkWriter(); err != nil {
@@ -1183,8 +1217,18 @@ func Open(path string, opts Options) (*Graph, error) {
 		return nil, err
 	}
 	// Replay with recording detached (g.wal still nil): replaying must not
-	// amplify frames. Torn tails stop at the last complete frame.
-	if _, err := w.Replay(g.applyChangeset); err != nil {
+	// amplify frames. Torn tails stop at the last complete frame. IndexDecl
+	// frames rebuild their declarations through IndexProperty (a no-op
+	// record while g.wal is nil).
+	if _, err := w.Replay(func(fr wal.Frame) error {
+		if fr.Changeset != nil {
+			return g.applyChangeset(*fr.Changeset)
+		}
+		for _, k := range fr.IndexKeys {
+			g.IndexProperty(k)
+		}
+		return nil
+	}); err != nil {
 		w.Close()
 		return nil, err
 	}
@@ -1256,12 +1300,19 @@ func (g *Graph) cleanupSnapshots(keep string) {
 // return ErrClosed; durability was the caller's job, v0.6 style). In both
 // modes queries stay legal after Close.
 func (g *Graph) Close() error {
-	if g.closed {
+	if g.closed.Load() {
 		return nil
+	}
+	// Close rewrites writer-private state (flushPending/forceMerge/
+	// publishLayer) — heavier than any write method, all of which are
+	// guarded; wrapper mode must go through Handle.Close (which yields the
+	// claim first), not race the writer from the outside.
+	if err := g.checkWriter(); err != nil {
+		return err
 	}
 	if g.wal == nil {
 		g.publishLayer()
-		g.closed = true
+		g.closed.Store(true)
 		return nil
 	}
 	if err := g.flushPending(); err != nil {
@@ -1288,7 +1339,7 @@ func (g *Graph) Close() error {
 	// The manifest has landed: this checkpoint is committed. From here on a
 	// failure is surfaced but must never leave the session retryable-but-
 	// unwritable — mark closed so a retry is a clean no-op.
-	g.closed = true
+	g.closed.Store(true)
 	if err := g.wal.Reset(lsn); err != nil && !errors.Is(err, wal.ErrClosed) {
 		g.wal.Close()
 		g.wal = nil
@@ -1468,7 +1519,7 @@ func (v *genView) unionRecords() ([]engine.NodeRec, []engine.EdgeRec, []string, 
 		labels = append(labels, name)
 		return id
 	}
-	for i := 0; i < v.base.LabelCount(); i++ {
+	for i := range v.base.LabelCount() {
 		intern(v.base.LabelName(uint32(i)))
 	}
 	for _, l := range v.layers {
@@ -1561,11 +1612,7 @@ func (v *genView) unionRecords() ([]engine.NodeRec, []engine.EdgeRec, []string, 
 			keySet[k] = true
 		}
 	}
-	indexKeys := make([]string, 0, len(keySet))
-	for k := range keySet {
-		indexKeys = append(indexKeys, k)
-	}
-	slices.Sort(indexKeys)
+	indexKeys := slices.Sorted(maps.Keys(keySet))
 	return nodes, edges, labels, indexKeys
 }
 
@@ -1749,7 +1796,17 @@ func (g *Graph) SaveFile(path string) error {
 		os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	// The rename is not durable on all filesystems until the parent
+	// directory is fsynced — checkpoint manifests point at this file.
+	// Best-effort: some filesystems reject directory fsync (EINVAL).
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		d.Sync()
+		d.Close()
+	}
+	return nil
 }
 
 // Load restores a graph from a snapshot and merges it into the initial base
@@ -1859,19 +1916,31 @@ func LoadFile(path string) (*Graph, error) {
 // declaration into the base index. Idempotent; unregistered keys yield
 // ok=false in LookupByProperty.
 //
+// Durability: with a WAL attached the declaration is recorded log-first as
+// an IndexDecl frame (one frame per run of consecutive declarations inside
+// a Batch), durable per the session's WAL mode — matching the industry norm
+// that schema operations survive crash recovery like data writes
+// (PostgreSQL WAL-logs CREATE INDEX; RocksDB logs column-family edits to
+// its MANIFEST). Checkpoints persist declarations in the snapshot either
+// way; WAL replay rebuilds them. A flush failure cannot surface through
+// this chainable API: the op stays buffered (never dropped) and the error
+// surfaces at the next error-capable boundary (a write op, Batch/Seal/
+// Compact/Close).
+//
 // Write-path method (it publishes a layer): after Close the declaration is
 // dropped and the graph returned unchanged (writes are closed; the chain
 // stays usable), and in wrapper mode it must run on the writer goroutine —
 // debug builds panic with ErrNotWriter otherwise (release builds rely on
 // the documented single-writer discipline, like Cycles).
 func (g *Graph) IndexProperty(key string) *Graph {
-	if g.closed {
+	if g.closed.Load() {
 		return g
 	}
 	g.assertWriter()
 	if g.indexDeclared(key) {
 		return g
 	}
+	_ = g.recordIndexDecl(key)
 	g.ensureBuilder()
 	g.builder.IndexProperty(key)
 	g.bIndex = append(g.bIndex, key)
@@ -1939,7 +2008,7 @@ func (g *Graph) Clone() *Graph {
 	nodes, edges, labels, indexKeys := g.unionRecords()
 	c, err := graphFromEngine(nodes, edges, labels, indexKeys)
 	if err != nil { // engine.Seal of valid records cannot fail; fail loud over corrupt state
-		panic(fmt.Sprintf("vectra: clone merge: %v", err))
+		panic(fmt.Errorf("vectra: clone merge: %w", err))
 	}
 	return c
 }
@@ -2019,11 +2088,9 @@ func lookupNodesOf(v *genView, key string, baseIndex func(*genView) ([]uint32, b
 	ids, effective := baseIndex(v)
 	pending := false
 	for _, l := range v.layers {
-		for _, k := range l.IndexKeys() {
-			if k == key {
-				pending = true
-				break
-			}
+		if slices.Contains(l.IndexKeys(), key) {
+			pending = true
+			break
 		}
 	}
 	if !effective && !pending {
@@ -2043,7 +2110,7 @@ func lookupNodesOf(v *genView, key string, baseIndex func(*genView) ([]uint32, b
 			m[rec.Key] = hit{NodeID(id), Node{ID: NodeID(id), Key: rec.Key, Label: rec.Label, Props: rec.Props}}
 		}
 	} else {
-		for id := 0; id < v.base.NodeCount(); id++ {
+		for id := range v.base.NodeCount() {
 			rec, _ := v.base.NodeInfo(uint32(id))
 			m[rec.Key] = hit{NodeID(id), Node{ID: NodeID(id), Key: rec.Key, Label: rec.Label, Props: rec.Props}}
 		}

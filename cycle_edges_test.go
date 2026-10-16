@@ -19,8 +19,8 @@ func TestCyclesCarryMemberEdges(t *testing.T) {
 	_, _ = g.AddEdge("a", "b", "DEPENDS_ON", map[string]any{"via": "ctor"})
 	_, _ = g.AddEdge("b", "c", "DEPENDS_ON", map[string]any{"via": "field"})
 	_, _ = g.AddEdge("c", "a", "DEPENDS_ON", nil)
-	_, _ = g.AddEdge("b", "a", "INJECT", nil)      // chord: still an intra-SCC edge
-	_, _ = g.AddEdge("b", "d", "DEPENDS_ON", nil)  // leaves the cycle: excluded
+	_, _ = g.AddEdge("b", "a", "INJECT", nil)     // chord: still an intra-SCC edge
+	_, _ = g.AddEdge("b", "d", "DEPENDS_ON", nil) // leaves the cycle: excluded
 	_, _ = g.AddEdge("s", "s", "SELF", map[string]any{"kind": "lazy"})
 	if err := g.Seal(); err != nil {
 		t.Fatal(err)

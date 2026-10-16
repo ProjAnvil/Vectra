@@ -21,9 +21,12 @@ func replayStats(t *testing.T, walDir string) (frames, entries int, last uint64)
 		t.Fatalf("wal open: %v", err)
 	}
 	defer w.Close()
-	last, err = w.Replay(func(cs vectra.Changeset) error {
+	last, err = w.Replay(func(fr vectra.Frame) error {
 		frames++
-		entries += len(cs.Nodes) + len(cs.Edges) + len(cs.EdgeDeletes) + len(cs.NodeDeletes)
+		if fr.Changeset != nil {
+			cs := fr.Changeset
+			entries += len(cs.Nodes) + len(cs.Edges) + len(cs.EdgeDeletes) + len(cs.NodeDeletes)
+		}
 		return nil
 	})
 	if err != nil {

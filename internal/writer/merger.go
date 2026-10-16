@@ -152,7 +152,7 @@ func (h *Handle) syncMerge() {
 	// layers (the generation stays readable — ruling 4) but never wedges
 	// the writer; the next batch re-triggers and retries.
 	const attempts = 3
-	for i := 0; i < attempts; i++ {
+	for range attempts {
 		mc := h.g.CaptureMerge()
 		r, err := mc.Seal()
 		if err != nil {

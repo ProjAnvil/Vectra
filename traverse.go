@@ -128,7 +128,10 @@ func (g *Graph) traverseConfig(v *genView, src tr.RowSource, opts ...BFSOption) 
 	}
 	if cfg.nodeFilter != nil {
 		tc.NodeFilter = func(id uint32) bool {
-			rec, _ := v.nodeByID(NodeID(id))
+			rec, ok := v.nodeByID(NodeID(id))
+			if !ok {
+				return false // unresolvable ID: filter out, never feed a phantom node to the predicate
+			}
 			return cfg.nodeFilter(Node{ID: NodeID(id), Key: rec.Key, Label: rec.Label, Props: rec.Props})
 		}
 	}
@@ -341,20 +344,20 @@ func (g *Graph) Cycles() []Cycle {
 		v = g.view.Load()
 	}
 	raw := tr.Cycles(v.base)
-	out := make([]Cycle, len(raw))
-	for i, c := range raw {
-		out[i] = Cycle{Nodes: make([]NodeID, len(c.Nodes))}
+	out := make([]Cycle, 0, len(raw))
+	for _, c := range raw {
+		cyc := Cycle{Nodes: make([]NodeID, len(c.Nodes))}
 		for j, v := range c.Nodes {
-			out[i].Nodes[j] = NodeID(v)
+			cyc.Nodes[j] = NodeID(v)
 		}
-		if len(c.Edges) > 0 {
-			out[i].Edges = make([]Edge, len(c.Edges))
-			for j, ce := range c.Edges {
-				if e, ok := g.EdgeByID(EdgeID(ce.EdgeID)); ok {
-					out[i].Edges[j] = e
-				}
+		for _, ce := range c.Edges {
+			// IDs come from the just-merged base, so a miss is impossible;
+			// skip rather than emit a zero-value phantom edge if it ever happens
+			if e, ok := g.EdgeByID(EdgeID(ce.EdgeID)); ok {
+				cyc.Edges = append(cyc.Edges, e)
 			}
 		}
+		out = append(out, cyc)
 	}
 	return out
 }

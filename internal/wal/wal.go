@@ -38,7 +38,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -84,6 +84,23 @@ type Changeset struct {
 	NodeDeletes []string     `json:"nodeDeletes"`
 }
 
+// IndexDecl is an index-declaration frame's payload: the property keys
+// IndexProperty declared since the previous frame (idempotent, order-
+// independent of data frames). The industry norm — PostgreSQL WAL-logs
+// CREATE INDEX, RocksDB logs column-family edits to the MANIFEST — is that
+// schema/metadata operations must survive crash recovery like data writes.
+// Vectra implements this as a separate frame type rather than a Changeset
+// field, keeping the Changeset wire shape frozen (spec §4 R9: the server
+// raft Batch embeds it with gob-flattened field names).
+//
+// Forward compatibility: a pre-0.7.1 reader stops replay at the first
+// IndexDecl frame (the standing stop-rather-than-guess rule for unknown
+// frame types); because the WAL resets at every checkpoint, the exposure
+// window is one checkpoint interval of a mixed-version downgrade.
+type IndexDecl struct {
+	Keys []string `json:"keys"`
+}
+
 // Mode selects the WAL's durability behavior. The zero value is ModeOff (no
 // WAL at all — v0.6 snapshot-only behavior).
 type Mode int
@@ -102,6 +119,7 @@ var segmentSize = 64 << 20
 const (
 	frameChangeset = 1
 	frameMarker    = 2
+	frameIndexDecl = 3  // v0.7.1: index declarations (spec errata III) — see IndexDecl
 	headerLen      = 12 // 8B length + 4B CRC
 	// rolloverHeadroom: a frame may only trigger a rollover once the segment
 	// holds more than this many bytes (i.e. past its leading marker).
@@ -253,7 +271,7 @@ func listSegments(dir string) ([]int, error) {
 		}
 		segs = append(segs, n)
 	}
-	sort.Ints(segs)
+	slices.Sort(segs)
 	return segs, nil
 }
 
@@ -284,6 +302,13 @@ func (w *WAL) createSegment(n int, salt uint32, base uint64) error {
 		return err
 	}
 	if w.f != nil {
+		// ModeInterval defers durability to Sync/checkpoint boundaries; the
+		// rollover itself is such a boundary — frames left in the outgoing
+		// segment would never be fsynced by a later Sync() on the new one.
+		if err := w.f.Sync(); err != nil {
+			w.f.Close()
+			return err
+		}
 		w.f.Close()
 	}
 	w.f, w.segment, w.salt, w.off, w.lsn = f, n, salt, int64(len(frame)), base-1
@@ -296,7 +321,7 @@ type segScan struct {
 	hasMark bool  // leading marker frame present and parseable
 	salt    uint32
 	base    uint64
-	nframes int // Changeset frames within the valid prefix
+	nframes int // non-marker frames (Changeset + IndexDecl) in the valid prefix — each consumes an LSN
 }
 
 // scanSegmentFile reads and parses one segment file's frame prefix.
@@ -320,7 +345,10 @@ func scanSegmentFile(dir string, n int) (segScan, error) {
 			sc.hasMark, sc.salt, sc.base = true, m.Salt, m.Base
 			return nil
 		}
-		if typ != frameChangeset {
+		// every non-marker frame type consumes an LSN — nframes must count
+		// them all or the write head parks early (next Append would
+		// overwrite a valid frame) and w.lsn regresses
+		if typ != frameChangeset && typ != frameIndexDecl {
 			return errStopScan
 		}
 		sc.nframes++
@@ -413,14 +441,30 @@ func Open(dir string, mode Mode) (*WAL, error) {
 // is fsynced before returning; in ModeInterval durability waits for an
 // explicit Sync (or the file system's default writeback).
 func (w *WAL) Append(cs Changeset) (uint64, error) {
-	if w.f == nil {
-		return 0, ErrClosed
-	}
 	payload, err := json.Marshal(cs)
 	if err != nil {
 		return 0, err
 	}
-	frame := appendFrame(nil, frameChangeset, payload)
+	return w.writeFrame(frameChangeset, payload)
+}
+
+// AppendIndex writes one IndexDecl frame (same rollover/LSN/durability
+// mechanics as Append).
+func (w *WAL) AppendIndex(d IndexDecl) (uint64, error) {
+	payload, err := json.Marshal(d)
+	if err != nil {
+		return 0, err
+	}
+	return w.writeFrame(frameIndexDecl, payload)
+}
+
+// writeFrame is the shared append path: rollover check, write, LSN
+// assignment, ModeAlways fsync.
+func (w *WAL) writeFrame(typ byte, payload []byte) (uint64, error) {
+	if w.f == nil {
+		return 0, ErrClosed
+	}
+	frame := appendFrame(nil, typ, payload)
 	if w.off > rolloverHeadroom && w.off+int64(len(frame)) > int64(segmentSize) {
 		if err := w.createSegment(w.segment+1, w.salt+1, w.lsn+1); err != nil {
 			return 0, err
@@ -448,19 +492,27 @@ func (w *WAL) Sync() error {
 	return w.f.Sync()
 }
 
+// Frame is one replayed frame above the checkpoint watermark: exactly one of
+// Changeset / IndexKeys is set.
+type Frame struct {
+	LSN       uint64
+	Changeset *Changeset // frameChangeset
+	IndexKeys []string   // frameIndexDecl
+}
+
 // Replay applies every frame above the manifest's base LSN to fn, in LSN
 // order, and returns the last applied LSN. A torn or corrupt tail stops the
 // replay at the first bad frame (returned as a normal end, not an error —
 // crash-torn tails are expected); an fn error aborts and propagates. Replay
 // is stateless with respect to the WAL: calling it twice replays the same
 // frames twice.
-func (w *WAL) Replay(fn func(Changeset) error) (uint64, error) {
-	return w.replayLSN(func(_ uint64, cs Changeset) error { return fn(cs) })
+func (w *WAL) Replay(fn func(Frame) error) (uint64, error) {
+	return w.replayLSN(func(_ uint64, fr Frame) error { return fn(fr) })
 }
 
-// replayLSN is Replay with per-frame LSN visibility (used by tests to assert
-// the manifest reconciliation invariant).
-func (w *WAL) replayLSN(fn func(lsn uint64, cs Changeset) error) (uint64, error) {
+// replayLSN is Replay with per-frame LSN visibility on the raw frame (used
+// by tests to assert the manifest reconciliation invariant).
+func (w *WAL) replayLSN(fn func(lsn uint64, fr Frame) error) (uint64, error) {
 	segs, err := listSegments(w.dir)
 	if err != nil {
 		return 0, err
@@ -502,7 +554,7 @@ func (w *WAL) replayLSN(fn func(lsn uint64, cs Changeset) error) (uint64, error)
 				}
 				return nil
 			}
-			if typ != frameChangeset {
+			if typ != frameChangeset && typ != frameIndexDecl {
 				stopped = true
 				return errStopScan
 			}
@@ -515,12 +567,24 @@ func (w *WAL) replayLSN(fn func(lsn uint64, cs Changeset) error) (uint64, error)
 				stopped = true
 				return errStopScan // gap or regression: stop rather than guess
 			}
-			var cs Changeset
-			if err := json.Unmarshal(payload, &cs); err != nil {
-				stopped = true
-				return errStopScan
+			var fr Frame
+			fr.LSN = lsn
+			if typ == frameIndexDecl {
+				var d IndexDecl
+				if err := json.Unmarshal(payload, &d); err != nil {
+					stopped = true
+					return errStopScan
+				}
+				fr.IndexKeys = d.Keys
+			} else {
+				var cs Changeset
+				if err := json.Unmarshal(payload, &cs); err != nil {
+					stopped = true
+					return errStopScan
+				}
+				fr.Changeset = &cs
 			}
-			if err := fn(lsn, cs); err != nil {
+			if err := fn(lsn, fr); err != nil {
 				return err
 			}
 			last = lsn
@@ -632,7 +696,7 @@ func scanFrames(buf []byte, fn func(typ byte, payload []byte) error) (int64, err
 			break // corrupt frame
 		}
 		typ := buf[off+12]
-		if typ != frameChangeset && typ != frameMarker {
+		if typ != frameChangeset && typ != frameMarker && typ != frameIndexDecl {
 			break
 		}
 		if err := fn(typ, buf[off+13:end]); err != nil {

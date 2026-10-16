@@ -47,3 +47,52 @@ func TestCloseAfterWALClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestIndexDeclWALRecovery pins the frame-type-3 durability path end to
+// end: index declarations are recorded log-first as IndexDecl frames, so a
+// crash between declaration and checkpoint loses nothing (WAL-only
+// recovery replays them), and the checkpoint snapshot carries them forward.
+func TestIndexDeclWALRecovery(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "graph.db")
+	g, err := Open(db, Options{WALMode: ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.AddNode("a", "Svc", map[string]any{"team": "core"}); err != nil {
+		t.Fatal(err)
+	}
+	g.IndexProperty("team")
+	if _, err := g.AddNode("b", "Svc", map[string]any{"team": "edge"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Crash: no Close. Reopen replays data frames AND the declaration.
+	g2, err := Open(db, Options{WALMode: ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g2.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	ns, ok := g2.LookupByProperty("team", "edge")
+	if !ok || len(ns) != 1 || ns[0].Key != "b" {
+		t.Fatalf("WAL-only recovery lost the index declaration: ok=%v nodes=%v", ok, ns)
+	}
+
+	// Checkpoint path: the watermark snapshot must persist it too.
+	if err := g2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	g3, err := Open(db, Options{WALMode: ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g3.Close()
+	if err := g3.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	if ns, ok := g3.LookupByProperty("team", "core"); !ok || len(ns) != 1 || ns[0].Key != "a" {
+		t.Fatalf("checkpoint recovery lost the index declaration: ok=%v nodes=%v", ok, ns)
+	}
+}
