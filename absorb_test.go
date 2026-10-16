@@ -334,3 +334,21 @@ func TestAbsorptionIDContractStable(t *testing.T) {
 		t.Fatal("UpsertEdge after delete must draw a fresh ID")
 	}
 }
+
+// TestAbsorptionAttachFlushesWindow: attaching the wrapper materializes the
+// caller's open window — the writes made just before Attach stay visible to
+// reads (wrapper-mode reads never flush, and the writer only publishes at
+// batch boundaries).
+func TestAbsorptionAttachFlushesWindow(t *testing.T) {
+	g := vectra.New()
+	_, _ = g.AddNode("a", "S", nil)
+	_, _ = g.AddNode("b", "S", nil)
+	_, _ = g.AddEdge("a", "b", "E", nil) // absorbed, no read since the writes
+	h := writer.Attach(g, writer.Config{})
+	if n, e := g.NodeCount(), g.EdgeCount(); n != 2 || e != 1 {
+		t.Fatalf("post-Attach counts %d/%d, want 2/1 (Attach must flush the caller's window)", n, e)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+}

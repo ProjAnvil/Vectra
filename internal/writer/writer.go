@@ -151,8 +151,14 @@ type Handle struct {
 // path (R7; direct writes from other goroutines fail with ErrNotWriter in
 // non-release builds). Attaching twice re-claims for the newer handle —
 // don't.
+//
+// The caller's open direct-mode absorption window (unflushed unbatched
+// writes) is materialized first when the caller is the window's writer —
+// otherwise those writes would stay invisible until the writer's first
+// batch boundary, and wrapper-mode reads never flush.
 func Attach(g *vectra.Graph, cfg Config) *Handle {
 	cfg = cfg.withDefaults()
+	g.FlushPend()
 	h := &Handle{
 		g:          g,
 		cfg:        cfg,
