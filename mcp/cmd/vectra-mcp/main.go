@@ -15,10 +15,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -48,9 +52,27 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", mcpserver.Handler(g, opts))
+	srv := &http.Server{
+		Addr:              *httpAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second, // slowloris guard; MCP sessions set their own deadlines
+	}
+	done := make(chan struct{})
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sig
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "vectra-mcp: shutdown: %v\n", err)
+		}
+		close(done)
+	}()
 	fmt.Fprintf(os.Stderr, "vectra-mcp listening on http://%s/mcp\n", *httpAddr)
-	if err := http.ListenAndServe(*httpAddr, mux); err != nil {
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	<-done
 }

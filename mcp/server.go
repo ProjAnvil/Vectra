@@ -10,7 +10,9 @@ package mcpserver
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"path/filepath"
 	"sync"
@@ -21,7 +23,16 @@ import (
 )
 
 // Version is the implementation version advertised by the MCP service.
-const Version = "0.7.0"
+// It is a var so release builds can inject the exact tag (the consensus
+// hybrid: -ldflags for the semver, source default as fallback for plain
+// `go build`/`go install`, which cannot carry flags):
+//
+//	go build -ldflags "-X github.com/projanvil/vectra/mcp.Version=v0.7.1" ./cmd/vectra-mcp
+//
+// The Makefile build target injects `git describe --tags --always --dirty`.
+// The source default still gets bumped at release (chore(release) commits),
+// so unbuilt checkouts and `go install` from a tag report a truthful value.
+var Version = "0.7.0"
 
 // defaultLimit is the default cap on nodes returned by bfs/reachable
 // (results are capped; the total field still reflects the true size,
@@ -68,9 +79,11 @@ type service struct {
 // vectra.Open recovers snapshot + WAL replay into a writable session. In
 // snapshot mode the loaded graph IS the live graph — v0.7 LoadFile graphs
 // are immediately writable (writes open a new generation), so the v0.6
-// sealed-view + write-after-seal-clone dance is gone. A snapshot load
-// failure keeps the passed-in graph (the v0.6 behavior: first seal then
-// writes the file).
+// sealed-view + write-after-seal-clone dance is gone. A missing snapshot
+// is a genuine first run (fresh graph; the first seal writes the file); a
+// PRESENT but unreadable snapshot sets openErr — every tool then fails
+// loudly instead of degrading to an empty graph whose first seal would
+// overwrite the (only copy of the) unreadable snapshot.
 func newService(g *vectra.Graph, opts Options) *service {
 	svc := &service{propKeys: map[string]bool{}, opts: opts}
 	switch {
@@ -90,11 +103,19 @@ func newService(g *vectra.Graph, opts Options) *service {
 		}
 		svc.live = og
 	case opts.SnapshotPath != "":
-		if loaded, err := vectra.LoadFile(opts.SnapshotPath); err == nil {
+		loaded, err := vectra.LoadFile(opts.SnapshotPath)
+		switch {
+		case err == nil:
 			svc.live = loaded
 			for _, k := range loaded.IndexedPropertyKeys() {
 				svc.propKeys[k] = true // snapshot's indexes survive the next seal
 			}
+		case errors.Is(err, fs.ErrNotExist):
+			// first run: no snapshot yet — start fresh, first seal creates it
+		default:
+			svc.openErr = fmt.Errorf("snapshot load %s: %w", opts.SnapshotPath, err)
+			svc.live = vectra.New()
+			return svc
 		}
 	}
 	if svc.live == nil {
@@ -470,11 +491,29 @@ func (svc *service) getNode(_ context.Context, _ *mcp.CallToolRequest, in struct
 	return nil, nodeOut{Key: n.Key, Label: n.Label, Props: n.Props}, nil
 }
 
-func parseDir(s string) vectra.Direction {
-	if s == "in" {
-		return vectra.DirIn
+// parseDir maps the tool's direction argument; anything but the exact "in"
+// or "out" (or empty) is an error — silently answering out-neighbors for a
+// typo'd value would be a wrong answer handed to the agent.
+// errPropNotIndexed is the single raise for lookup_property's not-indexed
+// misses across the three typed lookups.
+var errPropNotIndexed = errors.New("property is not indexed (re-seal after it appears in injected data)")
+
+func notIndexed(key string) error {
+	return fmt.Errorf("%w: %q", errPropNotIndexed, key)
+}
+
+// parseDir maps the tool's direction argument; anything but the exact "in"
+// or "out" (or empty) is an error — silently answering out-neighbors for a
+// typo'd value would be a wrong answer handed to the agent.
+func parseDir(s string) (vectra.Direction, error) {
+	switch s {
+	case "", "out":
+		return vectra.DirOut, nil
+	case "in":
+		return vectra.DirIn, nil
+	default:
+		return 0, fmt.Errorf("invalid direction %q (want \"in\" or \"out\")", s)
 	}
-	return vectra.DirOut
 }
 
 func (svc *service) neighbors(_ context.Context, _ *mcp.CallToolRequest, in neighborsIn) (*mcp.CallToolResult, listOut, error) {
@@ -486,7 +525,11 @@ func (svc *service) neighbors(_ context.Context, _ *mcp.CallToolRequest, in neig
 	if in.Label != "" {
 		labels = []string{in.Label}
 	}
-	ns, err := v.NeighborsOf(in.Key, parseDir(in.Direction), labels...)
+	dir, err := parseDir(in.Direction)
+	if err != nil {
+		return nil, listOut{}, err
+	}
+	ns, err := v.NeighborsOf(in.Key, dir, labels...)
 	if err != nil {
 		return nil, listOut{}, err
 	}
@@ -515,7 +558,11 @@ func (svc *service) bfs(_ context.Context, _ *mcp.CallToolRequest, in bfsIn) (*m
 		}
 		starts = append(starts, n.ID)
 	}
-	opts := []vectra.BFSOption{vectra.WithDirection(parseDir(in.Direction))}
+	dir, err := parseDir(in.Direction)
+	if err != nil {
+		return nil, depthOut{}, err
+	}
+	opts := []vectra.BFSOption{vectra.WithDirection(dir)}
 	if in.MaxDepth > 0 {
 		opts = append(opts, vectra.WithMaxDepth(in.MaxDepth))
 	}
@@ -632,19 +679,19 @@ func (svc *service) lookupProperty(_ context.Context, _ *mcp.CallToolRequest, in
 	case string:
 		ns, ok := v.LookupByProperty(in.PropKey, tv)
 		if !ok {
-			return nil, listOut{}, fmt.Errorf("property %q is not indexed (re-seal after it appears in injected data)", in.PropKey)
+			return nil, listOut{}, notIndexed(in.PropKey)
 		}
 		nodes = ns
 	case float64:
 		ns, ok := v.LookupByNumber(in.PropKey, tv)
 		if !ok {
-			return nil, listOut{}, fmt.Errorf("property %q is not indexed (re-seal after it appears in injected data)", in.PropKey)
+			return nil, listOut{}, notIndexed(in.PropKey)
 		}
 		nodes = ns
 	case bool:
 		ns, ok := v.LookupByBool(in.PropKey, tv)
 		if !ok {
-			return nil, listOut{}, fmt.Errorf("property %q is not indexed (re-seal after it appears in injected data)", in.PropKey)
+			return nil, listOut{}, notIndexed(in.PropKey)
 		}
 		nodes = ns
 	default:

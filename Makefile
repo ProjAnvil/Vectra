@@ -29,6 +29,11 @@ BENCH_EXTRA ?=
 # The repo contains three Go modules: root (engine), server/ (server + bench), mcp/ (agent gateway)
 MODULES := . server mcp
 
+# MCP implementation version: git-derived when available, source default
+# (mcp/server.go) otherwise — `go install`/plain `go build` builds carry no
+# flags and fall back to the source value, which release commits keep current.
+MCP_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null)
+
 .PHONY: help bench build test vet fmt clean deepclean
 
 help: ## show this help
@@ -51,7 +56,11 @@ bench: ## run the stress benchmark, e.g. make bench [SIZE=medium] [MODE=http] [W
 build: ## build all binaries into bin/ (vectra-server, vectra-bench, vectra-mcp)
 	cd server && go build -o ../bin/vectra-server ./cmd/vectra-server
 	cd server && go build -o ../bin/vectra-bench  ./cmd/vectra-bench
-	cd mcp && go build -o ../bin/vectra-mcp ./cmd/vectra-mcp
+	cd mcp && if [ -n '$(MCP_VERSION)' ]; then \
+	    go build -ldflags "-X github.com/projanvil/vectra/mcp.Version=$(MCP_VERSION)" -o ../bin/vectra-mcp ./cmd/vectra-mcp; \
+	else \
+	    go build -o ../bin/vectra-mcp ./cmd/vectra-mcp; \
+	fi
 
 test: ## run all tests (three modules)
 	@for m in $(MODULES); do echo "== go test $$m =="; (cd $$m && go test ./...) || exit 1; done
