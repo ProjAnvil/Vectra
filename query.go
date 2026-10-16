@@ -70,9 +70,13 @@ func (q *Query) Run() (*BFSResult, error) {
 // rows, so writes are visible immediately. With nothing unmerged the plain
 // CSR row zip runs (FastAdjacency hot path).
 // neighborsDedupLimit is the row size below which NeighborsOf dedups by
-// linear scan over the result instead of borrowing a visited bitmap: point
-// queries touch ~degree-sized rows, and a whole-graph bitmap (or the old
-// whole-graph []bool) per call was the top B2 allocation source.
+// linear scan over the result instead of allocating a visited bitmap: point
+// queries touch ~degree-sized rows, and a whole-graph allocation per call
+// was the top B2 allocation source. Rows above the limit allocate a LOCAL
+// bitmap (hub queries are rare) — deliberately NOT the traverse shared
+// pool: 7M+ QPS of small pool churn evicts the big BFS/ShortestPath
+// bitmaps and forced their fresh allocation per call (the bfsall
+// regression the retest matrix caught).
 const neighborsDedupLimit = 64
 
 // dedupAdd appends id's node record to out unless already present (linear
@@ -89,9 +93,15 @@ func dedupAppend(out []Node, materialize func(uint32) (Node, bool), id uint32) [
 	return out
 }
 
-// dedupSet dedups via a pooled bitmap for rows above the linear limit.
+// dedupSet dedups via a locally allocated bitmap for rows above the linear
+// limit (hub queries are rare; see neighborsDedupLimit for why this is not
+// pooled).
 type dedupSet struct {
 	words []uint32
+}
+
+func newDedupSet(nodeCount int) dedupSet {
+	return dedupSet{words: make([]uint32, (nodeCount+31)/32)}
 }
 
 func (d *dedupSet) seen(v uint32) bool {
@@ -135,8 +145,7 @@ func (g *Graph) NeighborsOf(key string, dir Direction, labels ...string) ([]Node
 			}
 			return out, nil
 		}
-		dedup := dedupSet{words: tr.AcquireVisited((src.NodeCount() + 31) / 32)}
-		defer tr.ReleaseVisited(dedup.words)
+		dedup := newDedupSet(src.NodeCount()) // local bitmap: see neighborsDedupLimit
 		for i, t := range tg {
 			if mask != nil && !mask[lb[i]] {
 				continue
@@ -159,8 +168,7 @@ func (g *Graph) NeighborsOf(key string, dir Direction, labels ...string) ([]Node
 		}
 		return out, nil
 	}
-	dedup := dedupSet{words: tr.AcquireVisited((src.NodeCount() + 31) / 32)}
-	defer tr.ReleaseVisited(dedup.words)
+	dedup := newDedupSet(src.NodeCount())
 	for _, r := range rows {
 		if mask != nil && !mask[r.LabelID] {
 			continue
