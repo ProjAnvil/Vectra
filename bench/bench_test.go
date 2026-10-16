@@ -1,4 +1,4 @@
-package vectra_test
+package bench
 
 import (
 	"fmt"

@@ -19,7 +19,7 @@ Vectra 最初的持久化赌注是"图数据可从上游再生，磁盘只做快
 
 ## 2. 为什么"seal 节流"撑不住事实源（定量）
 
-不用日志、靠定期 seal 存快照，持久化频率撞 O(V+E) 墙（`clone_bench_test.go`，M5 Pro 实测）：
+不用日志、靠定期 seal 存快照，持久化频率撞 O(V+E) 墙（`bench/clone_test.go`，M5 Pro 实测）：
 
 | 图规模 | 一次 seal（clone+Seal） | 持久化频率上限 |
 |---|---|---|

@@ -1,4 +1,4 @@
-package vectra_test
+package bench
 
 import (
 	"io"
@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/projanvil/vectra"
+	"github.com/projanvil/vectra/internal/fixture"
 )
 
 // ============================================================
@@ -25,13 +26,13 @@ import (
 // curateSNBParameters fixes benchmark parameters in advance:
 // - kHopSources: top-16 nodes by out-degree (SNB's "active user" start nodes)
 // - pathPairs: 64 verified-reachable node pairs (CR14 path query parameters)
-func curateSNBParameters(t testing.TB, g *vectra.Graph, el edgeList) (kHopSources []vectra.NodeID, pathPairs [][2]vectra.NodeID) {
+func curateSNBParameters(t testing.TB, g *vectra.Graph, el fixture.EdgeList) (kHopSources []vectra.NodeID, pathPairs [][2]vectra.NodeID) {
 	t.Helper()
-	outDeg := make([]int, el.n)
-	for _, s := range el.src {
+	outDeg := make([]int, el.N)
+	for _, s := range el.Src {
 		outDeg[s]++
 	}
-	idx := make([]int, el.n)
+	idx := make([]int, el.N)
 	for i := range idx {
 		idx[i] = i
 	}
@@ -43,13 +44,13 @@ func curateSNBParameters(t testing.TB, g *vectra.Graph, el edgeList) (kHopSource
 			}
 		}
 	}
-	for i := 0; i < 16 && i < el.n; i++ {
+	for i := 0; i < 16 && i < el.N; i++ {
 		kHopSources = append(kHopSources, vectra.NodeID(idx[i]))
 	}
 	// draw 64 pairs with a fixed seed, keeping only reachable ones (parameter screening = curation)
 	rng := rand.New(rand.NewSource(31))
 	for len(pathPairs) < 64 {
-		u, v := vectra.NodeID(rng.Intn(el.n)), vectra.NodeID(rng.Intn(el.n))
+		u, v := vectra.NodeID(rng.Intn(el.N)), vectra.NodeID(rng.Intn(el.N))
 		if u == v {
 			continue
 		}
@@ -62,7 +63,7 @@ func curateSNBParameters(t testing.TB, g *vectra.Graph, el edgeList) (kHopSource
 
 func benchSNB(b *testing.B) (*vectra.Graph, []vectra.NodeID, [][2]vectra.NodeID) {
 	b.Helper()
-	g, el := loadSNAPEmail(b)
+	g, el := fixture.SNAPEmail(b)
 	srcs, pairs := curateSNBParameters(b, g, el)
 	return g, srcs, pairs
 }

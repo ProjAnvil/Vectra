@@ -1,8 +1,10 @@
-package vectra_test
+package bench
 
-// v0.7 acceptance benchmarks (spec §7 lines A2/A3/A5/A6/A7 of
-// 2026-10-15-v07-delta-wal-aggregation). These are measurement tests: each
-// skips under -short, honors VECTRA_V07_BENCH_SECS for longer report runs,
+// Acceptance gates: measurement tests guarding the recorded performance
+// lines of the continuous-write/WAL model (spec §7 lines A2/A3/A5/A6/A7 of
+// docs/superpowers/specs/2026-10-15-v07-delta-wal-aggregation; each test's
+// doc comment names the line it guards). These are measurement tests: each
+// skips under -short, honors VECTRA_BENCH_SECS for longer report runs,
 // prints its distribution via t.Logf, and asserts only the acceptance line
 // it exists to guard (A2 ratio, A3/A7 latency ceilings). A1/A4 (v0.6.0
 // baseline comparisons) use the pre-existing benches — see
@@ -26,15 +28,15 @@ import (
 
 // ---- shared helpers -----------------------------------------------------------
 
-func v07BenchSecs(t *testing.T, def int) time.Duration {
+func benchSecs(t *testing.T, def int) time.Duration {
 	t.Helper()
 	if testing.Short() {
-		t.Skip("v0.7 acceptance benchmark: skipped under -short")
+		t.Skip("acceptance benchmark: skipped under -short")
 	}
 	s := def
-	if v := os.Getenv("VECTRA_V07_BENCH_SECS"); v != "" {
+	if v := os.Getenv("VECTRA_BENCH_SECS"); v != "" {
 		if _, err := fmt.Sscanf(v, "%d", &s); err != nil {
-			t.Fatalf("bad VECTRA_V07_BENCH_SECS=%q", v)
+			t.Fatalf("bad VECTRA_BENCH_SECS=%q", v)
 		}
 	}
 	return time.Duration(s) * time.Second
@@ -104,7 +106,7 @@ func fmtDur(d time.Duration) string {
 
 // ---- A2: query p99 while a merge is in flight ≤ 2x the steady write state ------
 
-// TestV07A2QueryDuringMerge: a 100K/1M base under continuous wrapper-mode
+// TestQueryLatencyDuringMerge: a 100K/1M base under continuous wrapper-mode
 // writes with concurrent readers, in three phases:
 //
 //	idle   — no writes (the merged-base floor)
@@ -117,8 +119,8 @@ func fmtDur(d time.Duration) string {
 // pipeline itself blow up query tails beyond what continuous writes cost
 // anyway? The idle→* ratios (the three-source traversal cost of a live
 // layer stack) are reported for attribution but are A1's domain.
-func TestV07A2QueryDuringMerge(t *testing.T) {
-	dur := v07BenchSecs(t, 6)
+func TestQueryLatencyDuringMerge(t *testing.T) {
+	dur := benchSecs(t, 6)
 	g := buildGraph(t, 100_000, 1_000_000)
 
 	read := func(tag string, cfg *writer.Config) (bfsP50, bfsP99, spP99, ptP99 time.Duration) {
@@ -231,11 +233,11 @@ func TestV07A2QueryDuringMerge(t *testing.T) {
 
 // ---- A3: write-then-point-query p99 -------------------------------------------
 
-// TestV07A3PointQueryAfterWrite: direct-mode writer loop on a merged base —
+// TestPointQueryAfterWrite: direct-mode writer loop on a merged base —
 // every iteration upserts an edge (materializing a fresh micro-layer) and
 // immediately point-queries through the three-source read path.
-func TestV07A3PointQueryAfterWrite(t *testing.T) {
-	dur := v07BenchSecs(t, 5)
+func TestPointQueryAfterWrite(t *testing.T) {
+	dur := benchSecs(t, 5)
 	for _, tier := range []struct {
 		name         string
 		nodes, edges int
@@ -284,7 +286,7 @@ func TestV07A3PointQueryAfterWrite(t *testing.T) {
 
 // ---- A4: WAL-Off unbatched direct-mode import throughput (hardening line) ----
 
-// TestV07A4DirectModeUnbatchedImport: the A4 hardening regression guard —
+// TestUnbatchedImportThroughput: the A4 hardening regression guard —
 // unbatched per-op direct writes (WAL off, the v0.6 idiom) at a floor of
 // 1.0M edges/s in the test process (review-measured 1.15-1.34M under test
 // load, 2.0M+ on quiet machines — the floor balances discrimination against
@@ -295,8 +297,8 @@ func TestV07A3PointQueryAfterWrite(t *testing.T) {
 // MODE=engine` protocol (the standalone bench harness runs ~20% hotter than
 // a Go test binary; docs/benchmarks/2026-10-15-delta-wal.md records both
 // readings and the same-session ratio).
-func TestV07A4DirectModeUnbatchedImport(t *testing.T) {
-	dur := v07BenchSecs(t, 1) // -short guard + env plumbing
+func TestUnbatchedImportThroughput(t *testing.T) {
+	dur := benchSecs(t, 1) // -short guard + env plumbing
 	_ = dur
 	const nodes = 100_000
 	const edges = 1_000_000 // the medium harness shape (fixed count, no per-op clock)
@@ -322,7 +324,7 @@ func TestV07A4DirectModeUnbatchedImport(t *testing.T) {
 	rate := float64(edges) / elapsed.Seconds()
 	t.Logf("A4: %d unbatched AddEdge in %s = %.0f edges/s (in-test floor ≥1.0M)",
 		edges, elapsed, rate)
-	if v07RaceBuild {
+	if raceBuild {
 		// -race multiplies the write path ~5-10x — the absolute floor is a
 		// non-race assertion (like A6's heavy tiers; full-scale numbers come
 		// from the non-race runs in docs/benchmarks)
@@ -338,13 +340,13 @@ func TestV07A4DirectModeUnbatchedImport(t *testing.T) {
 
 // ---- A5: WAL Always + Batch group-commit throughput ---------------------------
 
-// TestV07A5WALGroupCommit: direct-mode Batch group commit — one frame + one
+// TestWALGroupCommitBatchCost: direct-mode Batch group commit — one frame + one
 // fsync per batch of 100 edge upserts — across the three WAL modes. The
 // absolute ops/s is a property of the storage's fsync path (recorded in the
 // report with the machine environment); the line's NVMe assumption is
 // replaced by measured numbers.
-func TestV07A5WALGroupCommit(t *testing.T) {
-	dur := v07BenchSecs(t, 5)
+func TestWALGroupCommitBatchCost(t *testing.T) {
+	dur := benchSecs(t, 5)
 	const batchEdges = 100
 
 	for _, mode := range []struct {
@@ -397,7 +399,7 @@ func TestV07A5WALGroupCommit(t *testing.T) {
 
 // ---- A6: merge duration + amortization ----------------------------------------
 
-// TestV07A6MergeAmortization: (a) explicit Seal (the merge pipeline) timed on
+// TestMergeAmortization: (a) explicit Seal (the merge pipeline) timed on
 // a known layer stack at both tiers; (b) amortized cost — the same 50K-edge
 // wrapper workload under two threshold regimes:
 //
@@ -412,11 +414,11 @@ func TestV07A5WALGroupCommit(t *testing.T) {
 // sits strictly below the defaults regime (the tuning lever works). The
 // defaults-regime number is reported as the verdict it is — at large bases
 // the merge interval must be sized to the base (documented in the report).
-func TestV07A6MergeAmortization(t *testing.T) {
-	v07BenchSecs(t, 1) // -short guard + env plumbing
+func TestMergeAmortization(t *testing.T) {
+	benchSecs(t, 1) // -short guard + env plumbing
 
 	// (a) explicit merge durations (the 1M tier is race-build-skipped: the
-	// detector multiplies merge costs ~5-10x; see bench_v07_race_test.go)
+	// detector multiplies merge costs ~5-10x; see acceptance_race_test.go)
 	tiers := []struct {
 		name         string
 		nodes, edges int
@@ -424,7 +426,7 @@ func TestV07A6MergeAmortization(t *testing.T) {
 	}{
 		{"100K", 100_000, 1_000_000, 65_536}, // one default MergeEdges quantum
 	}
-	if !v07RaceBuild {
+	if !raceBuild {
 		tiers = append(tiers, struct {
 			name         string
 			nodes, edges int
@@ -456,7 +458,7 @@ func TestV07A6MergeAmortization(t *testing.T) {
 	// (race builds run a quarter workload: same regime structure, bounded
 	// wall time under the detector)
 	totalEdges := 50_000
-	if v07RaceBuild {
+	if raceBuild {
 		totalEdges = 12_500
 	}
 	run := func(nodes, edges int, cfg writer.Config) (writeWall, closeFold time.Duration) {
@@ -521,7 +523,7 @@ func TestV07A6MergeAmortization(t *testing.T) {
 	// the 1M/10M tier (race builds skip it: the detector multiplies the
 	// 10M-edge graph work past the timeout; full-scale numbers are recorded
 	// from non-race runs)
-	if !v07RaceBuild {
+	if !raceBuild {
 		if def1MShare, _ := amortized("defaults", 1_000_000, 10_000_000, writer.Config{}); def1MShare >= 0.25 {
 			t.Errorf("A6 FAIL: default-threshold share %.1f%% ≥ 25%% at the 1M/10M tier", def1MShare*100)
 		}
@@ -530,14 +532,14 @@ func TestV07A6MergeAmortization(t *testing.T) {
 
 // ---- A7: crash-recovery time-to-ready -----------------------------------------
 
-const v07A7ChildEnv = "VECTRA_V07_A7_CHILD_DIR"
+const crashChildEnv = "VECTRA_CRASH_CHILD_DIR"
 
-// TestV07A7CrashChild is the child half of the kill -9 simulation: it only
-// runs when the parent sets v07A7ChildEnv, logs 100K nodes plus edges until
+// TestCrashRecoveryChild is the child half of the kill -9 simulation: it only
+// runs when the parent sets crashChildEnv, logs 100K nodes plus edges until
 // the WAL holds ≥4 MiB of frames (no checkpoint — the log owns everything),
 // then SIGKILLs itself.
-func TestV07A7CrashChild(t *testing.T) {
-	dir := os.Getenv(v07A7ChildEnv)
+func TestCrashRecoveryChild(t *testing.T) {
+	dir := os.Getenv(crashChildEnv)
 	if dir == "" {
 		t.Skip("parent mode")
 	}
@@ -568,15 +570,15 @@ func TestV07A7CrashChild(t *testing.T) {
 	}
 }
 
-// TestV07A7CrashRecoveryTimeToReady measures Open's recovery (watermark
+// TestCrashRecoveryTimeToReady measures Open's recovery (watermark
 // snapshot when present + full WAL replay) after a kill -9. Line: 100K-scale
 // graph with ≈4 MiB of WAL recovers in < 3s.
-func TestV07A7CrashRecoveryTimeToReady(t *testing.T) {
-	v07BenchSecs(t, 1) // -short guard + env plumbing
+func TestCrashRecoveryTimeToReady(t *testing.T) {
+	benchSecs(t, 1) // -short guard + env plumbing
 	dir := t.TempDir()
 
-	cmd := exec.Command(os.Args[0], "-test.run=TestV07A7CrashChild$", "-test.timeout=10m")
-	cmd.Env = append(os.Environ(), v07A7ChildEnv+"="+dir)
+	cmd := exec.Command(os.Args[0], "-test.run=TestCrashRecoveryChild$", "-test.timeout=10m")
+	cmd.Env = append(os.Environ(), crashChildEnv+"="+dir)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("child exited cleanly — the kill -9 simulation is broken:\n%s", out)

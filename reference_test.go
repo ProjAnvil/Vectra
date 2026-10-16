@@ -1,15 +1,13 @@
 package vectra_test
 
 import (
-	"compress/gzip"
-	"fmt"
 	"math/rand"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/projanvil/vectra"
+	"github.com/projanvil/vectra/internal/fixture"
 )
 
 // ============================================================
@@ -373,56 +371,10 @@ func TestPropertyStatsSCCCount(t *testing.T) {
 // SNAP real-dataset loading
 // ============================================================
 
-// loadSNAPEmail reads the gzip edge list and builds the graph; returns the
-// graph and edge list (for the reference implementations).
+// loadSNAPEmail loads the shared SNAP dataset via internal/fixture and
+// adapts it to the local edgeList (which carries the reference helpers).
 func loadSNAPEmail(t testing.TB) (*vectra.Graph, edgeList) {
 	t.Helper()
-	f, err := os.Open("testdata/email-Eu-core.txt.gz")
-	if err != nil {
-		t.Fatalf("failed to open dataset (testdata/email-Eu-core.txt.gz): %v", err)
-	}
-	defer f.Close()
-	zr, err := gzip.NewReader(f)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer zr.Close()
-
-	el := edgeList{n: 1005}
-	dec := make(map[string]vectra.NodeID, 1005)
-	g := vectra.New()
-	ensure := func(id int) vectra.NodeID {
-		key := strconv.Itoa(id)
-		if nid, ok := dec[key]; ok {
-			return nid
-		}
-		nid, err := g.AddNode(key, "Person", nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		dec[key] = nid
-		return nid
-	}
-	line := 0
-	for {
-		var u, v int
-		if _, err := fmt.Fscan(zr, &u, &v); err != nil {
-			break
-		}
-		line++
-		ensure(u)
-		ensure(v)
-		if _, err := g.AddEdge(strconv.Itoa(u), strconv.Itoa(v), "EMAIL", nil); err != nil {
-			t.Fatal(err)
-		}
-		el.src = append(el.src, u)
-		el.dst = append(el.dst, v)
-	}
-	if err := g.Seal(); err != nil {
-		t.Fatal(err)
-	}
-	if line != 25571 {
-		t.Fatalf("read %d lines, want 25571", line)
-	}
-	return g, el
+	g, el := fixture.SNAPEmail(t)
+	return g, edgeList{n: el.N, src: el.Src, dst: el.Dst}
 }
