@@ -94,7 +94,6 @@ const (
 	DefaultParallelThreshold = 1024
 	parallelChunk            = 256
 	noDepth                  = ^uint32(0)
-	noParent                 = ^uint32(0)
 )
 
 // Config holds all tunables of a traversal. LabelMask is built by the caller
@@ -108,16 +107,32 @@ type Config struct {
 	NodeFilter        func(uint32) bool
 }
 
-// Result is the BFS result: per-layer members + depth array (noDepth =
-// unreached).
+// Result is the BFS result: per-layer members plus a depth array that
+// materializes lazily on the first EnsureDepth call (noDepth = unreached).
+// BFS itself allocates nothing NodeCount-sized — the eager fill was the B2
+// hot spot (a whole-ID-space array per call even when only Layers/Count are
+// consumed).
 type Result struct {
 	Layers [][]uint32
-	depth  []uint32
+	depth  []uint32 // nil until EnsureDepth
 }
 
-// DepthRaw returns the depth array itself (reused by the facade to avoid a
-// whole-graph copy; read-only contract).
-func (r *Result) DepthRaw() []uint32 { return r.depth }
+// EnsureDepth materializes and memoizes the depth array over the n-entry
+// ID space (noDepth fill + layer stamps). n is the caller's NodeCount —
+// the Result itself is reachable from BFS paths that never learn it.
+func (r *Result) EnsureDepth(n int) []uint32 {
+	if r.depth != nil {
+		return r.depth
+	}
+	d := filledNoDepth(uint32(n))
+	for depth, layer := range r.Layers {
+		for _, v := range layer {
+			d[v] = uint32(depth)
+		}
+	}
+	r.depth = d
+	return d
+}
 
 // BFS is a multi-source level-synchronous breadth-first search: starts at
 // depth 0, each layer expanded as a whole; once the frontier reaches the
@@ -129,7 +144,7 @@ func BFS(src RowSource, starts []uint32, cfg Config) *Result {
 	n := uint32(src.NodeCount())
 	for _, st := range starts {
 		if st >= n {
-			return &Result{depth: filledNoDepth(n)}
+			return &Result{} // nothing reached; EnsureDepth(n) is all-noDepth
 		}
 	}
 	if cfg.ParallelThreshold == 0 {
@@ -138,12 +153,11 @@ func BFS(src RowSource, starts []uint32, cfg Config) *Result {
 	visited := visitedPool.acquire(wordsFor(int(n)))
 	defer visitedPool.release(visited)
 
-	res := &Result{depth: filledNoDepth(n)}
+	res := &Result{}
 	frontier := make([]uint32, 0, len(starts))
 	for _, st := range starts {
 		if !testAndSet(visited, st) {
 			frontier = append(frontier, st)
-			res.depth[st] = 0
 		}
 	}
 	res.Layers = append(res.Layers, frontier)
@@ -157,9 +171,6 @@ func BFS(src RowSource, starts []uint32, cfg Config) *Result {
 			}
 			if len(next) == 0 {
 				break // exhausted: no trailing empty layer (MaxDepth cut has none either)
-			}
-			for _, v := range next {
-				res.depth[v] = depth
 			}
 			res.Layers = append(res.Layers, next)
 			frontier = next
@@ -176,9 +187,6 @@ func BFS(src RowSource, starts []uint32, cfg Config) *Result {
 		}
 		if len(next) == 0 {
 			break // exhausted: no trailing empty layer (MaxDepth cut has none either)
-		}
-		for _, v := range next {
-			res.depth[v] = depth
 		}
 		res.Layers = append(res.Layers, next)
 		frontier = next
@@ -440,34 +448,41 @@ func ShortestPath(src RowSource, from, to uint32) (nodes, edges []uint32, found 
 	bVis := visitedPool.acquire(wordsFor(n))
 	defer visitedPool.release(fVis)
 	defer visitedPool.release(bVis)
-	fParent := make([]uint32, n)
-	bParent := make([]uint32, n)
-	for i := range fParent {
-		fParent[i], bParent[i] = noParent, noParent
-	}
+	// parent[v] = u+1 (0 = none): the pool's zeroed acquire IS the noParent
+	// fill — two whole-node-space allocations and the fill loop per call
+	// were the B2 hot spot.
+	fParent := parentPool.acquire(n)
+	bParent := parentPool.acquire(n)
+	defer parentPool.release(fParent)
+	defer parentPool.release(bParent)
 
 	fFront := []uint32{from}
 	bFront := []uint32{to}
 	fVis[from>>5] |= 1 << (from & 31)
 	bVis[to>>5] |= 1 << (to & 31)
+	// Frontier scratch: each expansion fills the opposite side's old buffer
+	// (ping-pong), so per-level nil-append growth allocations are gone; the
+	// buffers grow geometrically if a frontier outgrows the initial cap.
+	fBuf := make([]uint32, 0, min(n, frontierCap))
+	bBuf := make([]uint32, 0, min(n, frontierCap))
 
 	if fAdj, ok := src.FastAdjacency(int(DirOut)); ok {
 		bAdj, _ := src.FastAdjacency(int(DirIn))
 		for len(fFront) > 0 && len(bFront) > 0 {
 			if len(fFront) <= len(bFront) {
-				next, meet, ok := expandMeeting(fFront, fAdj, fVis, bVis, fParent)
+				next, meet, ok := expandMeeting(fFront, fAdj, fVis, bVis, fParent, fBuf)
 				if ok {
 					nodes, edges := reconstructCSR(fAdj, meet, fParent, bParent)
 					return nodes, edges, true
 				}
-				fFront = next
+				fFront, fBuf = next, fFront[:0]
 			} else {
-				next, meet, ok := expandMeeting(bFront, bAdj, bVis, fVis, bParent)
+				next, meet, ok := expandMeeting(bFront, bAdj, bVis, fVis, bParent, bBuf)
 				if ok {
 					nodes, edges := reconstructCSR(fAdj, meet, fParent, bParent)
 					return nodes, edges, true
 				}
-				bFront = next
+				bFront, bBuf = next, bFront[:0]
 			}
 		}
 		return nil, nil, false
@@ -475,28 +490,34 @@ func ShortestPath(src RowSource, from, to uint32) (nodes, edges []uint32, found 
 	fRow, bRow := viewRow{src: src, dir: int(DirOut)}, viewRow{src: src, dir: int(DirIn)}
 	for len(fFront) > 0 && len(bFront) > 0 {
 		if len(fFront) <= len(bFront) {
-			next, meet, ok := expandMeetingRows(fFront, fRow, fVis, bVis, fParent)
+			next, meet, ok := expandMeetingRows(fFront, fRow, fVis, bVis, fParent, fBuf)
 			if ok {
 				nodes, edges := reconstructRows(fRow, meet, fParent, bParent)
 				return nodes, edges, true
 			}
-			fFront = next
+			fFront, fBuf = next, fFront[:0]
 		} else {
-			next, meet, ok := expandMeetingRows(bFront, bRow, bVis, fVis, bParent)
+			next, meet, ok := expandMeetingRows(bFront, bRow, bVis, fVis, bParent, bBuf)
 			if ok {
 				nodes, edges := reconstructRows(fRow, meet, fParent, bParent)
 				return nodes, edges, true
 			}
-			bFront = next
+			bFront, bBuf = next, bFront[:0]
 		}
 	}
 	return nil, nil, false
 }
 
-// expandMeeting expands one full layer and returns the new frontier; checks
-// the opposite side's visited bitmap when marking. CSR fast path (original
-// hot loop: Neighbors is a slice view, no interface).
-func expandMeeting(frontier []uint32, adj csr.Adjacency, mine, theirs []uint32, parent []uint32) (next []uint32, meet uint32, found bool) {
+// frontierCap is the initial frontier scratch capacity: typical bidirectional
+// frontiers stay path-sized; larger ones grow geometrically from here.
+const frontierCap = 256
+
+// expandMeeting expands one full layer into buf and returns the new frontier
+// (buf re-sliced); checks the opposite side's visited bitmap when marking.
+// CSR fast path (original hot loop: Neighbors is a slice view, no interface).
+// parent stores u+1 (0 = none).
+func expandMeeting(frontier []uint32, adj csr.Adjacency, mine, theirs []uint32, parent []uint32, buf []uint32) (next []uint32, meet uint32, found bool) {
+	next = buf[:0]
 	for _, u := range frontier {
 		for _, v := range adj.Neighbors(u) {
 			w := &mine[v>>5]
@@ -505,7 +526,7 @@ func expandMeeting(frontier []uint32, adj csr.Adjacency, mine, theirs []uint32, 
 				continue
 			}
 			*w |= bit
-			parent[v] = u
+			parent[v] = u + 1
 			next = append(next, v)
 			if !found && theirs[v>>5]&bit != 0 {
 				meet = v
@@ -516,7 +537,8 @@ func expandMeeting(frontier []uint32, adj csr.Adjacency, mine, theirs []uint32, 
 	return next, meet, found
 }
 
-func expandMeetingRows(frontier []uint32, r rower, mine, theirs []uint32, parent []uint32) (next []uint32, meet uint32, found bool) {
+func expandMeetingRows(frontier []uint32, r rower, mine, theirs []uint32, parent []uint32, buf []uint32) (next []uint32, meet uint32, found bool) {
+	next = buf[:0]
 	for _, u := range frontier {
 		for _, v := range neighborsOf(r, u) {
 			w := &mine[v>>5]
@@ -525,7 +547,7 @@ func expandMeetingRows(frontier []uint32, r rower, mine, theirs []uint32, parent
 				continue
 			}
 			*w |= bit
-			parent[v] = u
+			parent[v] = u + 1
 			next = append(next, v)
 			if !found && theirs[v>>5]&bit != 0 {
 				meet = v
@@ -545,15 +567,15 @@ func neighborsOf(r rower, u uint32) []uint32 {
 
 func reconstructCSR(adj csr.Adjacency, meet uint32, fParent, bParent []uint32) ([]uint32, []uint32) {
 	fwd := []uint32{meet} // meet -> from, reversed afterwards
-	for v := fParent[meet]; v != noParent; v = fParent[v] {
-		fwd = append(fwd, v)
+	for v := fParent[meet]; v != 0; v = fParent[v-1] {
+		fwd = append(fwd, v-1)
 	}
 	for i, j := 0, len(fwd)-1; i < j; i, j = i+1, j-1 {
 		fwd[i], fwd[j] = fwd[j], fwd[i]
 	}
 	var bwd []uint32 // meet -> to
-	for v := bParent[meet]; v != noParent; v = bParent[v] {
-		bwd = append(bwd, v)
+	for v := bParent[meet]; v != 0; v = bParent[v-1] {
+		bwd = append(bwd, v-1)
 	}
 	nodes := append(fwd, bwd...)
 	edges := make([]uint32, 0, len(nodes)-1)
@@ -575,15 +597,15 @@ func anyEdgeCSR(adj csr.Adjacency, u, v uint32) uint32 {
 
 func reconstructRows(r rower, meet uint32, fParent, bParent []uint32) ([]uint32, []uint32) {
 	fwd := []uint32{meet} // meet -> from, reversed afterwards
-	for v := fParent[meet]; v != noParent; v = fParent[v] {
-		fwd = append(fwd, v)
+	for v := fParent[meet]; v != 0; v = fParent[v-1] {
+		fwd = append(fwd, v-1)
 	}
 	for i, j := 0, len(fwd)-1; i < j; i, j = i+1, j-1 {
 		fwd[i], fwd[j] = fwd[j], fwd[i]
 	}
 	var bwd []uint32 // meet -> to
-	for v := bParent[meet]; v != noParent; v = bParent[v] {
-		bwd = append(bwd, v)
+	for v := bParent[meet]; v != 0; v = bParent[v-1] {
+		bwd = append(bwd, v-1)
 	}
 	nodes := append(fwd, bwd...)
 	edges := make([]uint32, 0, len(nodes)-1)
@@ -704,5 +726,19 @@ func (bp *bitmapPool) release(b []uint32) {
 }
 
 var visitedPool bitmapPool
+
+// parentPool backs ShortestPath's parent arrays: parent[v] = u+1 with 0 as
+// "none" so the pool's zeroing acquire is the whole initialization (the old
+// per-call make + fill loop over the full node space was a B2 hot spot).
+var parentPool bitmapPool
+
+// AcquireVisited borrows a zeroed visited bitmap from the shared pool; the
+// root facade uses it for large-row point-query dedup (a whole-graph
+// allocation per NeighborsOf call was the B2 hot spot). Pair every acquire
+// with ReleaseVisited.
+func AcquireVisited(words int) []uint32 { return visitedPool.acquire(words) }
+
+// ReleaseVisited returns a bitmap to the pool (cleared by the pool).
+func ReleaseVisited(b []uint32) { visitedPool.release(b) }
 
 func wordsFor(n int) int { return (n + 31) / 32 }

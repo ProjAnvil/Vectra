@@ -16,10 +16,13 @@ const (
 // per-node depth. Depth uses a flat uint32 array instead of a map — on
 // million-scale result sets map insertion cost would swallow the CSR's
 // memory-access advantage (verified by benchmarks), and the array's GC cost
-// is near zero.
+// is near zero. The array materializes lazily on the first Depth/Reached
+// call (BFS itself allocates nothing ID-space-sized — most consumers only
+// read Layers/Count, and the eager fill was the B2 hot spot).
 type BFSResult struct {
 	Layers [][]NodeID
-	depth  []uint32
+	n      int      // ID-space size (depth materialization bound)
+	depth  []uint32 // nil until the first Depth/Reached call
 }
 
 // Nodes returns all reached nodes (layers concatenated).
@@ -44,11 +47,29 @@ func (r *BFSResult) Count() int {
 	return total
 }
 
+// ensureDepth materializes the depth array over the ID space: noDepth fill +
+// layer stamps. Idempotent; first caller pays, later readers reuse.
+func (r *BFSResult) ensureDepth() {
+	if r.depth != nil {
+		return
+	}
+	d := make([]uint32, r.n)
+	for i := range d {
+		d[i] = ^uint32(0)
+	}
+	for depth, l := range r.Layers {
+		for _, id := range l {
+			d[id] = uint32(depth)
+		}
+	}
+	r.depth = d
+}
+
 // Depth returns the node depth; unreached nodes return math.MaxUint32.
-func (r *BFSResult) Depth(id NodeID) uint32 { return r.depth[id] }
+func (r *BFSResult) Depth(id NodeID) uint32 { r.ensureDepth(); return r.depth[id] }
 
 // Reached reports whether the node was reached.
-func (r *BFSResult) Reached(id NodeID) bool { return r.depth[id] != ^uint32(0) }
+func (r *BFSResult) Reached(id NodeID) bool { r.ensureDepth(); return r.depth[id] != ^uint32(0) }
 
 // DepthsMap builds a "node->depth" map on demand (a convenience for small
 // result sets; prefer Depth/Reached/Nodes for large ones).
@@ -102,7 +123,7 @@ func (g *Graph) BFS(starts []NodeID, opts ...BFSOption) (*BFSResult, error) {
 		}
 	}
 	res := tr.BFS(src, toU32s(starts), g.traverseConfig(v, src, opts...))
-	return &BFSResult{Layers: toNodeIDLayers(res.Layers), depth: res.DepthRaw()}, nil
+	return &BFSResult{Layers: toNodeIDLayers(res.Layers), n: int(n)}, nil
 }
 
 // traverseConfig builds the traversal config for one generation: the label

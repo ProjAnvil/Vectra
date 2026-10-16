@@ -67,7 +67,14 @@ func dumpState(t *testing.T, g *vectra.Graph, keys []string) string {
 				continue
 			}
 			for _, e := range es {
-				ek = append(ek, fmt.Sprintf("%d->%d:%s = %v", e.Src, e.Dst, e.Label, e.Props))
+				// Endpoints are dumped by KEY, not numeric ID: the oracle Seal
+				// and the wrapper's merges both renumber densely (R1), and the
+				// renumbering ORDER legitimately differs once the direct-mode
+				// layer-stack governor folds mid-stream (2026-10-16 B1 fix) —
+				// IDs are not an equivalence surface across merge orders.
+				s, _ := g.NodeByID(e.Src)
+				d, _ := g.NodeByID(e.Dst)
+				ek = append(ek, fmt.Sprintf("%s->%s:%s = %v", s.Key, d.Key, e.Label, e.Props))
 			}
 		}
 	}

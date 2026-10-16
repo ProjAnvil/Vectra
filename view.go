@@ -87,99 +87,167 @@ func (s *layerSource) Empty() bool {
 	return len(s.out) == 0 && len(s.in) == 0 && len(s.deadBase) == 0 && len(s.killed) == 0
 }
 
+// viewBuild carries the incremental construction state of one generation's
+// three-source View: everything engineView's loop accumulates across layers
+// (the resolve memo, the cumulative live-record index, the per-layer
+// sources, the widened ID space). The writer's prebuildView extends a
+// previously cached build across publishes — appending only the new layers'
+// sources — so the per-publish cost stays O(new records) regardless of
+// stack depth or volume; readers missing the cache build from scratch.
+type viewBuild struct {
+	builtTo int
+	sources []engine.DeltaSource
+	live    map[delta.EdgeKey][]uint32
+	nodeID  map[string]NodeID
+	baseLab map[string]uint32
+	nodeN   int
+	// snapF is the state at the governor's F-run boundary (see
+	// Graph.splitF): when a fold replaces the T run, the build rewinds to
+	// this snapshot and rebuilds T+tail only. nil until a full rebuild
+	// passes the boundary.
+	snapF *viewBuildSnap
+}
+
+// viewBuildSnap is one immutable copy of the rewinds-able build state.
+type viewBuildSnap struct {
+	live   map[delta.EdgeKey][]uint32
+	nodeID map[string]NodeID
+	nodeN  int
+}
+
+func newViewBuild(v *genView) *viewBuild {
+	baseLab := make(map[string]uint32, v.base.LabelCount())
+	for i := range v.base.LabelCount() {
+		baseLab[v.base.LabelName(uint32(i))] = uint32(i)
+	}
+	return &viewBuild{
+		live:    make(map[delta.EdgeKey][]uint32),
+		nodeID:  make(map[string]NodeID, 8),
+		baseLab: baseLab,
+		nodeN:   v.base.NodeCount(),
+	}
+}
+
+// snapshot copies the rewind state (taken when a full build passes the
+// F boundary; one O(F) copy per fold interval).
+func (vb *viewBuild) snapshot() *viewBuildSnap {
+	live := make(map[delta.EdgeKey][]uint32, len(vb.live))
+	for k, ids := range vb.live {
+		live[k] = append([]uint32(nil), ids...)
+	}
+	nodeID := make(map[string]NodeID, len(vb.nodeID))
+	for k, id := range vb.nodeID {
+		nodeID[k] = id
+	}
+	return &viewBuildSnap{live: live, nodeID: nodeID, nodeN: vb.nodeN}
+}
+
+// rewindTo restores the build to the splitF boundary: F's sources are kept
+// (the layers below splitF are pointer-identical — checked by the caller),
+// the cumulative state comes from the snapshot, and T+tail rebuild next.
+func (vb *viewBuild) rewindTo(splitF int) {
+	vb.sources = vb.sources[:splitF]
+	vb.live = make(map[delta.EdgeKey][]uint32, len(vb.snapF.live))
+	for k, ids := range vb.snapF.live {
+		vb.live[k] = ids
+	}
+	vb.nodeID = make(map[string]NodeID, len(vb.snapF.nodeID))
+	for k, id := range vb.snapF.nodeID {
+		vb.nodeID[k] = id
+	}
+	vb.nodeN = vb.snapF.nodeN
+	vb.builtTo = splitF
+}
+
+// appendLayer folds v.layers[i]'s source into the build (verbatim from
+// engineView's per-layer loop body; the cumulative live index and resolve
+// memo carry across calls).
+func (vb *viewBuild) appendLayer(v *genView, i int) {
+	l := v.layers[i]
+	s := &layerSource{
+		layer: l,
+		out:   make(map[uint32][]csr.AdjRow),
+		in:    make(map[uint32][]csr.AdjRow),
+	}
+	labLocal := make(map[string]uint32, len(l.Labels()))
+	for j, name := range l.Labels() {
+		labLocal[name] = uint32(j)
+	}
+	resolve := func(key string) (uint32, bool) {
+		if id, ok := vb.nodeID[key]; ok {
+			return uint32(id), true
+		}
+		if n, ok := v.nodeWinner(key); ok {
+			vb.nodeID[key] = n.ID
+			return uint32(n.ID), true
+		}
+		return 0, false // dead endpoint: a live record cannot reference one (cascades), defensive skip
+	}
+	// widen the ID space to every layer node (ratchet IDs may exceed
+	// base+Σcounts when a batch burned IDs on since-deleted nodes)
+	for j := range l.Nodes() {
+		if id := int(l.NodeIDAt(j)); id >= vb.nodeN {
+			vb.nodeN = id + 1
+		}
+	}
+	// bucket the layer's live records by winner-resolved endpoint IDs
+	for j, rec := range l.Edges() {
+		src, okS := resolve(rec.SrcKey)
+		dst, okD := resolve(rec.DstKey)
+		if !okS || !okD {
+			continue
+		}
+		eid, lid := l.EdgeIDAt(j), labLocal[rec.Label]
+		s.out[src] = append(s.out[src], csr.AdjRow{Target: dst, EdgeID: eid, LabelID: lid})
+		s.in[dst] = append(s.in[dst], csr.AdjRow{Target: src, EdgeID: eid, LabelID: lid})
+	}
+	// resolve this layer's tombstones against everything older. Fold
+	// transfer: the layer's own surviving record may carry an older
+	// record's (winner) EdgeID, so own record IDs are collected first
+	// and exempted from the kill list.
+	own := make(map[delta.EdgeKey][]uint32, l.EdgeCount())
+	for j, rec := range l.Edges() {
+		k := delta.EdgeKey{SrcKey: rec.SrcKey, DstKey: rec.DstKey, Label: rec.Label}
+		own[k] = append(own[k], l.EdgeIDAt(j))
+	}
+	for k := range l.EdgeTombstones() {
+		for _, eid := range vb.live[k] { // older-layer parallels die
+			if !slices.Contains(own[k], eid) {
+				s.killed = append(s.killed, eid)
+			}
+		}
+		delete(vb.live, k)
+		sb, okS := v.baseKeys[k.SrcKey] // base parallels die (targeted row scan)
+		db, okD := v.baseKeys[k.DstKey]
+		lid, okL := vb.baseLab[k.Label]
+		if !okS || !okD || !okL {
+			continue
+		}
+		tg, eids, lbs := v.base.AdjacencyF().Row(uint32(sb))
+		for x, t := range tg {
+			if t == uint32(db) && lbs[x] == lid {
+				s.deadBase = append(s.deadBase, eids[x])
+			}
+		}
+	}
+	for k, ids := range own {
+		vb.live[k] = append(vb.live[k], ids...)
+	}
+	vb.sources = append(vb.sources, s)
+	vb.builtTo++
+}
+
 // engineView builds the three-source View of this generation: one
 // DeltaSource per layer (rows bucketed by node ID, tombstone effects
 // resolved against the layers below), the union ID-space node count, and
 // engine.NewView's joint label table on top. Cost is proportional to the
 // unmerged delta (layer records + tombstone row scans), never to the base.
 func (v *genView) engineView() *engine.View {
-	nodeID := make(map[string]NodeID, 8) // memo: endpoint key -> winner ID
-	resolve := func(key string) (uint32, bool) {
-		if id, ok := nodeID[key]; ok {
-			return uint32(id), true
-		}
-		if n, ok := v.nodeWinner(key); ok {
-			nodeID[key] = n.ID
-			return uint32(n.ID), true
-		}
-		return 0, false // dead endpoint: a live record cannot reference one (cascades), defensive skip
+	vb := newViewBuild(v)
+	for i := range v.layers {
+		vb.appendLayer(v, i)
 	}
-	// base label name -> base LabelID (dead-base matching needs it: base rows
-	// carry LabelIDs, tombstones carry names)
-	baseLab := make(map[string]uint32, v.base.LabelCount())
-	for i := range v.base.LabelCount() {
-		baseLab[v.base.LabelName(uint32(i))] = uint32(i)
-	}
-	// cumulative live-record index: key -> record EdgeIDs indexed so far
-	// (older layers); each new layer's tombstones kill these, then the
-	// layer's own surviving records join the index.
-	live := make(map[delta.EdgeKey][]uint32)
-
-	n := v.base.NodeCount()
-	sources := make([]engine.DeltaSource, len(v.layers))
-	for i, l := range v.layers {
-		s := &layerSource{
-			layer: l,
-			out:   make(map[uint32][]csr.AdjRow),
-			in:    make(map[uint32][]csr.AdjRow),
-		}
-		labLocal := make(map[string]uint32, len(l.Labels()))
-		for j, name := range l.Labels() {
-			labLocal[name] = uint32(j)
-		}
-		// widen the ID space to every layer node (ratchet IDs may exceed
-		// base+Σcounts when a batch burned IDs on since-deleted nodes)
-		for j := range l.Nodes() {
-			if id := int(l.NodeIDAt(j)); id >= n {
-				n = id + 1
-			}
-		}
-		// bucket the layer's live records by winner-resolved endpoint IDs
-		for j, rec := range l.Edges() {
-			src, okS := resolve(rec.SrcKey)
-			dst, okD := resolve(rec.DstKey)
-			if !okS || !okD {
-				continue
-			}
-			eid, lid := l.EdgeIDAt(j), labLocal[rec.Label]
-			s.out[src] = append(s.out[src], csr.AdjRow{Target: dst, EdgeID: eid, LabelID: lid})
-			s.in[dst] = append(s.in[dst], csr.AdjRow{Target: src, EdgeID: eid, LabelID: lid})
-		}
-		// resolve this layer's tombstones against everything older. Fold
-		// transfer: the layer's own surviving record may carry an older
-		// record's (winner) EdgeID, so own record IDs are collected first
-		// and exempted from the kill list.
-		own := make(map[delta.EdgeKey][]uint32, l.EdgeCount())
-		for j, rec := range l.Edges() {
-			k := delta.EdgeKey{SrcKey: rec.SrcKey, DstKey: rec.DstKey, Label: rec.Label}
-			own[k] = append(own[k], l.EdgeIDAt(j))
-		}
-		for k := range l.EdgeTombstones() {
-			for _, eid := range live[k] { // older-layer parallels die
-				if !slices.Contains(own[k], eid) {
-					s.killed = append(s.killed, eid)
-				}
-			}
-			delete(live, k)
-			sb, okS := v.baseKeys[k.SrcKey] // base parallels die (targeted row scan)
-			db, okD := v.baseKeys[k.DstKey]
-			lid, okL := baseLab[k.Label]
-			if !okS || !okD || !okL {
-				continue
-			}
-			tg, eids, lbs := v.base.AdjacencyF().Row(uint32(sb))
-			for x, t := range tg {
-				if t == uint32(db) && lbs[x] == lid {
-					s.deadBase = append(s.deadBase, eids[x])
-				}
-			}
-		}
-		for k, ids := range own {
-			live[k] = append(live[k], ids...)
-		}
-		sources[i] = s
-	}
-	return engine.NewView(v.base, sources, n)
+	return engine.NewView(v.base, vb.sources, vb.nodeN)
 }
 
 // ---- Cypher's three-source execution surface ---------------------------------

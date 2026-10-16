@@ -69,6 +69,51 @@ func (q *Query) Run() (*BFSResult, error) {
 // generation's three-source View — base rows tombstone-filtered plus layer
 // rows, so writes are visible immediately. With nothing unmerged the plain
 // CSR row zip runs (FastAdjacency hot path).
+// neighborsDedupLimit is the row size below which NeighborsOf dedups by
+// linear scan over the result instead of allocating a visited bitmap: point
+// queries touch ~degree-sized rows, and a whole-graph allocation per call
+// was the top B2 allocation source. Rows above the limit allocate a LOCAL
+// bitmap (hub queries are rare) — deliberately NOT the traverse shared
+// pool: 7M+ QPS of small pool churn evicts the big BFS/ShortestPath
+// bitmaps and forced their fresh allocation per call (the bfsall
+// regression the retest matrix caught).
+const neighborsDedupLimit = 64
+
+// dedupAdd appends id's node record to out unless already present (linear
+// scan — bounded by neighborsDedupLimit callers).
+func dedupAppend(out []Node, materialize func(uint32) (Node, bool), id uint32) []Node {
+	for i := range out {
+		if out[i].ID == NodeID(id) {
+			return out
+		}
+	}
+	if rec, ok := materialize(id); ok {
+		return append(out, rec)
+	}
+	return out
+}
+
+// dedupSet dedups via a locally allocated bitmap for rows above the linear
+// limit (hub queries are rare; see neighborsDedupLimit for why this is not
+// pooled).
+type dedupSet struct {
+	words []uint32
+}
+
+func newDedupSet(nodeCount int) dedupSet {
+	return dedupSet{words: make([]uint32, (nodeCount+31)/32)}
+}
+
+func (d *dedupSet) seen(v uint32) bool {
+	w := &d.words[v>>5]
+	bit := uint32(1) << (v & 31)
+	if *w&bit != 0 {
+		return true
+	}
+	*w |= bit
+	return false
+}
+
 func (g *Graph) NeighborsOf(key string, dir Direction, labels ...string) ([]Node, error) {
 	n, ok := g.NodeByKey(key) // materializes the caller's absorption window
 	if !ok {
@@ -88,16 +133,24 @@ func (g *Graph) NeighborsOf(key string, dir Direction, labels ...string) ([]Node
 	materialize := func(id uint32) (Node, bool) {
 		return v.nodeByID(NodeID(id))
 	}
+	var out []Node
 	if adj, fast := src.FastAdjacency(dirCode); fast {
 		tg, _, lb := adj.Row(uint32(n.ID))
-		seen := make([]bool, src.NodeCount())
-		var out []Node
+		if len(tg) <= neighborsDedupLimit {
+			for i, t := range tg {
+				if mask != nil && !mask[lb[i]] {
+					continue
+				}
+				out = dedupAppend(out, materialize, t)
+			}
+			return out, nil
+		}
+		dedup := newDedupSet(src.NodeCount()) // local bitmap: see neighborsDedupLimit
 		for i, t := range tg {
 			if mask != nil && !mask[lb[i]] {
 				continue
 			}
-			if !seen[t] {
-				seen[t] = true
+			if !dedup.seen(t) {
 				if rec, ok := materialize(t); ok {
 					out = append(out, rec)
 				}
@@ -106,14 +159,21 @@ func (g *Graph) NeighborsOf(key string, dir Direction, labels ...string) ([]Node
 		return out, nil
 	}
 	rows := src.Rows(uint32(n.ID), dirCode)
-	seen := make([]bool, src.NodeCount())
-	var out []Node
+	if len(rows) <= neighborsDedupLimit {
+		for _, r := range rows {
+			if mask != nil && !mask[r.LabelID] {
+				continue
+			}
+			out = dedupAppend(out, materialize, r.Target)
+		}
+		return out, nil
+	}
+	dedup := newDedupSet(src.NodeCount())
 	for _, r := range rows {
 		if mask != nil && !mask[r.LabelID] {
 			continue
 		}
-		if !seen[r.Target] {
-			seen[r.Target] = true
+		if !dedup.seen(r.Target) {
 			if rec, ok := materialize(r.Target); ok {
 				out = append(out, rec)
 			}

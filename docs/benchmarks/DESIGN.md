@@ -60,6 +60,27 @@ Graphalytics 用 s(V,E)=log10(V+E) 分 T-shirt 档。Vectra 定位"10万~1000万
   读尾部因此可归因到具体的持续写速率（ pacing 精度上限 ~500/s）。
 - 输出：读/写两侧各自的 ops/QPS/p50/p90/p99/max。
 
+## direct 模式层栈治理（2026-10-16 B1 修复，v4 语义）
+
+`make bench` 基线（2026-10-16）定位：持续写入下每发布一层即新代，
+逐代 View 重建成本 ∝ 未合并记录 × 每端点 O(层数) 字符串查找；一旦
+重建耗时超过发布间隔，逐代缓存永不命中，每查询全量重建（读崩塌）。
+治理器（`SetAutoCompact`/`SetAutoSealEdges`，写前调用）：
+
+- 栈分三段：F（旧折叠 run）/ T（新折叠 run）/ tail（原始层）。
+- 触发（仅写路径：容量触发的窗口切割与 Batch 边界；读触发的
+  flush 只发布不折叠）：层数 ≥ 上限（默认 32）且 tail 边量 ≥ 64。
+- 折叠：`delta.FoldLayers(T + tail)`，成本 O(T+tail)；尺寸分层——
+  T ≥ max(512, F/2) 时才并入 F，摊还 ≤3 次拷贝/记录（整栈重折是
+  二次的，A3 门已抓）。折叠是纯视图变换：镜像、吸收窗口、WAL 帧
+  不动，重放语义等价（差分测试钉死，含严格 ID 与 Seal 重编号容忍
+  两种口径）。
+- 体量 Seal（仅 Batch 边界）：未合并边 ≥ max(64K, base) 时
+  forceMerge 入新基座——界住长跑体量并回收墓碑记录（A6 的
+  base 比例间隔规则）。O(base) 的 Seal 绝不落在查询路径（A3 门）。
+- wrapper 模式整体跳过：wrapper 自有合并调度（pubMu 协议、
+  MaxLayers、体量折叠），其验收门测的就是它。
+
 ## 指标
 
 注入：节点/s、边/s、Seal 耗时。查询：ops、p50/p90/p99/max 延迟、
