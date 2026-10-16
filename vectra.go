@@ -370,6 +370,11 @@ type Graph struct {
 type viewCacheEntry struct {
 	gen  *genView
 	view *engine.View
+	// ext is the writer-maintained incremental build state (see
+	// prebuildView); nil on entries stored by readers. Readers only read
+	// gen/view — the writer may steal and mutate a superseded entry's ext
+	// race-free by field separation.
+	ext *viewBuild
 }
 
 // engineViewOf returns v's three-source View through the per-generation
@@ -383,6 +388,68 @@ func (g *Graph) engineViewOf(v *genView) *engine.View {
 	ev := v.engineView()
 	g.viewCache.Store(&viewCacheEntry{gen: v, view: ev})
 	return ev
+}
+
+// layerPrefixMatch reports whether a and b share their first k layer
+// pointers (immutable layers — pointer equality is identity).
+func layerPrefixMatch(a, b []*delta.Layer, k int) bool {
+	if len(a) < k || len(b) < k {
+		return false
+	}
+	for i := range k {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// prebuildView refreshes the view cache on the writer path so readers of a
+// freshly published generation always hit. Without it the first query after
+// every publish pays the full O(unmerged-delta) assembly, and under
+// sustained writes that cost outlasts the publish interval — the cache
+// never hits and read latency collapses (the B1 mixed-read baseline:
+// rebuild ~50-90ms vs a 6ms publish interval at 165 batches/s).
+//
+// The incremental cases: a pure append reuses the cached build's sources
+// and cumulative state (cost O(new layers)); a T-run fold rewinds to the
+// F-boundary snapshot and rebuilds T+tail (cost O(T+tail), one O(F) map
+// copy per fold interval). Anything else (Seal, F-merge, rebase, replay)
+// rebuilds fully. Writer-path only, after the generation is stored; the
+// stolen ext is safe to mutate in place (see viewCacheEntry.ext).
+func (g *Graph) prebuildView(v *genView) {
+	if len(v.layers) == 0 || g.merging {
+		return
+	}
+	var vb *viewBuild
+	if c := g.viewCache.Load(); c != nil && c.ext != nil && c.gen.base == v.base {
+		old := c.ext
+		k := old.builtTo
+		switch {
+		case k <= len(v.layers) && k >= g.splitT && layerPrefixMatch(c.gen.layers, v.layers, k):
+			vb = old // pure append: T and F untouched, layers[k:] are new
+			for i := k; i < len(v.layers); i++ {
+				vb.appendLayer(v, i)
+			}
+		case old.snapF != nil && g.splitF < k && g.splitF <= len(v.layers) &&
+			layerPrefixMatch(c.gen.layers, v.layers, g.splitF):
+			vb = old // T run replaced by a fold: keep F, rewind, rebuild T+tail
+			vb.rewindTo(g.splitF)
+			for i := g.splitF; i < len(v.layers); i++ {
+				vb.appendLayer(v, i)
+			}
+		}
+	}
+	if vb == nil {
+		vb = newViewBuild(v)
+		for i := range v.layers {
+			vb.appendLayer(v, i)
+			if i+1 == g.splitF && vb.snapF == nil {
+				vb.snapF = vb.snapshot()
+			}
+		}
+	}
+	g.viewCache.Store(&viewCacheEntry{gen: v, view: engine.NewView(v.base, vb.sources, vb.nodeN), ext: vb})
 }
 
 // pendWindow is the metadata of one open absorption window. owner is the
@@ -579,10 +646,12 @@ func (g *Graph) maybeAutoCompact(atBatchEnd bool) {
 	} else {
 		g.splitF, g.splitT = foldFrom, foldFrom+1
 	}
-	g.view.Store(&genView{
+	nv := &genView{
 		base: v.base, baseKeys: v.baseKeys, layers: newLayers,
 		lsn: v.lsn, nodes: v.nodes, edges: v.edges,
-	})
+	}
+	g.view.Store(nv)
+	g.prebuildView(nv)
 	// Volume seal (Batch boundaries only): the layer cap bounds stack count,
 	// this bounds record VOLUME and reclaims tombstoned records at a
 	// base-proportional interval. Frames are already persisted; the WAL
@@ -849,10 +918,14 @@ func (g *Graph) publishLayer() {
 	if g.wal != nil {
 		lsn = g.wal.LastLSN()
 	}
-	g.view.Store(&genView{
+	nv := &genView{
 		base: v.base, baseKeys: v.baseKeys, layers: layers,
 		lsn: lsn, nodes: g.nodeTotal, edges: g.edgeTotal,
-	})
+	}
+	g.view.Store(nv)
+	if !g.merging {
+		g.prebuildView(nv) // forceMerge's publish is immediately superseded
+	}
 }
 
 // cutLayer is the mid-burst window flush: publishLayer, but the endpoint
