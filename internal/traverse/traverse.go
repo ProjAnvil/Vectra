@@ -705,4 +705,13 @@ func (bp *bitmapPool) release(b []uint32) {
 
 var visitedPool bitmapPool
 
+// AcquireVisited borrows a zeroed visited bitmap from the shared pool; the
+// root facade uses it for large-row point-query dedup (a whole-graph
+// allocation per NeighborsOf call was the B2 hot spot). Pair every acquire
+// with ReleaseVisited.
+func AcquireVisited(words int) []uint32 { return visitedPool.acquire(words) }
+
+// ReleaseVisited returns a bitmap to the pool (cleared by the pool).
+func ReleaseVisited(b []uint32) { visitedPool.release(b) }
+
 func wordsFor(n int) int { return (n + 31) / 32 }
