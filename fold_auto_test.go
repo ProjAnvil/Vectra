@@ -57,14 +57,23 @@ func compareGraphs(t *testing.T, gOn, gOff *Graph, keys []string, strictIDs bool
 			}
 		}
 	}
-	// traversal surfaces: BFS layer sets, reachability, shortest paths
+	// traversal surfaces: BFS layer sets, reachability, shortest paths.
+	// Start keys must exist on BOTH sides (a deleted key resolves to a zero
+	// ID, and post-Seal renumbering would point the two graphs' zero IDs at
+	// different nodes — a false divergence).
 	for _, k := range keys {
-		na, _ := gOn.NodeByKey(k)
+		na, aok := gOn.NodeByKey(k)
+		nb, bok := gOff.NodeByKey(k)
+		if aok != bok {
+			t.Fatalf("existence mismatch for %q: %v vs %v", k, aok, bok)
+		}
+		if !aok {
+			continue
+		}
 		la, err := gOn.BFS([]NodeID{na.ID})
 		if err != nil {
 			t.Fatal(err)
 		}
-		nb, _ := gOff.NodeByKey(k)
 		lb, err := gOff.BFS([]NodeID{nb.ID})
 		if err != nil {
 			t.Fatal(err)
@@ -148,8 +157,9 @@ func TestAutoCompactDifferentialEquivalence(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for batch := 0; batch < 150; batch++ {
-		n := 1 + rng.Intn(5)
+	folded := false
+	for batch := 0; batch < 60; batch++ {
+		n := 4 + rng.Intn(8)
 		ops := make([]foldOp, 0, n)
 		for range n {
 			a, b := keys[rng.Intn(len(keys))], keys[rng.Intn(len(keys))]
@@ -160,13 +170,16 @@ func TestAutoCompactDifferentialEquivalence(t *testing.T) {
 		}
 		applyFoldOps(gOn, ops)
 		applyFoldOps(gOff, ops)
+		if l, _ := gOn.LayerPressure(); l <= 2 {
+			folded = true // the stack was folded down to runs
+		}
 		if batch%25 == 24 {
 			compareGraphs(t, gOn, gOff, keys, true)
 		}
 	}
-	compareGraphs(t, gOn, gOff, keys, true)
-	if l, _ := gOn.LayerPressure(); l > 4 {
-		t.Fatalf("auto-compact left %d layers (cap 4)", l)
+	if !folded {
+		l, _ := gOn.LayerPressure()
+		t.Fatalf("governor never folded during the stream: %d layers", l)
 	}
 	if err := gOn.Seal(); err != nil {
 		t.Fatal(err)
@@ -189,15 +202,27 @@ func TestAutoCompactTriggerAndContinue(t *testing.T) {
 	if err := g.Seal(); err != nil {
 		t.Fatal(err)
 	}
-	for b := 0; b < 10; b++ {
-		applyFoldOps(g, []foldOp{{kind: 0, a: "n0", b: "n" + string(rune('0'+1+b%9)), prop: b}})
-		if l, _ := g.LayerPressure(); l > 4 {
-			t.Fatalf("after batch %d: %d layers > cap 4", b, l)
+	folded := false
+	for b := 0; b < 12; b++ {
+		ops := make([]foldOp, 0, 20)
+		for e := 0; e < 20; e++ {
+			ops = append(ops, foldOp{kind: 0, a: "n0", b: "n" + string(rune('0'+1+(b*20+e)%9)), prop: e})
+		}
+		applyFoldOps(g, ops)
+		if l, _ := g.LayerPressure(); l <= 2 {
+			folded = true
+		}
+		if l, _ := g.LayerPressure(); l > 8 { // volume gate: ~64-edge tail = a few raw layers between folds
+			t.Fatalf("after batch %d: %d layers", b, l)
 		}
 	}
+	if !folded {
+		l, _ := g.LayerPressure()
+		t.Fatalf("governor never folded: %d layers", l)
+	}
 	// writes and queries stay correct after folds
-	if g.EdgeCount() < 10 {
-		t.Fatalf("edges = %d", g.EdgeCount())
+	if g.EdgeCount() < 240 {
+		t.Fatalf("edges = %d after folds", g.EdgeCount())
 	}
 	if _, err := g.NeighborsOf("n0", DirOut); err != nil {
 		t.Fatal(err)
@@ -246,15 +271,19 @@ func TestAutoSealVolumeTrigger(t *testing.T) {
 	}
 	sealed := false
 	for b := 0; b < 12; b++ {
-		applyFoldOps(g, []foldOp{{kind: 0, a: "s0", b: "s" + string(rune('0'+1+b%7)), prop: b}})
+		ops := make([]foldOp, 0, 8)
+		for e := 0; e < 8; e++ {
+			ops = append(ops, foldOp{kind: 0, a: "s0", b: "s" + string(rune('0'+1+(b*8+e)%7)), prop: e})
+		}
+		applyFoldOps(g, ops)
 		if l, _ := g.LayerPressure(); l == 0 {
 			sealed = true // the volume trigger ran forceMerge
 		}
 	}
 	if !sealed {
-		t.Fatal("volume auto-seal never fired (threshold 30 edges)")
+		t.Fatal("volume auto-seal never fired (threshold 10 edges)")
 	}
-	if g.EdgeCount() < 12 {
+	if g.EdgeCount() < 96 {
 		t.Fatalf("edges = %d after auto-seal", g.EdgeCount())
 	}
 	if _, err := g.NeighborsOf("s0", DirOut); err != nil {
@@ -299,10 +328,14 @@ func TestAutoCompactWALReplay(t *testing.T) {
 		}
 	}
 	for b := 0; b < 8; b++ {
-		applyFoldOps(g, []foldOp{{kind: 0, a: "w0", b: "w" + string(rune('0'+1+b%5)), prop: b}})
-	}
-	if l, _ := g.LayerPressure(); l > 2 {
-		t.Fatalf("%d layers > cap 2", l)
+		ops := make([]foldOp, 0, 16)
+		for e := 0; e < 16; e++ {
+			ops = append(ops, foldOp{kind: 0, a: "w0", b: "w" + string(rune('0'+1+(b*16+e)%5)), prop: e})
+		}
+		applyFoldOps(g, ops)
+		if l, _ := g.LayerPressure(); l > 4 {
+			t.Fatalf("%d layers > cap 4", l)
+		}
 	}
 	wantNodes, wantEdges := g.NodeCount(), g.EdgeCount()
 	if err := g.Close(); err != nil {

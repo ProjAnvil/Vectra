@@ -331,27 +331,38 @@ type Graph struct {
 	viewCache atomic.Pointer[viewCacheEntry]
 
 	// autoCompactLayers is the direct-mode layer-stack governor (B1 fix):
-	// once a publish leaves the stack at/above the cap, the whole stack is
-	// folded into one layer (delta.FoldLayers) on the writer goroutine.
-	// Bounded stacks keep the per-generation View rebuild cost below the
-	// publish interval, so the viewCache keeps hitting under sustained
-	// writes; unbounded stacks rebuild per query once the delta outgrows the
-	// interval (the 2026-10-16 mixed-workload read collapse). The fold is a
-	// pure view swap — mirrors, absorption window and WAL frames are
-	// untouched (fold equivalence is delta-fold-tested; replay rebuilds the
-	// original layers with identical visible state). 0 disables. Set via
-	// SetAutoCompact before the first write. merging guards forceMerge's
-	// internal publishLayer from re-entering the governor.
+	// once a publish leaves the stack at/above the cap, the TAIL run folds
+	// into one layer on the writer goroutine (size-tiered: the folded run
+	// merges into the older run only at half its size — folding the whole
+	// stack every trigger is quadratic under sustained writes and the A3
+	// gate caught it). Bounded stacks keep the per-generation View rebuild
+	// cheap so the viewCache keeps hitting under sustained writes (the
+	// 2026-10-16 mixed-workload read collapse). Folds are pure view swaps —
+	// mirrors, absorption window and WAL frames untouched. 0 disables. Set
+	// via SetAutoCompact before the first write.
 	//
-	// autoSealEdges is the volume governor: after a fold, when the folded
-	// layer carries at least max(autoSealEdges, base/8) edge records, a
-	// forceMerge folds everything into a fresh base — bounding the unmerged
-	// RECORD volume for long-running writers (the layer cap alone bounds
-	// count, not bytes). The interval stays base-proportional (every fold
-	// costs O(base), A6's lesson). 0 disables. WAL checkpointing stays with
-	// explicit Seal — the frames of the folded layers are already persisted.
+	// splitF/splitT partition the stack: [0,splitF) = old folded run F,
+	// [splitF,splitT) = newer folded run T, [splitT,:) = raw tail.
+	// Writer-private; clamped when the stack is replaced externally
+	// (Seal/rebase/replay) — a stale split only mis-shapes the next fold's
+	// cost, never its semantics (any sub-stack folds validly).
+	//
+	// autoSealEdges is the volume governor: at Batch boundaries, once the
+	// unmerged stack carries at least max(autoSealEdges, base) edge records,
+	// a forceMerge folds everything into a fresh base — bounding unmerged
+	// VOLUME (and reclaiming tombstoned records) at a base-proportional
+	// interval (every fold costs O(base), A6's lesson; the wrapper uses the
+	// same rule). Never fires from read-triggered flushes — an O(base) seal
+	// on the query path blows write-then-read p99 (the A3 gate caught that
+	// too). 0 disables. WAL checkpointing stays with explicit Seal.
+	//
+	// merging guards forceMerge's internal publishLayer from re-entering the
+	// governor. writerAttached (wrapper mode) skips the governor entirely:
+	// the wrapper owns its merge scheduling (pubMu protocol, MaxLayers,
+	// volume folds) and its gates measure exactly that.
 	autoCompactLayers int
 	autoSealEdges     int
+	splitF, splitT    int
 	merging           bool
 }
 
@@ -437,12 +448,9 @@ type pendOp struct {
 const defaultAutoCompactLayers = 32
 
 // defaultAutoSealEdges is the floor of the volume-proportional auto-seal
-// trigger (mirrors internal/writer's MergeEdges); the divisor 8 mirrors the
-// size-proportional rule (fold when unmerged volume reaches base/8).
-const (
-	defaultAutoSealEdges = 65536
-	autoSealFactor       = 8
-)
+// trigger (mirrors internal/writer's MergeEdges): a fold fires when the
+// unmerged stack carries max(defaultAutoSealEdges, base.EdgeCount) edges.
+const defaultAutoSealEdges = 65536
 
 func New() *Graph {
 	g := &Graph{
@@ -481,9 +489,9 @@ func (g *Graph) SetAutoCompact(maxLayers int) *Graph {
 }
 
 // SetAutoSealEdges tunes the volume governor (see Graph.autoSealEdges): a
-// fold into a fresh base fires once the folded layer carries at least
-// max(minEdges, base.EdgeCount()/8) edge records. 0 disables. Chainable;
-// call before the first write.
+// fold into a fresh base fires at Batch boundaries once the unmerged stack
+// carries at least max(minEdges, base.EdgeCount()) edge records. 0
+// disables. Chainable; call before the first write.
 func (g *Graph) SetAutoSealEdges(minEdges int) *Graph {
 	g.autoSealEdges = minEdges
 	return g
@@ -497,29 +505,96 @@ func (g *Graph) SetAutoSealEdges(minEdges int) *Graph {
 // stay as published (replay rebuilds the original stack with identical
 // visible state). g.merging keeps forceMerge's internal publishLayer from
 // re-entering (it folds everything anyway).
-func (g *Graph) maybeAutoCompact() {
-	if g.autoCompactLayers <= 0 || g.merging {
+// minFoldMerge is the floor on the size-tier rule: a folded run merges into
+// the older run only at max(minFoldMerge, olderRunEdges/2) records, so tiny
+// tails never trigger F-merges (each costing O(F)) and small graphs fold
+// into one run early instead of carrying two. The floor also caps the tail
+// fold's own cost (T+tail records copied) — it lands on the triggering
+// read/write, and A3's write-then-read p99 line is 1ms.
+const minFoldMerge = 512
+
+// minTailFoldEdges is the tail volume gate: below it a fold costs more than
+// the tail carries (write amplification), so thin tails keep accumulating
+// raw layers instead. Bounded by the layer cap above, the extra depth is
+// a small constant.
+const minTailFoldEdges = 64
+
+// maybeAutoCompact is the direct-mode layer-stack governor. atBatchEnd is
+// true only at Batch boundaries — the sole site allowed to fire the O(base)
+// volume seal (read-triggered flushes fold, never seal). Writer-path only;
+// callers are cutLayer and Batch's end, both under the single-writer
+// discipline. The wrapper skips the governor entirely (it owns merging).
+func (g *Graph) maybeAutoCompact(atBatchEnd bool) {
+	if g.autoCompactLayers <= 0 || g.merging || g.writerAttached.Load() {
 		return
 	}
 	v := g.view.Load()
-	if len(v.layers) < g.autoCompactLayers {
+	n := len(v.layers)
+	if n < g.autoCompactLayers {
 		return
 	}
-	folded := delta.FoldLayers(v.layers)
+	// clamp stale split marks (stack replaced by Seal/rebase/replay)
+	if g.splitF > n {
+		g.splitF = n
+	}
+	if g.splitT > n || g.splitT < g.splitF {
+		g.splitT = g.splitF
+	}
+	if g.splitT >= n {
+		return // defensive: no tail to fold
+	}
+	// Tail volume gate: folding costs O(T+tail records); a 32-layer tail of
+	// 1-record changesets is 32 records — folding it into a 512-record run
+	// is 16x write amplification. Wait until the tail carries real volume.
+	tailEdges := 0
+	for _, l := range v.layers[g.splitT:] {
+		tailEdges += l.EdgeCount()
+	}
+	if tailEdges < minTailFoldEdges {
+		return
+	}
+	// fold the T run plus the raw tail into one layer — O(T + tail records),
+	// never touching F (re-folding F every trigger is quadratic under
+	// sustained writes; the size-tier rule below merges F only at T ≥ F/2).
+	foldFrom := g.splitF
+	folded := delta.FoldLayers(v.layers[foldFrom:])
 	if folded == nil {
 		return
 	}
+	newLayers := make([]*delta.Layer, 0, foldFrom+1)
+	newLayers = append(newLayers, v.layers[:foldFrom]...)
+	newLayers = append(newLayers, folded)
+	// size-tier: merge into F when the folded run reaches the rule line —
+	// amortized ≤3 record copies per write either way
+	fEdges := 0
+	for _, l := range v.layers[:foldFrom] {
+		fEdges += l.EdgeCount()
+	}
+	if foldFrom == 0 || folded.EdgeCount() >= max(minFoldMerge, fEdges/2) {
+		merged := delta.FoldLayers(newLayers)
+		if merged != nil {
+			newLayers = []*delta.Layer{merged}
+			g.splitF, g.splitT = 1, 1
+		}
+	} else {
+		g.splitF, g.splitT = foldFrom, foldFrom+1
+	}
 	g.view.Store(&genView{
-		base: v.base, baseKeys: v.baseKeys, layers: []*delta.Layer{folded},
+		base: v.base, baseKeys: v.baseKeys, layers: newLayers,
 		lsn: v.lsn, nodes: v.nodes, edges: v.edges,
 	})
-	// Volume governor: the layer cap bounds stack COUNT; this bounds record
-	// VOLUME for long-running writers. Base-proportional interval (every
-	// fold costs O(base) — A6's lesson), floor for small graphs. Frames are
-	// already persisted, so no WAL checkpoint here — that stays with the
-	// explicit Seal the user (or Close) runs.
-	if g.autoSealEdges > 0 && folded.EdgeCount() >= max(g.autoSealEdges, v.base.EdgeCount()/autoSealFactor) {
-		_ = g.forceMerge()
+	// Volume seal (Batch boundaries only): the layer cap bounds stack count,
+	// this bounds record VOLUME and reclaims tombstoned records at a
+	// base-proportional interval. Frames are already persisted; the WAL
+	// checkpoint stays with the explicit Seal the user (or Close) runs.
+	if atBatchEnd && g.autoSealEdges > 0 {
+		total := 0
+		for _, l := range newLayers {
+			total += l.EdgeCount()
+		}
+		if total >= max(g.autoSealEdges, v.base.EdgeCount()) {
+			_ = g.forceMerge() // resets the split marks
+		}
 	}
 }
 
@@ -568,7 +643,7 @@ func (g *Graph) finishOp(edges int) {
 			p.ops++
 		}
 		if p.ops >= pendMaxOps || p.edges >= pendMaxEdges {
-			g.cutLayer()
+			g.cutLayer(true) // write-path cap: folding (and sealing) allowed
 		}
 	}
 }
@@ -592,7 +667,7 @@ func (g *Graph) flushPend() {
 	if g.batching { // mid-Batch reads see the pre-batch generation (atomicity)
 		return
 	}
-	g.cutLayer()
+	g.cutLayer(false) // read-triggered flush: publish only, never fold
 }
 
 // FlushPend materializes the caller's direct-mode absorption window (a
@@ -787,14 +862,28 @@ func (g *Graph) publishLayer() {
 // per-op cost of write bursts. The registry stays coherent across cuts
 // because every write mutates it exactly as it mutates the published
 // mirrors. The next write's ensureBuilder reopens a fresh window counter.
-func (g *Graph) cutLayer() {
+// cutLayer is the mid-burst window flush: publishLayer, but the endpoint
+// registry (bNodeIDs/bLiveNodes) survives the cut. Without the carry, every
+// new window re-lifts each published endpoint its edges touch — one map
+// insert per first touch plus registry regrowth, which dominated the
+// per-op cost of write bursts. The registry stays coherent across cuts
+// because every write mutates it exactly as it mutates the published
+// mirrors. The next write's ensureBuilder reopens a fresh window counter.
+//
+// fold toggles the governor: write-path cuts (the capacity cap, Batch
+// boundaries) fold the layer stack; read-triggered flushes (flushPend's
+// write-then-read contract) publish only — folds cost O(T+tail) and landing
+// them on queries blows write-then-read p99 (the A3 gate).
+func (g *Graph) cutLayer(fold bool) {
 	if g.builder == nil {
 		return
 	}
 	keepIDs, keepLive := g.bNodeIDs, g.bLiveNodes
 	g.publishLayer()
 	g.bNodeIDs, g.bLiveNodes = keepIDs, keepLive
-	g.maybeAutoCompact()
+	if fold {
+		g.maybeAutoCompact(true)
+	}
 }
 
 // ---- public write path ------------------------------------------------------
@@ -1215,7 +1304,7 @@ func (g *Graph) Batch(fn func(*Graph)) error {
 		err = g.flushPending()
 	}
 	g.publishLayer()
-	g.maybeAutoCompact()
+	g.maybeAutoCompact(true) // Batch boundary: the volume seal may fire here
 	return err
 }
 
@@ -1777,6 +1866,7 @@ func (g *Graph) forceMerge() error {
 		g.labels[labels[er.LabelID]] = true
 	}
 	g.rebaseHappened.Store(false) // mirrors now match the published view
+	g.splitF, g.splitT = 0, 0     // empty stack: no runs
 	g.view.Store(&genView{
 		base: snap, baseKeys: baseKeys, layers: nil,
 		lsn: v.lsn, nodes: g.nodeTotal, edges: g.edgeTotal,

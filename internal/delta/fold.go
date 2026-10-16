@@ -45,12 +45,22 @@ func FoldLayers(layers []*Layer) *Layer {
 		idOK bool
 		live bool
 	}
-	nodes := make(map[string]*nodeWin)
+	// pre-size from the inputs: fold cost is dominated by map growth, and
+	// the governor folds on the write path where every µs shows up in
+	// write-then-read p99 (A3)
+	estNodes, estEdges, estNodeTomb, estEdgeTomb := 0, 0, 0, 0
+	for _, l := range layers {
+		estNodes += len(l.nodes)
+		estEdges += len(l.edges)
+		estNodeTomb += len(l.nodeTomb)
+		estEdgeTomb += len(l.edgeTomb)
+	}
+	nodes := make(map[string]*nodeWin, estNodes)
 	var nodeOrder []string
-	edges := make(map[EdgeKey][]*edgeSlot)
-	var edgeFlat []*edgeSlot
-	nodeTomb := make(map[string]bool)
-	edgeTomb := make(map[EdgeKey]bool)
+	edges := make(map[EdgeKey][]*edgeSlot, estEdges)
+	edgeFlat := make([]*edgeSlot, 0, estEdges)
+	nodeTomb := make(map[string]bool, estNodeTomb)
+	edgeTomb := make(map[EdgeKey]bool, estEdgeTomb)
 	labelSeen := make(map[string]bool)
 	var labels []string
 	indexSeen := make(map[string]bool)
