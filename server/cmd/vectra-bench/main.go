@@ -284,7 +284,14 @@ func injectHTTP(rep *report, bg *bench.Graph, dir string, sealInterval time.Dura
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	go func() { _ = http.Serve(httpLn, n.Handler()) }()
+	go func() {
+		if err := http.Serve(httpLn, n.Handler()); err != nil {
+			// the API dying mid-run would surface as a wall of confusing
+			// worker connection errors — fail the run at the cause instead
+			fmt.Fprintf(os.Stderr, "vectra-bench: http serve: %v\n", err)
+			os.Exit(1)
+		}
+	}()
 	waitLeader(n)
 
 	client := &http.Client{

@@ -5,10 +5,15 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/projanvil/vectra/server"
 )
@@ -40,9 +45,31 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "vectra-server %s http=%s raft=%s data=%s\n", *id, *httpAddr, *raftAddr, *dataDir)
-	if err := http.ListenAndServe(*httpAddr, n.Handler()); err != nil {
+
+	srv := &http.Server{
+		Addr:              *httpAddr,
+		Handler:           n.Handler(),
+		ReadHeaderTimeout: 10 * time.Second, // slowloris guard; handlers set their own body/ctx deadlines
+	}
+	// SIGINT/SIGTERM: drain in-flight requests, then close raft + stores —
+	// crash tolerance is the backstop, not the plan.
+	done := make(chan struct{})
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sig
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "vectra-server: shutdown: %v\n", err)
+		}
+		n.Close()
+		close(done)
+	}()
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		n.Close()
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	<-done
 }

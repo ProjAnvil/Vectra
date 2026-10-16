@@ -2,7 +2,7 @@ package bench
 
 import (
 	"math"
-	"sort"
+	"slices"
 	"time"
 )
 
@@ -12,8 +12,12 @@ func Percentile(durs []time.Duration, p float64) time.Duration {
 	if len(durs) == 0 {
 		return 0
 	}
-	sorted := append([]time.Duration(nil), durs...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	sorted := slices.Clone(durs)
+	slices.Sort(sorted)
+	return percentileOf(sorted, p)
+}
+
+func percentileOf(sorted []time.Duration, p float64) time.Duration {
 	// Nearest rank: the ceil(p*N)-th sample (1-based)
 	idx := int(math.Ceil(p*float64(len(sorted)))) - 1
 	idx = min(max(idx, 0), len(sorted)-1)
@@ -34,16 +38,18 @@ func Summarize(durs []time.Duration) Summary {
 	if len(durs) == 0 {
 		return Summary{}
 	}
+	sorted := slices.Clone(durs)
+	slices.Sort(sorted)
 	var total time.Duration
 	for _, d := range durs {
 		total += d
 	}
 	return Summary{
 		N:    len(durs),
-		P50:  Percentile(durs, 0.50),
-		P90:  Percentile(durs, 0.90),
-		P99:  Percentile(durs, 0.99),
-		Max:  Percentile(durs, 1.0),
+		P50:  percentileOf(sorted, 0.50),
+		P90:  percentileOf(sorted, 0.90),
+		P99:  percentileOf(sorted, 0.99),
+		Max:  sorted[len(sorted)-1],
 		Mean: total / time.Duration(len(durs)),
 	}
 }

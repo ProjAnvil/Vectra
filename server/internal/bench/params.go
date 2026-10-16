@@ -31,7 +31,7 @@ func Curate(g *vectra.Graph, bg *Graph, n int, seed int64) QueryParams {
 	p := QueryParams{}
 	if len(pool) == 0 {
 		// Edgeless graph: uniform sampling
-		for i := 0; i < n && i < len(bg.Nodes); i++ {
+		for i := range min(n, len(bg.Nodes)) {
 			p.Starts = append(p.Starts, keyOf(i))
 		}
 		return p

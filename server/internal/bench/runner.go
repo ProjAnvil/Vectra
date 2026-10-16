@@ -33,10 +33,8 @@ func RunWorkload(name string, op Op, workers int, duration time.Duration) LoadRe
 	var errs atomic.Int64
 	locs := make([][]time.Duration, workers)
 	var stop atomic.Bool
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func(w int) {
-			defer wg.Done()
+	for w := range workers {
+		wg.Go(func() {
 			local := make([]time.Duration, 0, 4096)
 			for !stop.Load() && time.Now().Before(deadline) {
 				t0 := time.Now()
@@ -48,7 +46,7 @@ func RunWorkload(name string, op Op, workers int, duration time.Duration) LoadRe
 				}
 			}
 			locs[w] = local
-		}(w)
+		})
 	}
 	// Stop at the deadline (duration already judged via deadline; this guarantees exit)
 	time.AfterFunc(duration, func() { stop.Store(true) })

@@ -36,6 +36,7 @@ const DefaultSealInterval = 2 * time.Second
 var (
 	ErrNotLeader   = errors.New("server: not leader")
 	ErrTimeout     = errors.New("server: apply timeout")
+	ErrShutdown    = errors.New("server: raft shutting down")
 	ErrDirMismatch = errors.New("server: data dir belongs to a different node")
 )
 
@@ -88,10 +89,10 @@ type Node struct {
 // bootstrap/join as needed. Empty Join with no existing state = single-node bootstrap.
 func New(cfg Config) (*Node, error) {
 	if cfg.NodeID == "" {
-		return nil, fmt.Errorf("server: NodeID required")
+		return nil, errors.New("server: NodeID required")
 	}
 	if cfg.DataDir == "" {
-		return nil, fmt.Errorf("server: DataDir required")
+		return nil, errors.New("server: DataDir required")
 	}
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, err
@@ -286,8 +287,18 @@ func (n *Node) Apply(ctx context.Context, b Batch) (ApplyResult, error) {
 		if errors.Is(err, raft.ErrLeadershipLost) {
 			return ApplyResult{}, ErrNotLeader
 		}
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, raft.ErrRaftShutdown) {
-			return ApplyResult{}, fmt.Errorf("%w: %v", ErrTimeout, err)
+		// raft's Apply surfaces backpressure on the apply channel as
+		// ErrEnqueueTimeout (e.g. the FSM thread stalls on a large Clone);
+		// an enqueued logFuture never carries context.DeadlineExceeded —
+		// both mean "did not commit in time".
+		if errors.Is(err, raft.ErrEnqueueTimeout) || errors.Is(err, context.DeadlineExceeded) {
+			return ApplyResult{}, fmt.Errorf("%w: %w", ErrTimeout, err)
+		}
+		// A shutting-down node is unavailable, not timed out — etcd maps
+		// this to Unavailable (retryable elsewhere/later); HTTP carries it
+		// as 503 with Retry-After, never as a 504 timeout.
+		if errors.Is(err, raft.ErrRaftShutdown) {
+			return ApplyResult{}, fmt.Errorf("%w: %w", ErrShutdown, err)
 		}
 		return ApplyResult{}, err
 	}

@@ -412,7 +412,9 @@ func (s *graphSnapshot) Release() {}
 
 // Restore rebuilds live from snapshot bytes and immediately does the first publish (readiness gate opens here).
 func (f *fsm) Restore(rc io.ReadCloser) error {
-	defer rc.Close()
+	// raft (v1.8.0) closes the source itself in both call paths (fsm restore
+	// closure and RecoverCluster); closing here would double-close the
+	// wrapped handle. ReadAll drains to EOF.
 	data, err := io.ReadAll(rc)
 	if err != nil {
 		return err
@@ -592,8 +594,8 @@ func (f *fsm) validateTxn(tg *TxnGuard, idx uint64, wNodes []string, wEdges []ed
 			}
 		}
 		for _, e := range tg.ReadEdges {
-			if edgeDirty(edgeVerKey{Src: e.Src, Dst: e.Dst, Label: e.Label}) {
-				add(edgeKeyString(edgeVerKey{Src: e.Src, Dst: e.Dst, Label: e.Label}))
+			if edgeDirty(edgeVerKey(e)) {
+				add(edgeKeyString(edgeVerKey(e)))
 			}
 		}
 	}

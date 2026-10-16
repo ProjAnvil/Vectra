@@ -75,9 +75,12 @@ func Generate(spec Spec) *Graph {
 
 	// Seed cluster (BA's initial complete graph)
 	const seedCluster = 4
-	for i := 0; i < seedCluster && len(g.Nodes) < spec.Nodes; i++ {
+	for range seedCluster {
+		if len(g.Nodes) >= spec.Nodes {
+			break
+		}
 		u := addNode()
-		for v := 0; v < u; v++ {
+		for v := range u {
 			g.Edges = append(g.Edges, Edge{Src: u, Dst: v, Label: edgeLabels[len(g.Edges)%len(edgeLabels)]})
 			targets = append(targets, u, v)
 		}

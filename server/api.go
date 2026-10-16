@@ -140,12 +140,17 @@ func (n *Node) handleBatch(w http.ResponseWriter, r *http.Request) {
 		NodeDeletes: req.NodeDeletes,
 	})
 	if err != nil {
-		if err == ErrNotLeader {
+		if errors.Is(err, ErrNotLeader) {
 			if hint := n.LeaderHint(); hint != "" {
 				w.Header().Set("X-Vectra-Leader", hint)
 			}
 			w.Header().Set("Retry-After", "1")
 			writeErr(w, http.StatusServiceUnavailable, "NOT_LEADER", "send writes to the leader")
+			return
+		}
+		if errors.Is(err, ErrShutdown) {
+			w.Header().Set("Retry-After", "5")
+			writeErr(w, http.StatusServiceUnavailable, "SHUTTING_DOWN", "node is shutting down; retry another node")
 			return
 		}
 		if errors.Is(err, ErrTimeout) {
@@ -204,12 +209,17 @@ func (n *Node) handleTxn(w http.ResponseWriter, r *http.Request) {
 		Txn:         req.Txn,
 	})
 	if err != nil {
-		if err == ErrNotLeader {
+		if errors.Is(err, ErrNotLeader) {
 			if hint := n.LeaderHint(); hint != "" {
 				w.Header().Set("X-Vectra-Leader", hint)
 			}
 			w.Header().Set("Retry-After", "1")
 			writeErr(w, http.StatusServiceUnavailable, "NOT_LEADER", "send writes to the leader")
+			return
+		}
+		if errors.Is(err, ErrShutdown) {
+			w.Header().Set("Retry-After", "5")
+			writeErr(w, http.StatusServiceUnavailable, "SHUTTING_DOWN", "node is shutting down; retry another node")
 			return
 		}
 		if errors.Is(err, ErrTimeout) {
@@ -371,7 +381,11 @@ func (n *Node) handleNeighbors(w http.ResponseWriter, r *http.Request) {
 	}
 	n.queryCount.Add(1)
 	key := r.URL.Query().Get("key")
-	dir := parseDirection(r.URL.Query().Get("dir"))
+	dir, err := parseDirection(r.URL.Query().Get("dir"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "VALIDATION", err.Error())
+		return
+	}
 	label := r.URL.Query().Get("label")
 	var labels []string
 	if label != "" {
@@ -401,7 +415,12 @@ func (n *Node) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	n.queryCount.Add(1)
 	// API semantics: maxDepth omitted/0 = unlimited hops
-	opts := []vectra.BFSOption{vectra.WithDirection(parseDirection(req.Direction))}
+	dir, err := parseDirection(req.Direction)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "VALIDATION", err.Error())
+		return
+	}
+	opts := []vectra.BFSOption{vectra.WithDirection(dir)}
 	if req.MaxDepth > 0 {
 		opts = append(opts, vectra.WithMaxDepth(req.MaxDepth))
 	}
@@ -557,9 +576,16 @@ func safeRegistry(n *Node) map[string]string {
 	return maps.Clone(n.registry)
 }
 
-func parseDirection(s string) vectra.Direction {
-	if s == "in" {
-		return vectra.DirIn
+// parseDirection maps the direction query parameter; anything but the
+// exact "in" or "out" (or empty) is a client error — silently answering
+// out-neighbors for a typo'd "IN"/"incoming" would be a wrong answer.
+func parseDirection(s string) (vectra.Direction, error) {
+	switch s {
+	case "", "out":
+		return vectra.DirOut, nil
+	case "in":
+		return vectra.DirIn, nil
+	default:
+		return 0, fmt.Errorf("invalid direction %q (want \"in\" or \"out\")", s)
 	}
-	return vectra.DirOut
 }
