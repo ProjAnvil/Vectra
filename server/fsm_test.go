@@ -303,3 +303,27 @@ func TestFSMApplyEdgeUpsertCollapses(t *testing.T) {
 		t.Fatalf("edges after replay = %d, want 1", st.Edges)
 	}
 }
+
+// TestFSMApplyOneLayerPerBatch: one committed raft entry replays as ONE
+// micro-layer (the Batch boundary wraps the replay loop; per-op material
+// would leave one layer per operation — an order of magnitude more layers to
+// fold), with live-graph content, counts and deterministic replay unchanged.
+func TestFSMApplyOneLayerPerBatch(t *testing.T) {
+	f := newFSM(time.Hour)
+	r := f.Apply(&raft.Log{Data: mustGob(t, sampleBatch())}).(ApplyResult)
+	if r.NodesApplied != 3 || r.EdgesApplied != 2 || r.EdgesSkipped != 1 {
+		t.Fatalf("Apply: %+v, want 3 nodes / 2 edges / 1 skipped", r)
+	}
+
+	f.mu.RLock()
+	n, e := f.live.NodeCount(), f.live.EdgeCount()
+	layers, _ := f.live.LayerPressure()
+	_, dbOK := f.live.NodeByKey("db")
+	f.mu.RUnlock()
+	if n != 3 || e != 2 || !dbOK {
+		t.Fatalf("live = %d/%d (db present: %v), want 3/2", n, e, dbOK)
+	}
+	if layers != 1 {
+		t.Fatalf("unmerged layers = %d, want 1 (one micro-layer per committed entry, not per op)", layers)
+	}
+}

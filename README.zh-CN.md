@@ -6,14 +6,15 @@
 
 v0.2 起，同一引擎可升级为**多副本基础服务**：独立的 `server` 模块用 hashicorp/raft（leader 选举、写复制）加 HTTP API 包住引擎——rqlite 模式的图版。并且原生说 **MCP**（Go / Python / TypeScript 三语实现），AI agent 可以直接查询你的依赖图谱。
 
-## 四个赌注
+## 五个赌注
 
 | 赌注 | 收益 |
 |---|---|
-| 全内存 + 无指针 CSR（`[]uint32` 平坦数组） | GC 成本与边数无关；`Seal()` 后并发读免锁 |
+| 全内存 + 无指针 CSR（`[]uint32` 平坦数组） | GC 成本与边数无关；并发读免锁——任何世代，无论是否 Seal |
 | 层同步并行 BFS（morsel 驱动 + 原子 Or 位图去重） | 1000 万边上比朴素 map 邻接快 3.3 倍 |
 | 写入侧 SCC 压缩（Tarjan）——查询面对 DAG | 可达性每位图一比特；`Cycles()` 免费诊断循环依赖 |
 | 单文件快照 + CRC32（v3 格式） | 原子发布/备份；服务模式蓝绿热替换；属性索引声明随快照往返 |
+| 不可变微层世代（v0.7） | 持续写 + 零锁读；每笔已应用写入立即可见 |
 
 ## 快速上手（嵌入式）
 
@@ -25,9 +26,12 @@ g.AddNode("gateway", "Service", map[string]any{"env": "prod"})
 g.AddEdge("gateway", "auth", "CALLS", nil)
 g.UpsertEdge("gateway", "auth", "CALLS", map[string]any{"weight": 2}) // 同键 (src,dst,label) 替换属性
 g.DeleteNode("ledger")                                               // 删点并级联删边
-g.Seal() // 此后不可变；并发读免锁
 
-// 链式遍历
+// 批量导入：用 g.Batch(func(g *vectra.Graph) { ... }) —— 每批一个微层；裸逐 op 写也会被
+// 吸收进一个打开的窗口（在下次查询、边界或容量上限时物化），批量导入不再强制 Batch——
+// 但 WAL 下 Batch 仍是最快形态（每边界一组帧，而非每写一帧）
+
+// 链式遍历（Seal 与否都能查——写入立即可见）
 res, _ := g.Query().From("gateway").Out("CALLS").MaxDepth(3).Run()
 
 // 可达性（SCC 压缩快路径）
@@ -44,6 +48,27 @@ g.SaveFile("deps.vg")
 ```
 
 快照说明：v3 格式会持久化 `IndexProperty` 声明，`vectra.Load` 恢复图的同时恢复查询索引（重载后类型化查找立即可用；v2/v1 旧文件仍可读但不含索引声明）。属性索引是**类型化的**——每个 key 三个有序桶（string / number / bool）：`LookupByProperty`（字符串等值）、`LookupByNumber` / `LookupByNumberRange(min, max *float64)`（数值等值 / 范围）、`LookupByBool`。数值在索引里统一归一化为 `float64`：Go API 写入的 `int` 与 JSON 快照读回的同值落进同一桶——"整数读回变 float64" 的老坑在索引查找上不复存在（`int64` 超过 2^53 有精度损失，JSON 数值模型的固有限制）。
+
+## 持续写模型：微层世代（v0.7）
+
+v0.7 溶解了密封快照门。每次写入（或 `Batch`）把变更物化为一个不可变**微层（micro-layer）**，经单个原子指针发布新世代 `{base, layers}`——读者永不加锁、永不阻塞，无论写者在做什么。后台合并器把 `base ∪ layers` 折叠成新的不可变 base（累计层边数达到 max(6.4万, 基座边数) 触发后台合并——折叠间隔与基座同量级，6.4万为小图下限；2048 层帽作为兜底触发 write stall，写者停顿等折叠落地），`Seal()`/`Compact()` 则显式执行该折叠，挂 WAL 时再追加 checkpoint。Seal 不再冻结任何东西：Seal 之后的写只是开启新世代；`Compact` 与 `Seal` 语义等价（spec §3.1 的"深度压缩重排"已被 merge 本身吸收）。二者都是写路径方法。
+
+**可见性分族：**
+
+| 查询族 | 可见性 |
+|---|---|
+| 点查族（`NodeByKey` / `NodeByID` / `EdgeByID` / 计数 / `EdgesOf` / `LookupBy*`） | 立即——三源联读（base ∪ layers，墓碑遮蔽） |
+| 遍历族（`BFS` / `ShortestPath` / `Cypher` / `Query` / `NeighborsOf`） | 立即——base 与微层记录合并行流 |
+| `Reachable` / SCC 相关统计 | 计数立即；超节点（SCC 压缩）加速只在合并后的 base 上生效，微层期间的查询退回点级 BFS |
+| `Cycles` | 先折叠未合并层——强一致答案，唯一走写路径的查询 |
+
+**ID 口径：**节点/边 ID 在世代内稳定（删除消耗号段）；merge 时稠密重编号，因此跨 `Seal`/`Compact`/后台折叠 ID 可能变化——与 v0.6 的跨 merge 契约一致，未变。
+
+**写者纪律：**零锁引擎假设单写者 goroutine。直接模式（自己调 `AddNode`/`Batch`/...）下就是你任意一个单一 goroutine——并发裸写是数据竞争且会交错 WAL 帧。未分组的逐 op 写累积进**吸收窗口**（一次 flush 物化一个微层——下次查询、边界或容量上限触发——而非每写一层），批量导入不再强制 `Batch`；WAL 下 `Batch`（或包装层 changeset）仍是最快形态：每边界一组帧而非每写一帧。结构化形态是单写者包装层（`internal/writer.Attach` → `Handle.Submit`）：有界队列、Badger 式组提交（每抽干批一组帧一次 fsync）、带层顶停顿的后台合并、以及 WAL 自上次 checkpoint ≥4 MiB 时的容量触发 checkpoint。附加期间，非 release 构建会以 `ErrNotWriter` 拒绝裸写与非写者 goroutine 的 `Seal`/`Compact`/`Cycles`；release 构建编译掉该检查，依赖本契约。
+
+**写前日志（可选）：**`Open(path, Options{WALMode, WALDir})` 开启持久会话——整帧 JSON changeset，`ModeAlways` 下每个 `Batch` 边界一次 fsync（`ModeInterval` 只在显式边界 fsync；零值 `ModeOff` 恰为 v0.6 快照行为）。checkpoint——`Seal`/`Compact`/`Close` 时或包装层的 ≥4 MiB 容量触发——写水位快照 `<db>-<lsn>.db`、原子翻 manifest、重置日志；恢复 = 载入水位快照 + 重放其上的帧（撕裂尾在首个坏帧处停止；checkpoint 失败保留 WAL 供下次尝试）。磁盘上这是快照文件旁的 `wal` 旁路目录：旧版本二进制读新目录会无害忽略；v0.7 面对没有 wal 目录的旧目录则直接加载快照——v3 快照格式本身不变。
+
+**内存：**merge 在旧世代成为垃圾前先分配新 base，1M/10M 档的峰值 RSS 接近 4.1 GB 活集的 2 倍（瞬时 9–11 GB；spec §9 R11）。merge 密集的 1M 档负载请预算 ≥16 GB 内存，或启用包装层的 `GCTune`（merge 前后把 GOGC 降到 50）。
 
 **⚠️ 升级到 0.5.0。** 存储快照改以 v3 格式写入。不兼容是单向的：v1/v2 旧文件仍可读，但 0.5 之前的二进制读不了 v3 文件——跨版本交换 `.vg` 快照的嵌入式与 MCP 用户需要两端都在 0.5+。raft 集群新旧混布策略不变（本就不支持）。
 
@@ -114,7 +139,7 @@ v0.4 起服务端在同一条 raft 日志上支持**交互式乐观事务**—�
 
 ## MCP（AI agent）
 
-三个一等实现——[Go（嵌入引擎）](mcp)、[Python（FastMCP）](mcp/python)、[TypeScript](mcp/ts)——把一跳/多跳/最短路/可达性/循环依赖（含环内边）/Cypher 子集模式查询暴露为 MCP 工具，另提供 `inject_batch` 写入（支持 `allowParallel`；`lookup_property` 接受 string/number/bool 值）：
+三个一等实现——[Go（嵌入引擎）](mcp)、[Python（FastMCP）](mcp/python)、[TypeScript](mcp/ts)——把一跳/多跳/最短路/可达性/循环依赖（含环内边）/Cypher 子集模式查询暴露为 MCP 工具，另提供 `inject_batch` 写入（支持 `allowParallel`；`lookup_property` 接受 string/number/bool 值）。Go 服务端每笔已应用写入立即可查——无需 seal 往返；`seal` 是可选维护（merge + checkpoint），`-wal <dir>` 则运行可跨重启恢复的持久会话：
 
 ```bash
 claude mcp add vectra -- /path/to/vectra-mcp
@@ -132,6 +157,8 @@ claude mcp add vectra -- /path/to/vectra-mcp
 | 最短路径 p50 | 3.2µs | 101µs | 1.1ms |
 | 注入（引擎 / raft+HTTP） | — | 950 万 / 140 万边每秒 | 940 万 / 130 万边每秒 |
 
+v0.7 验收报告——微层世代 + WAL 对拍 v0.6.0 基线（遍历回归、WAL Off 导入线、merge 进行中查询尾延迟、崩溃恢复）：[docs/benchmarks/2026-10-15-delta-wal.md](docs/benchmarks/2026-10-15-delta-wal.md)（Apple M5 Pro）。
+
 本地复现：`make bench [SIZE=medium] [MODE=http]`，数据目录与报告运行结束即删。
 
 正确性按 LDBC 方法验证：与独立参考实现做属性对账、真实数据集外部 ground truth（SNAP email-Eu-core：203 个 SCC / 最大 803，对外发布的数字）、混沌与退化图测试、确定性检查。覆盖率：根包 92.3% · csr/dag 100% · store 84.0% · engine+traverse 98.8% · server 87.5% · mcp 85.6%。
@@ -139,11 +166,18 @@ claude mcp add vectra -- /path/to/vectra-mcp
 ## 仓库布局
 
 ```
-vectra.go            门面：写入、Seal、快照、类型化属性索引
+vectra.go            门面：写入、Batch、Seal/Compact、快照、类型化属性索引
+changeset.go         Changeset 词表（WAL 帧、server raft 批）
+options.go           Open 选项：WALMode / WALDir
+merge.go             后台合并协议：CaptureMerge / PublishMerge / LayerPressure
+view.go              三源行流（base CSR + 微层记录）
 cypher.go            门面：Cypher 子集查询入口（Graph.Cypher）
 internal/csr         CSR 邻接（无指针 uint32 数组）
 internal/dag         Tarjan SCC、凝聚图、拓扑层级
 internal/engine      密封快照 + 访问器 + Seal 流水线
+internal/delta       不可变微层构建器与层记录
+internal/wal         嵌入式逻辑 WAL（JSON 帧、水位 checkpoint）
+internal/writer      单写者包装层：队列、组提交、后台合并器
 internal/cypher      Cypher 子集词法、语法、AST、行式执行器
 internal/traverse    算法：层同步 BFS、可达性、双向最短路、循环发现
 internal/store       快照编解码（v3：索引声明区 + CRC32 尾校验，v1/v2 读兼容）
@@ -151,7 +185,7 @@ server/              独立模块：raft 复制 + HTTP API + 热替换发布器
                      ├─ cmd/vectra-server   服务二进制
                      ├─ cmd/vectra-bench    压测工具
 mcp/                 独立模块：MCP 服务
-                     ├─ cmd/vectra-mcp      Go（嵌入引擎，stdio + HTTP）
+                     ├─ cmd/vectra-mcp      Go（嵌入引擎，stdio + HTTP，快照或 WAL 会话）
                      ├─ python/             FastMCP（包装 HTTP API）
                      └─ ts/                 TypeScript（包装 HTTP API）
 testdata/            真实数据集夹具（SNAP email-Eu-core，含引用）
@@ -162,7 +196,7 @@ docs/benchmarks/     压测设计与结果
 
 ## 明确不做
 
-在线写 / delta-CSR（会推翻两个核心赌注）、超 1000 万边的磁盘溢出、核心内置完整 GQL 解析器、分片。原路线图两项已落地：极简查询 DSL（`Graph.Cypher`、`/v1/cypher`、MCP `cypher`）与属性类型化索引。路线图：k-hop 预计算。
+在线写跨进 server 模块——raft 复制仍是克隆/发布模型（merge 会重编号 ID，副本回放必须确定性，v0.7 微层引擎仅限嵌入式）；超 1000 万边的磁盘溢出；核心内置完整 GQL 解析器；分片。原"在线写 / delta-CSR"这条排除项已解决：v0.7 以微层世代形态落地，且没有放弃两个核心赌注（内存 CSR、免锁读）。路线图不变：k-hop 预计算。
 
 ## 许可证
 

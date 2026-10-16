@@ -2,21 +2,40 @@ package cypher
 
 import (
 	"cmp"
+	"encoding/binary"
+	"fmt"
+	"math"
 	"slices"
+	"strconv"
 	"strings"
 )
 
+// maxGroups caps the number of distinct groups an aggregation may build
+// (a query-shape problem, like maxRows). Package variable so tests can
+// lower it.
+var maxGroups = 1_000_000
+
 // project applies RETURN / ORDER BY / LIMIT to the WHERE-filtered rows.
 // ORDER BY keys evaluate var[.prop] on the binding itself, so they may
-// reference properties not present in RETURN (Cypher-compatible).
+// reference properties not present in RETURN (Cypher-compatible); a key
+// that names a projected column (aliases included) uses that value.
 func (ex *executor) project(q *Query, rows []row) (*Result, error) {
 	items := q.Return.Items
 	if q.Return.Star {
 		items = starItems(q.Match)
 	}
+	for _, it := range items {
+		if it.Agg.Func != "" {
+			return ex.projectAgg(q, items, rows)
+		}
+	}
 	res := &Result{Columns: make([]string, len(items))}
 	for i, it := range items {
 		res.Columns[i] = it.Name
+	}
+	inCols := make(map[string]bool, len(items))
+	for _, it := range items {
+		inCols[it.Name] = true
 	}
 	projRows := make([]map[string]any, len(rows))
 	for i, r := range rows {
@@ -32,37 +51,271 @@ func (ex *executor) project(q *Query, rows []row) (*Result, error) {
 		for i, r := range rows {
 			vals := make([]any, len(keys))
 			for j, k := range keys {
-				vals[j] = ex.orderValue(k.Name, r)
+				if inCols[k.Name] {
+					vals[j] = projRows[i][k.Name] // projected column (alias) value
+				} else {
+					vals[j] = ex.orderValue(k.Name, r)
+				}
 			}
 			sortVals[i] = vals
 		}
-		idx := make([]int, len(projRows))
-		for i := range idx {
-			idx[i] = i
-		}
-		slices.SortStableFunc(idx, func(a, b int) int {
-			for j, k := range keys {
-				c := cmpVals(sortVals[a][j], sortVals[b][j])
-				if k.Desc {
-					c = -c
-				}
-				if c != 0 {
-					return c
-				}
-			}
-			return 0
-		})
-		sorted := make([]map[string]any, len(projRows))
-		for i, ix := range idx {
-			sorted[i] = projRows[ix]
-		}
-		projRows = sorted
+		projRows = sortRows(projRows, keys, sortVals)
 	}
 	if q.Return.Limit >= 0 && len(projRows) > q.Return.Limit {
 		projRows = projRows[:q.Return.Limit]
 	}
 	res.Rows = projRows
 	return res, nil
+}
+
+// projectAgg is the aggregation path: every non-aggregating RETURN item is a
+// grouping key, aggregations accumulate per group in one pass over rows, and
+// ORDER BY / LIMIT apply afterwards (LIMIT never short-circuits the pass).
+func (ex *executor) projectAgg(q *Query, items []*ReturnItem, rows []row) (*Result, error) {
+	res := &Result{Columns: make([]string, len(items))}
+	for i, it := range items {
+		res.Columns[i] = it.Name
+	}
+	var keyIdx, aggIdx []int
+	for i, it := range items {
+		if it.Agg.Func == "" {
+			keyIdx = append(keyIdx, i)
+		} else {
+			aggIdx = append(aggIdx, i)
+		}
+	}
+
+	groups := make(map[string]*accState)
+	var order []*accState // first-seen group order
+	for _, r := range rows {
+		var kb []byte
+		keys := make([]any, len(keyIdx))
+		for j, i := range keyIdx {
+			v := ex.itemValue(items[i], r)
+			keys[j] = v
+			kb = encodeVal(kb, v)
+		}
+		ks := string(kb)
+		st := groups[ks]
+		if st == nil {
+			if len(groups) >= maxGroups {
+				return nil, &Error{1, 1, fmt.Sprintf("too many groups: aggregation exceeded %d groups; add grouping keys or filters", maxGroups)}
+			}
+			st = &accState{keys: keys, aggs: make([]*aggAcc, len(aggIdx))}
+			groups[ks] = st
+			order = append(order, st)
+		}
+		for j, i := range aggIdx {
+			if st.aggs[j] == nil {
+				st.aggs[j] = &aggAcc{}
+			}
+			if err := ex.accum(items[i], st.aggs[j], r); err != nil {
+				return nil, err
+			}
+		}
+	}
+	// No grouping keys and no input rows: still exactly one output row
+	// (count=0, sum=0, avg/min/max=null, collect=[]).
+	if len(keyIdx) == 0 && len(order) == 0 {
+		st := &accState{aggs: make([]*aggAcc, len(aggIdx))}
+		for j := range st.aggs {
+			st.aggs[j] = &aggAcc{}
+		}
+		order = append(order, st)
+	}
+
+	projRows := make([]map[string]any, len(order))
+	for gi, st := range order {
+		m := make(map[string]any, len(items))
+		for j, i := range keyIdx {
+			m[items[i].Name] = st.keys[j]
+		}
+		for j, i := range aggIdx {
+			m[items[i].Name] = st.aggs[j].result(items[i].Agg)
+		}
+		projRows[gi] = m
+	}
+	if len(q.Return.OrderBy) > 0 {
+		keys := q.Return.OrderBy
+		sortVals := make([][]any, len(projRows))
+		for i, m := range projRows {
+			vals := make([]any, len(keys))
+			for j, k := range keys {
+				vals[j] = m[k.Name] // post-aggregation rows only have projected columns
+			}
+			sortVals[i] = vals
+		}
+		projRows = sortRows(projRows, keys, sortVals)
+	}
+	if q.Return.Limit >= 0 && len(projRows) > q.Return.Limit {
+		projRows = projRows[:q.Return.Limit]
+	}
+	res.Rows = projRows
+	return res, nil
+}
+
+// accState is one aggregation group: the key values and one accumulator per
+// aggregating RETURN item.
+type accState struct {
+	keys []any
+	aggs []*aggAcc
+}
+
+// aggAcc accumulates one aggregation call over a group. Null inputs are
+// skipped by every function (count(*) counts rows instead of values).
+type aggAcc struct {
+	n            int     // rows for count(*), non-null inputs otherwise
+	sum          float64 // sum/avg
+	sumN         int     // non-null numeric inputs (avg divisor)
+	minV, maxV   any
+	hasMin       bool
+	hasMax       bool
+	list         []any // collect
+	seenDistinct map[string]bool
+}
+
+// accum folds one binding row into the accumulator of aggregating item it.
+func (ex *executor) accum(it *ReturnItem, ac *aggAcc, r row) error {
+	call := it.Agg
+	if call.Star { // count(*): every row counts
+		ac.n++
+		return nil
+	}
+	v := ex.itemValue(call.Arg, r)
+	if v == nil {
+		return nil // null inputs never aggregate
+	}
+	if f, ok := numVal(v); ok {
+		v = f // numeric inputs normalize to float64
+	}
+	if call.Distinct {
+		enc := string(encodeVal(nil, v))
+		if ac.seenDistinct[enc] {
+			return nil
+		}
+		if ac.seenDistinct == nil {
+			ac.seenDistinct = map[string]bool{}
+		}
+		ac.seenDistinct[enc] = true
+	}
+	switch call.Func {
+	case "count":
+		ac.n++
+	case "sum", "avg":
+		f, ok := v.(float64) // numerics were normalized above
+		if !ok {
+			return &Error{1, 1, fmt.Sprintf("%s(): non-numeric input %T", call.Func, v)}
+		}
+		ac.sum += f
+		ac.sumN++
+	case "min":
+		if !ac.hasMin || cmpVals(v, ac.minV) < 0 {
+			ac.minV, ac.hasMin = v, true
+		}
+	case "max":
+		if !ac.hasMax || cmpVals(v, ac.maxV) > 0 {
+			ac.maxV = v
+			ac.hasMax = true
+		}
+	case "collect":
+		ac.list = append(ac.list, v)
+	}
+	return nil
+}
+
+// result finalizes the accumulator: count/sum/avg as float64, min/max as the
+// stored scalars, collect as []any.
+func (ac *aggAcc) result(call AggCall) any {
+	switch call.Func {
+	case "count":
+		return float64(ac.n)
+	case "sum":
+		return ac.sum // 0 over an empty/all-null group
+	case "avg":
+		if ac.sumN == 0 {
+			return nil
+		}
+		return ac.sum / float64(ac.sumN)
+	case "min":
+		if !ac.hasMin {
+			return nil
+		}
+		return ac.minV
+	case "max":
+		if !ac.hasMax {
+			return nil
+		}
+		return ac.maxV
+	case "collect":
+		if ac.list == nil {
+			return []any{}
+		}
+		return ac.list
+	}
+	return nil
+}
+
+// encodeVal appends a canonical, self-delimiting encoding of v (group keys
+// and DISTINCT seen-sets). The encoding is injective — distinct values
+// encode to distinct byte strings; the tag numbers are arbitrary and
+// unrelated to cmpVals' type ranking. Numbers are numVal-normalized IEEE
+// bits; null has its own tag.
+func encodeVal(b []byte, v any) []byte {
+	switch x := v.(type) {
+	case nil:
+		return append(b, 0)
+	case bool:
+		if x {
+			return append(b, 1, 1)
+		}
+		return append(b, 1, 0)
+	case string:
+		b = append(b, 2)
+		b = strconv.AppendInt(b, int64(len(x)), 10)
+		b = append(b, ' ')
+		return append(b, x...)
+	case NodeVal:
+		b = append(b, 3)
+		return binary.BigEndian.AppendUint32(b, x.ID)
+	case EdgeVal:
+		b = append(b, 4)
+		return binary.BigEndian.AppendUint32(b, x.ID)
+	}
+	if f, ok := numVal(v); ok {
+		b = append(b, 5)
+		return binary.BigEndian.AppendUint64(b, math.Float64bits(f))
+	}
+	s := fmt.Sprintf("%#v", v)
+	b = append(b, 6)
+	b = strconv.AppendInt(b, int64(len(s)), 10)
+	b = append(b, ' ')
+	return append(b, s...)
+}
+
+// sortRows stable-sorts projected rows by precomputed ORDER BY key values
+// (sortVals[i][j] belongs to projRows[i] and key j).
+func sortRows(projRows []map[string]any, keys []OrderKey, sortVals [][]any) []map[string]any {
+	idx := make([]int, len(projRows))
+	for i := range idx {
+		idx[i] = i
+	}
+	slices.SortStableFunc(idx, func(a, b int) int {
+		for j, k := range keys {
+			c := cmpVals(sortVals[a][j], sortVals[b][j])
+			if k.Desc {
+				c = -c
+			}
+			if c != 0 {
+				return c
+			}
+		}
+		return 0
+	})
+	sorted := make([]map[string]any, len(projRows))
+	for i, ix := range idx {
+		sorted[i] = projRows[ix]
+	}
+	return sorted
 }
 
 // starItems expands RETURN * to every named variable in declaration order
@@ -85,7 +338,7 @@ func starItems(m *MatchClause) []*ReturnItem {
 func (ex *executor) itemValue(it *ReturnItem, r row) any {
 	if it.Prop == "" {
 		if id, ok := r.nodes[it.Var]; ok {
-			rec, _ := ex.snap.NodeInfo(id)
+			rec, _ := ex.nodeInfo(id)
 			return NodeVal{ID: id, Key: rec.Key, Label: rec.Label, Props: rec.Props}
 		}
 		if id, ok := r.edges[it.Var]; ok {
@@ -101,7 +354,7 @@ func (ex *executor) itemValue(it *ReturnItem, r row) any {
 }
 
 func (ex *executor) edgeVal(id uint32) EdgeVal {
-	src, dst, label, props, _ := ex.snap.EdgeInfo(id)
+	src, dst, label, props, _ := ex.edgeInfo(id)
 	return EdgeVal{ID: id, Src: src, Dst: dst, Label: label, Props: props}
 }
 
@@ -122,7 +375,7 @@ func (ex *executor) orderValue(name string, r row) any {
 // variable is unbound or the property is absent (evaluates to null).
 func (ex *executor) scalarOf(r row, v, name string) (any, bool) {
 	if id, ok := r.nodes[v]; ok {
-		rec, _ := ex.snap.NodeInfo(id)
+		rec, _ := ex.nodeInfo(id)
 		switch name {
 		case "key":
 			return rec.Key, true
@@ -135,7 +388,7 @@ func (ex *executor) scalarOf(r row, v, name string) (any, bool) {
 		return val, present
 	}
 	if id, ok := r.edges[v]; ok {
-		_, _, label, props, _ := ex.snap.EdgeInfo(id)
+		_, _, label, props, _ := ex.edgeInfo(id)
 		switch name {
 		case "label":
 			return label, true

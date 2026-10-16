@@ -47,9 +47,13 @@ func TestCypherFacadeEndToEnd(t *testing.T) {
 		t.Fatalf("where: %+v", res.Rows)
 	}
 
-	// 未 Seal 拒查
-	if _, err := New().Cypher(`MATCH (a) RETURN a`); !errors.Is(err, ErrNotSealed) {
+	// 未 Seal 合法（门已溶解）：对空 base 作答（遍历族 base-only，Task 4 收口）
+	res2, err := New().Cypher(`MATCH (a) RETURN a`)
+	if err != nil {
 		t.Fatalf("unsealed: %v", err)
+	}
+	if len(res2.Rows) != 0 {
+		t.Fatalf("unsealed rows = %d, want 0 (empty base)", len(res2.Rows))
 	}
 
 	// 解析/语义错误是定位的 CypherError

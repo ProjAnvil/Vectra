@@ -1,5 +1,14 @@
 package vectra
 
+import (
+	"cmp"
+	"slices"
+
+	"github.com/projanvil/vectra/internal/delta"
+	"github.com/projanvil/vectra/internal/engine"
+	tr "github.com/projanvil/vectra/internal/traverse"
+)
+
 // Query is the chained traversal builder:
 //
 //	g.Query().From("gateway").Out("CALLS").MaxDepth(3).Run()
@@ -55,30 +64,59 @@ func (q *Query) Run() (*BFSResult, error) {
 
 // NeighborsOf returns the one-hop neighbors of the node key (label-filtered,
 // empty = all, deduplicated).
+//
+// v0.7 traversal family (spec §3.2, Task 4): row iteration over the
+// generation's three-source View — base rows tombstone-filtered plus layer
+// rows, so writes are visible immediately. With nothing unmerged the plain
+// CSR row zip runs (FastAdjacency hot path).
 func (g *Graph) NeighborsOf(key string, dir Direction, labels ...string) ([]Node, error) {
-	n, ok := g.NodeByKey(key)
+	n, ok := g.NodeByKey(key) // materializes the caller's absorption window
 	if !ok {
 		return nil, ErrNodeNotFound
 	}
-	if !g.sealed {
-		return nil, ErrNotSealed
+	v := g.view.Load()
+	src := g.rowsOf(v)
+	lr := labelResolver(v.base)
+	if view, ok := src.(*engine.View); ok { // joint label table
+		lr = view
 	}
-	adj := g.snap.AdjacencyF()
+	mask := labelMaskOf(lr, labels)
+	dirCode := int(tr.DirOut)
 	if dir == DirIn {
-		adj = g.snap.AdjacencyR()
+		dirCode = int(tr.DirIn)
 	}
-	mask := g.labelMask(labels)
-	seen := make([]bool, g.snap.NodeCount())
+	materialize := func(id uint32) (Node, bool) {
+		return v.nodeByID(NodeID(id))
+	}
+	if adj, fast := src.FastAdjacency(dirCode); fast {
+		tg, _, lb := adj.Row(uint32(n.ID))
+		seen := make([]bool, src.NodeCount())
+		var out []Node
+		for i, t := range tg {
+			if mask != nil && !mask[lb[i]] {
+				continue
+			}
+			if !seen[t] {
+				seen[t] = true
+				if rec, ok := materialize(t); ok {
+					out = append(out, rec)
+				}
+			}
+		}
+		return out, nil
+	}
+	rows := src.Rows(uint32(n.ID), dirCode)
+	seen := make([]bool, src.NodeCount())
 	var out []Node
-	tg, _, lb := adj.Row(uint32(n.ID))
-	for i, v := range tg {
-		if mask != nil && !mask[lb[i]] {
+	for _, r := range rows {
+		if mask != nil && !mask[r.LabelID] {
 			continue
 		}
-		if !seen[v] {
-			seen[v] = true
-			node, _ := g.NodeByID(NodeID(v))
-			out = append(out, node)
+		if !seen[r.Target] {
+			seen[r.Target] = true
+			if rec, ok := materialize(r.Target); ok {
+				out = append(out, rec)
+			}
 		}
 	}
 	return out, nil
@@ -88,45 +126,70 @@ func (g *Graph) NeighborsOf(key string, dir Direction, labels ...string) ([]Node
 // optional labels. Unlike NeighborsOf (deduplicated nodes), every parallel
 // edge is returned with its own props — this is the entry point for reading
 // weight-like attributes, e.g. read-modify-write updates via UpsertEdge
-// (safe under the embedded single-writer model). Works both before and
-// after Seal; a deleted node key yields ErrNodeNotFound.
+// (safe under the embedded single-writer model).
+//
+// v0.7 point-query family (spec §3.2): three-source read, immediately
+// consistent — base incidents come from the CSR rows (tombstone-filtered),
+// layer incidents from a record scan (newer-tombstone-filtered); results are
+// sorted by EdgeID ascending. A deleted node key yields ErrNodeNotFound.
 func (g *Graph) EdgesOf(key string, dir Direction, labels ...string) ([]Edge, error) {
-	n, ok := g.NodeByKey(key)
+	g.flushPend()
+	v := g.view.Load()
+	_, ok := v.nodeWinner(key)
 	if !ok {
 		return nil, ErrNodeNotFound
 	}
-	mask := g.labelMask(labels)
-	var out []Edge
-	if g.sealed {
-		adj := g.snap.AdjacencyF()
-		if dir == DirIn {
-			adj = g.snap.AdjacencyR()
+	var labSet map[string]bool
+	if len(labels) > 0 {
+		labSet = make(map[string]bool, len(labels))
+		for _, l := range labels {
+			labSet[l] = true
 		}
-		_, eids, lb := adj.Row(uint32(n.ID))
-		for i := range eids {
-			if mask != nil && !mask[lb[i]] {
+	}
+	var out []Edge
+	if bid, isBase := v.baseKeys[key]; isBase {
+		adj := v.base.AdjacencyF()
+		if dir == DirIn {
+			adj = v.base.AdjacencyR()
+		}
+		_, eids, _ := adj.Row(uint32(bid))
+		for _, eid := range eids {
+			src, dst, label, props, ok := v.base.EdgeInfo(eid)
+			if !ok {
 				continue
 			}
-			if e, ok := g.EdgeByID(EdgeID(eids[i])); ok {
-				out = append(out, e)
+			k := delta.EdgeKey{SrcKey: v.baseKeyOf(src), DstKey: v.baseKeyOf(dst), Label: label}
+			if !v.baseEdgeLive(k) {
+				continue
 			}
+			if labSet != nil && !labSet[label] {
+				continue
+			}
+			out = append(out, Edge{ID: EdgeID(eid), Src: NodeID(src), Dst: NodeID(dst), Label: label, Props: props})
 		}
-		return out, nil
 	}
-	for i, e := range g.edges {
-		if g.tombE[i] {
-			continue
+	for i, l := range v.layers {
+		for j, rec := range l.Edges() {
+			if dir == DirOut && rec.SrcKey != key {
+				continue
+			}
+			if dir == DirIn && rec.DstKey != key {
+				continue
+			}
+			if labSet != nil && !labSet[rec.Label] {
+				continue
+			}
+			k := delta.EdgeKey{SrcKey: rec.SrcKey, DstKey: rec.DstKey, Label: rec.Label}
+			if !v.layerEdgeLive(i, k) {
+				continue
+			}
+			out = append(out, Edge{
+				ID:  EdgeID(l.EdgeIDAt(j)),
+				Src: v.nodeIDOf(rec.SrcKey), Dst: v.nodeIDOf(rec.DstKey),
+				Label: rec.Label, Props: rec.Props,
+			})
 		}
-		if dir == DirOut && e.src != n.ID {
-			continue
-		}
-		if dir == DirIn && e.dst != n.ID {
-			continue
-		}
-		if mask != nil && !mask[e.label] {
-			continue
-		}
-		out = append(out, Edge{ID: EdgeID(i), Src: e.src, Dst: e.dst, Label: g.labels[e.label], Props: e.props})
 	}
+	slices.SortFunc(out, func(a, b Edge) int { return cmp.Compare(a.ID, b.ID) })
 	return out, nil
 }

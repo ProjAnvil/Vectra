@@ -229,13 +229,26 @@ func TestBFSHandlesCycles(t *testing.T) {
 	}
 }
 
-func TestBFSUnsealedRejected(t *testing.T) {
+// TestBFSUnsealedSeesLayerStart: the sealed gate is dissolved and the
+// traversal family is three-source (Task 4) — BFS anchors on a
+// layer-resident start in a graph that never merged anything.
+func TestBFSUnsealedSeesLayerStart(t *testing.T) {
 	g := vectra.New()
 	if _, err := g.AddNode("a", "S", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := g.BFS([]vectra.NodeID{0}); !errors.Is(err, vectra.ErrNotSealed) {
-		t.Errorf("err = %v, want ErrNotSealed", err)
+	res, err := g.BFS([]vectra.NodeID{0})
+	if err != nil {
+		t.Fatalf("BFS on layer-resident start: %v", err)
+	}
+	if res.Count() != 1 {
+		t.Errorf("Count = %d, want 1", res.Count())
+	}
+	if err := g.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.BFS([]vectra.NodeID{0}); err != nil {
+		t.Errorf("after Seal: %v", err)
 	}
 }
 
@@ -608,9 +621,12 @@ func TestCyclesEmptyOnDAG(t *testing.T) {
 	}
 }
 
-func TestCyclesRequiresSealed(t *testing.T) {
+// TestCyclesWorksBeforeSeal: the sealed gate is dissolved — Cycles on a
+// fresh graph is a legal query (empty answer; any pending layers are
+// force-merged first, spec §3.2).
+func TestCyclesWorksBeforeSeal(t *testing.T) {
 	g := vectra.New()
-	if cs := g.Cycles(); cs != nil {
-		t.Errorf("Cycles() before Seal = %v, want nil", cs)
+	if cs := g.Cycles(); len(cs) != 0 {
+		t.Errorf("Cycles() on empty graph = %v, want empty", cs)
 	}
 }

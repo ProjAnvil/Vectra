@@ -16,32 +16,49 @@ type CypherResult struct {
 	Rows    []map[string]any
 }
 
-// Cypher runs one Cypher-subset statement against the sealed graph:
+// Cypher runs one Cypher-subset statement against the graph:
 //
 //	g.Cypher(`MATCH (b {type:'controller'})-[:CALLS*1..2]->(s)
 //	          WHERE s.env = 'prod' RETURN b.key, s.key ORDER BY s.key DESC LIMIT 10`)
 //
 // The grammar is an openCypher/GQL-compatible core; variable-length edges
-// follow node-pair (shortest-distance) semantics. Requires Seal first.
+// follow node-pair (shortest-distance) semantics.
+//
+// v0.7 traversal family (spec §3.2, Task 4): Cypher executes over the
+// generation's three-source View — writes are visible immediately (edges,
+// nodes, and pattern anchors alike). With nothing unmerged the merged-base
+// hot path runs unchanged.
 func (g *Graph) Cypher(query string) (*CypherResult, error) {
-	if !g.sealed {
-		return nil, ErrNotSealed
-	}
-	res, err := cypher.Run(g.snap, query)
-	if err != nil {
-		return nil, err
+	g.flushPend()
+	v := g.view.Load()
+	var res *cypher.Result
+	if runView, src := g.cypherRunViewOf(v); runView {
+		r, err := cypher.RunView(src, query)
+		if err != nil {
+			return nil, err
+		}
+		res = r
+	} else {
+		r, err := cypher.Run(v.base, query)
+		if err != nil {
+			return nil, err
+		}
+		res = r
 	}
 	out := &CypherResult{Columns: res.Columns, Rows: res.Rows}
-	// retype engine-facing values into the public Node/Edge types
+	// retype engine-facing values into the public Node/Edge types (resolved
+	// through the same generation the query ran on — layer records included)
 	for _, r := range out.Rows {
-		for k, v := range r {
-			switch tv := v.(type) {
+		for k, cell := range r {
+			switch tv := cell.(type) {
 			case cypher.NodeVal:
-				n, _ := g.NodeByID(NodeID(tv.ID))
-				r[k] = n
+				if n, ok := v.nodeByID(NodeID(tv.ID)); ok {
+					r[k] = Node{ID: n.ID, Key: n.Key, Label: n.Label, Props: n.Props}
+				}
 			case cypher.EdgeVal:
-				e, _ := g.EdgeByID(EdgeID(tv.ID))
-				r[k] = e
+				if e, ok := v.edgeByID(EdgeID(tv.ID)); ok {
+					r[k] = Edge{ID: e.ID, Src: e.Src, Dst: e.Dst, Label: e.Label, Props: e.Props}
+				}
 			}
 		}
 	}

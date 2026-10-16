@@ -60,19 +60,19 @@ func TestAddEdgeUnknownNode(t *testing.T) {
 	}
 }
 
-func TestSealLocksMutationAndBuildsStats(t *testing.T) {
+// TestSealMergesAndKeepsGraphWritable: Seal merges the layers into a fresh
+// base (SCC stats available) — and, with the sealed gate dissolved, the
+// graph keeps accepting writes afterwards (they open a new generation).
+func TestSealMergesAndKeepsGraphWritable(t *testing.T) {
 	g := mustBuild(t)
 	if g.Sealed() {
-		t.Fatal("graph sealed before Seal()")
+		t.Fatal("graph sealed before any Seal() despite unmerged layers")
 	}
 	if err := g.Seal(); err != nil {
 		t.Fatal(err)
 	}
 	if !g.Sealed() {
-		t.Fatal("Seal() did not seal")
-	}
-	if _, err := g.AddNode("late", "Svc", nil); !errors.Is(err, vectra.ErrSealed) {
-		t.Errorf("AddNode after seal: %v, want ErrSealed", err)
+		t.Fatal("Seal() did not merge the layers")
 	}
 	st := g.Stats()
 	if st.Nodes != 4 || st.Edges != 4 {
@@ -80,6 +80,19 @@ func TestSealLocksMutationAndBuildsStats(t *testing.T) {
 	}
 	if st.SCCs != 4 {
 		t.Errorf("SCCs = %d, want 4 (acyclic)", st.SCCs)
+	}
+	// writes after Seal succeed and stay visible (three-source point queries)
+	if _, err := g.AddNode("late", "Svc", nil); err != nil {
+		t.Fatalf("AddNode after seal: %v (gate dissolved)", err)
+	}
+	if n, ok := g.NodeByKey("late"); !ok || n.Label != "Svc" {
+		t.Fatalf("post-Seal write invisible: %+v ok=%v", n, ok)
+	}
+	if g.Sealed() {
+		t.Fatal("post-Seal write must leave unmerged layers")
+	}
+	if st := g.Stats(); st.SCCs != 0 {
+		t.Errorf("Stats with layers present reports counts only: %+v", st)
 	}
 }
 
@@ -173,14 +186,23 @@ func TestGraphSaveLoadRoundtrip(t *testing.T) {
 	_ = n
 }
 
-func TestSaveRequiresSealed(t *testing.T) {
+// TestSaveUnsealedAllowed: Save no longer requires a Seal (R4) — it exports
+// the current logical view and the round-trip restores it fully merged.
+func TestSaveUnsealedAllowed(t *testing.T) {
 	g := vectra.New()
 	if _, err := g.AddNode("a", "S", nil); err != nil {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	if err := g.Save(&buf); !errors.Is(err, vectra.ErrNotSealed) {
-		t.Errorf("err = %v, want ErrNotSealed", err)
+	if err := g.Save(&buf); err != nil {
+		t.Fatalf("Save with unmerged layers: %v", err)
+	}
+	g2, err := vectra.Load(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g2.NodeCount() != 1 {
+		t.Fatalf("round-trip nodes = %d, want 1", g2.NodeCount())
 	}
 }
 

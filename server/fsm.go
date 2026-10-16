@@ -145,41 +145,51 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 			return ApplyResult{Committed: false, Index: l.Index, Conflicts: conflicts, ConflictTotal: total}
 		}
 	}
-	for _, n := range b.Nodes {
-		if _, err := f.live.AddNode(n.Key, n.Label, n.Props); err == nil {
-			res.NodesApplied++
+	// One Batch boundary per committed entry: the replay materializes as a
+	// single micro-layer (and, on a WAL-attached graph, one frame), not one
+	// per op. Determinism is unchanged — the wrap preserves op order and
+	// every per-op outcome, it only regroups layer/frame granularity, so all
+	// replicas fold the same result. The boundary's flush error is ignored
+	// deliberately: it depends on local disk state (not log content) and must
+	// never influence ApplyResult or the in-memory replay, or replicas could
+	// diverge; live has no WAL attached here, so it cannot fire anyway.
+	_ = f.live.Batch(func(g *vectra.Graph) {
+		for _, n := range b.Nodes {
+			if _, err := g.AddNode(n.Key, n.Label, n.Props); err == nil {
+				res.NodesApplied++
+			}
 		}
-	}
-	for _, e := range b.Edges {
-		var err error
-		if e.AllowParallel {
-			_, err = f.live.AddEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
-		} else {
-			_, err = f.live.UpsertEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
+		for _, e := range b.Edges {
+			var err error
+			if e.AllowParallel {
+				_, err = g.AddEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
+			} else {
+				_, err = g.UpsertEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
+			}
+			if err == nil {
+				res.EdgesApplied++
+			} else if errors.Is(err, vectra.ErrNodeNotFound) {
+				res.EdgesSkipped++ // Authoritative validation: replay skips invalid items, no divergence
+			}
 		}
-		if err == nil {
-			res.EdgesApplied++
-		} else if errors.Is(err, vectra.ErrNodeNotFound) {
-			res.EdgesSkipped++ // Authoritative validation: replay skips invalid items, no divergence
+		for _, d := range b.EdgeDeletes {
+			n, err := g.DeleteEdge(d.SrcKey, d.DstKey, d.Label)
+			if err != nil {
+				res.EdgesSkipped++ // References a nonexistent node: deterministic skip, no divergence
+				continue
+			}
+			res.EdgesDeleted += n
 		}
-	}
-	for _, d := range b.EdgeDeletes {
-		n, err := f.live.DeleteEdge(d.SrcKey, d.DstKey, d.Label)
-		if err != nil {
-			res.EdgesSkipped++ // References a nonexistent node: deterministic skip, no divergence
-			continue
+		for _, key := range b.NodeDeletes {
+			cascaded, err := g.DeleteNode(key)
+			if err != nil {
+				res.NodesSkipped++
+				continue
+			}
+			res.NodesDeleted++
+			res.EdgesDeleted += cascaded
 		}
-		res.EdgesDeleted += n
-	}
-	for _, key := range b.NodeDeletes {
-		cascaded, err := f.live.DeleteNode(key)
-		if err != nil {
-			res.NodesSkipped++
-			continue
-		}
-		res.NodesDeleted++
-		res.EdgesDeleted += cascaded
-	}
+	})
 	f.dirty = true
 	f.version++
 	f.appliedIndex.Store(l.Index)

@@ -12,6 +12,16 @@ type Adjacency struct {
 	Labels  []uint32
 }
 
+// AdjRow is one slot of an adjacency row in AoS form — the element-wise zip
+// of Adjacency's parallel Targets/EdgeIDs/Labels slices. The CSR hot path
+// reads the SoA slices directly; three-source views (engine.View) materialize
+// rows as AdjRow values instead.
+type AdjRow struct {
+	Target  uint32
+	EdgeID  uint32
+	LabelID uint32
+}
+
 // Build builds a CSR from an edge list via counting sort; neighbors of the
 // same node keep insertion order.
 func Build(numNodes uint32, src, dst []uint32) Adjacency {

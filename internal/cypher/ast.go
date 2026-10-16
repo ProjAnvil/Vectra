@@ -51,9 +51,21 @@ type ReturnClause struct {
 }
 
 type ReturnItem struct {
-	Var  string
-	Prop string // "" = the whole variable; "key"/"label"/"id" are pseudo-props
-	Name string // display name: "a" or "a.key"
+	Var   string
+	Prop  string  // "" = the whole variable; "key"/"label"/"id" are pseudo-props
+	Name  string  // display name: "a" or "a.key", the alias when AS is given, or the aggregation text
+	Alias string  // the "AS n" name; "" = no alias
+	Agg   AggCall // non-zero Func marks an aggregation item
+}
+
+// AggCall is one aggregation in a RETURN item: count/sum/avg/min/max/collect.
+// The zero value (Func "") marks a plain non-aggregating item. Star is only
+// valid for count(*), whose Arg is nil.
+type AggCall struct {
+	Func     string // "count", "sum", "avg", "min", "max", "collect"
+	Star     bool   // count(*): count rows, not values
+	Distinct bool   // count/collect(... DISTINCT ...) — dedupe within the group
+	Arg      *ReturnItem
 }
 
 type OrderKey struct {

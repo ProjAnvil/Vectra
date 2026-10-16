@@ -10,10 +10,11 @@ Since v0.2 the same engine upgrades into an optional **multi-replica infrastruct
 
 | Bet | Payoff |
 |---|---|
-| Whole graph in memory, CSR with zero pointers (`[]uint32` arrays) | GC cost independent of edge count; lock-free concurrent reads after `Seal()` |
+| Whole graph in memory, CSR with zero pointers (`[]uint32` arrays) | GC cost independent of edge count; lock-free concurrent reads — every generation, sealed or not |
 | Layer-synchronized parallel BFS (morsel-driven, atomic-OR bitmap dedup) | 3.3× over naive map adjacency at 10M edges |
 | SCC compression at write time (Tarjan) — queries face a DAG | Reachability with one bit per component; `Cycles()` as a free diagnostic |
 | Single-file snapshot with CRC32 (v3 format) | Atomic publish/backup; blue-green hot swap in server mode; property-index declarations round-trip |
+| Immutable micro-layer generations (v0.7) | Continuous writes with zero-lock reads; every applied write immediately visible |
 
 ## Quickstart (embedded)
 
@@ -25,9 +26,13 @@ g.AddNode("gateway", "Service", map[string]any{"env": "prod"})
 g.AddEdge("gateway", "auth", "CALLS", nil)
 g.UpsertEdge("gateway", "auth", "CALLS", map[string]any{"weight": 2}) // replace props on the same (src,dst,label)
 g.DeleteNode("ledger")                                               // cascade-deletes incident edges
-g.Seal() // immutable from here; concurrent reads are lock-free
 
-// chained traversal
+// bulk import: g.Batch(func(g *vectra.Graph) { ... }) — one micro-layer per batch; plain
+// unbatched writes are absorbed into one open window too (materialized at the next query,
+// boundary, or capacity cap), so bulk import no longer requires Batch — but Batch is still
+// the fastest shape under WAL (one frame group per boundary instead of a frame per write)
+
+// chained traversal (works with or without a Seal — writes are immediately visible)
 res, _ := g.Query().From("gateway").Out("CALLS").MaxDepth(3).Run()
 
 // reachability (SCC-compressed fast path)
@@ -44,6 +49,27 @@ g.SaveFile("deps.vg")
 ```
 
 Snapshot notes: the v3 format persists `IndexProperty` declarations, so `vectra.Load` restores both the graph and its lookup indexes (typed lookups work immediately after reload; v2/v1 files remain readable but carry no index declarations). Property indexes are **typed** — per key three sorted buckets (string / number / bool): `LookupByProperty` (string eq), `LookupByNumber` / `LookupByNumberRange(min, max *float64)` (numeric eq / range), `LookupByBool`. Numbers normalize to `float64` in the index, so an `int` written via the Go API and the same value read back from a JSON snapshot land in one bucket — the old "integers read back as float64" comparison pitfall disappears for indexed lookups (`int64` beyond 2^53 loses precision, inherent to the JSON number model).
+
+## Continuous writes: micro-layer generations (v0.7)
+
+v0.7 dissolves the sealed-snapshot gate. Every write (or `Batch`) materializes its changes as an immutable **micro-layer** and publishes a new generation `{base, layers}` through one atomic pointer — readers never lock and never block, whatever the writer is doing. A background merger folds `base ∪ layers` into a fresh immutable base (background merge triggers when accumulated layer edge-records reach max(64K, base edge count) — the fold interval stays proportional to the base, 64K being the floor for small graphs; a 2048-layer cap stalls the writer as a backstop until the fold lands), and `Seal()`/`Compact()` run that fold explicitly, plus a checkpoint when a WAL is attached. Sealing no longer freezes anything: writes after `Seal` simply open a new generation, and `Compact` is semantically identical to `Seal` (spec §3.1's "deep compaction renumbering" is absorbed by the merge itself). Both are write-path methods.
+
+**Read visibility by family:**
+
+| Query family | Visibility |
+|---|---|
+| Point lookups (`NodeByKey` / `NodeByID` / `EdgeByID` / counts / `EdgesOf` / `LookupBy*`) | immediate — three-source read (base ∪ layers, tombstone masking) |
+| Traversals (`BFS` / `ShortestPath` / `Cypher` / `Query` / `NeighborsOf`) | immediate — merged row streams over base + layers |
+| `Reachable` / SCC-dependent stats | counts immediate; supernode (SCC-compressed) acceleration applies to the merged base, delta-period queries fall back to node-level BFS |
+| `Cycles` | folds unmerged layers first — strongly consistent answers, the one query that walks the write path |
+
+**IDs:** node and edge IDs are stable within a generation (deleted IDs burn their numbers); merges renumber densely, so IDs may change across a `Seal`/`Compact`/background fold — the v0.6 cross-merge contract, unchanged.
+
+**Writer discipline:** the zero-lock engine assumes one writer goroutine. In direct mode (calling `AddNode`/`Batch`/... yourself) that is any single goroutine of yours — concurrent bare writes are a data race and interleave WAL frames. Unbatched per-op writes accumulate in an **absorption window** (one micro-layer per flush — the next query, a boundary, or a capacity cap — instead of one layer per op), so bulk import no longer forces `Batch`; `Batch` (or wrapper changesets) remains the fastest shape under WAL because it logs one frame group per boundary instead of a frame per write. The structured form is the single-writer wrapper (`internal/writer.Attach` → `Handle.Submit`): bounded queue, Badger-style group commit (one frame group and one fsync per drained batch), background merges with write-stall at the layer cap, and a volume-triggered checkpoint once the WAL holds ≥4 MiB since the last one. While attached, non-release builds reject bare writes — and off-writer `Seal`/`Compact`/`Cycles` — with `ErrNotWriter`; release builds compile the check away and rely on this contract.
+
+**Write-ahead log (optional):** `Open(path, Options{WALMode, WALDir})` starts a durable session — whole-JSON changeset frames, fsynced per `Batch` boundary in `ModeAlways` (`ModeInterval` fsyncs at explicit boundaries; `ModeOff`, the zero value, is exactly v0.6 snapshot behavior). Checkpoints — on `Seal`/`Compact`/`Close`, or the wrapper's ≥4 MiB volume trigger — write a watermark snapshot `<db>-<lsn>.db`, flip an atomic manifest onto it, and reset the log; recovery loads the watermark and replays the frames above it (a torn tail stops at the first bad frame; a checkpoint failure keeps the WAL for the next attempt). On disk this adds a `wal` sidecar directory next to the snapshot file: older binaries ignore it harmlessly, and a v0.7 binary facing a directory without one just loads the snapshot — no format change to the v3 snapshot itself.
+
+**Memory:** a merge allocates the new base before the old generation becomes garbage, so peak RSS at the 1M/10M tier approaches 2× the ~4.1 GB live set (9–11 GB momentary; spec §9 R11). Budget ≥16 GB for merge-heavy 1M-tier workloads, or enable the wrapper's `GCTune` (drops GOGC to 50 around merges).
 
 **⚠️ Upgrading to 0.5.0.** Store snapshots are now written in the v3 format. The incompatibility is one-directional: v1/v2 files remain readable, but pre-0.5 binaries cannot read v3 files — embedded and MCP users who exchange `.vg` snapshots across versions need both sides on 0.5+. The raft cluster mixed-version policy is unchanged (already unsupported).
 
@@ -114,7 +140,7 @@ conflict: 409 {committed: false, conflicts: [...], conflictTotal, hint}
 
 ## MCP (agents)
 
-Three first-class implementations — [Go (embedded engine)](mcp), [Python (FastMCP)](mcp/python), [TypeScript](mcp/ts) — exposing one-hop / multi-hop / shortest-path / reachability / cycles (with intra-cycle edges) / Cypher-subset pattern queries as MCP tools, plus `inject_batch` for writes (`allowParallel` supported; `lookup_property` takes string/number/bool values):
+Three first-class implementations — [Go (embedded engine)](mcp), [Python (FastMCP)](mcp/python), [TypeScript](mcp/ts) — exposing one-hop / multi-hop / shortest-path / reachability / cycles (with intra-cycle edges) / Cypher-subset pattern queries as MCP tools, plus `inject_batch` for writes (`allowParallel` supported; `lookup_property` takes string/number/bool values). In the Go server every applied write is immediately queryable — no seal round-trip; `seal` is optional maintenance (merge + checkpoint), and `-wal <dir>` runs a durable session that recovers across restarts:
 
 ```bash
 claude mcp add vectra -- /path/to/vectra-mcp
@@ -132,6 +158,8 @@ See [mcp/README.md](mcp/README.md) for all transports and host configurations.
 | shortest path p50 | 3.2µs | 101µs | 1.1ms |
 | injection (engine / raft+HTTP) | — | 9.5M / 1.4M edges/s | 9.4M / 1.3M edges/s |
 
+v0.7 acceptance report — micro-layer generations + WAL against a v0.6.0 baseline (traversal regression, WAL-off import line, merge-in-flight query tail, crash recovery): [docs/benchmarks/2026-10-15-delta-wal.md](docs/benchmarks/2026-10-15-delta-wal.md) (Apple M5 Pro).
+
 Reproduce locally: `make bench [SIZE=medium] [MODE=http]` — data and report are deleted when the run ends.
 
 Correctness is validated the LDBC way: property tests against independent reference implementations, real-dataset ground truth (SNAP email-Eu-core: 203 SCCs / largest 803, externally published numbers), chaos and degenerate-graph suites, determinism checks. Coverage: root 92.3% · csr/dag 100% · store 84.0% · engine+traverse 98.8% · server 87.5% · mcp 85.6%.
@@ -139,11 +167,18 @@ Correctness is validated the LDBC way: property tests against independent refere
 ## Repository layout
 
 ```
-vectra.go            facade: writes, Seal, snapshot, typed property index
+vectra.go            facade: writes, Batch, Seal/Compact, snapshot, typed property index
+changeset.go         Changeset vocabulary (WAL frames, server raft batches)
+options.go           Open options: WALMode / WALDir
+merge.go             background-merge protocol: CaptureMerge / PublishMerge / LayerPressure
+view.go              three-source row streams (base CSR + micro-layer records)
 cypher.go            facade: Cypher-subset query entry (Graph.Cypher)
 internal/csr         CSR adjacency (pointer-free uint32 arrays)
 internal/dag         Tarjan SCC, condensation, topological levels
 internal/engine      sealed snapshot + accessors + Seal pipeline
+internal/delta       immutable micro-layer builder and layer records
+internal/wal         embedded logical WAL (JSON frames, watermark checkpoints)
+internal/writer      single-writer wrapper: queue, group commit, background merger
 internal/cypher      Cypher-subset lexer, parser, AST, row executor
 internal/traverse    algorithms: layer-synced BFS, reachability, bidirectional path, cycles
 internal/store       snapshot codec (v3: indexKey section + CRC32 trailer, v1/v2 read-compatible)
@@ -151,7 +186,7 @@ server/              separate module: raft replication + HTTP API + hot-swap pub
                      ├─ cmd/vectra-server   service binary
                      ├─ cmd/vectra-bench    stress-test harness
 mcp/                 separate module: MCP servers
-                     ├─ cmd/vectra-mcp      Go (embedded engine, stdio + HTTP)
+                     ├─ cmd/vectra-mcp      Go (embedded engine, stdio + HTTP, snapshot or WAL session)
                      ├─ python/             FastMCP (wraps HTTP API)
                      └─ ts/                 TypeScript (wraps HTTP API)
 testdata/            real dataset fixture (SNAP email-Eu-core, cited)
@@ -162,7 +197,7 @@ The core module has **zero third-party dependencies** (`go.sum` absent). The `se
 
 ## Not in scope (deliberately)
 
-Online writes / delta-CSR (they would forfeit the two core bets), disk spill beyond 10M edges, a full GQL parser in core, sharding. Two former roadmap items shipped: the minimal query DSL (`Graph.Cypher`, `/v1/cypher`, MCP `cypher`) and property-typed indexes. The roadmap holds: k-hop precomputation.
+Online writes crossing into the server module — raft replication still runs the clone/publish model, because merges renumber IDs and replica replay must stay deterministic (the v0.7 micro-layer engine is embedded-only); disk spill beyond 10M edges; a full GQL parser in core; sharding. The old "online writes / delta-CSR" exclusion is resolved: v0.7 ships them as micro-layer generations without giving up either core bet (in-memory CSR, lock-free reads). The roadmap holds: k-hop precomputation.
 
 ## License
 

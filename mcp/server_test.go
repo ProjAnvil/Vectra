@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -177,29 +178,40 @@ func TestShortestPathReachableCycles(t *testing.T) {
 	}
 }
 
-func TestQueryBeforeSealIsHelpfulError(t *testing.T) {
+// v0.7: the sealed gate is dissolved — queries read the live graph's
+// current generation (lock-free view loads) and work with or without a
+// preceding seal.
+func TestQueryWithoutSealWorks(t *testing.T) {
 	cs := newTestSession(t)
 	call[any](t, cs, "inject_batch", map[string]any{
-		"nodes": []map[string]any{{"key": "a"}},
+		"nodes": []map[string]any{{"key": "a"}, {"key": "b"}},
+		"edges": []map[string]any{{"srcKey": "a", "dstKey": "b", "label": "CALLS"}},
 	})
-	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
-		Name: "neighbors", Arguments: map[string]any{"key": "a"},
-	})
-	if err != nil {
-		t.Fatal(err)
+
+	nb := call[struct {
+		Nodes []string `json:"nodes"`
+	}](t, cs, "neighbors", map[string]any{"key": "a"})
+	if len(nb.Nodes) != 1 || nb.Nodes[0] != "b" {
+		t.Fatalf("neighbors without seal: %+v", nb.Nodes)
 	}
-	if !res.IsError {
-		t.Fatal("query before seal should return a tool error")
+
+	// stats also serves the live generation; Sealed = "no unmerged
+	// micro-layers" (false while writes are unmerged)
+	st := call[struct {
+		Nodes  int  `json:"nodes"`
+		Edges  int  `json:"edges"`
+		Sealed bool `json:"sealed"`
+	}](t, cs, "stats", nil)
+	if st.Nodes != 2 || st.Edges != 1 || st.Sealed {
+		t.Fatalf("stats without seal: %+v", st)
 	}
-	// the error message should hint at seal
-	hint := ""
-	if len(res.Content) > 0 {
-		if tc, ok := res.Content[0].(*mcp.TextContent); ok {
-			hint = tc.Text
-		}
-	}
-	if !strings.Contains(hint, "seal") {
-		t.Errorf("error hint should contain seal: %q", hint)
+
+	call[any](t, cs, "seal", nil)
+	st2 := call[struct {
+		Sealed bool `json:"sealed"`
+	}](t, cs, "stats", nil)
+	if !st2.Sealed {
+		t.Fatalf("stats after seal: sealed=%v, want true", st2.Sealed)
 	}
 }
 
@@ -219,6 +231,75 @@ func TestLookupProperty(t *testing.T) {
 	// the MCP service auto-registers property keys seen during injection when sealing
 	if len(nodes.Nodes) != 1 || nodes.Nodes[0] != "a" {
 		t.Fatalf("lookup_property: %+v", nodes.Nodes)
+	}
+}
+
+// TestInjectCountsAndImmediateVisibility: one inject_batch carrying a bad
+// edge (nonexistent endpoint) reports exact counts — the bad edge is skipped,
+// never fatal — and everything applied is queryable right away, no seal
+// needed: the Batch boundary around the write loops publishes the layer
+// before the tool returns.
+func TestInjectCountsAndImmediateVisibility(t *testing.T) {
+	cs := newTestSession(t)
+
+	inj := call[struct {
+		NodesApplied int `json:"nodesApplied"`
+		EdgesApplied int `json:"edgesApplied"`
+		EdgesSkipped int `json:"edgesSkipped"`
+	}](t, cs, "inject_batch", map[string]any{
+		"nodes": []map[string]any{
+			{"key": "a"}, {"key": "b"}, {"key": "c"},
+		},
+		"edges": []map[string]any{
+			{"srcKey": "a", "dstKey": "b", "label": "CALLS"},
+			{"srcKey": "b", "dstKey": "c", "label": "CALLS"},
+			{"srcKey": "ghost", "dstKey": "a", "label": "CALLS"}, // bad endpoint: skipped
+		},
+	})
+	if inj.NodesApplied != 3 || inj.EdgesApplied != 2 || inj.EdgesSkipped != 1 {
+		t.Fatalf("inject counts: %+v, want 3 nodes / 2 edges / 1 skipped", inj)
+	}
+
+	nb := call[struct {
+		Nodes []string `json:"nodes"`
+	}](t, cs, "neighbors", map[string]any{"key": "a", "direction": "out"})
+	if len(nb.Nodes) != 1 || nb.Nodes[0] != "b" {
+		t.Fatalf("neighbors right after inject (no seal): %+v", nb.Nodes)
+	}
+	st := call[struct {
+		Nodes int `json:"nodes"`
+		Edges int `json:"edges"`
+	}](t, cs, "stats", nil)
+	if st.Nodes != 3 || st.Edges != 2 {
+		t.Fatalf("stats right after inject: %+v, want 3/2", st)
+	}
+}
+
+// TestInjectOneLayerPerBatch: one inject_batch call — nodes, edges and
+// deletes, applied in kind order — must materialize as ONE micro-layer, not
+// one per op (the pre-batching v0.7 path). LayerPressure is the observable
+// proxy: 9 applied ops must leave exactly 1 unmerged layer.
+func TestInjectOneLayerPerBatch(t *testing.T) {
+	svc := newService(vectra.New(), Options{})
+	_, out, err := svc.injectBatch(context.Background(), nil, injectIn{
+		Nodes: []nodeIn{{Key: "a"}, {Key: "b"}, {Key: "c"}, {Key: "d"}},
+		Edges: []edgeIn{
+			{SrcKey: "a", DstKey: "b", Label: "E"},
+			{SrcKey: "b", DstKey: "c", Label: "E"},
+			{SrcKey: "a", DstKey: "d", Label: "E"},
+		},
+		DeleteEdges: []edgeDeleteIn{{SrcKey: "a", DstKey: "d", Label: "E"}},
+		DeleteNodes: []string{"d"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.NodesApplied != 4 || out.EdgesApplied != 3 || out.EdgesDeleted != 1 || out.NodesDeleted != 1 {
+		t.Fatalf("counts: %+v, want 4 nodes / 3 edges / 1 edge deleted / 1 node deleted", out)
+	}
+	layers, _ := svc.live.LayerPressure()
+	if layers != 1 {
+		t.Fatalf("unmerged layers = %d, want 1 (one micro-layer per inject_batch, not per op)", layers)
 	}
 }
 
@@ -344,10 +425,10 @@ func TestInjectParallelEdges(t *testing.T) {
 	}
 }
 
-// TestSealThenReinjectContinues: "re-inject to write again" (the seal tool's
-// promise). After a seal, the first inject_batch re-opens a writable copy of
-// the published state; until the next seal, queries keep serving the old
-// published view (bounded-stale, same read model as the server module).
+// TestSealThenReinjectContinues: v0.7 continuous-write model — after a
+// seal, inject_batch continues on the SAME live graph (no lazy clone, no
+// bounded-stale published view): the new writes are immediately visible to
+// stats and queries, before any re-seal.
 func TestSealThenReinjectContinues(t *testing.T) {
 	cs := newTestSession(t)
 	stats := func() struct {
@@ -376,15 +457,104 @@ func TestSealThenReinjectContinues(t *testing.T) {
 		"edges": []map[string]any{{"srcKey": "b", "dstKey": "c", "label": "E"}},
 	})
 	if inj.NodesApplied != 1 {
-		t.Fatalf("re-inject after seal applied %d nodes, want 1 (writes must not be silently dropped)", inj.NodesApplied)
+		t.Fatalf("re-inject after seal applied %d nodes, want 1", inj.NodesApplied)
 	}
-	if st := stats(); st.Nodes != 2 {
-		t.Fatalf("pre-reseal stats = %+v, want the old published view (2 nodes, bounded-stale reads)", st)
+	// immediate visibility — the v0.7 payoff, no re-seal needed
+	if st := stats(); st.Nodes != 3 || st.Edges != 2 {
+		t.Fatalf("post-inject stats = %+v, want 3/2 immediately visible", st)
+	}
+	nb := call[struct {
+		Nodes []string `json:"nodes"`
+	}](t, cs, "neighbors", map[string]any{"key": "b"})
+	if len(nb.Nodes) != 1 || nb.Nodes[0] != "c" {
+		t.Fatalf("neighbors after re-inject: %+v", nb.Nodes)
 	}
 
 	call[any](t, cs, "seal", nil)
 	if st := stats(); st.Nodes != 3 || st.Edges != 2 {
-		t.Fatalf("post-reseal stats = %+v, want 3/2 (re-open must carry the published state forward)", st)
+		t.Fatalf("post-reseal stats = %+v, want 3/2", st)
+	}
+}
+
+// TestWALSessionPersistsAcrossRestart: with Options.WALDir the service
+// opens a durable session (vectra.Open, ModeAlways). seal = merge +
+// checkpoint; a fresh service on the same directory recovers everything.
+func TestWALSessionPersistsAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+
+	cs := newWALSession(t, dir)
+	call[any](t, cs, "inject_batch", map[string]any{
+		"nodes": []map[string]any{{"key": "a"}, {"key": "b"}},
+		"edges": []map[string]any{{"srcKey": "a", "dstKey": "b", "label": "E"}},
+	})
+	call[any](t, cs, "seal", nil) // checkpoint: watermark snapshot + manifest
+	// post-checkpoint writes live in the WAL until the next seal
+	call[any](t, cs, "inject_batch", map[string]any{
+		"nodes": []map[string]any{{"key": "c"}},
+		"edges": []map[string]any{{"srcKey": "b", "dstKey": "c", "label": "E"}},
+	})
+	_ = cs.Close() // session ends without a final seal — the WAL owns the tail
+
+	cs2 := newWALSession(t, dir)
+	st := call[struct {
+		Nodes int `json:"nodes"`
+		Edges int `json:"edges"`
+	}](t, cs2, "stats", nil)
+	if st.Nodes != 3 || st.Edges != 2 {
+		t.Fatalf("restarted stats = %+v, want 3/2 (checkpoint + WAL replay)", st)
+	}
+}
+
+// newWALSession starts a service backed by a durable WAL session in dir
+// (fresh per call: the second invocation simulates a process restart).
+func newWALSession(t *testing.T, dir string) *mcp.ClientSession {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	s := New(nil, Options{WALDir: dir})
+	ct, st := mcp.NewInMemoryTransports()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	go func() { _ = s.Run(ctx, st) }()
+	cs, err := client.Connect(ctx, ct, nil)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cs.Close()
+		cancel()
+	})
+	return cs
+}
+
+// TestWALDirOpenFailureSurfaces: a WAL directory that cannot be opened
+// (here: a regular file blocks MkdirAll) must fail every tool call loudly —
+// never silently degrade to a volatile in-memory graph that pretends to be
+// durable.
+func TestWALDirOpenFailureSurfaces(t *testing.T) {
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cs := newWALSession(t, blocker)
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "stats", Arguments: map[string]any{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError {
+		t.Fatal("stats over a failed WAL session must return a tool error")
+	}
+	hint := ""
+	if len(res.Content) > 0 {
+		if tc, ok := res.Content[0].(*mcp.TextContent); ok {
+			hint = tc.Text
+		}
+	}
+	if !strings.Contains(hint, "wal") && !strings.Contains(hint, "WAL") {
+		t.Errorf("error hint should name the WAL failure: %q", hint)
 	}
 }
 

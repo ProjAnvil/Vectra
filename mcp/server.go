@@ -12,8 +12,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"sync"
-	"sync/atomic"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -21,7 +21,7 @@ import (
 )
 
 // Version is the implementation version advertised by the MCP service.
-const Version = "0.6.0"
+const Version = "0.7.0"
 
 // defaultLimit is the default cap on nodes returned by bfs/reachable
 // (results are capped; the total field still reflects the true size,
@@ -32,38 +32,76 @@ const defaultLimit = 1000
 type Options struct {
 	// SnapshotPath, when non-empty: loaded at startup, saved after each seal (single-file snapshot).
 	SnapshotPath string
+
+	// WALDir, when non-empty, switches the service to a durable WAL
+	// session: the graph is opened with vectra.Open (ModeAlways) using
+	// WALDir as the WAL directory. The db/snapshot path is SnapshotPath
+	// when set, else <WALDir>/graph.db. seal then checkpoints (merge +
+	// watermark snapshot + manifest + WAL reset) and a restart on the same
+	// directory recovers every write. WALDir takes precedence over
+	// SnapshotPath (the snapshot path names the db file, not a load-and-
+	// save target). Empty = the snapshot mode above (v0.6 behavior).
+	WALDir string
 }
 
-// service holds the embedded engine state. Writes accumulate in the live
-// graph; after seal, queries go through the sealed view. MCP sessions may
-// call tools concurrently: write tools are mutually exclusive (mu), queries
-// are lock-free — the view pointer is atomic so seal's publish never races
-// concurrent readers. ONE service backs every session of a server (stdio:
-// the single session; HTTP: all connections share it — see Handler).
+// service holds the embedded engine state: ONE live graph carrying the
+// current generation, written by inject_batch/seal under mu and read by
+// every query tool lock-free (the engine's generation pointer is atomic —
+// v0.7's dissolved gates: queries never require a seal). The live pointer
+// itself is assigned only during construction, before the service is
+// shared. ONE service backs every session of a server (stdio: the single
+// session; HTTP: all connections share it — see Handler).
 type service struct {
 	mu   sync.Mutex
 	live *vectra.Graph
-	view atomic.Pointer[vectra.Graph] // sealed view (nil = not sealed)
+
+	// openErr is set when a WALDir session failed to open: every tool
+	// call then fails loudly instead of silently degrading to a volatile
+	// in-memory graph that pretends to be durable.
+	openErr error
 
 	propKeys map[string]bool // property keys seen during injection, auto-indexed at seal
 	opts     Options
 }
 
-// newService builds the embedded state once: live graph, snapshot view,
-// auto-index seeds. Snapshot mode additionally lets writes continue from the
-// snapshot's content when the embedded graph is empty and still writable, so
-// post-restart injections extend the persisted graph instead of replacing it.
+// newService builds the embedded state once. WAL mode (Options.WALDir):
+// vectra.Open recovers snapshot + WAL replay into a writable session. In
+// snapshot mode the loaded graph IS the live graph — v0.7 LoadFile graphs
+// are immediately writable (writes open a new generation), so the v0.6
+// sealed-view + write-after-seal-clone dance is gone. A snapshot load
+// failure keeps the passed-in graph (the v0.6 behavior: first seal then
+// writes the file).
 func newService(g *vectra.Graph, opts Options) *service {
-	svc := &service{live: g, propKeys: map[string]bool{}, opts: opts}
-	if opts.SnapshotPath != "" {
+	svc := &service{propKeys: map[string]bool{}, opts: opts}
+	switch {
+	case opts.WALDir != "":
+		dbPath := opts.SnapshotPath
+		if dbPath == "" {
+			dbPath = filepath.Join(opts.WALDir, "graph.db")
+		}
+		og, err := vectra.Open(dbPath, vectra.Options{
+			WALMode: vectra.ModeAlways,
+			WALDir:  opts.WALDir,
+		})
+		if err != nil {
+			svc.openErr = fmt.Errorf("wal session at %s: %w", opts.WALDir, err)
+			svc.live = vectra.New()
+			return svc
+		}
+		svc.live = og
+	case opts.SnapshotPath != "":
 		if loaded, err := vectra.LoadFile(opts.SnapshotPath); err == nil {
-			svc.view.Store(loaded) // Load seals automatically
+			svc.live = loaded
 			for _, k := range loaded.IndexedPropertyKeys() {
-				svc.propKeys[k] = true // snapshot's indexes survive the next re-seal
+				svc.propKeys[k] = true // snapshot's indexes survive the next seal
 			}
-			if g != nil && !g.Sealed() && g.NodeCount() == 0 {
-				svc.live = loaded.Clone() // writes continue from the snapshot content
-			}
+		}
+	}
+	if svc.live == nil {
+		if g != nil {
+			svc.live = g
+		} else {
+			svc.live = vectra.New()
 		}
 	}
 	return svc
@@ -75,10 +113,12 @@ func newServer(svc *service) *mcp.Server {
 	s := mcp.NewServer(
 		&mcp.Implementation{Name: "github.com/projanvil/vectra", Version: Version},
 		&mcp.ServerOptions{
-			Instructions: "Vectra in-memory graph engine (dependency graphs). Write with inject_batch, " +
-				"then call seal before querying; query tools: neighbors (one hop), " +
-				"bfs (multi-hop), shortest_path, reachable (impact set), cycles (dependency cycles), " +
-				"cypher (Cypher-subset pattern queries), stats, get_node, lookup_property.",
+			Instructions: "Vectra in-memory graph engine (dependency graphs). Write with inject_batch — " +
+				"writes are immediately visible to every query tool (neighbors: one hop, bfs: multi-hop, " +
+				"shortest_path, reachable: impact set, cycles: dependency cycles, cypher: Cypher-subset " +
+				"pattern queries, stats, get_node, lookup_property). Call seal periodically to merge " +
+				"micro-layers and checkpoint (in WAL mode it is the durability boundary); it is " +
+				"maintenance, never a query prerequisite.",
 		},
 	)
 	registerTools(s, svc)
@@ -93,9 +133,9 @@ func New(g *vectra.Graph, opts Options) *mcp.Server {
 
 // Handler returns an http.Handler for the Streamable HTTP transport (mounted
 // at /mcp). One shared service backs every session: all connections
-// serialize writes through the same mutex and watch the same sealed view
+// serialize writes through the same mutex and read the same live graph
 // (per-session services would share the live graph without sharing the lock
-// — a data race — and would never observe each other's seals). The SDK asks
+// — a data race — and would never observe each other's writes). The SDK asks
 // for a server per session (and once more per request for protocol-version
 // negotiation), so the callback only wires a lightweight mcp.Server — no
 // snapshot reload, no state.
@@ -238,18 +278,24 @@ func registerTools(s *mcp.Server, svc *service) {
 			"edge identity is (srcKey,dstKey,label) — set allowParallel=true on an edge to append a true " +
 			"parallel edge instead of collapsing onto the existing one; deleteEdges removes by " +
 			"(srcKey,dstKey,label), deleteNodes removes nodes and cascades their edges). " +
-			"Call seal after writing, before querying.",
+			"Everything applied is immediately visible to query tools.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false},
 	}, svc.injectBatch)
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "seal",
-		Description: "Seal the graph: builds query indexes and makes the graph read-only and queryable (re-inject to write again). Returns graph stats.",
+		Name: "seal",
+		Description: "Merge the graph's unmerged micro-layers into the sealed base and checkpoint: " +
+			"WAL mode writes the watermark snapshot + manifest (the durability boundary); snapshot mode " +
+			"saves the snapshot file. Auto-indexes property keys seen during injection, and makes SCC " +
+			"structures available to stats. Optional maintenance — queries work without it (the graph " +
+			"stays writable afterwards; writes open a new generation). Returns graph stats.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false},
 	}, svc.seal)
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "stats", Description: "Graph stats: nodes/edges/strongly connected components/nodes on cycles.",
+		Name: "stats",
+		Description: "Graph stats: nodes/edges/strongly connected components/nodes on cycles. " +
+			"sealed=true means no unmerged micro-layers (SCC fields are reported once sealed).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.stats)
 
@@ -282,7 +328,8 @@ func registerTools(s *mcp.Server, svc *service) {
 	}, svc.reachable)
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "cycles", Description: "All dependency cycles (strongly connected component member lists, sorted by size descending). The edges field lists each cycle's intra-cycle edges (src/dst/label) for severity triage. No params.",
+		Name:        "cycles",
+		Description: "All dependency cycles (strongly connected component member lists, sorted by size descending). The edges field lists each cycle's intra-cycle edges (src/dst/label) for severity triage. No params.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.cycles)
 
@@ -304,70 +351,77 @@ func registerTools(s *mcp.Server, svc *service) {
 // ---- tool implementations ----
 
 func (svc *service) injectBatch(_ context.Context, _ *mcp.CallToolRequest, in injectIn) (*mcp.CallToolResult, countsOut, error) {
+	if svc.openErr != nil {
+		return nil, countsOut{}, svc.openErr
+	}
 	svc.mu.Lock()
 	defer svc.mu.Unlock()
-	// Write-after-seal re-open: the last seal published live as an immutable
-	// view; the first new write lazily clones that view back into a writable
-	// graph (O(V+E), carries index declarations). Queries never notice — they
-	// keep reading the published view until the next seal, the same
-	// bounded-stale read model as the server module.
-	if (len(in.Nodes) > 0 || len(in.Edges) > 0 || len(in.DeleteEdges) > 0 || len(in.DeleteNodes) > 0) && svc.live.Sealed() {
-		live := vectra.New()
-		if v := svc.view.Load(); v != nil {
-			live = v.Clone()
-		}
-		svc.live = live
-	}
 	out := countsOut{}
-	for _, n := range in.Nodes {
-		if _, err := svc.live.AddNode(n.Key, n.Label, n.Props); err == nil {
-			out.NodesApplied++
+	// One Batch boundary per tool call: the whole inject materializes as one
+	// micro-layer and — in WAL mode — flushes as one frame (one fsync), not
+	// one layer/frame per op (v0.7 per-op writes were an order of magnitude
+	// slower). Within-batch visibility is preserved (endpoint validation and
+	// upsert folding consult the builder mirrors), and the loops keep their
+	// lenient per-op error semantics: a failed item is counted as skipped,
+	// never fatal. The boundary's own flush error keeps the same lenient
+	// surface — the ops already hit memory and stay buffered in pendOps for
+	// the next successful flush (see Batch's direct-mode limitation note).
+	_ = svc.live.Batch(func(g *vectra.Graph) {
+		for _, n := range in.Nodes {
+			if _, err := g.AddNode(n.Key, n.Label, n.Props); err == nil {
+				out.NodesApplied++
+			}
+			for k := range n.Props {
+				svc.propKeys[k] = true
+			}
 		}
-		for k := range n.Props {
-			svc.propKeys[k] = true
+		for _, e := range in.Edges {
+			var err error
+			if e.AllowParallel {
+				_, err = g.AddEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
+			} else {
+				_, err = g.UpsertEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
+			}
+			if err == nil {
+				out.EdgesApplied++
+			} else {
+				out.EdgesSkipped++
+			}
+			for k := range e.Props {
+				svc.propKeys[k] = true
+			}
 		}
-	}
-	for _, e := range in.Edges {
-		var err error
-		if e.AllowParallel {
-			_, err = svc.live.AddEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
-		} else {
-			_, err = svc.live.UpsertEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
+		for _, d := range in.DeleteEdges {
+			if n, err := g.DeleteEdge(d.SrcKey, d.DstKey, d.Label); err == nil {
+				out.EdgesDeleted += n
+			}
 		}
-		if err == nil {
-			out.EdgesApplied++
-		} else {
-			out.EdgesSkipped++
+		for _, k := range in.DeleteNodes {
+			if n, err := g.DeleteNode(k); err == nil {
+				out.NodesDeleted++
+				out.EdgesDeleted += n
+			}
 		}
-		for k := range e.Props {
-			svc.propKeys[k] = true
-		}
-	}
-	for _, d := range in.DeleteEdges {
-		if n, err := svc.live.DeleteEdge(d.SrcKey, d.DstKey, d.Label); err == nil {
-			out.EdgesDeleted += n
-		}
-	}
-	for _, k := range in.DeleteNodes {
-		if n, err := svc.live.DeleteNode(k); err == nil {
-			out.NodesDeleted++
-			out.EdgesDeleted += n
-		}
-	}
+	})
 	return nil, out, nil
 }
 
 func (svc *service) seal(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, statsOut, error) {
+	if svc.openErr != nil {
+		return nil, statsOut{}, svc.openErr
+	}
 	svc.mu.Lock()
 	defer svc.mu.Unlock()
 	for k := range svc.propKeys {
 		svc.live.IndexProperty(k) // auto-index property keys seen during injection
 	}
+	// Seal = merge + checkpoint: with a WAL attached the checkpoint (watermark
+	// snapshot + manifest + WAL reset) is Seal's own pipeline; snapshot mode
+	// persists via the single snapshot file.
 	if err := svc.live.Seal(); err != nil {
 		return nil, statsOut{}, err
 	}
-	svc.view.Store(svc.live)
-	if svc.opts.SnapshotPath != "" {
+	if svc.opts.SnapshotPath != "" && svc.opts.WALDir == "" {
 		if err := svc.live.SaveFile(svc.opts.SnapshotPath); err != nil {
 			return nil, statsOut{}, fmt.Errorf("snapshot save failed: %w", err)
 		}
@@ -379,32 +433,33 @@ func (svc *service) seal(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) 
 	}, nil
 }
 
-// view returns the sealed view; gives an actionable error when not sealed.
-// Lock-free: the atomic pointer makes the seal-time publish visible to
-// concurrent query tools without taking the write mutex.
-func (svc *service) viewOrSealHint() (*vectra.Graph, error) {
-	if v := svc.view.Load(); v != nil {
-		return v, nil
+// view returns the live graph for a query tool. svc.live is assigned only
+// during construction, so reading it needs no lock; the reads inside the
+// Graph are lock-free generation loads (v0.7: sealed queries are gone).
+// A failed WAL session makes every query fail loudly instead.
+func (svc *service) view() (*vectra.Graph, error) {
+	if svc.openErr != nil {
+		return nil, svc.openErr
 	}
-	return nil, fmt.Errorf("graph is not sealed: call inject_batch to write, then seal before querying")
+	return svc.live, nil
 }
 
 func (svc *service) stats(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, statsOut, error) {
-	v, err := svc.viewOrSealHint()
+	v, err := svc.view()
 	if err != nil {
 		return nil, statsOut{}, err
 	}
 	st := v.Stats()
 	return nil, statsOut{
 		Nodes: st.Nodes, Edges: st.Edges, SCCs: st.SCCs,
-		CyclicNodes: st.CyclicNodes, Sealed: true,
+		CyclicNodes: st.CyclicNodes, Sealed: v.Sealed(),
 	}, nil
 }
 
 func (svc *service) getNode(_ context.Context, _ *mcp.CallToolRequest, in struct {
 	Key string `json:"key"`
 }) (*mcp.CallToolResult, nodeOut, error) {
-	v, err := svc.viewOrSealHint()
+	v, err := svc.view()
 	if err != nil {
 		return nil, nodeOut{}, err
 	}
@@ -423,7 +478,7 @@ func parseDir(s string) vectra.Direction {
 }
 
 func (svc *service) neighbors(_ context.Context, _ *mcp.CallToolRequest, in neighborsIn) (*mcp.CallToolResult, listOut, error) {
-	v, err := svc.viewOrSealHint()
+	v, err := svc.view()
 	if err != nil {
 		return nil, listOut{}, err
 	}
@@ -444,7 +499,7 @@ func (svc *service) neighbors(_ context.Context, _ *mcp.CallToolRequest, in neig
 }
 
 func (svc *service) bfs(_ context.Context, _ *mcp.CallToolRequest, in bfsIn) (*mcp.CallToolResult, depthOut, error) {
-	v, err := svc.viewOrSealHint()
+	v, err := svc.view()
 	if err != nil {
 		return nil, depthOut{}, err
 	}
@@ -487,7 +542,7 @@ func (svc *service) bfs(_ context.Context, _ *mcp.CallToolRequest, in bfsIn) (*m
 }
 
 func (svc *service) shortestPath(_ context.Context, _ *mcp.CallToolRequest, in pathIn) (*mcp.CallToolResult, pathOut, error) {
-	v, err := svc.viewOrSealHint()
+	v, err := svc.view()
 	if err != nil {
 		return nil, pathOut{}, err
 	}
@@ -507,7 +562,7 @@ func (svc *service) shortestPath(_ context.Context, _ *mcp.CallToolRequest, in p
 }
 
 func (svc *service) reachable(_ context.Context, _ *mcp.CallToolRequest, in reachIn) (*mcp.CallToolResult, listOut, error) {
-	v, err := svc.viewOrSealHint()
+	v, err := svc.view()
 	if err != nil {
 		return nil, listOut{}, err
 	}
@@ -531,7 +586,15 @@ func (svc *service) reachable(_ context.Context, _ *mcp.CallToolRequest, in reac
 }
 
 func (svc *service) cycles(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, cyclesOut, error) {
-	v, err := svc.viewOrSealHint()
+	// Cycles is the query-family exception: with unmerged layers it folds
+	// them first (engine-side force merge), which rewrites writer-private
+	// state — so it serializes against inject/seal through the write mutex.
+	if svc.openErr != nil {
+		return nil, cyclesOut{}, svc.openErr
+	}
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+	v, err := svc.view()
 	if err != nil {
 		return nil, cyclesOut{}, err
 	}
@@ -556,7 +619,7 @@ func (svc *service) cycles(_ context.Context, _ *mcp.CallToolRequest, _ struct{}
 }
 
 func (svc *service) lookupProperty(_ context.Context, _ *mcp.CallToolRequest, in lookupIn) (*mcp.CallToolResult, listOut, error) {
-	v, err := svc.viewOrSealHint()
+	v, err := svc.view()
 	if err != nil {
 		return nil, listOut{}, err
 	}
@@ -599,7 +662,7 @@ func (svc *service) lookupProperty(_ context.Context, _ *mcp.CallToolRequest, in
 }
 
 func (svc *service) cypher(_ context.Context, _ *mcp.CallToolRequest, in cypherIn) (*mcp.CallToolResult, cypherOut, error) {
-	v, err := svc.viewOrSealHint()
+	v, err := svc.view()
 	if err != nil {
 		return nil, cypherOut{}, err
 	}
