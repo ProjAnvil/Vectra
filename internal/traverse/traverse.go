@@ -107,16 +107,32 @@ type Config struct {
 	NodeFilter        func(uint32) bool
 }
 
-// Result is the BFS result: per-layer members + depth array (noDepth =
-// unreached).
+// Result is the BFS result: per-layer members plus a depth array that
+// materializes lazily on the first EnsureDepth call (noDepth = unreached).
+// BFS itself allocates nothing NodeCount-sized — the eager fill was the B2
+// hot spot (a whole-ID-space array per call even when only Layers/Count are
+// consumed).
 type Result struct {
 	Layers [][]uint32
-	depth  []uint32
+	depth  []uint32 // nil until EnsureDepth
 }
 
-// DepthRaw returns the depth array itself (reused by the facade to avoid a
-// whole-graph copy; read-only contract).
-func (r *Result) DepthRaw() []uint32 { return r.depth }
+// EnsureDepth materializes and memoizes the depth array over the n-entry
+// ID space (noDepth fill + layer stamps). n is the caller's NodeCount —
+// the Result itself is reachable from BFS paths that never learn it.
+func (r *Result) EnsureDepth(n int) []uint32 {
+	if r.depth != nil {
+		return r.depth
+	}
+	d := filledNoDepth(uint32(n))
+	for depth, layer := range r.Layers {
+		for _, v := range layer {
+			d[v] = uint32(depth)
+		}
+	}
+	r.depth = d
+	return d
+}
 
 // BFS is a multi-source level-synchronous breadth-first search: starts at
 // depth 0, each layer expanded as a whole; once the frontier reaches the
@@ -128,7 +144,7 @@ func BFS(src RowSource, starts []uint32, cfg Config) *Result {
 	n := uint32(src.NodeCount())
 	for _, st := range starts {
 		if st >= n {
-			return &Result{depth: filledNoDepth(n)}
+			return &Result{} // nothing reached; EnsureDepth(n) is all-noDepth
 		}
 	}
 	if cfg.ParallelThreshold == 0 {
@@ -137,12 +153,11 @@ func BFS(src RowSource, starts []uint32, cfg Config) *Result {
 	visited := visitedPool.acquire(wordsFor(int(n)))
 	defer visitedPool.release(visited)
 
-	res := &Result{depth: filledNoDepth(n)}
+	res := &Result{}
 	frontier := make([]uint32, 0, len(starts))
 	for _, st := range starts {
 		if !testAndSet(visited, st) {
 			frontier = append(frontier, st)
-			res.depth[st] = 0
 		}
 	}
 	res.Layers = append(res.Layers, frontier)
@@ -156,9 +171,6 @@ func BFS(src RowSource, starts []uint32, cfg Config) *Result {
 			}
 			if len(next) == 0 {
 				break // exhausted: no trailing empty layer (MaxDepth cut has none either)
-			}
-			for _, v := range next {
-				res.depth[v] = depth
 			}
 			res.Layers = append(res.Layers, next)
 			frontier = next
@@ -175,9 +187,6 @@ func BFS(src RowSource, starts []uint32, cfg Config) *Result {
 		}
 		if len(next) == 0 {
 			break // exhausted: no trailing empty layer (MaxDepth cut has none either)
-		}
-		for _, v := range next {
-			res.depth[v] = depth
 		}
 		res.Layers = append(res.Layers, next)
 		frontier = next
