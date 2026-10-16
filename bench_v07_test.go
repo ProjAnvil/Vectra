@@ -286,9 +286,10 @@ func TestV07A3PointQueryAfterWrite(t *testing.T) {
 
 // TestV07A4DirectModeUnbatchedImport: the A4 hardening regression guard —
 // unbatched per-op direct writes (WAL off, the v0.6 idiom) at a floor of
-// 1.5M edges/s in the test process (4x the pre-fix 0.36-0.41M; the floor is
-// deliberately conservative against machine/thermal variance — losing the
-// absorption window costs ~10x, which it catches with huge margin). The
+// 1.0M edges/s in the test process (review-measured 1.15-1.34M under test
+// load, 2.0M+ on quiet machines — the floor balances discrimination against
+// machine/thermal noise; losing the absorption window costs ~10x, which it
+// still catches with wide margin). The
 // acceptance comparison itself — ≥0.9x the recorded v0.6.0 baseline (4.09M
 // edges/s) — is measured by the two-worktree `make bench SIZE=medium
 // MODE=engine` protocol (the standalone bench harness runs ~20% hotter than
@@ -319,7 +320,7 @@ func TestV07A4DirectModeUnbatchedImport(t *testing.T) {
 	}
 	elapsed := time.Since(t0)
 	rate := float64(edges) / elapsed.Seconds()
-	t.Logf("A4: %d unbatched AddEdge in %s = %.0f edges/s (in-test floor ≥1.5M)",
+	t.Logf("A4: %d unbatched AddEdge in %s = %.0f edges/s (in-test floor ≥1.0M)",
 		edges, elapsed, rate)
 	if v07RaceBuild {
 		// -race multiplies the write path ~5-10x — the absolute floor is a
@@ -327,8 +328,8 @@ func TestV07A4DirectModeUnbatchedImport(t *testing.T) {
 		// from the non-race runs in docs/benchmarks)
 		t.Skipf("race build: measured %.0f edges/s, floor asserted in non-race builds only", rate)
 	}
-	if rate < 1.5e6 {
-		t.Errorf("A4 FAIL: unbatched direct-mode import %.0f edges/s — the absorption window regressed (floor 1.5M in-test)", rate)
+	if rate < 1.0e6 {
+		t.Errorf("A4 FAIL: unbatched direct-mode import %.0f edges/s — the absorption window regressed (floor 1.0M in-test)", rate)
 	}
 	if err := g.Seal(); err != nil {
 		t.Fatal(err)
