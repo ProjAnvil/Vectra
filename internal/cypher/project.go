@@ -256,8 +256,10 @@ func (ac *aggAcc) result(call AggCall) any {
 }
 
 // encodeVal appends a canonical, self-delimiting encoding of v (group keys
-// and DISTINCT seen-sets). The tag follows the cmpVals type order; numbers
-// are numVal-normalized IEEE bits, null has its own tag.
+// and DISTINCT seen-sets). The encoding is injective — distinct values
+// encode to distinct byte strings; the tag numbers are arbitrary and
+// unrelated to cmpVals' type ranking. Numbers are numVal-normalized IEEE
+// bits; null has its own tag.
 func encodeVal(b []byte, v any) []byte {
 	switch x := v.(type) {
 	case nil:

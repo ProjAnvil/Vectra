@@ -134,7 +134,7 @@ freeze（O(delta) 浅拷）→ 后台 `engine.Seal(unionRecords)`（纯函数零
 | 公共 API 语义漂移 | 中 | §6 新行为表 + README 迁移说明 + sentinel 保留一版 |
 | 恢复时长（逻辑日志重放 ∝ 变更数） | 中 | A7 线 + checkpoint 阈值即恢复上界（4MB WAL）；文档明示 |
 
-## 10. 实现期勘误（2026-10-15，T6 收口时记录）
+## 10. 实现期勘误 I（2026-10-15，T6 收口时记录）
 
 实现过程中与本 spec 字面表述不一致的落地点，行为契约以本节为准：
 
@@ -143,3 +143,11 @@ freeze（O(delta) 浅拷）→ 后台 `engine.Seal(unionRecords)`（纯函数零
 3. **§4 组提交 fsync 表述 → 混合批按 kind 拆帧（T5 Important 2）。** spec 的 "一组一帧一次 fsync" 仅在批内 op 序按 Changeset kind 有序时成立；kind 回退批（如先删后加同键）在每次 kind 回退处切帧，多帧各自保序重放。层仍按 Batch 边界一对一（多帧一层的例外已写入 Graph doc）。
 4. **§4 "WAL ≥4MB 自动 checkpoint" 的最终裁量（T6/A.2）：已实现，落点在 writer 循环而非 merger。** `writer.Config.CheckpointBytes`（默认 4 MiB，负值关闭）：writer 的 afterBatch 钩子在有效帧字节达到阈值时于**写者 goroutine 上**执行完整 Seal 管线（merge + 水位快照 + manifest + WAL reset）——对免锁读者不可见，Submit 观察到一次 checkpoint 形态的写停顿。这与 spec §4 "writer→merger→checkpoint 全部经 merger goroutine 串行化" 的表述偏离（checkpoint 与 merge 同属 Seal 的所有权域，merger 侧 PublishMerge 是视图级 rebase、无 checkpoint 能力）；失败语义为粘性：错误经 Close 上报、触发器自禁用（显式 Compact/Close 仍可用），避免故障盘把每批变成重试风暴。直接模式（无包装层）不设自动触发，显式 Seal/Compact/Close 触发（文档化）。
 5. **§3.1/§6 Compact 与 deep compaction 的 R1 吸收口径。** spec 的 "`Compact()` = 显式 merge + deep compaction 重排"：落地中 merge 本身即稠密重建节点/边 ID（R1），不存在额外的 "deep" 阶段——`Compact()` 与 `Seal()` 跑同一管线、语义等价（T5 裁决 7，godoc 已写明）。
+
+## 11. 实现期勘误 II（2026-10-16，Task 7 hardening 收尾时记录）
+
+Task 7（吸收窗口 + View 缓存 + 比例阈值）落地后与本 spec 字面表述不一致的落地点，行为契约以本节为准（接 §10）：
+
+1. **API 形名勘误（终审 M1）**：后台 rebase 后的镜像重建入口是 `Graph.RepairAfterRebase()`（由 internal/writer 的 applyBatch 在每批之前调用），不是 "WriteHandle" 上的方法；包装层的类型名是 `writer.Handle`（`writer.Attach(g, cfg)` 构造）。`Options{WALMode, WALDir}` 是 `Open` 的参数（快照式 `Load/LoadFile` 不做 WAL 重放——只有 `Open` 恢复会话；`Load/LoadFile` 将快照合并为初始 base，可继续写但无日志）。
+2. **§2.3/§4 逐 op 物化 → 吸收窗口（A4 hardening）**：spec 的 "每个未分组写物化一个微层" 落地为**直接模式吸收窗口**：未分组逐 op 写累积进一个打开的 builder 窗口，按 flush 触发物化为**一个**层——读 API 入口（写后立读保持即时：直接模式下读者即写者，经 owner-token 守卫）、Batch/Seal/Compact/Cycles/Close 边界、容量上限（边类 op 64K 边记录、其余 4096 op）。WAL 记录器**不**延迟：逐 op 帧与其 fsync 契约不变，吸收的只是层物化（N 帧 → 1 层；层 lsn = flush 时已记录的最大帧 lsn，checkpoint 水位不变量 "快照含 ≤lsn 全部帧" 保持）。包装模式不开窗口（写者走 Batch），其读者跳过 flush（mid-batch 读者看到批前世代 = 既有原子批语义）。
+3. **§3.1 merge 阈值 → 尺寸比例触发（A6 hardening）**：spec 的 "MergeEdges 累计层边数触发 + MaxLayers 层帽触发" 落地为**体积比例规则**：后台 fold 触发 = 累计层边数 ≥ max(MergeEdges, base.EdgeCount)——折叠间隔与基座同量级（每次 fold O(base+layers)，定长间隔随基座增长必然重新超标）；`MergeEdges`（默认 64K）语义变为**下限**（小图仍按量子折叠）；`MaxLayers` 保留为深栈兜底的硬层帽 + write-stall 线（默认 64 → 2048——小层帽作为实际触发器会以 层数×批尺寸 的定长间隔折叠，结构性违反上述契约）。遍历读放大由**世代级 View 缓存**缓解（engineView 按世代指针键控、每世代构建一次，消灭 T4 遗留的每查询重算）。

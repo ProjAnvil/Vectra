@@ -747,7 +747,7 @@ func (q *Query) validate() error {
 		if len(nodeVars)+len(edgeVars) == 0 {
 			return &Error{1, 1, "RETURN * with no named variables in the pattern"}
 		}
-		return nil // ORDER BY together with * is rejected below
+		return nil // RETURN * + ORDER BY is supported: keys evaluate on the bindings (see project)
 	}
 	if len(items) == 0 {
 		return &Error{1, 1, "RETURN requires at least one item"}

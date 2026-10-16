@@ -27,7 +27,10 @@ g.AddEdge("gateway", "auth", "CALLS", nil)
 g.UpsertEdge("gateway", "auth", "CALLS", map[string]any{"weight": 2}) // replace props on the same (src,dst,label)
 g.DeleteNode("ledger")                                               // cascade-deletes incident edges
 
-// bulk import: g.Batch(func(g *vectra.Graph) { ... }) — one micro-layer per batch instead of per write, an order of magnitude faster
+// bulk import: g.Batch(func(g *vectra.Graph) { ... }) — one micro-layer per batch; plain
+// unbatched writes are absorbed into one open window too (materialized at the next query,
+// boundary, or capacity cap), so bulk import no longer requires Batch — but Batch is still
+// the fastest shape under WAL (one frame group per boundary instead of a frame per write)
 
 // chained traversal (works with or without a Seal — writes are immediately visible)
 res, _ := g.Query().From("gateway").Out("CALLS").MaxDepth(3).Run()
@@ -62,7 +65,7 @@ v0.7 dissolves the sealed-snapshot gate. Every write (or `Batch`) materializes i
 
 **IDs:** node and edge IDs are stable within a generation (deleted IDs burn their numbers); merges renumber densely, so IDs may change across a `Seal`/`Compact`/background fold — the v0.6 cross-merge contract, unchanged.
 
-**Writer discipline:** the zero-lock engine assumes one writer goroutine. In direct mode (calling `AddNode`/`Batch`/... yourself) that is any single goroutine of yours — concurrent bare writes are a data race and interleave WAL frames. Group bulk imports in `Batch` (or wrapper changesets): each *unbatched* write materializes its own micro-layer, which is correct but roughly an order of magnitude slower at million-edge scale (see the acceptance report). The structured form is the single-writer wrapper (`internal/writer.Attach` → `Handle.Submit`): bounded queue, Badger-style group commit (one frame group and one fsync per drained batch), background merges with write-stall at the layer cap, and a volume-triggered checkpoint once the WAL holds ≥4 MiB since the last one. While attached, non-release builds reject bare writes — and off-writer `Seal`/`Compact`/`Cycles` — with `ErrNotWriter`; release builds compile the check away and rely on this contract.
+**Writer discipline:** the zero-lock engine assumes one writer goroutine. In direct mode (calling `AddNode`/`Batch`/... yourself) that is any single goroutine of yours — concurrent bare writes are a data race and interleave WAL frames. Unbatched per-op writes accumulate in an **absorption window** (one micro-layer per flush — the next query, a boundary, or a capacity cap — instead of one layer per op), so bulk import no longer forces `Batch`; `Batch` (or wrapper changesets) remains the fastest shape under WAL because it logs one frame group per boundary instead of a frame per write. The structured form is the single-writer wrapper (`internal/writer.Attach` → `Handle.Submit`): bounded queue, Badger-style group commit (one frame group and one fsync per drained batch), background merges with write-stall at the layer cap, and a volume-triggered checkpoint once the WAL holds ≥4 MiB since the last one. While attached, non-release builds reject bare writes — and off-writer `Seal`/`Compact`/`Cycles` — with `ErrNotWriter`; release builds compile the check away and rely on this contract.
 
 **Write-ahead log (optional):** `Open(path, Options{WALMode, WALDir})` starts a durable session — whole-JSON changeset frames, fsynced per `Batch` boundary in `ModeAlways` (`ModeInterval` fsyncs at explicit boundaries; `ModeOff`, the zero value, is exactly v0.6 snapshot behavior). Checkpoints — on `Seal`/`Compact`/`Close`, or the wrapper's ≥4 MiB volume trigger — write a watermark snapshot `<db>-<lsn>.db`, flip an atomic manifest onto it, and reset the log; recovery loads the watermark and replays the frames above it (a torn tail stops at the first bad frame; a checkpoint failure keeps the WAL for the next attempt). On disk this adds a `wal` sidecar directory next to the snapshot file: older binaries ignore it harmlessly, and a v0.7 binary facing a directory without one just loads the snapshot — no format change to the v3 snapshot itself.
 
