@@ -16,9 +16,15 @@ package delta
 //     live records already won over its own tombstones at build time;
 //   - labels and index declarations: first-seen union.
 //
-// The input layers are not modified. A stack of ID-less layers folds to an
-// ID-less layer; a mixed stack degrades to ID-less (root never mixes).
-// FoldLayers is pure: no locks, no shared state, safe on any goroutine.
+// ID discipline is per side: a node-only layer legally carries a nil edgeIDs
+// slice (and vice versa), so each side keeps its IDs unless one of the layers
+// holding that side's records lacks its ID map. Consumers resolve records
+// through the ID maps without checking presence, so a side degrades wholly —
+// a partial ID map would resolve phantom ID 0 — whenever any live record
+// ends up without its ID.
+//
+// The input layers are not modified. FoldLayers is pure: no locks, no shared
+// state, safe on any goroutine.
 func FoldLayers(layers []*Layer) *Layer {
 	if len(layers) == 0 {
 		return nil
@@ -36,6 +42,7 @@ func FoldLayers(layers []*Layer) *Layer {
 	type edgeSlot struct {
 		rec  EdgeRec
 		id   uint32
+		idOK bool
 		live bool
 	}
 	nodes := make(map[string]*nodeWin)
@@ -48,12 +55,8 @@ func FoldLayers(layers []*Layer) *Layer {
 	var labels []string
 	indexSeen := make(map[string]bool)
 	var indexKeys []string
-	hasIDs := true
 
 	for _, l := range layers {
-		if l.nodeIDs == nil || l.edgeIDs == nil {
-			hasIDs = false
-		}
 		for k := range l.nodeTomb {
 			nodeTomb[k] = true
 			if w := nodes[k]; w != nil {
@@ -70,6 +73,8 @@ func FoldLayers(layers []*Layer) *Layer {
 			w.rec, w.dead = rec, false
 			if id, ok := l.LookupNodeID(rec.Key); ok {
 				w.id, w.hasID = id, true
+			} else {
+				w.hasID = false
 			}
 		}
 		for k := range l.edgeTomb {
@@ -81,7 +86,7 @@ func FoldLayers(layers []*Layer) *Layer {
 		for j, rec := range l.edges {
 			s := &edgeSlot{rec: rec, live: true}
 			if l.edgeIDs != nil {
-				s.id = l.edgeIDs[j]
+				s.id, s.idOK = l.edgeIDs[j], true
 			}
 			k := EdgeKey{SrcKey: rec.SrcKey, DstKey: rec.DstKey, Label: rec.Label}
 			edges[k] = append(edges[k], s)
@@ -101,6 +106,18 @@ func FoldLayers(layers []*Layer) *Layer {
 		}
 	}
 
+	hasNodeIDs, hasEdgeIDs := true, true
+	for _, k := range nodeOrder {
+		if w := nodes[k]; !w.dead && !w.hasID {
+			hasNodeIDs = false
+		}
+	}
+	for _, s := range edgeFlat {
+		if s.live && !s.idOK {
+			hasEdgeIDs = false
+		}
+	}
+
 	f := &Layer{
 		nodeTomb:  nodeTomb,
 		edgeTomb:  edgeTomb,
@@ -109,7 +126,7 @@ func FoldLayers(layers []*Layer) *Layer {
 	}
 	f.nodes = make([]NodeRec, 0, len(nodeOrder))
 	f.nodeIdx = make(map[string]int, len(nodeOrder))
-	if hasIDs {
+	if hasNodeIDs {
 		f.nodeIDs = make(map[string]uint32, len(nodeOrder))
 		f.nodeIDIdx = make(map[uint32]int, len(nodeOrder))
 	}
@@ -120,7 +137,7 @@ func FoldLayers(layers []*Layer) *Layer {
 		}
 		f.nodeIdx[k] = len(f.nodes)
 		f.nodes = append(f.nodes, w.rec)
-		if hasIDs && w.hasID {
+		if hasNodeIDs {
 			f.nodeIDs[k] = w.id
 			f.nodeIDIdx[w.id] = len(f.nodes) - 1
 		}
@@ -132,7 +149,7 @@ func FoldLayers(layers []*Layer) *Layer {
 		}
 	}
 	f.edges = make([]EdgeRec, 0, liveEdges)
-	if hasIDs {
+	if hasEdgeIDs {
 		f.edgeIDs = make([]uint32, 0, liveEdges)
 	}
 	for _, s := range edgeFlat {
@@ -140,7 +157,7 @@ func FoldLayers(layers []*Layer) *Layer {
 			continue
 		}
 		f.edges = append(f.edges, s.rec)
-		if hasIDs {
+		if hasEdgeIDs {
 			f.edgeIDs = append(f.edgeIDs, s.id)
 		}
 	}

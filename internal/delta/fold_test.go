@@ -33,10 +33,10 @@ func TestFoldLayersNodeAndEdgeSemantics(t *testing.T) {
 			b.IndexProperty("tier")
 		},
 		func(b *Builder) {
-			_ = b.UpsertNode("a", "A1", map[string]any{"v": 1}) // override
-			_ = b.UpsertNode("b", "B", nil)                     // endpoint lift for the new edge
+			_ = b.UpsertNode("a", "A1", map[string]any{"v": 1})                    // override
+			_ = b.UpsertNode("b", "B", nil)                                        // endpoint lift for the new edge
 			_, _ = b.DeleteEdge(EdgeKey{SrcKey: "a", DstKey: "b", Label: "CALLS"}) // kills layer-1 parallels via tombstone
-			_ = b.AddEdge("b", "a", "DATA", nil)                                     // survives
+			_ = b.AddEdge("b", "a", "DATA", nil)                                   // survives
 		},
 		func(b *Builder) {
 			_, _ = b.DeleteNode("b", nil) // tombstone (b dead until revived)
@@ -195,23 +195,42 @@ func TestFoldLayersRandomDifferential(t *testing.T) {
 		f := FoldLayers(layers)
 		o.check(t, f)
 
-			// per-key surviving edge sequences match the oracle
-			for k, want := range o.edges {
-				var got []EdgeRec
-				for _, rec := range f.Edges() {
-					if (EdgeKey{SrcKey: rec.SrcKey, DstKey: rec.DstKey, Label: rec.Label}) == k {
-						got = append(got, rec)
-					}
+		// per-key surviving edge sequences match the oracle
+		for k, want := range o.edges {
+			var got []EdgeRec
+			for _, rec := range f.Edges() {
+				if (EdgeKey{SrcKey: rec.SrcKey, DstKey: rec.DstKey, Label: rec.Label}) == k {
+					got = append(got, rec)
 				}
-				if len(got) != len(want) {
-					t.Fatalf("round %d key %v: %d surviving records, want %d", round, k, len(got), len(want))
+			}
+			if len(got) != len(want) {
+				t.Fatalf("round %d key %v: %d surviving records, want %d", round, k, len(got), len(want))
+			}
+			for i := range got {
+				if !reflect.DeepEqual(got[i], want[i]) {
+					t.Fatalf("round %d key %v [%d]: got %+v want %+v", round, k, i, got[i], want[i])
 				}
-				for i := range got {
-					if !reflect.DeepEqual(got[i], want[i]) {
-						t.Fatalf("round %d key %v [%d]: got %+v want %+v", round, k, i, got[i], want[i])
-					}
 			}
 		}
+	}
+}
+
+// TestFoldLayersNodeOnlyLayerKeepsNodeIDs: a node-only layer legally carries
+// a nil edgeIDs slice while keeping its node IDs — the fold must keep the
+// node side's IDs (a whole-stack degradation would resolve phantom ID 0).
+func TestFoldLayersNodeOnlyLayerKeepsNodeIDs(t *testing.T) {
+	b1 := NewBuilder()
+	_ = b1.UpsertNode("a", "A", nil)
+	l1 := b1.BuildWithIDs(map[string]uint32{"a": 7}, nil)
+	b2 := NewBuilder()
+	_ = b2.UpsertNode("b", "B", nil)
+	l2 := b2.BuildWithIDs(map[string]uint32{"b": 8}, nil)
+	f := FoldLayers([]*Layer{l1, l2})
+	if id, ok := f.LookupNodeID("a"); !ok || id != 7 {
+		t.Errorf("a: id=%d ok=%v, want 7", id, ok)
+	}
+	if id, ok := f.LookupNodeID("b"); !ok || id != 8 {
+		t.Errorf("b: id=%d ok=%v, want 8", id, ok)
 	}
 }
 

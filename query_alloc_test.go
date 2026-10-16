@@ -56,6 +56,9 @@ func itoa(i int) string {
 // pooled visited bitmap. Bound is result growth (≤3 append allocs at degree
 // 8) — the old code spent one extra NodeCount-sized []bool every call.
 func TestNeighborsOfAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("alloc counts differ under -race")
+	}
 	g, small, hub := buildAllocGraph(t)
 	if _, err := g.NeighborsOf(small, DirOut); err != nil { // warm
 		t.Fatal(err)
