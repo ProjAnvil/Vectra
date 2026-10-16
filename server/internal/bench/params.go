@@ -13,7 +13,18 @@ import (
 type QueryParams struct {
 	Starts []string
 	Pairs  [][2]string
+	// TraversalEdges maps a start key to the number of directed out-edges an
+	// unbounded out-BFS from it scans (the sum of visited nodes'
+	// out-degrees) — the TEPS numerator under the GAP/Graph500 convention.
+	// Sampled for at most tepsSample starts; curation-time cost is one
+	// unbounded BFS per sampled start.
+	TraversalEdges map[string]int
 }
+
+// tepsSample caps how many curated starts get a TraversalEdges measurement:
+// at the L tier one unbounded hub BFS already scans a large share of the
+// graph, and the metric only needs a representative sample.
+const tepsSample = 16
 
 // Curate samples n start nodes and n reachable node pairs from the sealed graph
 // and generation artifacts. Deterministic seed.
@@ -44,6 +55,36 @@ func Curate(g *vectra.Graph, bg *Graph, n int, seed int64) QueryParams {
 		}
 		seen[id] = true
 		p.Starts = append(p.Starts, keyOf(id))
+	}
+
+	// TEPS numerators for the sampled starts: sum of visited out-degrees of
+	// an unbounded out-BFS. keyToIdx maps engine keys back to generation
+	// indexes so out-degrees come from the generator's edge list, not a
+	// per-node engine query per visited node.
+	if len(p.Starts) > 0 {
+		keyToIdx := make(map[string]int, len(bg.Nodes))
+		for i, n := range bg.Nodes {
+			keyToIdx[n.Key] = i
+		}
+		p.TraversalEdges = make(map[string]int, min(len(p.Starts), tepsSample))
+		for _, k := range p.Starts[:min(len(p.Starts), tepsSample)] {
+			node, ok := g.NodeByKey(k)
+			if !ok {
+				continue
+			}
+			res, err := g.BFS([]vectra.NodeID{node.ID})
+			if err != nil {
+				continue
+			}
+			edges := 0
+			for _, id := range res.Nodes() {
+				nd, _ := g.NodeByID(id)
+				if idx, ok := keyToIdx[nd.Key]; ok {
+					edges += outDeg[idx]
+				}
+			}
+			p.TraversalEdges[k] = edges
+		}
 	}
 
 	// Reachable node pairs: BFS from sampled start nodes, take nodes reached at depth ≥2

@@ -19,10 +19,13 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/pprof"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -60,7 +63,10 @@ func main() {
 	keep := flag.Bool("keep", false, "keep the data directory (debugging)")
 	out := flag.String("out", "", "write results to file (stdout by default)")
 	sealInterval := flag.Duration("seal-interval", 2*time.Second, "publish throttle interval in http mode")
-	workloads := flag.String("workloads", "", "comma-separated workload subset (all by default): neighbors,bfs2,bfs3,bfsall,path,reach; http mode additionally: txnsi,txnser (http-only)")
+	workloads := flag.String("workloads", "", "comma-separated workload subset (all by default): neighbors,bfs2,bfs3,bfsall,path,reach,mixed (engine-only read+write phase); http mode additionally: txnsi,txnser (http-only)")
+	writeRate := flag.Int("writerate", 200, "mixed workload: paced write batches/s (engine mode; 0 disables; pacing accuracy degrades above ~500)")
+	writeBatch := flag.Int("writebatch", 50, "mixed workload: edges per write changeset (half prop upserts, half new edges)")
+	profileDir := flag.String("profile", "", "pprof output directory: per-workload cpu profile plus heap/mutex snapshots (attribution runs)")
 	flag.Parse()
 
 	spec, ok := sizes[*size]
@@ -126,11 +132,32 @@ func main() {
 		fmt.Fprintf(os.Stderr, "unknown mode: %s\n", *mode)
 		os.Exit(2)
 	}
+	m := bench.SampleMem()
+	rep.MemAfterInject = &m
 
 	// 3. Parameter curation
 	t0 = time.Now()
 	params := bench.Curate(queryGraph, bg, 64, *seed+1)
 	rep.CurateTime = time.Since(t0)
+	if len(params.TraversalEdges) > 0 {
+		var sum int
+		for _, e := range params.TraversalEdges {
+			sum += e
+		}
+		rep.TepsAvgEdges = float64(sum) / float64(len(params.TraversalEdges))
+	}
+
+	// pprof setup for attribution runs: cpu profiles span each measured
+	// workload, heap/mutex snapshots land after it. Mutex sampling stays on
+	// for the whole run once -profile is given (its overhead is part of the
+	// attribution run and such runs are never compared against clean runs).
+	if *profileDir != "" {
+		if err := os.MkdirAll(*profileDir, 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "profile dir: %v\n", err)
+			os.Exit(1)
+		}
+		runtime.SetMutexProfileFraction(1)
+	}
 
 	// 4. Workloads
 	ops, txnStats := buildWorkloads(*mode, queryGraph, baseURL, httpc, params)
@@ -164,6 +191,20 @@ func main() {
 			fmt.Fprintln(os.Stderr, "note: no requested workloads available in this mode; nothing to run")
 		}
 	}
+	// The mixed phase is engine-only and selected like a workload: on by
+	// default, or only when "mixed" appears in an explicit -workloads list.
+	runMixed := *mode == "engine" && *writeRate > 0
+	if *workloads != "" {
+		wantMixed := false
+		for _, w := range strings.Split(*workloads, ",") {
+			if strings.TrimSpace(w) == "mixed" {
+				wantMixed = true
+			}
+		}
+		if !wantMixed {
+			runMixed = false
+		}
+	}
 	// Two-snapshot diff: the inmem sink cannot be cleared and keeps rolling
 	// intervals spanning injection as well, so capture the logsPerBatch
 	// aggregates right before the workload loop and again after it; the phase
@@ -176,7 +217,11 @@ func main() {
 		if ts := txnStats[w.name]; ts != nil {
 			ts.Reset() // warmup OCC outcomes are discarded too
 		}
+		stopProfile := startCPUProfile(*profileDir, w.name)
 		res := bench.RunWorkload(w.name, w.op, *workers, *duration)
+		stopProfile()
+		writeProfileSnapshot(*profileDir, w.name, "heap")
+		writeProfileSnapshot(*profileDir, w.name, "mutex")
 		fmt.Fprintf(os.Stderr, "  %-10s ops=%-7d p50=%-9s p99=%s\n",
 			res.Name, res.Ops, bench.FormatDur(res.P50), bench.FormatDur(res.P99))
 		if ts := txnStats[w.name]; ts != nil {
@@ -219,7 +264,112 @@ func main() {
 		}
 	}
 
-	// 5. Output
+	mw := bench.SampleMem()
+	rep.MemAfterWorkloads = &mw
+
+	// 4b. Mixed read/write phase (engine mode): `workers` readers at full
+	// speed plus one paced writer goroutine committing -writebatch changesets
+	// (the engine serializes writes, so a single writer is the honest shape).
+	// SNB Interactive runs ~20% updates; here the offered write load is an
+	// explicit dial (-writerate) so read tails attribute to a specific
+	// sustained write rate.
+	if runMixed {
+		nextStart, nextPair := rotators(params)
+		var fam atomic.Int64
+		readOp := func() error {
+			switch fam.Add(1) % 4 {
+			case 0:
+				_, err := queryGraph.NeighborsOf(nextStart(), vectra.DirOut)
+				return err
+			case 1:
+				n, _ := queryGraph.NodeByKey(nextStart())
+				_, err := queryGraph.BFS([]vectra.NodeID{n.ID}, vectra.WithMaxDepth(2))
+				return err
+			case 2:
+				n, _ := queryGraph.NodeByKey(nextStart())
+				_, err := queryGraph.BFS([]vectra.NodeID{n.ID}, vectra.WithMaxDepth(3))
+				return err
+			default:
+				pair := nextPair()
+				_, _, err := queryGraph.ShortestPath(pair[0], pair[1])
+				return err
+			}
+		}
+		// One deterministic writer (single goroutine — no rng race). Half the
+		// changeset re-upserts generated edges with a fresh prop, half adds
+		// new MIXED-label edges between existing nodes: topology churn plus
+		// prop updates, without invalidating the curated read parameters.
+		wrng := rand.New(rand.NewSource(*seed + 2))
+		writeOp := func() error {
+			var first error
+			if err := queryGraph.Batch(func(gg *vectra.Graph) {
+				for range *writeBatch {
+					var err error
+					if wrng.Intn(2) == 0 {
+						e := bg.Edges[wrng.Intn(len(bg.Edges))]
+						_, err = gg.UpsertEdge(bg.Nodes[e.Src].Key, bg.Nodes[e.Dst].Key, e.Label,
+							map[string]any{"mixw": wrng.Int63()})
+					} else {
+						u, v := wrng.Intn(len(bg.Nodes)), wrng.Intn(len(bg.Nodes))
+						if u == v {
+							continue
+						}
+						_, err = gg.AddEdge(bg.Nodes[u].Key, bg.Nodes[v].Key, "MIXED", nil)
+					}
+					if err != nil && first == nil {
+						first = err
+					}
+				}
+			}); err != nil && first == nil {
+				first = err
+			}
+			return first
+		}
+		bench.RunMixed("mixed", readOp, writeOp, 1, *warmup, *writeRate) // warmup discarded
+		stopProfile := startCPUProfile(*profileDir, "mixed")
+		rd, wr := bench.RunMixed("mixed", readOp, writeOp, *workers, *duration, *writeRate)
+		stopProfile()
+		writeProfileSnapshot(*profileDir, "mixed", "heap")
+		writeProfileSnapshot(*profileDir, "mixed", "mutex")
+		rd.Name, wr.Name = "mixed-read", "mixed-write"
+		fmt.Fprintf(os.Stderr, "  %-11s ops=%-7d p50=%-9s p99=%s | writes %.0f batches/s p99=%s\n",
+			rd.Name, rd.Ops, bench.FormatDur(rd.P50), bench.FormatDur(rd.P99),
+			wr.QPS, bench.FormatDur(wr.P99))
+		rep.MixedReads, rep.MixedWrites = &rd, &wr
+		rep.MixedWriteRate, rep.WriteBatch = *writeRate, *writeBatch
+		mm := bench.SampleMem()
+		rep.MemAfterMixed = &mm
+	}
+
+	// 5. Cold start (engine mode): SaveFile → LoadFile round trip, the
+	// library restart path (server-mode recovery is A7's WAL replay). The
+	// snapshot reflects the post-mixed graph when mixed ran.
+	if *mode == "engine" {
+		snapPath := filepath.Join(dir, "coldstart.snap")
+		if err := queryGraph.SaveFile(snapPath); err != nil {
+			fmt.Fprintf(os.Stderr, "coldstart save: %v\n", err)
+		} else {
+			fi, statErr := os.Stat(snapPath)
+			if statErr == nil {
+				rep.ColdStartBytes = fi.Size()
+			}
+			t0 := time.Now()
+			g2, err := vectra.LoadFile(snapPath)
+			loadDur := time.Since(t0)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "coldstart load: %v\n", err)
+			} else {
+				rep.ColdStartTime = loadDur
+				rep.ColdStartNodes, rep.ColdStartEdges = g2.NodeCount(), g2.EdgeCount()
+				_ = g2.Close()
+				fmt.Fprintf(os.Stderr, "  coldstart: %s nodes / %s edges restored in %s (%s snapshot)\n",
+					intComma(rep.ColdStartNodes), intComma(rep.ColdStartEdges),
+					bench.FormatDur(loadDur), bench.FormatBytes(uint64(rep.ColdStartBytes)))
+			}
+		}
+	}
+
+	// 6. Output
 	md := rep.markdown()
 	if *out != "" {
 		if err := os.WriteFile(*out, []byte(md), 0o644); err != nil {
@@ -487,6 +637,49 @@ func rate(n int, d time.Duration) float64 {
 	return float64(n) / d.Seconds()
 }
 
+// ---- pprof helpers (attribution runs, -profile) ----
+
+// startCPUProfile begins a CPU profile into <dir>/<workload>.cpu.pprof when
+// dir is set; the returned stop function ends and closes it. Failures print
+// and degrade to a no-op (an attribution run still produces the other
+// profiles).
+func startCPUProfile(dir, workload string) (stop func()) {
+	if dir == "" {
+		return func() {}
+	}
+	f, err := os.Create(filepath.Join(dir, workload+".cpu.pprof"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cpuprofile: %v\n", err)
+		return func() {}
+	}
+	if err := pprof.StartCPUProfile(f); err != nil {
+		fmt.Fprintf(os.Stderr, "cpuprofile: %v\n", err)
+		f.Close()
+		return func() {}
+	}
+	return func() {
+		pprof.StopCPUProfile()
+		f.Close()
+	}
+}
+
+// writeProfileSnapshot dumps one runtime profile ("heap", "mutex", ...) into
+// <dir>/<workload>.<kind>.pprof when dir is set.
+func writeProfileSnapshot(dir, workload, kind string) {
+	if dir == "" {
+		return
+	}
+	f, err := os.Create(filepath.Join(dir, workload+"."+kind+".pprof"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s profile: %v\n", kind, err)
+		return
+	}
+	defer f.Close()
+	if err := pprof.Lookup(kind).WriteTo(f, 0); err != nil {
+		fmt.Fprintf(os.Stderr, "%s profile: %v\n", kind, err)
+	}
+}
+
 // ---- Workload definitions ----
 
 type workload struct {
@@ -610,6 +803,19 @@ type report struct {
 	CurateTime      time.Duration
 	Results         []bench.LoadResult
 	Txn             map[string]*bench.TxnStats // OCC stats per transaction workload (http mode)
+
+	TepsAvgEdges      float64            // mean scanned out-edges per unbounded BFS (curated sample)
+	MemAfterInject    *bench.MemSnapshot // phase boundaries for the memory/GC table
+	MemAfterWorkloads *bench.MemSnapshot
+	MemAfterMixed     *bench.MemSnapshot
+	MixedReads        *bench.LoadResult
+	MixedWrites       *bench.LoadResult
+	MixedWriteRate    int // offered batches/s (-writerate)
+	WriteBatch        int
+	ColdStartTime     time.Duration
+	ColdStartBytes    int64
+	ColdStartNodes    int
+	ColdStartEdges    int
 }
 
 func newReport(s sizeSpec, mode string, workers int, dur time.Duration, seed int64) *report {
@@ -663,7 +869,85 @@ func (r *report) markdown() string {
 			txnRows,
 		))
 	}
+	// Traversal throughput under the GAP/Graph500 normalization: TEPS ≈
+	// QPS × mean scanned out-edges per op (per-op edge counts are the
+	// curated-sample mean, so this is a mean-throughput estimate).
+	if r.TepsAvgEdges > 0 {
+		for _, res := range r.Results {
+			if res.Name != "bfsall" {
+				continue
+			}
+			teps := res.QPS * r.TepsAvgEdges
+			fmt.Fprintf(&b, "\nbfsall TEPS ≈ **%.2fM edges/s** (QPS %.0f × mean %.0f scanned edges/op)\n",
+				teps/1e6, res.QPS, r.TepsAvgEdges)
+		}
+	}
+	// Mixed read+write phase (engine mode)
+	if r.MixedReads != nil {
+		fmt.Fprintf(&b, "\n### Mixed read+write (readers=%d + 1 writer, %d-edge batches at %d/s offered)\n\n",
+			r.Workers, r.WriteBatch, r.MixedWriteRate)
+		rows := [][]string{mixedRow(r.MixedReads), mixedRow(r.MixedWrites)}
+		b.WriteString(bench.MarkdownTable(
+			[]string{"side", "ops", "QPS", "p50", "p90", "p99", "max", "err"},
+			rows,
+		))
+	}
+	// Cold start (Save→LoadFile round trip)
+	if r.ColdStartTime > 0 && r.ColdStartEdges > 0 {
+		sec := r.ColdStartTime.Seconds()
+		fmt.Fprintf(&b, "\n### Cold start (snapshot restore)\n\n")
+		fmt.Fprintf(&b, "- %s nodes / %s edges, %s snapshot → restored in %s (%.0f edges/s, %.1f MiB/s)\n",
+			intComma(r.ColdStartNodes), intComma(r.ColdStartEdges),
+			bench.FormatBytes(uint64(r.ColdStartBytes)), bench.FormatDur(r.ColdStartTime),
+			float64(r.ColdStartEdges)/sec, float64(r.ColdStartBytes)/(1<<20)/sec)
+	}
+	// Memory & GC at phase boundaries
+	if r.MemAfterInject != nil {
+		b.WriteString("\n### Memory & GC (runtime, phase boundaries)\n\n")
+		type phase struct {
+			name string
+			s    *bench.MemSnapshot
+		}
+		phases := []phase{
+			{"after inject", r.MemAfterInject},
+			{"after read workloads", r.MemAfterWorkloads},
+			{"after mixed", r.MemAfterMixed},
+		}
+		var prev *bench.MemSnapshot
+		rows := make([][]string, 0, len(phases))
+		for _, ph := range phases {
+			if ph.s == nil {
+				continue
+			}
+			gcRuns, gcPause := int(ph.s.NumGC), ph.s.GCPauseTotal
+			if prev != nil {
+				gcRuns -= int(prev.NumGC)
+				gcPause -= prev.GCPauseTotal
+			}
+			rows = append(rows, []string{
+				ph.name,
+				bench.FormatBytes(ph.s.HeapAllocBytes),
+				bench.FormatBytes(ph.s.HeapSysBytes),
+				intComma(gcRuns),
+				bench.FormatDur(gcPause),
+				fmt.Sprintf("%.1f%%", ph.s.GCCPUFraction*100),
+			})
+			prev = ph.s
+		}
+		b.WriteString(bench.MarkdownTable(
+			[]string{"phase", "heap alloc", "heap sys", "GC runs", "GC pause", "GC CPU%"},
+			rows,
+		))
+	}
 	return b.String()
+}
+
+func mixedRow(res *bench.LoadResult) []string {
+	return []string{
+		res.Name, intComma(res.Ops), fmt.Sprintf("%.0f", res.QPS),
+		bench.FormatDur(res.P50), bench.FormatDur(res.P90), bench.FormatDur(res.P99),
+		bench.FormatDur(res.Max), intComma(res.Errors),
+	}
 }
 
 func intComma(n int) string {

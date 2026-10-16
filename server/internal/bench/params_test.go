@@ -81,6 +81,53 @@ func TestCurateStartsDegreeWeighted(t *testing.T) {
 	}
 }
 
+func TestCurateTraversalEdges(t *testing.T) {
+	g, bg := buildSealed(t, Spec{Nodes: 800, Edges: 8000, Seed: 11})
+	p := Curate(g, bg, 32, 21)
+	if len(p.TraversalEdges) == 0 {
+		t.Fatal("TraversalEdges empty")
+	}
+	// Independently recompute the expected scan count for each sampled start:
+	// unbounded out-BFS, summing visited nodes' generation out-degrees.
+	outDeg := make(map[string]int)
+	for _, e := range bg.Edges {
+		outDeg[bg.Nodes[e.Src].Key]++
+	}
+	sampled := 0
+	for _, k := range p.Starts {
+		edges, ok := p.TraversalEdges[k]
+		if !ok {
+			continue // only the first tepsSample starts are measured
+		}
+		sampled++
+		if edges <= 0 {
+			t.Fatalf("start %s: edges = %d", k, edges)
+		}
+		node, ok := g.NodeByKey(k)
+		if !ok {
+			t.Fatal("start key missing")
+		}
+		res, err := g.BFS([]vectra.NodeID{node.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := 0
+		for _, id := range res.Nodes() {
+			nd, _ := g.NodeByID(id)
+			want += outDeg[nd.Key]
+		}
+		if edges != want {
+			t.Fatalf("start %s: edges = %d, want %d", k, edges, want)
+		}
+	}
+	if sampled == 0 {
+		t.Fatal("no starts measured")
+	}
+	if len(p.TraversalEdges) > tepsSample {
+		t.Fatalf("measured %d starts, cap is %d", len(p.TraversalEdges), tepsSample)
+	}
+}
+
 func TestCuratePairsReachable(t *testing.T) {
 	g, bg := buildSealed(t, Spec{Nodes: 1500, Edges: 15000, Seed: 8})
 	p := Curate(g, bg, 64, 13)
