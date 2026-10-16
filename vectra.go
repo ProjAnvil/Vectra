@@ -329,6 +329,21 @@ type Graph struct {
 	// a racing reader may briefly pin one stale generation (bounded, GC'd).
 	// All access via the atomic pointer; entries are immutable.
 	viewCache atomic.Pointer[viewCacheEntry]
+
+	// autoCompactLayers is the direct-mode layer-stack governor (B1 fix):
+	// once a publish leaves the stack at/above the cap, the whole stack is
+	// folded into one layer (delta.FoldLayers) on the writer goroutine.
+	// Bounded stacks keep the per-generation View rebuild cost below the
+	// publish interval, so the viewCache keeps hitting under sustained
+	// writes; unbounded stacks rebuild per query once the delta outgrows the
+	// interval (the 2026-10-16 mixed-workload read collapse). The fold is a
+	// pure view swap — mirrors, absorption window and WAL frames are
+	// untouched (fold equivalence is delta-fold-tested; replay rebuilds the
+	// original layers with identical visible state). 0 disables. Set via
+	// SetAutoCompact before the first write. merging guards forceMerge's
+	// internal publishLayer from re-entering the governor.
+	autoCompactLayers int
+	merging           bool
 }
 
 // viewCacheEntry is one memoized (generation, View) pair; see Graph.viewCache.
@@ -404,11 +419,20 @@ type pendOp struct {
 // New returns an empty graph. The initial generation is an empty merged
 // base (engine.Seal of nothing), so every query is legal from the start;
 // Sealed() is true until the first write opens a layer.
+// defaultAutoCompactLayers bounds the direct-mode unmerged layer stack: with
+// sustained small batches a deeper stack makes the per-generation View
+// rebuild outlast the publish interval and the viewCache never hits (every
+// query pays a full O(delta × stack) rebuild — the B1 collapse). 32 keeps
+// rebuilds sub-millisecond at the M/L tiers while folding only every ~32
+// publishes at O(pending records), amortized well under 1% of write time.
+const defaultAutoCompactLayers = 32
+
 func New() *Graph {
 	g := &Graph{
-		nodes:  map[string]nodeRef{},
-		edges:  map[delta.EdgeKey]edgeRef{},
-		labels: map[string]bool{},
+		nodes:             map[string]nodeRef{},
+		edges:             map[delta.EdgeKey]edgeRef{},
+		labels:            map[string]bool{},
+		autoCompactLayers: defaultAutoCompactLayers,
 	}
 	snap, err := engine.Seal(nil, nil, nil, nil)
 	if err != nil {
@@ -427,6 +451,41 @@ func copyProps(props map[string]any) map[string]any {
 		m[k] = v
 	}
 	return m
+}
+
+// SetAutoCompact tunes the direct-mode layer-stack governor (see
+// Graph.autoCompactLayers): the stack folds into one layer once a publish
+// leaves it at/above maxLayers. 0 disables. Chainable; call before the
+// first write (write-path field, like the rest of the tunables).
+func (g *Graph) SetAutoCompact(maxLayers int) *Graph {
+	g.autoCompactLayers = maxLayers
+	return g
+}
+
+// maybeAutoCompact folds the published layer stack down to one layer once it
+// has reached the cap (B1). Writer-path only — callers are cutLayer and
+// Batch's end, both already under the single-writer discipline. The fold is
+// a pure view swap: the mirrors, the absorption-window registry and the
+// builder are untouched (visible state does not change), and WAL frames
+// stay as published (replay rebuilds the original stack with identical
+// visible state). g.merging keeps forceMerge's internal publishLayer from
+// re-entering (it folds everything anyway).
+func (g *Graph) maybeAutoCompact() {
+	if g.autoCompactLayers <= 0 || g.merging {
+		return
+	}
+	v := g.view.Load()
+	if len(v.layers) < g.autoCompactLayers {
+		return
+	}
+	folded := delta.FoldLayers(v.layers)
+	if folded == nil {
+		return
+	}
+	g.view.Store(&genView{
+		base: v.base, baseKeys: v.baseKeys, layers: []*delta.Layer{folded},
+		lsn: v.lsn, nodes: v.nodes, edges: v.edges,
+	})
 }
 
 // ---- writer-side batch plumbing ---------------------------------------------
@@ -700,6 +759,7 @@ func (g *Graph) cutLayer() {
 	keepIDs, keepLive := g.bNodeIDs, g.bLiveNodes
 	g.publishLayer()
 	g.bNodeIDs, g.bLiveNodes = keepIDs, keepLive
+	g.maybeAutoCompact()
 }
 
 // ---- public write path ------------------------------------------------------
@@ -1120,6 +1180,7 @@ func (g *Graph) Batch(fn func(*Graph)) error {
 		err = g.flushPending()
 	}
 	g.publishLayer()
+	g.maybeAutoCompact()
 	return err
 }
 
@@ -1635,6 +1696,10 @@ func (v *genView) baseEdgeKeyFrom(er engine.EdgeRec) delta.EdgeKey {
 // The old generation stays readable for concurrent holders; memory is
 // reclaimed by GC. Cycles() uses this before answering (spec §3.2).
 func (g *Graph) forceMerge() error {
+	// merging guards maybeAutoCompact against re-entry: forceMerge's own
+	// publishLayer must not fire the governor (this IS the full fold).
+	g.merging = true
+	defer func() { g.merging = false }()
 	// unconditional: a mid-batch Seal flushes the pending batch, and even
 	// with the builder already closed (window cut by an earlier read) the
 	// endpoint registry must be dropped — the merge below renumbers IDs, and
