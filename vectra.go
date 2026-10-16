@@ -342,7 +342,16 @@ type Graph struct {
 	// original layers with identical visible state). 0 disables. Set via
 	// SetAutoCompact before the first write. merging guards forceMerge's
 	// internal publishLayer from re-entering the governor.
+	//
+	// autoSealEdges is the volume governor: after a fold, when the folded
+	// layer carries at least max(autoSealEdges, base/8) edge records, a
+	// forceMerge folds everything into a fresh base — bounding the unmerged
+	// RECORD volume for long-running writers (the layer cap alone bounds
+	// count, not bytes). The interval stays base-proportional (every fold
+	// costs O(base), A6's lesson). 0 disables. WAL checkpointing stays with
+	// explicit Seal — the frames of the folded layers are already persisted.
 	autoCompactLayers int
+	autoSealEdges     int
 	merging           bool
 }
 
@@ -427,12 +436,21 @@ type pendOp struct {
 // publishes at O(pending records), amortized well under 1% of write time.
 const defaultAutoCompactLayers = 32
 
+// defaultAutoSealEdges is the floor of the volume-proportional auto-seal
+// trigger (mirrors internal/writer's MergeEdges); the divisor 8 mirrors the
+// size-proportional rule (fold when unmerged volume reaches base/8).
+const (
+	defaultAutoSealEdges = 65536
+	autoSealFactor       = 8
+)
+
 func New() *Graph {
 	g := &Graph{
 		nodes:             map[string]nodeRef{},
 		edges:             map[delta.EdgeKey]edgeRef{},
 		labels:            map[string]bool{},
 		autoCompactLayers: defaultAutoCompactLayers,
+		autoSealEdges:     defaultAutoSealEdges,
 	}
 	snap, err := engine.Seal(nil, nil, nil, nil)
 	if err != nil {
@@ -462,6 +480,15 @@ func (g *Graph) SetAutoCompact(maxLayers int) *Graph {
 	return g
 }
 
+// SetAutoSealEdges tunes the volume governor (see Graph.autoSealEdges): a
+// fold into a fresh base fires once the folded layer carries at least
+// max(minEdges, base.EdgeCount()/8) edge records. 0 disables. Chainable;
+// call before the first write.
+func (g *Graph) SetAutoSealEdges(minEdges int) *Graph {
+	g.autoSealEdges = minEdges
+	return g
+}
+
 // maybeAutoCompact folds the published layer stack down to one layer once it
 // has reached the cap (B1). Writer-path only — callers are cutLayer and
 // Batch's end, both already under the single-writer discipline. The fold is
@@ -486,6 +513,14 @@ func (g *Graph) maybeAutoCompact() {
 		base: v.base, baseKeys: v.baseKeys, layers: []*delta.Layer{folded},
 		lsn: v.lsn, nodes: v.nodes, edges: v.edges,
 	})
+	// Volume governor: the layer cap bounds stack COUNT; this bounds record
+	// VOLUME for long-running writers. Base-proportional interval (every
+	// fold costs O(base) — A6's lesson), floor for small graphs. Frames are
+	// already persisted, so no WAL checkpoint here — that stays with the
+	// explicit Seal the user (or Close) runs.
+	if g.autoSealEdges > 0 && folded.EdgeCount() >= max(g.autoSealEdges, v.base.EdgeCount()/autoSealFactor) {
+		_ = g.forceMerge()
+	}
 }
 
 // ---- writer-side batch plumbing ---------------------------------------------

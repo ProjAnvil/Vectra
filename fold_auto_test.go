@@ -232,6 +232,57 @@ func TestAutoCompactDisabledByZero(t *testing.T) {
 	}
 }
 
+// ---- volume auto-seal --------------------------------------------------------
+
+func TestAutoSealVolumeTrigger(t *testing.T) {
+	g := New().SetAutoCompact(4).SetAutoSealEdges(10)
+	for i := range 8 {
+		if _, err := g.AddNode("s"+string(rune('0'+i)), "SVC", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := g.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	sealed := false
+	for b := 0; b < 12; b++ {
+		applyFoldOps(g, []foldOp{{kind: 0, a: "s0", b: "s" + string(rune('0'+1+b%7)), prop: b}})
+		if l, _ := g.LayerPressure(); l == 0 {
+			sealed = true // the volume trigger ran forceMerge
+		}
+	}
+	if !sealed {
+		t.Fatal("volume auto-seal never fired (threshold 30 edges)")
+	}
+	if g.EdgeCount() < 12 {
+		t.Fatalf("edges = %d after auto-seal", g.EdgeCount())
+	}
+	if _, err := g.NeighborsOf("s0", DirOut); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.AddEdge("s1", "s2", "POST", nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAutoSealDisabledByZero(t *testing.T) {
+	g := New().SetAutoCompact(4).SetAutoSealEdges(0)
+	for i := range 8 {
+		if _, err := g.AddNode("s"+string(rune('0'+i)), "SVC", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := g.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	for b := 0; b < 12; b++ {
+		applyFoldOps(g, []foldOp{{kind: 0, a: "s0", b: "s" + string(rune('0'+1+b%7)), prop: b}})
+	}
+	if l, _ := g.LayerPressure(); l == 0 {
+		t.Fatal("auto-seal fired despite SetAutoSealEdges(0)")
+	}
+}
+
 // ---- WAL replay safety -------------------------------------------------------
 
 func TestAutoCompactWALReplay(t *testing.T) {
