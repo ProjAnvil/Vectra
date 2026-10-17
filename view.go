@@ -51,7 +51,7 @@ func (s snapRows) Rows(u uint32, dir int) []csr.AdjRow {
 // when nothing is unmerged (A1: zero View construction on the hot path), or
 // the three-source engine.View otherwise — routed through the graph's
 // per-generation View cache so repeated queries over one generation build
-// it once (see Graph.viewCache).
+// it once (see engineViewOf and genView.cached).
 func (g *Graph) rowsOf(v *genView) tr.RowSource {
 	if len(v.layers) == 0 {
 		return snapRows{base: v.base}
@@ -324,7 +324,7 @@ func nodesToIDs(ns []Node) []uint32 {
 // cypherRunViewOf returns the execution source for this generation: the base
 // snapshot itself keeps Run's zero-indirection hot path; a generation with
 // unmerged layers executes through RunView over the cached three-source
-// View (see Graph.viewCache).
+// View (see engineViewOf and genView.cached).
 func (g *Graph) cypherRunViewOf(v *genView) (runView bool, src cypherSource) {
 	if len(v.layers) == 0 {
 		return false, cypherSource{}

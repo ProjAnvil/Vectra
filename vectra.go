@@ -135,6 +135,15 @@ type genView struct {
 	lsn      uint64            // WAL LSN covered by the newest layer (informational)
 	nodes    int               // visible node count (three-source)
 	edges    int               // visible edge count (three-source)
+
+	// cached is this generation's three-source View slot (see engineViewOf
+	// and prebuildView). Per-generation rather than per-graph: the writer
+	// fills it BEFORE publishing the generation, so readers of a fresh
+	// generation always hit, and a reader's own build can never clobber a
+	// newer generation's writer-maintained entry (the single-slot cache had
+	// both races — a miss storm of full rebuilds on every publish was the
+	// 2026-10-17 writer-throttle finding).
+	cached atomic.Pointer[viewCacheEntry]
 }
 
 // nodeWinner resolves key to its visible node (three-source).
@@ -320,16 +329,6 @@ type Graph struct {
 	writerAttached atomic.Bool
 	pend           atomic.Pointer[pendWindow]
 
-	// viewCache memoizes the three-source engine.View of the latest
-	// generation, keyed by the genView pointer (v0.7 hardening, task 7 / A2):
-	// the first traversal/cypher query after a publish pays the
-	// O(unmerged-delta) assembly, every later query over the same generation
-	// reuses it — T4's deferred per-query cost, gone. Single slot: writes
-	// advance the generation monotonically, so the newest entry always wins;
-	// a racing reader may briefly pin one stale generation (bounded, GC'd).
-	// All access via the atomic pointer; entries are immutable.
-	viewCache atomic.Pointer[viewCacheEntry]
-
 	// autoCompactLayers is the direct-mode layer-stack governor (B1 fix):
 	// once a publish leaves the stack at/above the cap, the TAIL run folds
 	// into one layer on the writer goroutine (size-tiered: the folded run
@@ -366,27 +365,30 @@ type Graph struct {
 	merging           bool
 }
 
-// viewCacheEntry is one memoized (generation, View) pair; see Graph.viewCache.
+// viewCacheEntry is one generation's memoized three-source View (held in
+// genView.cached). view is immutable once stored; ext is the writer's
+// incremental build state (nil on reader-built entries) — readers only read
+// view, so the writer may steal and extend a superseded generation's ext
+// race-free by field separation.
 type viewCacheEntry struct {
-	gen  *genView
 	view *engine.View
-	// ext is the writer-maintained incremental build state (see
-	// prebuildView); nil on entries stored by readers. Readers only read
-	// gen/view — the writer may steal and mutate a superseded entry's ext
-	// race-free by field separation.
-	ext *viewBuild
+	ext  *viewBuild
 }
 
-// engineViewOf returns v's three-source View through the per-generation
-// cache. Concurrent first-readers may each build (engineView reads
-// immutable state only, so racing builds are safe); the Store publishes one
-// and the losers' copies become garbage.
+// engineViewOf returns v's three-source View through the generation's slot.
+// Writer-published generations arrive pre-filled (prebuildView); a miss is a
+// generation published without prebuild (wrapper rebase, replay) — racing
+// first-readers each build (engineView reads immutable state only), one
+// CAS wins and the losers' copies become garbage.
 func (g *Graph) engineViewOf(v *genView) *engine.View {
-	if c := g.viewCache.Load(); c != nil && c.gen == v {
+	if c := v.cached.Load(); c != nil {
 		return c.view
 	}
 	ev := v.engineView()
-	g.viewCache.Store(&viewCacheEntry{gen: v, view: ev})
+	v.cached.CompareAndSwap(nil, &viewCacheEntry{view: ev})
+	if c := v.cached.Load(); c != nil {
+		return c.view
+	}
 	return ev
 }
 
@@ -417,39 +419,57 @@ func layerPrefixMatch(a, b []*delta.Layer, k int) bool {
 // copy per fold interval). Anything else (Seal, F-merge, rebase, replay)
 // rebuilds fully. Writer-path only, after the generation is stored; the
 // stolen ext is safe to mutate in place (see viewCacheEntry.ext).
-func (g *Graph) prebuildView(v *genView) {
-	if len(v.layers) == 0 || g.merging {
+// prebuildView fills nv's view slot BEFORE nv is published (callers Store
+// the generation afterwards), extending the predecessor generation's build
+// where it can. Readers of a published generation therefore always hit.
+// Without it the first query after every publish pays the full
+// O(unmerged-delta) assembly; under sustained writes that outlasts the
+// publish interval, the cache never hits, and read latency collapses (the
+// B1 mixed-read baseline: rebuild ~50-90ms vs a 6ms publish interval at 165
+// batches/s). Filling the slot after the Store re-opened that window on
+// every publish — a miss storm of reader full rebuilds that also clobbered
+// the writer's build state (the 2026-10-17 writer throttle to 54 batches/s).
+//
+// The incremental cases: a pure append reuses the predecessor's sources and
+// cumulative state (cost O(new layers)); a T-run fold rewinds to the
+// F-boundary snapshot and rebuilds T+tail (cost O(T+tail), one O(F) map
+// copy per fold interval). Anything else (Seal, F-merge, rebase, replay)
+// rebuilds fully. Writer-path only; the predecessor is g.view at call time
+// and its ext is stolen and mutated in place (see viewCacheEntry).
+func (g *Graph) prebuildView(nv *genView) {
+	if len(nv.layers) == 0 || g.merging {
 		return
 	}
 	var vb *viewBuild
-	if c := g.viewCache.Load(); c != nil && c.ext != nil && c.gen.base == v.base {
+	prev := g.view.Load()
+	if c := prev.cached.Load(); c != nil && c.ext != nil && prev.base == nv.base {
 		old := c.ext
 		k := old.builtTo
 		switch {
-		case k <= len(v.layers) && k >= g.splitT && layerPrefixMatch(c.gen.layers, v.layers, k):
+		case k <= len(nv.layers) && k >= g.splitT && layerPrefixMatch(prev.layers, nv.layers, k):
 			vb = old // pure append: T and F untouched, layers[k:] are new
-			for i := k; i < len(v.layers); i++ {
-				vb.appendLayer(v, i)
+			for i := k; i < len(nv.layers); i++ {
+				vb.appendLayer(nv, i)
 			}
-		case old.snapF != nil && g.splitF < k && g.splitF <= len(v.layers) &&
-			layerPrefixMatch(c.gen.layers, v.layers, g.splitF):
+		case old.snapF != nil && g.splitF < k && g.splitF <= len(nv.layers) &&
+			layerPrefixMatch(prev.layers, nv.layers, g.splitF):
 			vb = old // T run replaced by a fold: keep F, rewind, rebuild T+tail
 			vb.rewindTo(g.splitF)
-			for i := g.splitF; i < len(v.layers); i++ {
-				vb.appendLayer(v, i)
+			for i := g.splitF; i < len(nv.layers); i++ {
+				vb.appendLayer(nv, i)
 			}
 		}
 	}
 	if vb == nil {
-		vb = newViewBuild(v)
-		for i := range v.layers {
-			vb.appendLayer(v, i)
+		vb = newViewBuild(nv)
+		for i := range nv.layers {
+			vb.appendLayer(nv, i)
 			if i+1 == g.splitF && vb.snapF == nil {
 				vb.snapF = vb.snapshot()
 			}
 		}
 	}
-	g.viewCache.Store(&viewCacheEntry{gen: v, view: engine.NewView(v.base, vb.sources, vb.nodeN), ext: vb})
+	nv.cached.Store(&viewCacheEntry{view: engine.NewView(nv.base, vb.sources, vb.nodeN), ext: vb})
 }
 
 // pendWindow is the metadata of one open absorption window. owner is the
@@ -650,8 +670,8 @@ func (g *Graph) maybeAutoCompact(atBatchEnd bool) {
 		base: v.base, baseKeys: v.baseKeys, layers: newLayers,
 		lsn: v.lsn, nodes: v.nodes, edges: v.edges,
 	}
+	g.prebuildView(nv) // fill the slot first: readers of nv must never miss
 	g.view.Store(nv)
-	g.prebuildView(nv)
 	// Volume seal (Batch boundaries only): the layer cap bounds stack count,
 	// this bounds record VOLUME and reclaims tombstoned records at a
 	// base-proportional interval. Frames are already persisted; the WAL
@@ -922,10 +942,10 @@ func (g *Graph) publishLayer() {
 		base: v.base, baseKeys: v.baseKeys, layers: layers,
 		lsn: lsn, nodes: g.nodeTotal, edges: g.edgeTotal,
 	}
-	g.view.Store(nv)
 	if !g.merging {
-		g.prebuildView(nv) // forceMerge's publish is immediately superseded
+		g.prebuildView(nv) // fill the slot first; forceMerge's publish is superseded at once
 	}
+	g.view.Store(nv)
 }
 
 // cutLayer is the mid-burst window flush: publishLayer, but the endpoint

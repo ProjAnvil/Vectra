@@ -48,9 +48,9 @@ func TestPrebuildViewEquivalence(t *testing.T) {
 		if len(v.layers) == 0 {
 			return
 		}
-		c := g.viewCache.Load()
-		if c == nil || c.gen != v || c.ext == nil {
-			t.Fatalf("step %d: cache missing or not prebuilt", step)
+		c := v.cached.Load()
+		if c == nil || c.ext == nil {
+			t.Fatalf("step %d: slot missing or not prebuilt", step)
 		}
 		fresh := v.engineView()
 		if c.view.NodeCount() != fresh.NodeCount() {
