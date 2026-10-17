@@ -60,7 +60,7 @@ Graphalytics 用 s(V,E)=log10(V+E) 分 T-shirt 档。Vectra 定位"10万~1000万
   读尾部因此可归因到具体的持续写速率（ pacing 精度上限 ~500/s）。
 - 输出：读/写两侧各自的 ops/QPS/p50/p90/p99/max。
 
-## direct 模式层栈治理（2026-10-16 B1 修复，v4 语义）
+## direct 模式层栈治理（2026-10-16 B1 修复，v4 语义；2026-10-17 折叠移后台）
 
 `make bench` 基线（2026-10-16）定位：持续写入下每发布一层即新代，
 逐代 View 重建成本 ∝ 未合并记录 × 每端点 O(层数) 字符串查找；一旦
@@ -68,16 +68,24 @@ Graphalytics 用 s(V,E)=log10(V+E) 分 T-shirt 档。Vectra 定位"10万~1000万
 治理器（`SetAutoCompact`/`SetAutoSealEdges`，写前调用）：
 
 - 栈分三段：F（旧折叠 run）/ T（新折叠 run）/ tail（原始层）。
+  分段标记随代不可变（genView.splitF/splitT）。
 - 触发（仅写路径：容量触发的窗口切割与 Batch 边界；读触发的
   flush 只发布不折叠）：层数 ≥ 上限（默认 32）且 tail 边量 ≥ 64。
-- 折叠：`delta.FoldLayers(T + tail)`，成本 O(T+tail)；尺寸分层——
-  T ≥ max(512, F/2) 时才并入 F，摊还 ≤3 次拷贝/记录（整栈重折是
-  二次的，A3 门已抓）。折叠是纯视图变换：镜像、吸收窗口、WAL 帧
-  不动，重放语义等价（差分测试钉死，含严格 ID 与 Seal 重编号容忍
-  两种口径）。
-- 体量 Seal（仅 Batch 边界）：未合并边 ≥ max(64K, base) 时
+- **折叠在后台 goroutine**（2026-10-17，对齐 LevelDB/RocksDB/Pebble
+  模式）：写者只发信号；折叠器从已发布代（不可变）计算
+  `delta.FoldLayers(T + tail)`，尺寸分层——T ≥ max(512, F/2) 时才并入
+  F（摊还 ≤3 拷贝/记录）——并**从零构建**折叠前缀的视图状态；结果经
+  原子交接槽交给写者，写者在下次发布时**并入**（前缀拼接 + O(tail)
+  视图追加）。发布权只归写者：无 CAS 协议、无丢失更新；共享状态仅
+  原子量与一个唤醒 channel。折叠器惰性启动、空闲 500ms 退出。
+  前缀被 Seal/rebase 打破的结果直接丢弃。
+- 视图槽位 per-generation（genView.cached）：写者在原子发布**前**填好，
+  读者永远命中；读者自建只 CAS 进自己代的空槽，不覆写写者状态。
+- 体量 Seal（仅 Batch 边界，栈达上限时）：未合并边 ≥ max(64K, base) 时
   forceMerge 入新基座——界住长跑体量并回收墓碑记录（A6 的
-  base 比例间隔规则）。O(base) 的 Seal 绝不落在查询路径（A3 门）。
+  base 比例间隔规则）。留在写者（重建写者私有镜像）。
+- 背压（简化 LevelDB slowdown）：折叠在飞且栈 ≥ 4× 上限时，写者每次
+  发布 sleep 1ms。
 - wrapper 模式整体跳过：wrapper 自有合并调度（pubMu 协议、
   MaxLayers、体量折叠），其验收门测的就是它。
 

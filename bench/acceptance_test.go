@@ -28,6 +28,19 @@ import (
 
 // ---- shared helpers -----------------------------------------------------------
 
+// lineFail reports a latency-line breach. Under the race detector the
+// timing lines are not asserted (-race multiplies costs 5-10x; the gates
+// still run for data-race detection and the breach is logged) — full-scale
+// verdicts come from the non-race runs recorded in docs/benchmarks.
+func lineFail(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if raceBuild {
+		t.Logf("(race build, line not asserted) "+format, args...)
+		return
+	}
+	t.Errorf(format, args...)
+}
+
 func benchSecs(t *testing.T, def int) time.Duration {
 	t.Helper()
 	if testing.Short() {
@@ -224,7 +237,7 @@ func TestQueryLatencyDuringMerge(t *testing.T) {
 	// p99s — so the gate keeps meaning "merges do not blow tails past what
 	// the allocation-heavy read path ever cost".
 	floors := map[string]time.Duration{
-		"bfs-p99":          300 * time.Microsecond,
+		"bfs-p99":           300 * time.Microsecond,
 		"shortest-path-p99": 500 * time.Microsecond,
 		"point-p99":         10 * time.Microsecond,
 	}
@@ -239,7 +252,7 @@ func TestQueryLatencyDuringMerge(t *testing.T) {
 		t.Logf("A2 ratio %s: merge-storm/idle = %.2fx (line ≤2x) | steady口径: merge-storm/writes %.2fx, writes/idle %.2fx",
 			tc.name, ratio(tc.idle, tc.mg), ratio(tc.quiet, tc.mg), ratio(tc.idle, tc.quiet))
 		if r := ratio(tc.idle, tc.mg); r > 2.0 && tc.mg > floors[tc.name] {
-			t.Errorf("A2 FAIL: %s merge-window p99 %.2fx the idle p99 (line: ≤2x or ≤ the pre-B2 idle floor %s; got %s)",
+			lineFail(t, "A2 FAIL: %s merge-window p99 %.2fx the idle p99 (line: ≤2x or ≤ the pre-B2 idle floor %s; got %s)",
 				tc.name, r, fmtDur(floors[tc.name]), fmtDur(tc.mg))
 		}
 	}
@@ -289,10 +302,10 @@ func TestPointQueryAfterWrite(t *testing.T) {
 				t.Logf("A3[%s]: note — point-query p99 below timer granularity (macOS ~42ns ticks): sub-tens-of-ns reads", tier.name)
 			}
 			if p := pct(n, 99); p > tier.p99Line {
-				t.Errorf("A3 FAIL: NodeByKey p99 %s exceeds the %s line", fmtDur(p), fmtDur(tier.p99Line))
+				lineFail(t, "A3 FAIL: NodeByKey p99 %s exceeds the %s line", fmtDur(p), fmtDur(tier.p99Line))
 			}
 			if p := pct(e, 99); p > tier.p99Line {
-				t.Errorf("A3 FAIL: EdgeByID p99 %s exceeds the %s line", fmtDur(p), fmtDur(tier.p99Line))
+				lineFail(t, "A3 FAIL: EdgeByID p99 %s exceeds the %s line", fmtDur(p), fmtDur(tier.p99Line))
 			}
 		})
 	}

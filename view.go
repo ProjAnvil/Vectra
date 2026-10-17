@@ -91,9 +91,11 @@ func (s *layerSource) Empty() bool {
 // three-source View: everything engineView's loop accumulates across layers
 // (the resolve memo, the cumulative live-record index, the per-layer
 // sources, the widened ID space). The writer's prebuildView extends a
-// previously cached build across publishes — appending only the new layers'
+// previously built state across publishes — appending only the new layers'
 // sources — so the per-publish cost stays O(new records) regardless of
-// stack depth or volume; readers missing the cache build from scratch.
+// stack depth or volume; the background folder builds a fresh state for a
+// folded prefix off the writer path; readers missing a slot build from
+// scratch.
 type viewBuild struct {
 	builtTo int
 	sources []engine.DeltaSource
@@ -101,18 +103,6 @@ type viewBuild struct {
 	nodeID  map[string]NodeID
 	baseLab map[string]uint32
 	nodeN   int
-	// snapF is the state at the governor's F-run boundary (see
-	// Graph.splitF): when a fold replaces the T run, the build rewinds to
-	// this snapshot and rebuilds T+tail only. nil until a full rebuild
-	// passes the boundary.
-	snapF *viewBuildSnap
-}
-
-// viewBuildSnap is one immutable copy of the rewinds-able build state.
-type viewBuildSnap struct {
-	live   map[delta.EdgeKey][]uint32
-	nodeID map[string]NodeID
-	nodeN  int
 }
 
 func newViewBuild(v *genView) *viewBuild {
@@ -126,37 +116,6 @@ func newViewBuild(v *genView) *viewBuild {
 		baseLab: baseLab,
 		nodeN:   v.base.NodeCount(),
 	}
-}
-
-// snapshot copies the rewind state (taken when a full build passes the
-// F boundary; one O(F) copy per fold interval).
-func (vb *viewBuild) snapshot() *viewBuildSnap {
-	live := make(map[delta.EdgeKey][]uint32, len(vb.live))
-	for k, ids := range vb.live {
-		live[k] = append([]uint32(nil), ids...)
-	}
-	nodeID := make(map[string]NodeID, len(vb.nodeID))
-	for k, id := range vb.nodeID {
-		nodeID[k] = id
-	}
-	return &viewBuildSnap{live: live, nodeID: nodeID, nodeN: vb.nodeN}
-}
-
-// rewindTo restores the build to the splitF boundary: F's sources are kept
-// (the layers below splitF are pointer-identical — checked by the caller),
-// the cumulative state comes from the snapshot, and T+tail rebuild next.
-func (vb *viewBuild) rewindTo(splitF int) {
-	vb.sources = vb.sources[:splitF]
-	vb.live = make(map[delta.EdgeKey][]uint32, len(vb.snapF.live))
-	for k, ids := range vb.snapF.live {
-		vb.live[k] = ids
-	}
-	vb.nodeID = make(map[string]NodeID, len(vb.snapF.nodeID))
-	for k, id := range vb.snapF.nodeID {
-		vb.nodeID[k] = id
-	}
-	vb.nodeN = vb.snapF.nodeN
-	vb.builtTo = splitF
 }
 
 // appendLayer folds v.layers[i]'s source into the build (verbatim from
