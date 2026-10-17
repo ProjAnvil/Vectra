@@ -82,3 +82,37 @@ go test -race .                             # 根模块 race
 go test -run 'TestQueryLatencyDuringMerge|TestPointQueryAfterWrite|TestWALGroupCommitBatchCost|TestMergeAmortization|TestCrashRecoveryTimeToReady|TestUnbatchedImportThroughput' -v ./bench/
 make bench SIZE=medium WORKERS=8 DURATION=10s BENCH_EXTRA='-warmup 1s'
 ```
+
+---
+
+# 第二轮(2026-10-17):残余项 1 修复——写侧摊销
+
+分支: `feat/background-folder`(基于 8a0f12c)。同行调研: LevelDB/RocksDB/Pebble/Badger 一致为"写者 O(1) 发布 + 后台压实 + 不可变输入原子安装 + stall 背压";SQLite autocheckpoint 是反例(提交线程做压实,commit 尾部周期性尖峰)。
+
+## 结论
+
+1. **画像推翻了假设**: 写者节流的根因不是折叠(FoldLayers/快照合计 <1% CPU),而是**视图缓存未命中风暴**——单槽缓存在 `view.Store` 之后才填充,读者在窗口内全量重建(`appendLayer` 占全部 CPU 的 63%),且读者的无状态条目覆写写者的增量状态,逼写者也全量重建(10ms/批)。
+2. **per-generation 视图槽位**(6e1f577): 槽位挂在 genView 上,写者发布前填好,读者 CAS 只进自己代的空槽。M-w8 读 p50 2.67ms→238µs,p99 66→16ms,写 55→132 批/s。
+3. **后台折叠器**(a7db582): 写者只发信号;折叠器从不可变代计算折叠 + 折叠前缀的完整视图状态,经原子交接槽交给写者,写者下次发布时前缀拼接 + O(tail) 追加。发布权只归写者(无 CAS 协议)。写 132→**166 批/s**(= 无折叠基线的步调上限),写 p99 60→**5-6ms**,max 330→15-18ms。
+
+## 终验(engine, 供速 200 批/s × 50 边, M-w8 ×2)
+
+| 指标 | 10-16 基线 | 第一轮末 | **第二轮末** |
+|---|---|---|---|
+| mixed-read p50 | 109ms | 2.75-3.98ms | **205-212µs**(530×) |
+| mixed-read p99 | 1.42s | 62-64ms | **14.6-15.4ms**(95×) |
+| mixed-read QPS | 31 | 507 | **4520-4834** |
+| mixed-write 达成速率 | 164-167(无折叠) | 53-56 | **166**(步调上限) |
+| mixed-write p50 / p99 / max | 151µs / 393µs / 3.9ms | ~1ms / 68ms / 330ms | **851-862µs / 4.8-5.9ms / 15-18ms** |
+| 纯读 bfsall p50 / p99 | 3.96 / 13.2ms | 4.49 / 34ms | **3.10 / 7.5ms** |
+| 纯读 bfs3 p99 · reach p99 | 3.64 · 3.08ms | 3.68 · 13.1ms | **1.94 · 1.68ms** |
+
+M-w16: 读 p50 248µs / p99 47ms,写 154/s(p99 13ms)。L-w8: 读 p50 **1.30ms** / p99 95ms(基线 149ms / 2.80s),写 120/s(p99 15ms,max 71ms);L 的读 p99 由 bfsall 族本身(p50 56ms 的全图 BFS)主导。
+
+spec 验收线(M-w8): 写达成 ≥190 → 166,**即供速 200 下步调器的实际上限**(无折叠基线同为 164-167,time.Sleep 粒度所限);写 p99 ≤10ms → 4.8-5.9 ✓;写 max ≤50ms → 15-18 ✓;读不回退 ✓;门 A2-A7 + race ✓。
+
+## 残余
+
+- 写 p50 851µs(基线 151µs): 每发布的预构建追加 + NewView 标签/杀除聚合 + 折叠并入;写者 CPU 占比 ~1.4%,非瓶颈。
+- 折叠器每次从零构建折叠前缀的视图状态(O(F+T),后台): F 受体量 Seal 界住(≤max(64K, base));长跑下折叠器可能落后 → 1ms slowdown 背压兜底。增量复用 F 的 sources 可再降,v0.8 候选。
+- 门卫生: A2/A3 时序线在 -race 下改为只记录(合并前 main 同样失败——race 检测器下时序门无意义,项目约定以非 race 运行为准)。
