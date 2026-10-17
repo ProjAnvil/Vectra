@@ -182,7 +182,7 @@ func main() {
 		// mode): note and skip rather than failing the whole run.
 		for _, w := range strings.Split(*workloads, ",") {
 			w = strings.TrimSpace(w)
-			if w != "" && want[w] && !available[w] {
+			if w != "" && w != "mixed" && want[w] && !available[w] { // mixed is the engine-only phase below, not an op
 				fmt.Fprintf(os.Stderr, "note: workload %q is not available in %s mode — skipped\n", w, *mode)
 				want[w] = false
 			}

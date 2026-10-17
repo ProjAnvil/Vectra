@@ -170,6 +170,7 @@ func TestAutoCompactDifferentialEquivalence(t *testing.T) {
 		}
 		applyFoldOps(gOn, ops)
 		applyFoldOps(gOff, ops)
+		settleFolds(t, gOn)
 		if l, _ := gOn.LayerPressure(); l <= 2 {
 			folded = true // the stack was folded down to runs
 		}
@@ -209,6 +210,7 @@ func TestAutoCompactTriggerAndContinue(t *testing.T) {
 			ops = append(ops, foldOp{kind: 0, a: "n0", b: "n" + string(rune('0'+1+(b*20+e)%9)), prop: e})
 		}
 		applyFoldOps(g, ops)
+		settleFolds(t, g)
 		if l, _ := g.LayerPressure(); l <= 2 {
 			folded = true
 		}
@@ -276,6 +278,7 @@ func TestAutoSealVolumeTrigger(t *testing.T) {
 			ops = append(ops, foldOp{kind: 0, a: "s0", b: "s" + string(rune('0'+1+(b*8+e)%7)), prop: e})
 		}
 		applyFoldOps(g, ops)
+		settleFolds(t, g)
 		if l, _ := g.LayerPressure(); l == 0 {
 			sealed = true // the volume trigger ran forceMerge
 		}
@@ -333,6 +336,7 @@ func TestAutoCompactWALReplay(t *testing.T) {
 			ops = append(ops, foldOp{kind: 0, a: "w0", b: "w" + string(rune('0'+1+(b*16+e)%5)), prop: e})
 		}
 		applyFoldOps(g, ops)
+		settleFolds(t, g)
 		if l, _ := g.LayerPressure(); l > 4 {
 			t.Fatalf("%d layers > cap 4", l)
 		}

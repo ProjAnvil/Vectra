@@ -54,6 +54,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/projanvil/vectra/internal/delta"
 	"github.com/projanvil/vectra/internal/engine"
@@ -135,6 +136,22 @@ type genView struct {
 	lsn      uint64            // WAL LSN covered by the newest layer (informational)
 	nodes    int               // visible node count (three-source)
 	edges    int               // visible edge count (three-source)
+
+	// cached is this generation's three-source View slot (see engineViewOf
+	// and prebuildView). Per-generation rather than per-graph: the writer
+	// fills it BEFORE publishing the generation, so readers of a fresh
+	// generation always hit, and a reader's own build can never clobber a
+	// newer generation's writer-maintained entry (the single-slot cache had
+	// both races — a miss storm of full rebuilds on every publish was the
+	// 2026-10-17 writer-throttle finding).
+	cached atomic.Pointer[viewCacheEntry]
+
+	// splitF/splitT partition this generation's stack for the fold
+	// governor: [0,splitF) = the old folded run F, [splitF,splitT) = the
+	// newer folded run T, [splitT,:) = the raw tail. Immutable with the
+	// generation (the writer stamps them at publish from the fold result it
+	// incorporated), so the background folder reads them race-free.
+	splitF, splitT int
 }
 
 // nodeWinner resolves key to its visible node (three-source).
@@ -320,40 +337,36 @@ type Graph struct {
 	writerAttached atomic.Bool
 	pend           atomic.Pointer[pendWindow]
 
-	// viewCache memoizes the three-source engine.View of the latest
-	// generation, keyed by the genView pointer (v0.7 hardening, task 7 / A2):
-	// the first traversal/cypher query after a publish pays the
-	// O(unmerged-delta) assembly, every later query over the same generation
-	// reuses it — T4's deferred per-query cost, gone. Single slot: writes
-	// advance the generation monotonically, so the newest entry always wins;
-	// a racing reader may briefly pin one stale generation (bounded, GC'd).
-	// All access via the atomic pointer; entries are immutable.
-	viewCache atomic.Pointer[viewCacheEntry]
-
 	// autoCompactLayers is the direct-mode layer-stack governor (B1 fix):
-	// once a publish leaves the stack at/above the cap, the TAIL run folds
-	// into one layer on the writer goroutine (size-tiered: the folded run
-	// merges into the older run only at half its size — folding the whole
-	// stack every trigger is quadratic under sustained writes and the A3
-	// gate caught it). Bounded stacks keep the per-generation View rebuild
-	// cheap so the viewCache keeps hitting under sustained writes (the
-	// 2026-10-16 mixed-workload read collapse). Folds are pure view swaps —
-	// mirrors, absorption window and WAL frames untouched. 0 disables. Set
-	// via SetAutoCompact before the first write.
+	// once a publish leaves the stack at/above the cap (and the raw tail
+	// carries real volume), the background folder folds the T run plus the
+	// tail into one layer (size-tiered: the folded run merges into the
+	// older run only at half its size — folding the whole stack every
+	// trigger is quadratic under sustained writes and the A3 gate caught
+	// it). Bounded stacks keep the per-generation View cheap so readers keep
+	// hitting their slots under sustained writes (the 2026-10-16 mixed
+	// read collapse). Folds are pure view transforms — mirrors, absorption
+	// window and WAL frames untouched. 0 disables. Set via SetAutoCompact
+	// before the first write.
 	//
-	// splitF/splitT partition the stack: [0,splitF) = old folded run F,
-	// [splitF,splitT) = newer folded run T, [splitT,:) = raw tail.
-	// Writer-private; clamped when the stack is replaced externally
-	// (Seal/rebase/replay) — a stale split only mis-shapes the next fold's
-	// cost, never its semantics (any sub-stack folds validly).
+	// The fold runs OFF the writer (2026-10-17, the LevelDB/RocksDB/Pebble
+	// model): the writer only signals pressure, the folder goroutine
+	// computes the folded prefix plus its full view-build state from the
+	// published (immutable) generation, and hands the result over in
+	// pendingFold; the writer incorporates it at its next publish — a
+	// prefix splice plus an O(tail) view append. Publication stays with the
+	// single writer (no CAS protocol, no lost updates); the only shared
+	// state is atomics and a wake channel. A result whose source prefix no
+	// longer matches (Seal/rebase in between) is discarded.
 	//
 	// autoSealEdges is the volume governor: at Batch boundaries, once the
 	// unmerged stack carries at least max(autoSealEdges, base) edge records,
 	// a forceMerge folds everything into a fresh base — bounding unmerged
 	// VOLUME (and reclaiming tombstoned records) at a base-proportional
 	// interval (every fold costs O(base), A6's lesson; the wrapper uses the
-	// same rule). Never fires from read-triggered flushes — an O(base) seal
-	// on the query path blows write-then-read p99 (the A3 gate caught that
+	// same rule). It stays inline on the writer: it rebuilds writer-private
+	// mirrors. Never fires from read-triggered flushes — an O(base) seal on
+	// the query path blows write-then-read p99 (the A3 gate caught that
 	// too). 0 disables. WAL checkpointing stays with explicit Seal.
 	//
 	// merging guards forceMerge's internal publishLayer from re-entering the
@@ -362,31 +375,57 @@ type Graph struct {
 	// volume folds) and its gates measure exactly that.
 	autoCompactLayers int
 	autoSealEdges     int
-	splitF, splitT    int
 	merging           bool
+
+	// Background folder plumbing (direct mode). foldWake carries the
+	// writer's pressure signals (cap 1, non-blocking sends); foldInFlight
+	// is set while a fold is pending or computing so the writer signals at
+	// most once per fold; folderRunning is the lazily started goroutine's
+	// liveness flag (it exits after foldIdleExit without signals);
+	// pendingFold is the hand-over slot the writer Swaps at publish.
+	foldWake      chan struct{}
+	foldInFlight  atomic.Bool
+	folderRunning atomic.Bool
+	pendingFold   atomic.Pointer[foldResult]
 }
 
-// viewCacheEntry is one memoized (generation, View) pair; see Graph.viewCache.
+// foldResult is one background fold hand-over: the source prefix it was
+// computed from (pointer-identical layers — the writer only ever appends,
+// so a prefix match means the result still applies), the folded replacement
+// run(s), the full view-build state of the folded prefix (the writer
+// appends the tail onto it), and the split marks for the resulting stack.
+type foldResult struct {
+	src    []*delta.Layer
+	folded []*delta.Layer
+	ext    *viewBuild
+	splitF int
+	splitT int
+}
+
+// viewCacheEntry is one generation's memoized three-source View (held in
+// genView.cached). view is immutable once stored; ext is the writer's
+// incremental build state (nil on reader-built entries) — readers only read
+// view, so the writer may steal and extend a superseded generation's ext
+// race-free by field separation.
 type viewCacheEntry struct {
-	gen  *genView
 	view *engine.View
-	// ext is the writer-maintained incremental build state (see
-	// prebuildView); nil on entries stored by readers. Readers only read
-	// gen/view — the writer may steal and mutate a superseded entry's ext
-	// race-free by field separation.
-	ext *viewBuild
+	ext  *viewBuild
 }
 
-// engineViewOf returns v's three-source View through the per-generation
-// cache. Concurrent first-readers may each build (engineView reads
-// immutable state only, so racing builds are safe); the Store publishes one
-// and the losers' copies become garbage.
+// engineViewOf returns v's three-source View through the generation's slot.
+// Writer-published generations arrive pre-filled (prebuildView); a miss is a
+// generation published without prebuild (wrapper rebase, replay) — racing
+// first-readers each build (engineView reads immutable state only), one
+// CAS wins and the losers' copies become garbage.
 func (g *Graph) engineViewOf(v *genView) *engine.View {
-	if c := g.viewCache.Load(); c != nil && c.gen == v {
+	if c := v.cached.Load(); c != nil {
 		return c.view
 	}
 	ev := v.engineView()
-	g.viewCache.Store(&viewCacheEntry{gen: v, view: ev})
+	v.cached.CompareAndSwap(nil, &viewCacheEntry{view: ev})
+	if c := v.cached.Load(); c != nil {
+		return c.view
+	}
 	return ev
 }
 
@@ -417,39 +456,46 @@ func layerPrefixMatch(a, b []*delta.Layer, k int) bool {
 // copy per fold interval). Anything else (Seal, F-merge, rebase, replay)
 // rebuilds fully. Writer-path only, after the generation is stored; the
 // stolen ext is safe to mutate in place (see viewCacheEntry.ext).
-func (g *Graph) prebuildView(v *genView) {
-	if len(v.layers) == 0 || g.merging {
+// prebuildView fills nv's view slot BEFORE nv is published (callers Store
+// the generation afterwards), extending the predecessor generation's build
+// where it can. Readers of a published generation therefore always hit.
+// Without it the first query after every publish pays the full
+// O(unmerged-delta) assembly; under sustained writes that outlasts the
+// publish interval, the cache never hits, and read latency collapses (the
+// B1 mixed-read baseline: rebuild ~50-90ms vs a 6ms publish interval at 165
+// batches/s). Filling the slot after the Store re-opened that window on
+// every publish — a miss storm of reader full rebuilds that also clobbered
+// the writer's build state (the 2026-10-17 writer throttle to 54 batches/s).
+//
+// The incremental cases: a pure append reuses the predecessor's sources and
+// cumulative state (cost O(new layers)); a T-run fold rewinds to the
+// F-boundary snapshot and rebuilds T+tail (cost O(T+tail), one O(F) map
+// copy per fold interval). Anything else (Seal, F-merge, rebase, replay)
+// rebuilds fully. Writer-path only; the predecessor is g.view at call time
+// and its ext is stolen and mutated in place (see viewCacheEntry).
+func (g *Graph) prebuildView(nv *genView, from *viewBuild) {
+	if len(nv.layers) == 0 || g.merging {
 		return
 	}
 	var vb *viewBuild
-	if c := g.viewCache.Load(); c != nil && c.ext != nil && c.gen.base == v.base {
-		old := c.ext
-		k := old.builtTo
-		switch {
-		case k <= len(v.layers) && k >= g.splitT && layerPrefixMatch(c.gen.layers, v.layers, k):
-			vb = old // pure append: T and F untouched, layers[k:] are new
-			for i := k; i < len(v.layers); i++ {
-				vb.appendLayer(v, i)
-			}
-		case old.snapF != nil && g.splitF < k && g.splitF <= len(v.layers) &&
-			layerPrefixMatch(c.gen.layers, v.layers, g.splitF):
-			vb = old // T run replaced by a fold: keep F, rewind, rebuild T+tail
-			vb.rewindTo(g.splitF)
-			for i := g.splitF; i < len(v.layers); i++ {
-				vb.appendLayer(v, i)
-			}
+	if from != nil {
+		// a background fold was incorporated: its state covers the folded
+		// prefix, append whatever the writer stacked past it
+		vb = from
+	} else {
+		prev := g.view.Load()
+		if c := prev.cached.Load(); c != nil && c.ext != nil && prev.base == nv.base &&
+			c.ext.builtTo <= len(nv.layers) && layerPrefixMatch(prev.layers, nv.layers, c.ext.builtTo) {
+			vb = c.ext // pure append: layers[builtTo:] are new
 		}
 	}
 	if vb == nil {
-		vb = newViewBuild(v)
-		for i := range v.layers {
-			vb.appendLayer(v, i)
-			if i+1 == g.splitF && vb.snapF == nil {
-				vb.snapF = vb.snapshot()
-			}
-		}
+		vb = newViewBuild(nv)
 	}
-	g.viewCache.Store(&viewCacheEntry{gen: v, view: engine.NewView(v.base, vb.sources, vb.nodeN), ext: vb})
+	for i := vb.builtTo; i < len(nv.layers); i++ {
+		vb.appendLayer(nv, i)
+	}
+	nv.cached.Store(&viewCacheEntry{view: engine.NewView(nv.base, vb.sources, vb.nodeN), ext: vb})
 }
 
 // pendWindow is the metadata of one open absorption window. owner is the
@@ -526,6 +572,7 @@ func New() *Graph {
 		labels:            map[string]bool{},
 		autoCompactLayers: defaultAutoCompactLayers,
 		autoSealEdges:     defaultAutoSealEdges,
+		foldWake:          make(chan struct{}, 1),
 	}
 	snap, err := engine.Seal(nil, nil, nil, nil)
 	if err != nil {
@@ -564,20 +611,10 @@ func (g *Graph) SetAutoSealEdges(minEdges int) *Graph {
 	return g
 }
 
-// maybeAutoCompact folds the published layer stack down to one layer once it
-// has reached the cap (B1). Writer-path only — callers are cutLayer and
-// Batch's end, both already under the single-writer discipline. The fold is
-// a pure view swap: the mirrors, the absorption-window registry and the
-// builder are untouched (visible state does not change), and WAL frames
-// stay as published (replay rebuilds the original stack with identical
-// visible state). g.merging keeps forceMerge's internal publishLayer from
-// re-entering (it folds everything anyway).
 // minFoldMerge is the floor on the size-tier rule: a folded run merges into
 // the older run only at max(minFoldMerge, olderRunEdges/2) records, so tiny
 // tails never trigger F-merges (each costing O(F)) and small graphs fold
-// into one run early instead of carrying two. The floor also caps the tail
-// fold's own cost (T+tail records copied) — it lands on the triggering
-// read/write, and A3's write-then-read p99 line is 1ms.
+// into one run early instead of carrying two.
 const minFoldMerge = 512
 
 // minTailFoldEdges is the tail volume gate: below it a fold costs more than
@@ -586,12 +623,23 @@ const minFoldMerge = 512
 // a small constant.
 const minTailFoldEdges = 64
 
-// maybeAutoCompact is the direct-mode layer-stack governor. atBatchEnd is
-// true only at Batch boundaries — the sole site allowed to fire the O(base)
-// volume seal (read-triggered flushes fold, never seal). Writer-path only;
-// callers are cutLayer and Batch's end, both under the single-writer
-// discipline. The wrapper skips the governor entirely (it owns merging).
-func (g *Graph) maybeAutoCompact(atBatchEnd bool) {
+// foldIdleExit is how long the folder goroutine waits for another pressure
+// signal before exiting (it restarts lazily on the next signal), so idle or
+// short-lived graphs carry no goroutine.
+const foldIdleExit = 500 * time.Millisecond
+
+// foldStallFactor: with a fold in flight and the stack past this multiple
+// of the layer cap, the writer sleeps 1ms per publish (LevelDB's slowdown
+// stall) so the folder catches up. A long-run safety valve; the mixed
+// workload never reaches it.
+const foldStallFactor = 4
+
+// afterPublish is the writer-side half of the direct-mode governor, run
+// after every publish: signal the background folder when the stack is under
+// pressure, pace the writer if the folder is far behind, and (at Batch
+// boundaries only) fire the inline volume seal. Writer-path only; callers
+// are cutLayer and Batch's end. The wrapper skips it (it owns merging).
+func (g *Graph) afterPublish(atBatchEnd bool) {
 	if g.autoCompactLayers <= 0 || g.merging || g.writerAttached.Load() {
 		return
 	}
@@ -600,71 +648,140 @@ func (g *Graph) maybeAutoCompact(atBatchEnd bool) {
 	if n < g.autoCompactLayers {
 		return
 	}
-	// clamp stale split marks (stack replaced by Seal/rebase/replay)
-	if g.splitF > n {
-		g.splitF = n
+	// Volume seal (Batch boundaries only, stack at the cap): bounds record
+	// VOLUME and reclaims tombstoned records at a base-proportional
+	// interval; inline because it rebuilds writer-private mirrors.
+	if atBatchEnd && g.autoSealEdges > 0 {
+		total := 0
+		for _, l := range v.layers {
+			total += l.EdgeCount()
+		}
+		if total >= max(g.autoSealEdges, v.base.EdgeCount()) {
+			_ = g.forceMerge()
+			return
+		}
 	}
-	if g.splitT > n || g.splitT < g.splitF {
-		g.splitT = g.splitF
+	if g.foldInFlight.Load() {
+		if n >= foldStallFactor*g.autoCompactLayers {
+			time.Sleep(time.Millisecond)
+		}
+		return
 	}
-	if g.splitT >= n {
-		return // defensive: no tail to fold
-	}
-	// Tail volume gate: folding costs O(T+tail records); a 32-layer tail of
-	// 1-record changesets is 32 records — folding it into a 512-record run
-	// is 16x write amplification. Wait until the tail carries real volume.
 	tailEdges := 0
-	for _, l := range v.layers[g.splitT:] {
+	for _, l := range v.layers[v.splitT:] {
 		tailEdges += l.EdgeCount()
 	}
 	if tailEdges < minTailFoldEdges {
 		return
 	}
-	// fold the T run plus the raw tail into one layer — O(T + tail records),
-	// never touching F (re-folding F every trigger is quadratic under
-	// sustained writes; the size-tier rule below merges F only at T ≥ F/2).
-	foldFrom := g.splitF
-	folded := delta.FoldLayers(v.layers[foldFrom:])
-	if folded == nil {
-		return
+	g.foldInFlight.Store(true)
+	if g.folderRunning.CompareAndSwap(false, true) {
+		go g.foldLoop()
 	}
-	newLayers := make([]*delta.Layer, 0, foldFrom+1)
-	newLayers = append(newLayers, v.layers[:foldFrom]...)
+	select {
+	case g.foldWake <- struct{}{}:
+	default:
+	}
+}
+
+// foldLoop is the background folder goroutine: it folds on each wake and
+// exits after foldIdleExit without one. The exit re-checks the wake channel
+// after clearing folderRunning so a signal landing in that gap is never lost
+// (the signaler restarts a goroutine only when the flag reads false).
+func (g *Graph) foldLoop() {
+	idle := time.NewTimer(foldIdleExit)
+	defer idle.Stop()
+	for {
+		select {
+		case <-g.foldWake:
+			if g.closed.Load() {
+				g.folderRunning.Store(false)
+				return
+			}
+			g.runFold()
+			idle.Reset(foldIdleExit)
+		case <-idle.C:
+			g.folderRunning.Store(false)
+			select {
+			case <-g.foldWake:
+				if !g.folderRunning.CompareAndSwap(false, true) {
+					return // the signaler started a fresh goroutine
+				}
+				if g.closed.Load() {
+					g.folderRunning.Store(false)
+					return
+				}
+				g.runFold()
+				idle.Reset(foldIdleExit)
+			default:
+				return
+			}
+		}
+	}
+}
+
+// runFold computes one fold from the published generation and hands it
+// over. Pure with respect to writer state: it reads immutable layers and the
+// generation's own split marks, and the writer only sees the result through
+// pendingFold.
+func (g *Graph) runFold() {
+	defer g.foldInFlight.Store(false)
+	v := g.view.Load()
+	r := computeFold(v)
+	if r != nil {
+		g.pendingFold.Store(r)
+	}
+}
+
+// computeFold is the size-tiered fold of one generation's stack: T plus the
+// raw tail fold into one layer — O(T + tail records), never touching F
+// (re-folding F every trigger is quadratic under sustained writes) — and
+// the folded run merges into F only when it reaches max(minFoldMerge, F/2)
+// (amortized <=3 record copies per write). It also builds the folded
+// prefix's full view state (the writer appends only the tail onto it). nil
+// when there is nothing to fold.
+func computeFold(v *genView) *foldResult {
+	n := len(v.layers)
+	splitF, splitT := v.splitF, v.splitT
+	if splitF > n {
+		splitF = n
+	}
+	if splitT > n || splitT < splitF {
+		splitT = splitF
+	}
+	if splitT >= n {
+		return nil
+	}
+	folded := delta.FoldLayers(v.layers[splitF:])
+	if folded == nil {
+		return nil
+	}
+	newLayers := make([]*delta.Layer, 0, splitF+1)
+	newLayers = append(newLayers, v.layers[:splitF]...)
 	newLayers = append(newLayers, folded)
-	// size-tier: merge into F when the folded run reaches the rule line —
-	// amortized ≤3 record copies per write either way
 	fEdges := 0
-	for _, l := range v.layers[:foldFrom] {
+	for _, l := range v.layers[:splitF] {
 		fEdges += l.EdgeCount()
 	}
-	if foldFrom == 0 || folded.EdgeCount() >= max(minFoldMerge, fEdges/2) {
-		merged := delta.FoldLayers(newLayers)
-		if merged != nil {
+	r := &foldResult{src: v.layers}
+	if splitF == 0 || folded.EdgeCount() >= max(minFoldMerge, fEdges/2) {
+		if merged := delta.FoldLayers(newLayers); merged != nil {
 			newLayers = []*delta.Layer{merged}
-			g.splitF, g.splitT = 1, 1
 		}
+		r.splitF, r.splitT = 1, 1
 	} else {
-		g.splitF, g.splitT = foldFrom, foldFrom+1
+		r.splitF, r.splitT = splitF, splitF+1
 	}
-	nv := &genView{
-		base: v.base, baseKeys: v.baseKeys, layers: newLayers,
-		lsn: v.lsn, nodes: v.nodes, edges: v.edges,
+	r.folded = newLayers
+	// view state of the folded prefix — resolve/live/memo built over the
+	// folded layers only (they stand on the same base)
+	fv := &genView{base: v.base, baseKeys: v.baseKeys, layers: newLayers}
+	vb := newViewBuild(fv)
+	for i := range newLayers {
+		vb.appendLayer(fv, i)
 	}
-	g.view.Store(nv)
-	g.prebuildView(nv)
-	// Volume seal (Batch boundaries only): the layer cap bounds stack count,
-	// this bounds record VOLUME and reclaims tombstoned records at a
-	// base-proportional interval. Frames are already persisted; the WAL
-	// checkpoint stays with the explicit Seal the user (or Close) runs.
-	if atBatchEnd && g.autoSealEdges > 0 {
-		total := 0
-		for _, l := range newLayers {
-			total += l.EdgeCount()
-		}
-		if total >= max(g.autoSealEdges, v.base.EdgeCount()) {
-			_ = g.forceMerge() // resets the split marks
-		}
-	}
+	r.ext = vb
+	return r
 }
 
 // ---- writer-side batch plumbing ---------------------------------------------
@@ -870,17 +987,54 @@ func (g *Graph) publishLayer() {
 	g.builder = nil
 	g.bNodeIDs, g.bEdgeIDs = nil, nil
 	g.bLiveNodes, g.bKilled, g.bIndex = nil, nil, nil
-	if l == nil {
-		return
-	}
-
-	if l.NodeCount() == 0 && l.EdgeCount() == 0 &&
+	if l != nil && l.NodeCount() == 0 && l.EdgeCount() == 0 &&
 		len(l.NodeTombstones()) == 0 && len(l.EdgeTombstones()) == 0 && len(l.IndexKeys()) == 0 {
+		l = nil // an entirely empty layer is dropped: it must not flip Sealed() or grow the stack
+	}
+	if l == nil && g.pendingFold.Load() == nil {
 		return
 	}
+	if l != nil {
+		g.reconcileMirrors(l)
+	}
 
-	// reconcile the published mirrors: tombstones first, live records on top
-	// (the layer's own live records win over its own tombstones).
+	v := g.view.Load()
+	// Incorporate a finished background fold: the result stands on a prefix
+	// of the current stack (the writer only appends), so the folded runs
+	// replace that prefix and the layers stacked since ride on top. A
+	// stale result (Seal/rebase replaced the stack) is dropped.
+	stack, splitF, splitT := v.layers, v.splitF, v.splitT
+	var from *viewBuild
+	if r := g.pendingFold.Swap(nil); r != nil && !g.merging && len(r.src) <= len(stack) &&
+		layerPrefixMatch(stack, r.src, len(r.src)) {
+		spliced := make([]*delta.Layer, 0, len(r.folded)+len(stack)-len(r.src)+1)
+		spliced = append(spliced, r.folded...)
+		spliced = append(spliced, stack[len(r.src):]...)
+		stack, splitF, splitT, from = spliced, r.splitF, r.splitT, r.ext
+	}
+	layers := stack[:len(stack):len(stack)]
+	if l != nil {
+		layers = append(layers, l)
+	}
+	lsn := v.lsn
+	if g.wal != nil {
+		lsn = g.wal.LastLSN()
+	}
+	nv := &genView{
+		base: v.base, baseKeys: v.baseKeys, layers: layers,
+		lsn: lsn, nodes: g.nodeTotal, edges: g.edgeTotal,
+		splitF: splitF, splitT: splitT,
+	}
+	if !g.merging {
+		g.prebuildView(nv, from) // fill the slot first; forceMerge's publish is superseded at once
+	}
+	g.view.Store(nv)
+}
+
+// reconcileMirrors applies one published layer to the writer-private
+// mirrors: tombstones first, live records on top (the layer's own live
+// records win over its own tombstones).
+func (g *Graph) reconcileMirrors(l *delta.Layer) {
 	for k := range l.NodeTombstones() {
 		if ref, ok := g.nodes[k]; ok && ref.live {
 			ref.live = false
@@ -912,20 +1066,6 @@ func (g *Graph) publishLayer() {
 		g.edgeTotal++
 	}
 
-	v := g.view.Load()
-	layers := append(v.layers, l)
-	lsn := v.lsn
-	if g.wal != nil {
-		lsn = g.wal.LastLSN()
-	}
-	nv := &genView{
-		base: v.base, baseKeys: v.baseKeys, layers: layers,
-		lsn: lsn, nodes: g.nodeTotal, edges: g.edgeTotal,
-	}
-	g.view.Store(nv)
-	if !g.merging {
-		g.prebuildView(nv) // forceMerge's publish is immediately superseded
-	}
 }
 
 // cutLayer is the mid-burst window flush: publishLayer, but the endpoint
@@ -949,13 +1089,16 @@ func (g *Graph) publishLayer() {
 // them on queries blows write-then-read p99 (the A3 gate).
 func (g *Graph) cutLayer(fold bool) {
 	if g.builder == nil {
+		if g.pendingFold.Load() != nil {
+			g.publishLayer() // no pending writes: incorporate a finished fold (pure view swap)
+		}
 		return
 	}
 	keepIDs, keepLive := g.bNodeIDs, g.bLiveNodes
 	g.publishLayer()
 	g.bNodeIDs, g.bLiveNodes = keepIDs, keepLive
 	if fold {
-		g.maybeAutoCompact(true)
+		g.afterPublish(true)
 	}
 }
 
@@ -1377,7 +1520,7 @@ func (g *Graph) Batch(fn func(*Graph)) error {
 		err = g.flushPending()
 	}
 	g.publishLayer()
-	g.maybeAutoCompact(true) // Batch boundary: the volume seal may fire here
+	g.afterPublish(true) // Batch boundary: the volume seal may fire here
 	return err
 }
 
@@ -1893,7 +2036,7 @@ func (v *genView) baseEdgeKeyFrom(er engine.EdgeRec) delta.EdgeKey {
 // The old generation stays readable for concurrent holders; memory is
 // reclaimed by GC. Cycles() uses this before answering (spec §3.2).
 func (g *Graph) forceMerge() error {
-	// merging guards maybeAutoCompact against re-entry: forceMerge's own
+	// merging guards afterPublish against re-entry: forceMerge's own
 	// publishLayer must not fire the governor (this IS the full fold).
 	g.merging = true
 	defer func() { g.merging = false }()
@@ -1939,7 +2082,7 @@ func (g *Graph) forceMerge() error {
 		g.labels[labels[er.LabelID]] = true
 	}
 	g.rebaseHappened.Store(false) // mirrors now match the published view
-	g.splitF, g.splitT = 0, 0     // empty stack: no runs
+	g.pendingFold.Store(nil)      // any fold in hand-over targeted the old stack
 	g.view.Store(&genView{
 		base: snap, baseKeys: baseKeys, layers: nil,
 		lsn: v.lsn, nodes: g.nodeTotal, edges: g.edgeTotal,
