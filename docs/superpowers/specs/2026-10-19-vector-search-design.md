@@ -375,3 +375,13 @@ func (g *Graph) QueryVector(index string, vec []float32, o QueryVectorOptions) (
 ## 实现期偏差记录
 
 （实现时逐条记录与本 spec 的偏差，模式沿用 typed-index spec。）
+
+- Phase 0 (2026-10-19): dead set is a plain map[uint32]struct{} rather than a chunked bitmap (D6 allows implementation reuse; bitmap swap lands with Phase 1 integration).
+- Phase 0 (2026-10-19): dead-vid hit counting (spec §4.3) deferred — no Phase 0 consumer.
+- Phase 0 (2026-10-19): benchmark matrix is Cosine-only; L2/Dot covered by unit tests.
+- Phase 0 (2026-10-19): memory口径 pinned to live HeapAlloc after explicit GC (spec's "常驻"); HeapInuse reported alongside for span-level visibility.
+- Phase 0 (2026-10-19): HNSW is single-threaded for build AND search in Phase 0 — the epoch-visited array is mutable read-path state (data race under concurrent Search, -race verified). Phase 1 must localize visited state per reader before immutable snapshots publish concurrently (spec D1 zero-lock-read prerequisite).
+- Phase 0 (2026-10-19): query protocol is perturbed-indexed-vector (in-distribution, standard ANN). The original genClustered(n=50) queries were OOD (single far center; measured 0.928 vs 1.0000 recall at 10k@ef128). OOD curves are retained in the report as a stress upper bound.
+- Phase 0 (2026-10-19): DefaultC locked at 2 from the in-distribution 100k sweep; the 64 floor dominates in practice.
+- Phase 0 (2026-10-19): 500k/1M acceptance runs cancelled by the owner before completion (pivot to build-throughput optimization). 门 2a verdict is conditional on 100k-measured lines + extrapolation; re-measure after the optimization pass.
+- Phase 0 (2026-10-19): build throughput decays superlinearly (~80 vec/s at 10k×768 → ~17 at 100k×768), 10-20x off hnswlib single-thread. Not a 门 2a line but an operational red line: sustained writes above the fold rate back up the overlay, and 1M restart rebuild is impractical. Dedicated optimization session commissioned (see ledger).

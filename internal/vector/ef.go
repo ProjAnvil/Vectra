@@ -18,6 +18,7 @@ func AdaptiveEf(k, n int, c float64) int {
 }
 
 // DefaultC is the adaptive-ef constant locked from the Phase 0 recall-ef
-// sweep (Task 6). 0 means "not locked yet"; callers must treat 0 as
-// "use plain 64".
-var DefaultC float64
+// sweep: the 0.95 recall line is already crossed at ef=32 on 100k x 768
+// (in-distribution protocol), c = 32/log2(100k) ~= 1.93 -> 2. The 64
+// floor dominates for every n this side of 2^32.
+var DefaultC float64 = 2
