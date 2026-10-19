@@ -18,26 +18,69 @@ const (
 // Distance computes the metric between two equal-length vectors. Cosine
 // assumes pre-normalized inputs and returns 1 - dot. L2 returns the
 // squared euclidean distance (monotone in true L2, cheaper).
+//
+// The kernels carry eight independent accumulators: the Go compiler does
+// not auto-vectorize float loops (strict FP semantics), and a single
+// accumulator serializes on the ~4-cycle FADD latency — eight chains keep
+// the multiplier/adder pipes busy instead (profile 2026-10-20: Distance
+// was 88% of build CPU in the chained form). Summation order differs from
+// the naive loop, shifting results by last-ulp amounts, far below ANN
+// margins.
 func Distance(m Metric, a, b []float32) float64 {
+	if m == L2 {
+		return l2Squared(a, b)
+	}
 	// float32 accumulation: ~2-3x faster than float64 on this hot path;
 	// the ~1e-5 relative error over <=4096 dims is far below ANN margins.
-	var dot float32
-	for i := range a {
-		dot += a[i] * b[i]
-	}
-	switch m {
-	case Cosine:
+	dot := dotProduct(a, b)
+	if m == Cosine {
 		return 1 - float64(dot)
-	case Dot:
-		return -float64(dot)
-	default:
-		var sq float64
-		for i := range a {
-			t := float64(a[i] - b[i])
-			sq += t * t
-		}
-		return sq
 	}
+	return -float64(dot)
+}
+
+func dotProduct(a, b []float32) float32 {
+	var s0, s1, s2, s3, s4, s5, s6, s7 float32
+	i, n := 0, len(a)&^7
+	for ; i < n; i += 8 {
+		av := a[i : i+8 : i+8]
+		bv := b[i : i+8 : i+8]
+		s0 += av[0] * bv[0]
+		s1 += av[1] * bv[1]
+		s2 += av[2] * bv[2]
+		s3 += av[3] * bv[3]
+		s4 += av[4] * bv[4]
+		s5 += av[5] * bv[5]
+		s6 += av[6] * bv[6]
+		s7 += av[7] * bv[7]
+	}
+	dot := ((s0+s4)+(s1+s5))+((s2+s6)+(s3+s7))
+	var tail float32
+	for ; i < len(a); i++ {
+		tail += a[i] * b[i]
+	}
+	return dot + tail
+}
+
+func l2Squared(a, b []float32) float64 {
+	var s0, s1, s2, s3 float64
+	i, n := 0, len(a)&^3
+	for ; i < n; i += 4 {
+		t0 := float64(a[i] - b[i])
+		t1 := float64(a[i+1] - b[i+1])
+		t2 := float64(a[i+2] - b[i+2])
+		t3 := float64(a[i+3] - b[i+3])
+		s0 += t0 * t0
+		s1 += t1 * t1
+		s2 += t2 * t2
+		s3 += t3 * t3
+	}
+	sq := (s0+s1)+(s2+s3)
+	for ; i < len(a); i++ {
+		t := float64(a[i] - b[i])
+		sq += t * t
+	}
+	return sq
 }
 
 // Normalize returns a unit-length defensive copy of v. The zero vector is

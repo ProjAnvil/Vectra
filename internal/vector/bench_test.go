@@ -132,6 +132,29 @@ func percentiles(times []time.Duration) (p50, p99 time.Duration) {
 	return
 }
 
+// BenchmarkDistance is the kernel micro-bench for the 2026-10-20 build
+// throughput work: 768-dim Cosine is the spike-matrix hot shape.
+func BenchmarkDistance(b *testing.B) {
+	rng := rand.New(rand.NewSource(7))
+	a := Normalize(randVec(rng, 768))
+	v := Normalize(randVec(rng, 768))
+	sink = Distance(Cosine, a, v)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sink = Distance(Cosine, a, v)
+	}
+}
+
+var sink float64
+
+func randVec(rng *rand.Rand, dim int) []float32 {
+	v := make([]float32, dim)
+	for j := range v {
+		v[j] = rng.Float32()*2 - 1
+	}
+	return v
+}
+
 // TestRecallSmoke: always-run quality gate. Calibrated 2026-10-19: 0.990
 // under the old off-distribution query protocol; 1.0000 after switching to
 // perturbed in-distribution queries (same day). The 0.95 line has margin.
