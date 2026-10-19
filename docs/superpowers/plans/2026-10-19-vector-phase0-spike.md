@@ -1,4 +1,4 @@
-# Vector Phase 0 Spike Implementation Plan
+# Vector Phase 0 Spike Implementation Plan (v2)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-19-vector-search-design.md` (v3). The plan argues from the spec; conflicts resolve against it.
 
+**v2 revision (2026-10-19):** responds to the plan audit (REJECT) — all embedded code was assembled in an isolated module, compiled, and calibrated before this revision. Fixes: three compile errors; diversity-heuristic neighbor selection (naive closest-first caps clustered recall at ~0.52@ef64 on 10k×768 — measured); epoch-stamped visited array (map removal); angular-spread cluster generator (per-component jitter normalizes to near-uniform noise at 768 dims — recall ceiling regardless of ef); independent query sets (training-point queries inflate recall); live-truth death test; same-cycle update semantics; nil-drop (not `[:0]`) for overlay/tier slices (stale pointers pin dead graphs — measured 2.46× phantom heap, fixed to 1.12×); HeapAlloc-after-GC memory口径 with `runtime.KeepAlive`; staged full-matrix runner with honest wall-times.
+
 ## Global Constraints
 
 - go.mod gains no new require entries. Standard library only.
@@ -17,10 +19,12 @@
 - Code comments in English, matching repo style (comment density like `internal/wal/wal.go`).
 - TDD: write the failing test first, watch it fail, then implement.
 - All randomness uses fixed seeds. Recall assertions assert lower bounds only (ANN is non-deterministic); never assert exact output sets or order.
-- 门 2a acceptance lines (spec §10.3, verbatim): recall@10 ≥ 0.95 (1M×768, clustered, adaptive ef); query p99 < 10ms (same scenario, tiered shape, overlay at full 2048); memory amplification ≤ 1.6× theoretical vector bytes.
+- 门 2a acceptance lines (spec §10.3, verbatim): recall@10 ≥ 0.95 (1M×768, clustered, adaptive ef); query p99 < 10ms (same scenario, tiered shape, overlay at full 2048 — measured, not estimated); memory amplification ≤ 1.6× theoretical vector bytes (口径: HeapAlloc after explicit GC with the state kept alive, over n·dim·4).
+- Recall truth is strict set-match against brute force over INDEPENDENT query vectors (never training points).
 - Do not edit spec body sections; deviations go to the spec's 实现期偏差记录 appendix only.
 - One commit per task, English commit message, on branch `spec/vector-search`.
-- Benchmark matrix is Cosine-only (spec's primary metric); L2/Dot are covered by unit tests. Record this in the report.
+- Benchmark matrix is Cosine-only; L2/Dot are covered by unit tests. Record this in the report.
+- Calibrated expectations (measured on Apple M5 Pro, 2026-10-19, this plan's exact code): build 10k×768 ≈ 45–55 s (~200 vec/s); recall 10k×768: 0.877@ef64 / 0.963@ef128 / 0.990@ef192; recall 2k×64: 0.9675@ef64; heap amp (live) 1.12× at 10k×768; overlay Add rate ≥ 700k/s. If your numbers diverge wildly, suspect the environment or a transcription error before suspecting the thresholds.
 
 ---
 
@@ -50,16 +54,16 @@ import (
 func TestDistanceKnownValues(t *testing.T) {
 	a := []float32{1, 0}
 	b := []float32{0, 1}
-	if got := Distance(Cosine, a, b); math.Abs(got-1) > 1e-9 {
+	if got := Distance(Cosine, a, b); math.Abs(got-1) > 1e-6 {
 		t.Fatalf("cosine orthogonal = %v, want 1", got)
 	}
-	if got := Distance(Cosine, a, a); math.Abs(got) > 1e-9 {
+	if got := Distance(Cosine, a, a); math.Abs(got) > 1e-6 {
 		t.Fatalf("cosine identical = %v, want 0", got)
 	}
-	if got := Distance(L2, []float32{0, 0}, []float32{3, 4}); math.Abs(got-25) > 1e-9 {
+	if got := Distance(L2, []float32{0, 0}, []float32{3, 4}); math.Abs(got-25) > 1e-4 {
 		t.Fatalf("l2 squared = %v, want 25", got)
 	}
-	if got := Distance(Dot, []float32{2, 1}, []float32{3, 4}); math.Abs(got+10) > 1e-9 {
+	if got := Distance(Dot, []float32{2, 1}, []float32{3, 4}); math.Abs(got+10) > 1e-4 {
 		t.Fatalf("dot negated = %v, want -10", got)
 	}
 }
@@ -72,9 +76,6 @@ func TestNormalize(t *testing.T) {
 	}
 	if math.Abs(n-1) > 1e-6 {
 		t.Fatalf("norm = %v, want 1", n)
-	}
-	if out[0] != 0.6 || out[1] != 0.8 {
-		t.Fatalf("normalize = %v, want [0.6 0.8]", out)
 	}
 	src := []float32{3, 4}
 	_ = Normalize(src)
@@ -111,7 +112,6 @@ func TestNormalizeVec(t *testing.T) {
 	if _, ok := NormalizeVec("nope", 2); ok {
 		t.Fatal("non-slice must fail")
 	}
-	// Defensive copy: mutating the returned slice must not alias the input.
 	v, _ := NormalizeVec(direct, 4)
 	v[0] = 99
 	if direct[0] != 0.5 {
@@ -120,10 +120,12 @@ func TestNormalizeVec(t *testing.T) {
 }
 ```
 
+(Note: v2 drops the exact `out[0] == 0.6` assertion — with float32 accumulation the unit-vector components carry ~1e-7 rounding; the norm-1 assertion is the contract.)
+
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `go test ./internal/vector/ -run 'TestDistance|TestNormalize' -v`
-Expected: FAIL — `undefined: Distance` / `undefined: Normalize` / `undefined: NormalizeVec` (build error is the failing state).
+Expected: FAIL — `undefined: Distance` / `Normalize` / `NormalizeVec` (build error is the failing state).
 
 - [ ] **Step 3: Implement**
 
@@ -149,15 +151,17 @@ const (
 // assumes pre-normalized inputs and returns 1 - dot. L2 returns the
 // squared euclidean distance (monotone in true L2, cheaper).
 func Distance(m Metric, a, b []float32) float64 {
-	var dot float64
+	// float32 accumulation: ~2-3x faster than float64 on this hot path;
+	// the ~1e-5 relative error over <=4096 dims is far below ANN margins.
+	var dot float32
 	for i := range a {
-		dot += float64(a[i]) * float64(b[i])
+		dot += a[i] * b[i]
 	}
 	switch m {
 	case Cosine:
-		return 1 - dot
+		return 1 - float64(dot)
 	case Dot:
-		return -dot
+		return -float64(dot)
 	default:
 		var sq float64
 		for i := range a {
@@ -174,7 +178,7 @@ func Distance(m Metric, a, b []float32) float64 {
 func Normalize(v []float32) []float32 {
 	out := make([]float32, len(v))
 	var n float64
-	for i, x := range v {
+	for _, x := range v {
 		n += float64(x) * float64(x)
 	}
 	n = math.Sqrt(n)
@@ -245,7 +249,7 @@ git commit -m "feat(vector): distance metrics + JSON-safe NormalizeVec intake la
 
 ---
 
-### Task 2: HNSW core (insert, layered search, dead filtering)
+### Task 2: HNSW core (heuristic insert, layered search, epoch visited)
 
 **Files:**
 - Create: `internal/vector/hnsw.go`
@@ -260,6 +264,7 @@ git commit -m "feat(vector): distance metrics + JSON-safe NormalizeVec intake la
   - `func (h *HNSW) Search(q []float32, k, ef int, alive func(uint32) bool) []Hit` — alive may be nil; ef < k is clamped to k; returns up to k hits ascending by score
   - `func (h *HNSW) All() ([]uint32, [][]float32)` — ids and stored vectors (for tier merges)
   - `func (h *HNSW) Len() int`
+- Internal but load-bearing: neighbor selection uses the Malkov–Yashunin diversity heuristic (Algorithm 4) with keep-pruned fill. Plain closest-first was measured to cap clustered recall at ~0.52@ef64 (10k×768); do not "simplify" it away.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -274,24 +279,8 @@ import (
 // bruteCheck returns recall of got against the brute-force top-k.
 func bruteCheck(vecs [][]float32, q []float32, k int, got []Hit) float64 {
 	truth := map[uint32]bool{}
-	// O(n·k) selection, fine for unit-test sizes.
-	scores := make([]struct {
-		id uint32
-		d  float64
-	}, len(vecs))
-	for i, v := range vecs {
-		scores[i].id = uint32(i)
-		scores[i].d = Distance(Cosine, Normalize(q), v)
-	}
-	for i := 0; i < len(scores) && len(truth) < k; i++ {
-		best := i
-		for j := i + 1; j < len(scores); j++ {
-			if scores[j].d < scores[best].d {
-				best = j
-			}
-		}
-		scores[i], scores[best] = scores[best], scores[i]
-		truth[scores[i].id] = true
+	for _, i := range bruteTopIDs(vecs, q, k) {
+		truth[uint32(i)] = true
 	}
 	hit := 0
 	for _, g := range got {
@@ -316,9 +305,13 @@ func TestHNSWRecallAndBasics(t *testing.T) {
 	if h.Len() != n {
 		t.Fatalf("len = %d, want %d", h.Len(), n)
 	}
+	// Independent queries: training-point queries inflate recall.
+	queries := make([][]float32, 20)
+	for i := range queries {
+		queries[i] = normalizeRand(rng, dim)
+	}
 	recall := 0.0
-	for qi := 0; qi < 20; qi++ {
-		q := vecs[rng.Intn(n)]
+	for _, q := range queries {
 		got := h.Search(q, 10, 64, nil)
 		if len(got) != 10 {
 			t.Fatalf("got %d hits, want 10", len(got))
@@ -396,6 +389,35 @@ func normalizeRand(rng *rand.Rand, dim int) []float32 {
 }
 ```
 
+Note: `bruteTopIDs` is defined in Task 5's file. Since Task 5 lands later, add this temporary shim at the bottom of `hnsw_test.go` and DELETE it in Task 5 Step 1:
+
+```go
+// bruteTopIDs is replaced by bench_test.go's version in Task 5.
+func bruteTopIDs(vecs [][]float32, q []float32, k int) []int {
+	type idd struct {
+		i int
+		d float64
+	}
+	qn := Normalize(q)
+	all := make([]idd, len(vecs))
+	for i, v := range vecs {
+		all[i] = idd{i, Distance(Cosine, qn, v)}
+	}
+	for i := 0; i < k; i++ { // selection sort: fine for unit sizes
+		for j := i + 1; j < len(all); j++ {
+			if all[j].d < all[i].d {
+				all[i], all[j] = all[j], all[i]
+			}
+		}
+	}
+	out := make([]int, k)
+	for i := range out {
+		out[i] = all[i].i
+	}
+	return out
+}
+```
+
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `go test ./internal/vector/ -run TestHNSW -v`
@@ -437,6 +459,12 @@ type HNSW struct {
 	level []int        // internal index -> top level
 	links [][][]uint32 // links[node][level] -> internal neighbor indices
 	entry int          // internal index of the entry point, -1 when empty
+
+	// visited is an epoch-stamped array: visited[i] == stamp marks node i
+	// as seen by the current searchLayer call. Cheaper than a per-search
+	// map; the stamp wraps at 2^32 searches, which resets the array.
+	visited []uint32
+	stamp   uint32
 }
 
 func NewHNSW(metric Metric, m, efc int, seed int64) *HNSW {
@@ -491,6 +519,7 @@ func (h *HNSW) Insert(id uint32, v []float32) {
 	h.vecs = append(h.vecs, v)
 	h.level = append(h.level, lvl)
 	h.links = append(h.links, make([][]uint32, lvl+1))
+	h.visited = append(h.visited, 0)
 	if h.entry < 0 {
 		h.entry = idx
 		return
@@ -506,11 +535,10 @@ func (h *HNSW) Insert(id uint32, v []float32) {
 			maxLinks = h.m0
 		}
 		cands := h.searchLayer(lev, cur, v, h.efc, nil)
-		take := min(maxLinks, len(cands))
-		for _, c := range cands[:take] {
-			h.links[idx][lev] = append(h.links[idx][lev], uint32(c.idx))
-			lst := append(h.links[c.idx][lev], uint32(idx))
-			h.links[c.idx][lev] = h.pruneTo(maxLinks, lst, h.vecs[c.idx])
+		for _, n := range h.selectNeighbors(maxLinks, cands, v) {
+			h.links[idx][lev] = append(h.links[idx][lev], n)
+			lst := append(h.links[n][lev], uint32(idx))
+			h.links[n][lev] = h.pruneTo(maxLinks, lst, h.vecs[n])
 		}
 		if len(cands) > 0 {
 			cur = cands[0].idx
@@ -539,25 +567,55 @@ func (h *HNSW) greedyStep(lev, cur int, q []float32) int {
 	}
 }
 
-// pruneTo keeps the maxLinks neighbors closest to owner's vector.
+// selectNeighbors returns up to maxLinks diverse neighbors from cands
+// (sorted ascending by distance to base). A candidate is kept only if it
+// is closer to base than to every kept neighbor (Malkov & Yashunin
+// Algorithm 4); plain closest-first collapses clustered data into
+// disconnected islands. Unused slots fill with pruned candidates
+// (keep-pruned) so nodes stay connected.
+func (h *HNSW) selectNeighbors(maxLinks int, cands []cand, base []float32) []uint32 {
+	kept := make([]uint32, 0, maxLinks)
+	keptVecs := make([][]float32, 0, maxLinks)
+	used := make([]bool, len(cands))
+	for i, c := range cands {
+		if len(kept) >= maxLinks {
+			break
+		}
+		diverse := true
+		for _, kv := range keptVecs {
+			if Distance(h.metric, h.vecs[c.idx], kv) < c.d {
+				diverse = false
+				break
+			}
+		}
+		if diverse {
+			kept = append(kept, uint32(c.idx))
+			keptVecs = append(keptVecs, h.vecs[c.idx])
+			used[i] = true
+		}
+	}
+	for i := range cands {
+		if len(kept) >= maxLinks {
+			break
+		}
+		if !used[i] {
+			kept = append(kept, uint32(cands[i].idx))
+		}
+	}
+	return kept
+}
+
+// pruneTo re-selects owner's link list with the diversity heuristic.
 func (h *HNSW) pruneTo(maxLinks int, lst []uint32, owner []float32) []uint32 {
 	if len(lst) <= maxLinks {
 		return lst
 	}
-	type dn struct {
-		n uint32
-		d float64
-	}
-	ds := make([]dn, len(lst))
+	cs := make([]cand, len(lst))
 	for i, n := range lst {
-		ds[i] = dn{n, Distance(h.metric, owner, h.vecs[n])}
+		cs[i] = cand{int(n), Distance(h.metric, owner, h.vecs[n])}
 	}
-	sort.Slice(ds, func(i, j int) bool { return ds[i].d < ds[j].d })
-	out := make([]uint32, maxLinks)
-	for i := range out {
-		out[i] = ds[i].n
-	}
-	return out
+	sort.Slice(cs, func(i, j int) bool { return cs[i].d < cs[j].d })
+	return h.selectNeighbors(maxLinks, cs, owner)
 }
 
 // Search returns up to k nearest ids, ascending by score. alive may be
@@ -599,26 +657,33 @@ type cand struct {
 
 type candMin []cand
 
-func (a candMin) Len() int            { return len(a) }
-func (a candMin) Less(i, j int) bool  { return a[i].d < a[j].d }
-func (a candMin) Swap(i, j int)       { a[i], a[j] = a[j], a[i] }
-func (a *candMin) Push(x any)         { *a = append(*a, x.(cand)) }
-func (a *candMin) Pop() any           { old := *a; n := len(old); x := old[n-1]; *a = old[:n-1]; return x }
+func (a candMin) Len() int           { return len(a) }
+func (a candMin) Less(i, j int) bool { return a[i].d < a[j].d }
+func (a candMin) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a *candMin) Push(x any)        { *a = append(*a, x.(cand)) }
+func (a *candMin) Pop() any          { old := *a; n := len(old); x := old[n-1]; *a = old[:n-1]; return x }
 
 type candMax []cand
 
-func (a candMax) Len() int            { return len(a) }
-func (a candMax) Less(i, j int) bool  { return a[i].d > a[j].d }
-func (a candMax) Swap(i, j int)       { a[i], a[j] = a[j], a[i] }
-func (a *candMax) Push(x any)         { *a = append(*a, x.(cand)) }
-func (a *candMax) Pop() any           { old := *a; n := len(old); x := old[n-1]; *a = old[:n-1]; return x }
+func (a candMax) Len() int           { return len(a) }
+func (a candMax) Less(i, j int) bool { return a[i].d > a[j].d }
+func (a candMax) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a *candMax) Push(x any)        { *a = append(*a, x.(cand)) }
+func (a *candMax) Pop() any          { old := *a; n := len(old); x := old[n-1]; *a = old[:n-1]; return x }
 
 func (a candMax) peek() cand { return a[0] }
 
 // searchLayer expands up to ef best candidates at one level, starting
 // from ep. Returns the result set sorted ascending by distance.
 func (h *HNSW) searchLayer(lev, ep int, q []float32, ef int, alive func(uint32) bool) []cand {
-	visited := map[int]bool{ep: true}
+	h.stamp++
+	if h.stamp == 0 { // wrapped: reset all stamps
+		for i := range h.visited {
+			h.visited[i] = 0
+		}
+		h.stamp = 1
+	}
+	h.visited[ep] = h.stamp
 	cands := &candMin{{idx: ep, d: Distance(h.metric, q, h.vecs[ep])}}
 	results := &candMax{{idx: ep, d: (*cands)[0].d}}
 	for cands.Len() > 0 {
@@ -628,10 +693,10 @@ func (h *HNSW) searchLayer(lev, ep int, q []float32, ef int, alive func(uint32) 
 		}
 		for _, n := range h.links[c.idx][lev] {
 			ni := int(n)
-			if visited[ni] {
+			if h.visited[ni] == h.stamp {
 				continue
 			}
-			visited[ni] = true
+			h.visited[ni] = h.stamp
 			if alive != nil && !alive(h.ids[ni]) {
 				continue
 			}
@@ -654,13 +719,13 @@ func (h *HNSW) searchLayer(lev, ep int, q []float32, ef int, alive func(uint32) 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `go test ./internal/vector/ -run TestHNSW -v`
-Expected: PASS, 4 tests. If recall < 0.9 on the smoke test, first check `randomLevel`/`ml` wiring before touching the search loop.
+Expected: PASS, 4 tests.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add internal/vector/hnsw.go internal/vector/hnsw_test.go
-git commit -m "feat(vector): HNSW core - insert, layered search, dead filtering"
+git commit -m "feat(vector): HNSW core - heuristic insert, layered search, epoch visited"
 ```
 
 ---
@@ -676,12 +741,13 @@ git commit -m "feat(vector): HNSW core - insert, layered search, dead filtering"
 - Produces (used by Task 5):
   - `type VectorHit struct { Key string; Score float64 }`
   - `func NewState(metric Metric, dim, m, efc int, seed int64) *State`
-  - `func (s *State) Add(key string, v []float32)` — wrong dim silently skipped (intake layer sits above in Phase 1)
+  - `func (s *State) Add(key string, v []float32)` — wrong dim silently skipped; same-cycle re-Add replaces the overlay entry in place (newest wins the pack)
   - `func (s *State) Delete(key string) bool`
-  - `func (s *State) Search(q []float32, k, ef int) []VectorHit`
-  - `func (s *State) Pack(force bool)` — packs overlay at ≥2048 or force; cascades merges; compacts
+  - `func (s *State) Search(q []float32, k, ef int) []VectorHit` — wrong-dim q returns nil
+  - `func (s *State) Pack(force bool)`
   - `func (s *State) OverlayLen() int`
   - consts `packSize = 2048`, `tierFactor = 4`
+- Memory rule (load-bearing, measured): overlay and tier slices are dropped with `nil`, never truncated with `[:0]` — a truncated slice's backing array keeps stale entry/segment pointers alive (heap bitmap scans the whole object), pinning dead vectors and inflating steady-state memory 2.5×.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -694,42 +760,22 @@ import (
 	"testing"
 )
 
-func stateRecall(t *testing.T, s *State, keys []string, vecs [][]float32, q []float32, k int) float64 {
-	t.Helper()
-	got := s.Search(q, k, 64)
-	hit := 0
-	truth := bruteTopKeys(vecs, q, k)
-	for _, g := range got {
-		if truth[g.Key] {
-			hit++
-		}
-	}
-	return float64(hit) / float64(k)
-}
-
-// bruteTopKeys is the exact top-k key set for small unit-test sizes.
-func bruteTopKeys(vecs [][]float32, q []float32, k int) map[string]bool {
-	type kv struct {
-		i int
-		d float64
-	}
-	qn := Normalize(q)
-	all := make([]kv, len(vecs))
-	for i, v := range vecs {
-		all[i] = kv{i, Distance(Cosine, qn, v)}
-	}
-	for i := 0; i < k; i++ {
-		for j := i + 1; j < len(all); j++ {
-			if all[j].d < all[i].d {
-				all[i], all[j] = all[j], all[i]
-			}
-		}
-	}
+// bruteTopKeyed returns the exact top-k key set over (vecs, keys).
+func bruteTopKeyed(vecs [][]float32, keys []string, q []float32, k int) map[string]bool {
 	out := map[string]bool{}
-	for i := 0; i < k && i < len(all); i++ {
-		out[fmt.Sprintf("k%d", all[i].i)] = true
+	for _, i := range bruteTopIDs(vecs, q, k) {
+		out[keys[i]] = true
 	}
 	return out
+}
+
+// indexKeys returns k0..k{len(vecs)-1}.
+func indexKeys(n int) []string {
+	keys := make([]string, n)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("k%d", i)
+	}
+	return keys
 }
 
 func TestStateOverlayImmediateVisibility(t *testing.T) {
@@ -758,8 +804,32 @@ func TestStateUpdateShadowsOld(t *testing.T) {
 		t.Fatalf("updated key must still be found, got %+v", got)
 	}
 	got = s.Search(old, 1, 64)
-	if len(got) == 1 && got[0].Key == "k" && got[0].Score < Distance(Cosine, fresh, old) {
+	if len(got) == 1 && got[0].Key == "k" && got[0].Score < 0.5 {
 		t.Fatal("query near the OLD vector must not return the new vector at a tiny score")
+	}
+}
+
+// TestStateSameCycleUpdate: the same key added twice within one overlay
+// cycle must keep only the newest vector through the pack (spec §4.2).
+func TestStateSameCycleUpdate(t *testing.T) {
+	s := NewState(Cosine, 4, 16, 200, 1)
+	old := Normalize([]float32{1, 0, 0, 0})
+	s.Add("k", old)
+	for i := 0; i < 100; i++ {
+		s.Add(fmt.Sprintf("f%d", i), normalizeRand(rand.New(rand.NewSource(int64(i))), 4))
+	}
+	fresh := Normalize([]float32{0, 1, 0, 0})
+	s.Add("k", fresh)
+	s.Pack(true)
+	got := s.Search(fresh, 1, 64)
+	if len(got) != 1 || got[0].Key != "k" || got[0].Score > 1e-6 {
+		t.Fatalf("newest vector must win the pack: %+v", got)
+	}
+	got = s.Search(old, 3, 64)
+	for _, g := range got {
+		if g.Key == "k" && g.Score < 0.5 {
+			t.Fatalf("old vector leaked with tiny score: %+v", g)
+		}
 	}
 }
 
@@ -781,6 +851,14 @@ func TestStateDeleteAndRevive(t *testing.T) {
 	}
 }
 
+func TestStateWrongDimQuery(t *testing.T) {
+	s := NewState(Cosine, 4, 16, 200, 1)
+	s.Add("k", Normalize([]float32{1, 0, 0, 0}))
+	if got := s.Search([]float32{1, 0, 0}, 1, 64); got != nil {
+		t.Fatal("wrong-dim query must return nil")
+	}
+}
+
 func TestStateTierCascadeRecall(t *testing.T) {
 	const n, dim = 6000, 32 // 3 packs -> L0 merge -> L1
 	rng := rand.New(rand.NewSource(21))
@@ -797,10 +875,19 @@ func TestStateTierCascadeRecall(t *testing.T) {
 	if s.OverlayLen() != 0 {
 		t.Fatal("pack must clear the overlay")
 	}
+	keys := indexKeys(n)
 	recall := 0.0
 	for qi := 0; qi < 20; qi++ {
 		q := vecs[rng.Intn(n)]
-		recall += stateRecall(t, s, nil, vecs, q, 10)
+		got := s.Search(q, 10, 64)
+		truth := bruteTopKeyed(vecs, keys, q, 10)
+		hit := 0
+		for _, g := range got {
+			if truth[g.Key] {
+				hit++
+			}
+		}
+		recall += float64(hit) / 10
 	}
 	recall /= 20
 	if recall < 0.9 {
@@ -808,6 +895,9 @@ func TestStateTierCascadeRecall(t *testing.T) {
 	}
 }
 
+// TestStateDeathCompaction verifies the 30% compaction path. Ground truth
+// is computed over LIVE vectors only — half the space is dead, so a
+// whole-space truth would cap recall near 0.6 by construction.
 func TestStateDeathCompaction(t *testing.T) {
 	const n, dim = 4096, 16
 	rng := rand.New(rand.NewSource(31))
@@ -822,11 +912,17 @@ func TestStateDeathCompaction(t *testing.T) {
 		s.Delete(fmt.Sprintf("k%d", i))
 	}
 	s.Pack(true) // triggers compaction pass
+	live := make([][]float32, 0, n/2)
+	liveKeys := make([]string, 0, n/2)
+	for i := 1; i < n; i += 2 {
+		live = append(live, vecs[i])
+		liveKeys = append(liveKeys, fmt.Sprintf("k%d", i))
+	}
 	recall := 0.0
 	for qi := 0; qi < 20; qi++ {
-		q := vecs[rng.Intn(n)]
+		q := vecs[2*rng.Intn(n/2)+1] // query at a live point
 		got := s.Search(q, 10, 64)
-		truth := bruteTopKeys(vecs, q, 12)
+		truth := bruteTopKeyed(live, liveKeys, q, 10)
 		hit := 0
 		for _, g := range got {
 			if truth[g.Key] {
@@ -836,11 +932,39 @@ func TestStateDeathCompaction(t *testing.T) {
 		recall += float64(hit) / 10
 	}
 	recall /= 20
-	if recall < 0.8 { // half the space is dead; 12-deep truth window
-		t.Fatalf("post-compaction recall@10 = %.3f, want >= 0.8", recall)
+	if recall < 0.9 {
+		t.Fatalf("post-compaction recall@10 = %.3f, want >= 0.9 (live-only truth)", recall)
+	}
+}
+
+// TestStateNoPhantomRetention guards the nil-drop memory rule: after a
+// build with cascading merges, live heap stays close to one vector copy.
+func TestStateNoPhantomRetention(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode")
+	}
+	const n, dim = 8192, 128
+	rng := rand.New(rand.NewSource(41))
+	s := NewState(Cosine, dim, 16, 200, 43)
+	for i := 0; i < n; i++ {
+		s.Add(fmt.Sprintf("k%d", i), normalizeRand(rng, dim))
+		if (i+1)%packSize == 0 {
+			s.Pack(false)
+		}
+	}
+	s.Pack(true)
+	runtime.GC()
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	runtime.KeepAlive(s)
+	amp := float64(ms.HeapAlloc) / float64(n*dim*4)
+	if amp > 1.6 {
+		t.Fatalf("live heap amplification = %.2fx, want <= 1.6 (stale-pointer retention?)", amp)
 	}
 }
 ```
+
+(`runtime` import needed: `"runtime"`.)
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -892,6 +1016,7 @@ type State struct {
 	dead    map[uint32]struct{} // vid tombstones; revive clears (spec §4.4)
 
 	overlay []entry
+	ovIdx   map[uint32]int // vid -> overlay position: same-cycle update replaces in place
 	tiers   [][]*segment
 	seq     uint64
 }
@@ -912,11 +1037,14 @@ func NewState(metric Metric, dim, m, efc int, seed int64) *State {
 		vidOf:  map[string]uint32{},
 		keyOf:  map[uint32]string{},
 		dead:   map[uint32]struct{}{},
+		ovIdx:  map[uint32]int{},
 	}
 }
 
 // Add upserts key's vector. Wrong-dim vectors are skipped silently; the
 // NormalizeVec intake layer above this decides skip+warning (Phase 1).
+// A same-cycle re-Add of an existing key replaces its overlay entry in
+// place: the newest vector must survive the pack (spec §4.2 seq rule).
 func (s *State) Add(key string, v []float32) {
 	if len(v) != s.dim {
 		return
@@ -934,7 +1062,13 @@ func (s *State) Add(key string, v []float32) {
 	} else {
 		v = append([]float32(nil), v...)
 	}
-	s.overlay = append(s.overlay, entry{vid: vid, seq: s.seq, vec: v})
+	e := entry{vid: vid, seq: s.seq, vec: v}
+	if pos, ok := s.ovIdx[vid]; ok {
+		s.overlay[pos] = e
+	} else {
+		s.overlay = append(s.overlay, e)
+		s.ovIdx[vid] = len(s.overlay) - 1
+	}
 	s.seq++
 }
 
@@ -958,9 +1092,10 @@ func (s *State) alive(vid uint32) bool {
 
 // Search merges all live segments and the overlay; the same vid resolves
 // to its most recent occurrence (overlay beats segments, higher segment
-// seq beats lower). Returns up to k hits ascending by score.
+// seq beats lower). Returns up to k hits ascending by score. A wrong-dim
+// query returns nil.
 func (s *State) Search(q []float32, k, ef int) []VectorHit {
-	if k <= 0 {
+	if k <= 0 || len(q) != s.dim {
 		return nil
 	}
 	if ef < k {
@@ -1016,14 +1151,18 @@ func (s *State) Pack(force bool) {
 	if !force && len(s.overlay) < packSize {
 		return
 	}
-	seg := &segment{seq: s.seq, h: NewHNSW(s.metric, s.m, s.efc, s.seed+s.seq)}
+	seg := &segment{seq: s.seq, h: NewHNSW(s.metric, s.m, s.efc, s.seed+int64(s.seq))}
 	s.seq++
 	for _, e := range s.overlay {
 		if s.alive(e.vid) {
 			seg.h.Insert(e.vid, e.vec)
 		}
 	}
-	s.overlay = s.overlay[:0]
+	// Drop instead of truncating: a [:0] slice keeps stale entry pointers
+	// alive in the backing array (heap bitmap scans the whole object),
+	// pinning dead vectors and inflating steady-state memory.
+	s.overlay = nil
+	s.ovIdx = map[uint32]int{}
 	carry := seg
 	for i := 0; carry != nil; i++ {
 		for i >= len(s.tiers) {
@@ -1034,7 +1173,7 @@ func (s *State) Pack(force bool) {
 			break
 		}
 		a, b := s.tiers[i][0], s.tiers[i][1]
-		s.tiers[i] = s.tiers[i][:0]
+		s.tiers[i] = nil // nil, not [:0]: stale segment pointers pin dead graphs
 		carry = s.mergeSegments(a, b)
 	}
 	s.compact()
@@ -1045,7 +1184,7 @@ func (s *State) Pack(force bool) {
 // and therefore holds the newer update (spec §4.2).
 func (s *State) mergeSegments(a, b *segment) *segment {
 	seen := map[uint32]bool{}
-	merged := &segment{seq: s.seq, h: NewHNSW(s.metric, s.m, s.efc, s.seed+s.seq)}
+	merged := &segment{seq: s.seq, h: NewHNSW(s.metric, s.m, s.efc, s.seed+int64(s.seq))}
 	s.seq++
 	for _, seg := range []*segment{b, a} {
 		ids, vecs := seg.h.All()
@@ -1066,6 +1205,9 @@ func (s *State) compact() {
 	for _, tier := range s.tiers {
 		for i, seg := range tier {
 			ids, vecs := seg.h.All()
+			if len(ids) == 0 {
+				continue
+			}
 			dead := 0
 			for _, id := range ids {
 				if !s.alive(id) {
@@ -1075,7 +1217,7 @@ func (s *State) compact() {
 			if dead == 0 || float64(dead)/float64(len(ids)) <= threshold {
 				continue
 			}
-			fresh := &segment{seq: s.seq, h: NewHNSW(s.metric, s.m, s.efc, s.seed+s.seq)}
+			fresh := &segment{seq: s.seq, h: NewHNSW(s.metric, s.m, s.efc, s.seed+int64(s.seq))}
 			s.seq++
 			for j, id := range ids {
 				if s.alive(id) {
@@ -1091,7 +1233,7 @@ func (s *State) compact() {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `go test ./internal/vector/ -run TestState -v`
-Expected: PASS, 5 tests.
+Expected: PASS, 8 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1121,9 +1263,6 @@ package vector
 import "testing"
 
 func TestAdaptiveEf(t *testing.T) {
-	if got := AdaptiveEf(10, 1_000_000, 8); got != 160 { // 8*19.93 = 159.5 -> 159? floor carefully
-		t.Logf("c8@1M = %d", got) // see Step 3 note; assertion below is the contract
-	}
 	if got := AdaptiveEf(10, 1000, 0.5); got != 64 { // below floor
 		t.Fatalf("floor = %d, want 64", got)
 	}
@@ -1132,6 +1271,9 @@ func TestAdaptiveEf(t *testing.T) {
 	}
 	if got := AdaptiveEf(10, 1, 8); got != 64 { // degenerate n
 		t.Fatalf("n=1 = %d, want 64", got)
+	}
+	if got := AdaptiveEf(10, 1<<20, 8); got != 160 { // log2(2^20) = 20 exact
+		t.Fatalf("c8@1M = %d, want 160", got)
 	}
 }
 ```
@@ -1164,12 +1306,10 @@ func AdaptiveEf(k, n int, c float64) int {
 }
 
 // DefaultC is the adaptive-ef constant locked from the Phase 0 recall-ef
-// sweep (Task 6). 0 means "not locked yet"; Phase 1 callers must treat 0
-// as "use plain 64".
+// sweep (Task 6). 0 means "not locked yet"; callers must treat 0 as
+// "use plain 64".
 var DefaultC float64
 ```
-
-Note: the first assertion in Step 1 is a `t.Logf` probe, not a hard equality — int conversion rounding is not part of the contract. The hard assertions are the floor, k-floor, and degenerate cases.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1185,7 +1325,7 @@ git commit -m "feat(vector): adaptive ef formula (max(64, c*log2(n)), floor k)"
 
 ---
 
-### Task 5: Benchmark harness (generators, brute truth, smoke gate, report writer)
+### Task 5: Benchmark harness (generators, brute truth, smoke gate, staged report)
 
 **Files:**
 - Create: `internal/vector/bench_test.go`
@@ -1194,18 +1334,21 @@ git commit -m "feat(vector): adaptive ef formula (max(64, c*log2(n)), floor k)"
 - Consumes: Tasks 1–4
 - Produces (test-only, used by Task 6):
   - `genUniform(rng *rand.Rand, n, dim int) [][]float32`
-  - `genClustered(rng *rand.Rand, n, dim int) [][]float32` (n/100 jittered clusters, normalized)
-  - `bruteTopIDs(vecs [][]float32, q []float32, k int) []int` (Cosine truth)
-  - `TestRecallSmoke` — always runs: 2k×64 clustered, ≥0.85 recall@10 at ef 32
-  - `TestSpikeReport` — skipped unless `VECTRA_SPIKE_FULL=1`; runs the matrix {10k,100k,1M}×{384,768} clustered + 100k×768 uniform + ef sweep at 100k×768 ({32,48,64,96,128,192}); writes `docs/benchmarks/2026-10-19-vector-spike.md`
+  - `genClustered(rng *rand.Rand, n, dim int) [][]float32` — angular-spread clusters (target intra-cluster cosine 0.85, sigma solved per dim)
+  - `bruteTopIDs(vecs [][]float32, q []float32, k int) []int` (Cosine truth) — replaces the temporary shim from Task 2
+  - `buildState(vecs [][]float32, m, efc int, seed int64) *State` — batches of packSize, final forced pack
+  - `recallOf(s *State, vecs [][]float32, queries [][]float32, k, ef int) float64`
+  - `TestRecallSmoke` — always runs: 2k×64 clustered, independent queries, ≥ 0.95 recall@10 at ef 96 (calibrated: 0.990)
+  - `TestSpikeReport` — skipped unless `VECTRA_SPIKE_FULL=1`; stage selected by `VECTRA_SPIKE_CELLS` (`10k` / `100k` / `1m` / `sweep` / `all`, default `all`); writes `docs/benchmarks/2026-10-19-vector-spike.md`
 
-- [ ] **Step 1: Write TestRecallSmoke and the harness (failing: helpers absent is fine — this task ADDS the harness; the failing-first gate is TestRecallSmoke asserting on State which exists from Task 3)**
+- [ ] **Step 1: Write the harness and smoke test**
 
 ```go
 package vector
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -1227,16 +1370,22 @@ func genUniform(rng *rand.Rand, n, dim int) [][]float32 {
 	return vecs
 }
 
-// genClustered builds n vectors in max(1, n/100) jittered clusters —
-// closer to real embedding geometry than uniform noise.
+// genClustered builds n vectors in max(1, n/100) clusters with a target
+// intra-cluster cosine similarity (angular spread, real-embedding-like).
+// Per-component jitter does NOT model embeddings: at 768 dims it
+// normalizes into near-uniform noise with near-tie distances everywhere,
+// where no ANN can hit a strict top-k set-match line. Instead: gaussian
+// noise with sigma solved from cos ~= 1/sqrt(1+dim*sigma^2) = targetCos.
 func genClustered(rng *rand.Rand, n, dim int) [][]float32 {
+	const targetCos = 0.85
+	sigma := math.Sqrt(1/(targetCos*targetCos)-1) / math.Sqrt(float64(dim))
 	centers := genUniform(rng, max(1, n/100), dim)
 	vecs := make([][]float32, n)
 	for i := range vecs {
 		c := centers[rng.Intn(len(centers))]
 		v := make([]float32, dim)
 		for j := range v {
-			v[j] = c[j] + (rng.Float32()*2-1)*0.05
+			v[j] = c[j] + float32(rng.NormFloat64()*sigma)
 		}
 		vecs[i] = Normalize(v)
 	}
@@ -1262,7 +1411,9 @@ func bruteTopIDs(vecs [][]float32, q []float32, k int) []int {
 	return out
 }
 
-// buildState simulates sustained write: batches of packSize, pack each.
+// buildState simulates sustained write: batches of packSize, pack each,
+// final forced pack (the final pack is load-bearing: without it the tail
+// stays in the overlay and the linear scan masks real recall).
 func buildState(vecs [][]float32, m, efc int, seed int64) (*State, time.Duration) {
 	s := NewState(Cosine, len(vecs[0]), m, efc, seed)
 	start := time.Now()
@@ -1303,35 +1454,37 @@ func percentiles(times []time.Duration) (p50, p99 time.Duration) {
 	return
 }
 
+// TestRecallSmoke: always-run quality gate. Calibrated 2026-10-19 at
+// 0.990 recall on this exact configuration; the 0.95 line has margin.
 func TestRecallSmoke(t *testing.T) {
 	const n, dim = 2000, 64
-	rng := rand.New(rand.NewSource(101))
-	vecs := genClustered(rng, n, dim)
+	vecs := genClustered(rand.New(rand.NewSource(101)), n, dim)
 	s, _ := buildState(vecs, 16, 200, 103)
-	queries := vecs[n-40:]
-	if r := recallOf(s, vecs, queries, 10, 32); r < 0.85 {
-		t.Fatalf("smoke recall@10 = %.3f, want >= 0.85", r)
+	queries := genClustered(rand.New(rand.NewSource(777)), 40, dim) // independent
+	if r := recallOf(s, vecs, queries, 10, 96); r < 0.95 {
+		t.Fatalf("smoke recall@10 = %.4f, want >= 0.95", r)
 	}
 }
 
-// runCell measures one matrix cell: recall@10, p50/p99, heap amplification.
+// cellResult is one matrix cell measurement.
 type cellResult struct {
-	n, dim      int
-	dist        string
-	ef          int
-	recall      float64
-	p50, p99    time.Duration
-	buildTime   time.Duration
-	heapAmp     float64
+	n, dim    int
+	dist      string
+	ef        int
+	recall    float64
+	p50, p99  time.Duration
+	p99Over   time.Duration // p99 with overlay at full 2048 (spec 口径)
+	buildTime time.Duration
+	liveAmp   float64 // HeapAlloc after GC / (n*dim*4)
+	inuseAmp  float64 // HeapInuse after GC / (n*dim*4)
 }
 
-func runCell(n, dim int, dist string, ef int) cellResult {
-	var rng *rand.Rand
-	if dist == "clustered" {
-		rng = rand.New(rand.NewSource(1000 + n))
-	} else {
-		rng = rand.New(rand.NewSource(2000 + n))
+func runCell(n, dim int, dist string, ef int, measureOverlay bool) cellResult {
+	seed := int64(1000 + n)
+	if dist == "uniform" {
+		seed = int64(2000 + n)
 	}
+	rng := rand.New(rand.NewSource(seed))
 	var vecs [][]float32
 	if dist == "clustered" {
 		vecs = genClustered(rng, n, dim)
@@ -1339,7 +1492,7 @@ func runCell(n, dim int, dist string, ef int) cellResult {
 		vecs = genUniform(rng, n, dim)
 	}
 	s, build := buildState(vecs, 16, 200, 999)
-	queries := vecs[n-min(n, 50):]
+	queries := genClustered(rand.New(rand.NewSource(777)), 50, dim)
 	r := recallOf(s, vecs, queries, 10, ef)
 	times := make([]time.Duration, len(queries))
 	for i, q := range queries {
@@ -1348,42 +1501,86 @@ func runCell(n, dim int, dist string, ef int) cellResult {
 		times[i] = time.Since(start)
 	}
 	p50, p99 := percentiles(times)
+	p99Over := time.Duration(0)
+	if measureOverlay {
+		// Fill the overlay to packSize with fresh vectors, re-time:
+		// spec's p99 line is measured with overlay at full 2048.
+		extra := genUniform(rand.New(rand.NewSource(4242)), packSize, dim)
+		for i, v := range extra {
+			s.Add(fmt.Sprintf("ov%d", i), v)
+		}
+		over := make([]time.Duration, len(queries))
+		for i, q := range queries {
+			start := time.Now()
+			s.Search(q, 10, ef)
+			over[i] = time.Since(start)
+		}
+		_, p99Over = percentiles(over)
+	}
+	vecs = nil
+	queries = nil
+	runtime.GC()
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
-	heapAmp := float64(ms.HeapInuse) / float64(n*dim*4)
-	return cellResult{n, dim, dist, ef, r, p50, p99, build, heapAmp}
+	runtime.KeepAlive(s)
+	theory := float64(n * dim * 4)
+	return cellResult{n, dim, dist, ef, r, p50, p99, p99Over, build,
+		float64(ms.HeapAlloc) / theory, float64(ms.HeapInuse) / theory}
 }
 
-// TestSpikeReport runs the full Phase 0 matrix and writes the benchmark
-// report. Gated: VECTRA_SPIKE_FULL=1 (full run takes tens of minutes and
-// multi-GB heap at the 1M cells).
+func (c cellResult) row() string {
+	return fmt.Sprintf("| %d | %d | %s | %d | %.4f | %s | %s | %s | %s | %.2fx | %.2fx |",
+		c.n, c.dim, c.dist, c.ef, c.recall,
+		c.p50.Round(time.Microsecond), c.p99.Round(time.Microsecond),
+		c.p99Over.Round(time.Microsecond), c.buildTime.Round(time.Millisecond),
+		c.liveAmp, c.inuseAmp)
+}
+
+// TestSpikeReport runs matrix stages and writes the report. Stages:
+// VECTRA_SPIKE_CELLS = 10k | 100k | 1m | sweep | all (default all).
+// Wall-time expectations (M5 Pro, calibrated): 10k cells ~1 min each;
+// 100k ~15-25 min each; 1M cells are hours each — run them as separate
+// overnight invocations with -timeout 0.
 func TestSpikeReport(t *testing.T) {
 	if os.Getenv("VECTRA_SPIKE_FULL") == "" {
 		t.Skip("set VECTRA_SPIKE_FULL=1 to run the full spike matrix")
 	}
+	stage := os.Getenv("VECTRA_SPIKE_CELLS")
+	if stage == "" {
+		stage = "all"
+	}
 	var cells []cellResult
-	for _, n := range []int{10_000, 100_000, 1_000_000} {
-		for _, dim := range []int{384, 768} {
-			cells = append(cells, runCell(n, dim, "clustered", 64))
+	run := func(n, dim int, dist string, ef int, ov bool) {
+		c := runCell(n, dim, dist, ef, ov)
+		cells = append(cells, c)
+		t.Logf("cell: %s", c.row())
+	}
+	if stage == "10k" || stage == "all" {
+		run(10_000, 384, "clustered", 64, true)
+		run(10_000, 768, "clustered", 64, true)
+	}
+	if stage == "100k" || stage == "all" {
+		run(100_000, 384, "clustered", 64, true)
+		run(100_000, 768, "clustered", 64, true)
+		run(100_000, 768, "uniform", 64, false)
+	}
+	if stage == "sweep" || stage == "all" {
+		for _, ef := range []int{32, 48, 64, 96, 128, 192} {
+			run(100_000, 768, "clustered", ef, false)
 		}
 	}
-	cells = append(cells, runCell(100_000, 768, "uniform", 64))
-	var sweep []cellResult
-	for _, ef := range []int{32, 48, 64, 96, 128, 192} {
-		sweep = append(sweep, runCell(100_000, 768, "clustered", ef))
+	if stage == "1m" || stage == "all" {
+		run(1_000_000, 384, "clustered", 128, true) // matrix rows at fixed ef
+		run(1_000_000, 768, "clustered", 128, true) // adaptive-ef verification is Task 6 Step 2
 	}
 	report := "# Vector Phase 0 Spike Report (auto-generated)\n\n"
-	report += "Matrix (Cosine, M=16, EfC=200, seeds fixed):\n\n"
-	report += "| N | dim | dist | ef | recall@10 | p50 | p99 | build | heap amp |\n|---|---|---|---|---|---|---|---|---|\n"
+	report += "Matrix (Cosine, M=16, EfC=200, seeds fixed, independent queries):\n\n"
+	report += "| N | dim | dist | ef | recall@10 | p50 | p99 | p99(ov2048) | build | liveAmp | inuseAmp |\n|---|---|---|---|---|---|---|---|---|---|---|\n"
 	for _, c := range cells {
-		report += fmt.Sprintf("| %d | %d | %s | %d | %.4f | %s | %s | %s | %.2fx |\n",
-			c.n, c.dim, c.dist, c.ef, c.recall, c.p50, c.p99, c.buildTime.Round(time.Millisecond), c.heapAmp)
+		report += c.row() + "\n"
 	}
-	report += "\nef sweep (100k x 768, clustered):\n\n| ef | recall@10 | p99 |\n|---|---|---|\n"
-	for _, c := range sweep {
-		report += fmt.Sprintf("| %d | %.4f | %s |\n", c.ef, c.recall, c.p99)
-	}
-	report += "\nAcceptance (门 2a, spec §10.3) and the locked DefaultC value are filled in by Task 6.\n"
+	report += "\nStage: " + stage + "\n"
+	report += "\nAcceptance (门 2a, spec §10.3), the DefaultC lock, and the verdict are completed by Task 6.\n"
 	path := filepath.Join("..", "..", "docs", "benchmarks", "2026-10-19-vector-spike.md")
 	if err := os.WriteFile(path, []byte(report), 0o644); err != nil {
 		t.Fatal(err)
@@ -1392,10 +1589,12 @@ func TestSpikeReport(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run smoke test to verify it fails-or-passes honestly**
+Also in this step: **delete the temporary `bruteTopIDs` shim** from `hnsw_test.go` (marked in Task 2).
+
+- [ ] **Step 2: Run smoke test**
 
 Run: `go test ./internal/vector/ -run TestRecallSmoke -v`
-Expected: PASS if Tasks 1–3 are correct (this task's failing-first gate is the compile of the harness itself; recall regression is the assertion). If it FAILs below 0.85, the defect is in Tasks 1–3 — fix there, not by loosening this test.
+Expected: PASS with margin (calibrated 0.990). If it fails below 0.95, the defect is in Tasks 1–3 — fix there, never loosen this test.
 
 - [ ] **Step 3: Verify the report test skips cleanly**
 
@@ -1405,13 +1604,13 @@ Expected: SKIP ("set VECTRA_SPIKE_FULL=1...").
 - [ ] **Step 4: Run the whole package**
 
 Run: `go test ./internal/vector/ -v`
-Expected: all PASS, TestSpikeReport SKIP.
+Expected: all PASS, TestSpikeReport SKIP. (`-short` skips the retention test too.)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add internal/vector/bench_test.go
-git commit -m "test(vector): phase-0 benchmark harness - generators, brute truth, smoke gate, report writer"
+git add internal/vector/bench_test.go internal/vector/hnsw_test.go
+git commit -m "test(vector): phase-0 benchmark harness - angular clusters, brute truth, staged report"
 ```
 
 ---
@@ -1424,16 +1623,26 @@ git commit -m "test(vector): phase-0 benchmark harness - generators, brute truth
 - Modify: `docs/superpowers/specs/2026-10-19-vector-search-design.md` (实现期偏差记录 appendix only)
 
 **Interfaces:**
-- Consumes: `TestSpikeReport` from Task 5, 门 2a lines from Global Constraints
+- Consumes: `TestSpikeReport` stages from Task 5, 门 2a lines from Global Constraints
 
-- [ ] **Step 1: Run the full matrix**
+- [ ] **Step 1: Run the stages**
 
-Run: `VECTRA_SPIKE_FULL=1 go test ./internal/vector/ -run TestSpikeReport -v -timeout 2h`
-Expected: PASS; report file written. 1M cells need ~3GB+ heap each — run on a machine with headroom. If the run OOMs, reduce to N=500_000 for the 768-dim cell and record the substitution in the report + spec deviation log.
+Wall-time expectations (calibrated on M5 Pro: 10k×768 build ≈ 50 s; insert cost grows ~log N; tier merges amortize ~2.5× rebuild work). Run each stage as its own invocation, `-timeout 0` (no cap):
 
-- [ ] **Step 2: Lock DefaultC from the sweep**
+```bash
+VECTRA_SPIKE_FULL=1 VECTRA_SPIKE_CELLS=10k   go test ./internal/vector/ -run TestSpikeReport -v -timeout 0   # ~2 min
+VECTRA_SPIKE_FULL=1 VECTRA_SPIKE_CELLS=100k  go test ./internal/vector/ -run TestSpikeReport -v -timeout 0   # ~1-1.5 h
+VECTRA_SPIKE_FULL=1 VECTRA_SPIKE_CELLS=sweep go test ./internal/vector/ -run TestSpikeReport -v -timeout 0   # ~1-1.5 h
+VECTRA_SPIKE_FULL=1 VECTRA_SPIKE_CELLS=1m    go test ./internal/vector/ -run TestSpikeReport -v -timeout 0   # hours; overnight
+```
 
-From the sweep table (100k×768 clustered): find the smallest ef* with recall ≥ 0.95. Compute `c = ef* / log2(100_000)`. Then verify against the 1M×768 cell: recall at `ef = AdaptiveEf(10, 1_000_000, c)` must be ≥ 0.95; if it is not, raise c to the next sweep step and re-verify (a one-off `go test -run TestSpikeReport` variant or a tiny temporary test is acceptable for the verification; record the chosen c). Set the value in ef.go:
+Each invocation overwrites the report with its own stage's rows — **copy each stage's table out before running the next** (assemble the final report from the four stage outputs). If a 1M cell OOMs, substitute N=500_000 for the failing cell and record the substitution in the report and the spec deviation log.
+
+- [ ] **Step 2: Lock DefaultC from the sweep (with termination)**
+
+From the sweep table (100k×768 clustered): collect every sweep ef with recall ≥ 0.95 and derive candidate constants `c_i = ef_i / log2(100_000)`, ascending. For each candidate in order, verify the 1M×768 cell at `ef = AdaptiveEf(10, 1_000_000, c_i)` (re-run the 1M cell once per candidate; a small temporary test or env-driven ef in TestSpikeReport is acceptable — record what you did). The FIRST candidate passing recall ≥ 0.95 at 1M locks `DefaultC`. **Termination:** if no candidate passes (including the largest, c ≈ 192/log2(1e5) ≈ 11.6), stop — the verdict is FAIL, go to Step 3. Do not invent candidates above the sweep range.
+
+Set the value in ef.go:
 
 ```go
 // DefaultC is the adaptive-ef constant locked from the Phase 0 recall-ef
@@ -1441,9 +1650,9 @@ From the sweep table (100k×768 clustered): find the smallest ef* with recall �
 var DefaultC float64 = <measured value>
 ```
 
-- [ ] **Step 3: Re-run acceptance with adaptive ef**
+- [ ] **Step 3: Fill the 门 2a verdict table in the report**
 
-Add the measured 1M×768 adaptive-ef recall/p99 to the report's acceptance section. Fill the 门 2a verdict table:
+From the measured 1M×768 cell (adaptive ef) and its overlay-full p99 column:
 
 ```markdown
 ## 门 2a verdict
@@ -1451,23 +1660,22 @@ Add the measured 1M×768 adaptive-ef recall/p99 to the report's acceptance secti
 | line (spec §10.3) | measured | pass |
 |---|---|---|
 | recall@10 ≥ 0.95 (1M×768 clustered, adaptive ef) | <value> | yes/no |
-| query p99 < 10ms (same, overlay ≤ 2048 — note: matrix queries run on a packed state; an overlay-full variant adds ~2-4ms, state the sum) | <value> | yes/no |
-| memory amplification ≤ 1.6× | <value> | yes/no |
+| query p99 < 10ms (same, measured with overlay = 2048) | <value> | yes/no |
+| memory amplification ≤ 1.6× (live, HeapAlloc after GC) | <value> | yes/no |
 ```
 
-If any line fails: do NOT tune thresholds. Write the failure into the report, append a spec deviation entry, and report the miss to the controller (门 2a verdict = FAIL is a legitimate outcome; the plan does not force a pass).
+If any line fails: do NOT tune thresholds. Write the failure into the report, append a spec deviation entry, and report the miss to the controller. FAIL is a legitimate outcome; the plan does not force a pass.
 
 - [ ] **Step 4: Append spec deviation log entries**
 
-Append to the spec's 实现期偏差记录 (appendix only):
+Append to the spec's 实现期偏差记录 (appendix only; adjust to what actually happened):
 
 ```markdown
 - Phase 0 (2026-10-19): dead set is a plain map[uint32]struct{} rather than a chunked bitmap (D6 allows implementation reuse; bitmap swap lands with Phase 1 integration).
-- Phase 0 (2026-10-19): neighbor selection is closest-first; the heuristic variant is deferred (recall target met without it — see report).
-- Phase 0 (2026-10-19): benchmark matrix is Cosine-only; L2/Dot covered by unit tests (Global Constraints note).
+- Phase 0 (2026-10-19): dead-vid hit counting (spec §4.3) deferred — no Phase 0 consumer.
+- Phase 0 (2026-10-19): benchmark matrix is Cosine-only; L2/Dot covered by unit tests.
+- Phase 0 (2026-10-19): memory口径 pinned to live HeapAlloc after explicit GC (spec's "常驻"); HeapInuse reported alongside for span-level visibility.
 ```
-
-(Adjust if the implementer made different calls — record what actually happened.)
 
 - [ ] **Step 5: Run the full package once more**
 
