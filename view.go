@@ -103,6 +103,12 @@ type viewBuild struct {
 	nodeID  map[string]NodeID
 	baseLab map[string]uint32
 	nodeN   int
+	// deadBase/killed carry the aggregated shadow sets of the appended
+	// sources (copy-on-write chunks) so per-publish assembly extends them
+	// with the new layer's kills only — re-aggregating the whole stack per
+	// publish was the writer's dominant cost (2026-10-17 round 3).
+	deadBase engine.KillSet
+	killed   engine.KillSet
 }
 
 func newViewBuild(v *genView) *viewBuild {
@@ -192,6 +198,8 @@ func (vb *viewBuild) appendLayer(v *genView, i int) {
 	for k, ids := range own {
 		vb.live[k] = append(vb.live[k], ids...)
 	}
+	vb.deadBase = vb.deadBase.With(s.deadBase)
+	vb.killed = vb.killed.With(s.killed)
 	vb.sources = append(vb.sources, s)
 	vb.builtTo++
 }

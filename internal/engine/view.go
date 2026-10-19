@@ -57,9 +57,9 @@ type View struct {
 	nodeCount int      // union ID-space size (arrays are sized by this)
 	labels    []string // joint label table
 	labelID   map[string]uint32
-	remap     [][]uint32      // per source: local label ID -> joint label ID
-	deadBase  map[uint32]bool // base edge ID -> shadowed (nil when none)
-	killed    map[uint32]bool // layer row EdgeID -> shadowed (nil when none)
+	remap     [][]uint32 // per source: local label ID -> joint label ID
+	deadBase  KillSet    // base edge IDs shadowed (nil when none)
+	killed    KillSet    // layer row EdgeIDs shadowed (nil when none)
 }
 
 // NewView assembles the three-source view. nodeCount is the union ID-space
@@ -93,22 +93,43 @@ func NewView(base *Snapshot, sources []DeltaSource, nodeCount int) *View {
 			v.remap[si] = m
 		}
 	}
+	var deadBase, killed KillSet
 	for _, s := range sources {
-		if db := s.DeadBaseEdges(); len(db) > 0 {
-			if v.deadBase == nil {
-				v.deadBase = make(map[uint32]bool, len(db))
-			}
-			for _, eid := range db {
-				v.deadBase[eid] = true
-			}
+		deadBase = deadBase.With(s.DeadBaseEdges())
+		killed = killed.With(s.KilledEdgeIDs())
+	}
+	return NewViewWithKills(base, sources, nodeCount, deadBase, killed)
+}
+
+// NewViewWithKills assembles the view trusting pre-aggregated kill sets that
+// already cover every source's DeadBaseEdges/KilledEdgeIDs — the incremental
+// builder's path (see root's viewBuild): per-publish assembly then costs
+// O(new kills) instead of re-aggregating the whole stack.
+func NewViewWithKills(base *Snapshot, sources []DeltaSource, nodeCount int, deadBase, killed KillSet) *View {
+	v := &View{base: base, sources: sources, nodeCount: nodeCount, deadBase: deadBase, killed: killed}
+	v.labels = make([]string, 0, base.LabelCount())
+	v.labelID = make(map[string]uint32, base.LabelCount())
+	intern := func(name string) uint32 {
+		if id, ok := v.labelID[name]; ok {
+			return id
 		}
-		if k := s.KilledEdgeIDs(); len(k) > 0 {
-			if v.killed == nil {
-				v.killed = make(map[uint32]bool, len(k))
+		id := uint32(len(v.labels))
+		v.labelID[name] = id
+		v.labels = append(v.labels, name)
+		return id
+	}
+	for i := range base.LabelCount() {
+		intern(base.LabelName(uint32(i)))
+	}
+	if len(sources) > 0 {
+		v.remap = make([][]uint32, len(sources))
+		for si, s := range sources {
+			local := s.Labels()
+			m := make([]uint32, len(local))
+			for li, name := range local {
+				m[li] = intern(name)
 			}
-			for _, eid := range k {
-				v.killed[eid] = true
-			}
+			v.remap[si] = m
 		}
 	}
 	return v
@@ -164,7 +185,7 @@ func (v *View) Rows(u uint32, dir int) []csr.AdjRow {
 		}
 		tg, eids, lbs := adj.Row(u)
 		for i := range tg {
-			if v.deadBase != nil && v.deadBase[eids[i]] {
+			if v.deadBase.Has(eids[i]) {
 				continue
 			}
 			out = append(out, csr.AdjRow{Target: tg[i], EdgeID: eids[i], LabelID: lbs[i]})
@@ -177,7 +198,7 @@ func (v *View) Rows(u uint32, dir int) []csr.AdjRow {
 		}
 		remap := v.remap[si]
 		for _, r := range rows {
-			if v.killed != nil && v.killed[r.EdgeID] {
+			if v.killed.Has(r.EdgeID) {
 				continue
 			}
 			r.LabelID = remap[r.LabelID]

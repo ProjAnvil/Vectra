@@ -89,3 +89,66 @@ func TestFolderLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestBigLayerSkipsPrebuild: bulk-import windows (layers above
+// prebuildMaxLayerEdges) skip the writer's per-publish view prebuild — the
+// import regression guard — while reads of those generations still work via
+// the slot's CAS fallback, and the incremental chain re-establishes on the
+// next small publish.
+func TestBigLayerSkipsPrebuild(t *testing.T) {
+	g := New()
+	keys := make([]string, 2000)
+	for i := range keys {
+		keys[i] = itoa(i)
+	}
+	_ = g.Batch(func(gg *Graph) {
+		for _, k := range keys {
+			_, _ = gg.AddNode(k, "SVC", nil)
+		}
+	})
+	// one big window-cut layer via unbatched burst (absorbs to 64K-edge cuts;
+	// 9000 edges stay one layer)
+	for i := 0; i+1 < len(keys); i++ {
+		for _, k := range keys[(i+1)%len(keys):min(i+6, len(keys))] {
+			if _, err := g.AddEdge(keys[i], k, "BULK", nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	g.FlushPend()
+	v := g.view.Load()
+	if len(v.layers) == 0 {
+		t.Fatal("no layers after burst")
+	}
+	if v.layers[len(v.layers)-1].EdgeCount() <= prebuildMaxLayerEdges {
+		t.Fatalf("layer too small to test: %d edges", v.layers[len(v.layers)-1].EdgeCount())
+	}
+	if c := v.cached.Load(); c != nil {
+		t.Fatal("big layer was prebuilt on the writer")
+	}
+	// reads of the un-prebuilt generation work (CAS fallback)
+	n, ok := g.NodeByKey("0")
+	if !ok {
+		t.Fatal("node missing")
+	}
+	res, err := g.BFS([]NodeID{n.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Count() < 5 {
+		t.Fatalf("BFS count = %d", res.Count())
+	}
+	if v.cached.Load() == nil {
+		t.Fatal("reader build did not fill the slot")
+	}
+	// small publish re-establishes the incremental chain
+	if _, err := g.AddEdge("0", "1", "SMALL", nil); err != nil {
+		t.Fatal(err)
+	}
+	g.FlushPend()
+	v2 := g.view.Load()
+	c2 := v2.cached.Load()
+	if c2 == nil || c2.ext == nil {
+		t.Fatal("incremental chain not re-established after a small publish")
+	}
+}

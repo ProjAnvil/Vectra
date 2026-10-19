@@ -477,6 +477,9 @@ func (g *Graph) prebuildView(nv *genView, from *viewBuild) {
 	if len(nv.layers) == 0 || g.merging {
 		return
 	}
+	if l := nv.layers[len(nv.layers)-1]; l.EdgeCount() > prebuildMaxLayerEdges {
+		return // bulk-import window: no interleaved readers to serve
+	}
 	var vb *viewBuild
 	if from != nil {
 		// a background fold was incorporated: its state covers the folded
@@ -495,7 +498,12 @@ func (g *Graph) prebuildView(nv *genView, from *viewBuild) {
 	for i := vb.builtTo; i < len(nv.layers); i++ {
 		vb.appendLayer(nv, i)
 	}
-	nv.cached.Store(&viewCacheEntry{view: engine.NewView(nv.base, vb.sources, vb.nodeN), ext: vb})
+	// the carried kill sets already cover every appended source — assembly
+	// costs O(new layer), not O(stack)
+	nv.cached.Store(&viewCacheEntry{
+		view: engine.NewViewWithKills(nv.base, vb.sources, vb.nodeN, vb.deadBase, vb.killed),
+		ext:  vb,
+	})
 }
 
 // pendWindow is the metadata of one open absorption window. owner is the
@@ -622,6 +630,14 @@ const minFoldMerge = 512
 // raw layers instead. Bounded by the layer cap above, the extra depth is
 // a small constant.
 const minTailFoldEdges = 64
+
+// prebuildMaxLayerEdges is the layer size above which the writer skips the
+// per-publish view prebuild: bulk-import windows (64K-edge absorption cuts)
+// carry no interleaved readers, so prebuilding them is pure writer overhead
+// (the import regression: 1.27M -> 0.78M edges/s). Readers of an un-prebuilt
+// generation build once through the slot's CAS fallback; the next small
+// publish pays one full rebuild to re-establish the incremental chain.
+const prebuildMaxLayerEdges = 4096
 
 // foldIdleExit is how long the folder goroutine waits for another pressure
 // signal before exiting (it restarts lazily on the next signal), so idle or
