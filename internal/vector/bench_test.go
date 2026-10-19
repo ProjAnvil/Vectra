@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -242,6 +243,47 @@ func (c cellResult) row() string {
 		c.p50.Round(time.Microsecond), c.p99.Round(time.Microsecond),
 		c.p99Over.Round(time.Microsecond), c.buildTime.Round(time.Millisecond),
 		c.liveAmp, c.inuseAmp)
+}
+
+// TestBuildThroughput is the post-optimization build-rate gate driver
+// (docs/benchmarks/2026-10-19-vector-build-optimization.md). Gated: set
+// VECTRA_BUILD_BENCH=1, optional VECTRA_BUILD_N (default 10000) and
+// VECTRA_BUILD_SWEEP=1 to also measure recall@10/p99 at ef 32/64/128.
+// Mirrors runCell's protocol exactly (clustered seed 1000+n, buildState
+// 16/200/999, perturbed queries seed 777).
+func TestBuildThroughput(t *testing.T) {
+	if os.Getenv("VECTRA_BUILD_BENCH") == "" {
+		t.Skip("set VECTRA_BUILD_BENCH=1 (optional VECTRA_BUILD_N, VECTRA_BUILD_SWEEP=1)")
+	}
+	n := 10000
+	if s := os.Getenv("VECTRA_BUILD_N"); s != "" {
+		v, err := strconv.Atoi(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n = v
+	}
+	vecs := genClustered(rand.New(rand.NewSource(1000+int64(n))), n, 768)
+	s, d := buildState(vecs, 16, 200, 999)
+	t.Logf("built n=%d dim=768 clustered in %s (%.1f vec/s)",
+		n, d.Round(time.Millisecond), float64(n)/d.Seconds())
+	if os.Getenv("VECTRA_BUILD_SWEEP") != "" {
+		queries := perturbedQueries(rand.New(rand.NewSource(777)), vecs, 50)
+		for _, ef := range []int{32, 64, 128} {
+			r := recallOf(s, vecs, queries, 10, ef)
+			times := make([]time.Duration, len(queries))
+			for i, q := range queries {
+				start := time.Now()
+				s.Search(q, 10, ef)
+				times[i] = time.Since(start)
+			}
+			p50, p99 := percentiles(times)
+			t.Logf("sweep ef=%d recall@10=%.4f p50=%s p99=%s",
+				ef, r, p50.Round(time.Microsecond), p99.Round(time.Microsecond))
+		}
+	}
+	runtime.KeepAlive(s)
+	runtime.KeepAlive(vecs)
 }
 
 // TestSpikeReport runs matrix stages and writes the report. Stages:
