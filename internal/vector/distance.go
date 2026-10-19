@@ -97,8 +97,12 @@ func Normalize(v []float32) []float32 {
 		copy(out, v)
 		return out
 	}
+	// One division + multiplies instead of len(v) divisions; the ~1e-7
+	// relative error sits far below ANN margins (same argument as the
+	// float32 kernel accumulation).
+	inv := float32(1 / n)
 	for i, x := range v {
-		out[i] = float32(float64(x) / n)
+		out[i] = x * inv
 	}
 	return out
 }

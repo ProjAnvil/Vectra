@@ -179,7 +179,7 @@ func (s *State) Pack(force bool) {
 	s.seq++
 	for _, e := range s.overlay {
 		if s.alive(e.vid) {
-			seg.h.Insert(e.vid, e.vec)
+			seg.h.insertPrepared(e.vid, e.vec) // overlay vecs are normalized copies
 		}
 	}
 	// Drop instead of truncating: a [:0] slice keeps stale entry pointers
@@ -217,7 +217,7 @@ func (s *State) mergeSegments(a, b *segment) *segment {
 				continue
 			}
 			seen[id] = true
-			merged.h.Insert(id, vecs[i])
+			merged.h.insertPrepared(id, vecs[i]) // All() vecs are stored-form; source graph dies here
 		}
 	}
 	return merged
@@ -245,7 +245,7 @@ func (s *State) compact() {
 			s.seq++
 			for j, id := range ids {
 				if s.alive(id) {
-					fresh.h.Insert(id, vecs[j])
+					fresh.h.insertPrepared(id, vecs[j]) // stored-form; old graph dropped below
 				}
 			}
 			tier[i] = fresh

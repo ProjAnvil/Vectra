@@ -1,7 +1,6 @@
 package vector
 
 import (
-	"container/heap"
 	"math"
 	"math/rand"
 	"sort"
@@ -40,6 +39,21 @@ type HNSW struct {
 	// map; the stamp wraps at 2^32 searches, which resets the array.
 	visited []uint32
 	stamp   uint32
+
+	// Scratch buffers reused across neighbor selection (alloc profile
+	// 2026-10-20: selectNeighbors+pruneTo churned 1.3GB per 10k build on
+	// single-use keptVecs/used/cand slices). Valid under the Phase 0
+	// single-threaded contract only; Phase 1 concurrency must move these
+	// into per-call state.
+	snVecs  [][]float32
+	snUsed  []bool
+	prCands []cand
+
+	// searchLayer heap scratch: the returned result set aliases slResults;
+	// callers finish reading it before the next searchLayer invocation
+	// (Insert's per-level loop and Search's final loop both qualify).
+	slCands   []cand
+	slResults []cand
 }
 
 func NewHNSW(metric Metric, m, efc int, seed int64) *HNSW {
@@ -88,6 +102,17 @@ func (h *HNSW) Insert(id uint32, v []float32) {
 	} else {
 		v = append([]float32(nil), v...)
 	}
+	h.insertPrepared(id, v)
+}
+
+// insertPrepared inserts v WITHOUT copying: the caller certifies v already
+// matches the metric's stored form (unit length for Cosine) and gives up
+// ownership. Internal rebuild paths (State.Pack, mergeSegments, compact)
+// feed vectors that State.Add or All() already normalized/copied — the
+// defensive second copy in Insert was pure churn (0.14GB per 10k build).
+// All()-sourced vectors alias the dying source graph; that graph becomes
+// unreachable as soon as the rebuild lands, so the alias is retention-free.
+func (h *HNSW) insertPrepared(id uint32, v []float32) {
 	idx := len(h.ids)
 	lvl := h.randomLevel()
 	h.ids = append(h.ids, id)
@@ -149,9 +174,19 @@ func (h *HNSW) greedyStep(lev, cur int, q []float32) int {
 // disconnected islands. Unused slots fill with pruned candidates
 // (keep-pruned) so nodes stay connected.
 func (h *HNSW) selectNeighbors(maxLinks int, cands []cand, base []float32) []uint32 {
+	// kept is returned and stored in link lists — it must stay a fresh
+	// allocation; everything else lives in reusable scratch.
 	kept := make([]uint32, 0, maxLinks)
-	keptVecs := make([][]float32, 0, maxLinks)
-	used := make([]bool, len(cands))
+	keptVecs := h.snVecs[:0]
+	used := h.snUsed
+	if cap(used) < len(cands) {
+		used = make([]bool, len(cands))
+		h.snUsed = used
+	}
+	used = used[:len(cands)]
+	for i := range used {
+		used[i] = false
+	}
 	for i, c := range cands {
 		if len(kept) >= maxLinks {
 			break
@@ -177,6 +212,7 @@ func (h *HNSW) selectNeighbors(maxLinks int, cands []cand, base []float32) []uin
 			kept = append(kept, uint32(cands[i].idx))
 		}
 	}
+	h.snVecs = keptVecs
 	return kept
 }
 
@@ -185,7 +221,12 @@ func (h *HNSW) pruneTo(maxLinks int, lst []uint32, owner []float32) []uint32 {
 	if len(lst) <= maxLinks {
 		return lst
 	}
-	cs := make([]cand, len(lst))
+	cs := h.prCands
+	if cap(cs) < len(lst) {
+		cs = make([]cand, len(lst))
+		h.prCands = cs
+	}
+	cs = cs[:len(lst)]
 	for i, n := range lst {
 		cs[i] = cand{int(n), Distance(h.metric, owner, h.vecs[n])}
 	}
@@ -230,23 +271,90 @@ type cand struct {
 	d   float64
 }
 
-type candMin []cand
+// searchLayer uses hand-rolled binary heaps instead of container/heap:
+// pushing a 16-byte struct through the heap.Interface boxes it into an
+// interface value, and that conversion allocated 0.57GB per 10k build
+// (alloc profile 2026-10-20). Tie order differs from container/heap, so
+// exact-tie graphs are not bit-identical to the old implementation;
+// same-seed runs remain deterministic (TestHNSWDeterminism).
 
-func (a candMin) Len() int           { return len(a) }
-func (a candMin) Less(i, j int) bool { return a[i].d < a[j].d }
-func (a candMin) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a *candMin) Push(x any)        { *a = append(*a, x.(cand)) }
-func (a *candMin) Pop() any          { old := *a; n := len(old); x := old[n-1]; *a = old[:n-1]; return x }
+func minHeapPush(h *[]cand, c cand) {
+	a := append(*h, c)
+	i := len(a) - 1
+	for i > 0 {
+		p := (i - 1) / 2
+		if a[p].d <= a[i].d {
+			break
+		}
+		a[p], a[i] = a[i], a[p]
+		i = p
+	}
+	*h = a
+}
 
-type candMax []cand
+func minHeapPop(h *[]cand) cand {
+	a := *h
+	top := a[0]
+	last := len(a) - 1
+	a[0] = a[last]
+	a = a[:last]
+	i := 0
+	for {
+		l, r, m := 2*i+1, 2*i+2, i
+		if l < len(a) && a[l].d < a[m].d {
+			m = l
+		}
+		if r < len(a) && a[r].d < a[m].d {
+			m = r
+		}
+		if m == i {
+			break
+		}
+		a[i], a[m] = a[m], a[i]
+		i = m
+	}
+	*h = a
+	return top
+}
 
-func (a candMax) Len() int           { return len(a) }
-func (a candMax) Less(i, j int) bool { return a[i].d > a[j].d }
-func (a candMax) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a *candMax) Push(x any)        { *a = append(*a, x.(cand)) }
-func (a *candMax) Pop() any          { old := *a; n := len(old); x := old[n-1]; *a = old[:n-1]; return x }
+func maxHeapPush(h *[]cand, c cand) {
+	a := append(*h, c)
+	i := len(a) - 1
+	for i > 0 {
+		p := (i - 1) / 2
+		if a[p].d >= a[i].d {
+			break
+		}
+		a[p], a[i] = a[i], a[p]
+		i = p
+	}
+	*h = a
+}
 
-func (a candMax) peek() cand { return a[0] }
+func maxHeapPop(h *[]cand) cand {
+	a := *h
+	top := a[0]
+	last := len(a) - 1
+	a[0] = a[last]
+	a = a[:last]
+	i := 0
+	for {
+		l, r, m := 2*i+1, 2*i+2, i
+		if l < len(a) && a[l].d > a[m].d {
+			m = l
+		}
+		if r < len(a) && a[r].d > a[m].d {
+			m = r
+		}
+		if m == i {
+			break
+		}
+		a[i], a[m] = a[m], a[i]
+		i = m
+	}
+	*h = a
+	return top
+}
 
 // searchLayer expands up to ef best candidates at one level, starting
 // from ep. Returns the result set sorted ascending by distance.
@@ -259,11 +367,14 @@ func (h *HNSW) searchLayer(lev, ep int, q []float32, ef int, alive func(uint32) 
 		h.stamp = 1
 	}
 	h.visited[ep] = h.stamp
-	cands := &candMin{{idx: ep, d: Distance(h.metric, q, h.vecs[ep])}}
-	results := &candMax{{idx: ep, d: (*cands)[0].d}}
-	for cands.Len() > 0 {
-		c := heap.Pop(cands).(cand)
-		if results.Len() >= ef && c.d >= results.peek().d {
+	d0 := Distance(h.metric, q, h.vecs[ep])
+	cands := h.slCands[:0]
+	results := h.slResults[:0]
+	minHeapPush(&cands, cand{idx: ep, d: d0})
+	maxHeapPush(&results, cand{idx: ep, d: d0})
+	for len(cands) > 0 {
+		c := minHeapPop(&cands)
+		if len(results) >= ef && c.d >= results[0].d {
 			break
 		}
 		for _, n := range h.links[c.idx][lev] {
@@ -276,16 +387,17 @@ func (h *HNSW) searchLayer(lev, ep int, q []float32, ef int, alive func(uint32) 
 				continue
 			}
 			nd := Distance(h.metric, q, h.vecs[ni])
-			if results.Len() < ef || nd < results.peek().d {
-				heap.Push(cands, cand{ni, nd})
-				heap.Push(results, cand{ni, nd})
-				if results.Len() > ef {
-					heap.Pop(results)
+			if len(results) < ef || nd < results[0].d {
+				minHeapPush(&cands, cand{ni, nd})
+				maxHeapPush(&results, cand{ni, nd})
+				if len(results) > ef {
+					maxHeapPop(&results)
 				}
 			}
 		}
 	}
-	out := *results
-	sort.Slice(out, func(i, j int) bool { return out[i].d < out[j].d })
-	return out
+	sort.Slice(results, func(i, j int) bool { return results[i].d < results[j].d })
+	h.slCands = cands
+	h.slResults = results
+	return results
 }
