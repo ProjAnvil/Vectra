@@ -116,28 +116,3 @@ func normalizeRand(rng *rand.Rand, dim int) []float32 {
 	}
 	return Normalize(v)
 }
-
-// bruteTopIDs is replaced by bench_test.go's version in Task 5.
-func bruteTopIDs(vecs [][]float32, q []float32, k int) []int {
-	type idd struct {
-		i int
-		d float64
-	}
-	qn := Normalize(q)
-	all := make([]idd, len(vecs))
-	for i, v := range vecs {
-		all[i] = idd{i, Distance(Cosine, qn, v)}
-	}
-	for i := 0; i < k; i++ { // selection sort: fine for unit sizes
-		for j := i + 1; j < len(all); j++ {
-			if all[j].d < all[i].d {
-				all[i], all[j] = all[j], all[i]
-			}
-		}
-	}
-	out := make([]int, k)
-	for i := range out {
-		out[i] = all[i].i
-	}
-	return out
-}
