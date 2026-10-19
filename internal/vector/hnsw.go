@@ -41,7 +41,7 @@ type HNSW struct {
 	stamp   uint32
 
 	// Scratch buffers reused across neighbor selection (alloc profile
-	// 2026-10-20: selectNeighbors+pruneTo churned 1.3GB per 10k build on
+	// 2026-10-19: selectNeighbors+pruneTo churned 1.3GB per 10k build on
 	// single-use keptVecs/used/cand slices). Valid under the Phase 0
 	// single-threaded contract only; Phase 1 concurrency must move these
 	// into per-call state.
@@ -274,7 +274,7 @@ type cand struct {
 // searchLayer uses hand-rolled binary heaps instead of container/heap:
 // pushing a 16-byte struct through the heap.Interface boxes it into an
 // interface value, and that conversion allocated 0.57GB per 10k build
-// (alloc profile 2026-10-20). Tie order differs from container/heap, so
+// (alloc profile 2026-10-19). Tie order differs from container/heap, so
 // exact-tie graphs are not bit-identical to the old implementation;
 // same-seed runs remain deterministic (TestHNSWDeterminism).
 

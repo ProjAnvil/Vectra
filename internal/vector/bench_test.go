@@ -132,7 +132,7 @@ func percentiles(times []time.Duration) (p50, p99 time.Duration) {
 	return
 }
 
-// BenchmarkDistance is the kernel micro-bench for the 2026-10-20 build
+// BenchmarkDistance is the kernel micro-bench for the 2026-10-19 build
 // throughput work: 768-dim Cosine is the spike-matrix hot shape.
 func BenchmarkDistance(b *testing.B) {
 	rng := rand.New(rand.NewSource(7))

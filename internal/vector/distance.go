@@ -22,7 +22,7 @@ const (
 // The kernels carry eight independent accumulators: the Go compiler does
 // not auto-vectorize float loops (strict FP semantics), and a single
 // accumulator serializes on the ~4-cycle FADD latency — eight chains keep
-// the multiplier/adder pipes busy instead (profile 2026-10-20: Distance
+// the multiplier/adder pipes busy instead (profile 2026-10-19: Distance
 // was 88% of build CPU in the chained form). Summation order differs from
 // the naive loop, shifting results by last-ulp amounts, far below ANN
 // margins.
