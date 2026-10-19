@@ -20,11 +20,11 @@
 - TDD: write the failing test first, watch it fail, then implement.
 - All randomness uses fixed seeds. Recall assertions assert lower bounds only (ANN is non-deterministic); never assert exact output sets or order.
 - 门 2a acceptance lines (spec §10.3, verbatim): recall@10 ≥ 0.95 (1M×768, clustered, adaptive ef); query p99 < 10ms (same scenario, tiered shape, overlay at full 2048 — measured, not estimated); memory amplification ≤ 1.6× theoretical vector bytes (口径: HeapAlloc after explicit GC with the state kept alive, over n·dim·4).
-- Recall truth is strict set-match against brute force over INDEPENDENT query vectors (never training points).
+- Recall truth for ACCEPTANCE measurements is strict set-match against brute force over INDEPENDENT query vectors. Semantic guard unit tests may query stored vectors (training points) where the assertion targets shadowing/revive/dead-set logic, not recall quality.
 - Do not edit spec body sections; deviations go to the spec's 实现期偏差记录 appendix only.
 - One commit per task, English commit message, on branch `spec/vector-search`.
 - Benchmark matrix is Cosine-only; L2/Dot are covered by unit tests. Record this in the report.
-- Calibrated expectations (measured on Apple M5 Pro, 2026-10-19, this plan's exact code): build 10k×768 ≈ 45–55 s (~200 vec/s); recall 10k×768: 0.877@ef64 / 0.963@ef128 / 0.990@ef192; recall 2k×64: 0.9675@ef64; heap amp (live) 1.12× at 10k×768; overlay Add rate ≥ 700k/s. If your numbers diverge wildly, suspect the environment or a transcription error before suspecting the thresholds.
+- Calibrated expectations (auditor-reproduced 2026-10-19 on this plan's exact code and seeds; machine-dependent — treat timings as order-of-magnitude, thresholds as authoritative): build 10k×768 ≈ 126 s; recall 10k×768: 0.840@ef64 / 0.928@ef128 / 0.956@ef192; smoke 2k×64@ef96 = 0.9900; liveAmp 1.122× at 10k×768; overlay Add rate ≥ 700k/s. If your numbers diverge wildly, suspect the environment or a transcription error before suspecting the thresholds.
 
 ---
 
@@ -443,9 +443,12 @@ type Hit struct {
 }
 
 // HNSW is a hierarchical navigable small-world graph over caller-supplied
-// uint32 ids (the vector index's vid space, spec §4.1). Single-writer:
-// build offline (folder lane in Phase 1), publish read-only. Concurrent
-// reads of a non-mutating instance are safe.
+// uint32 ids (the vector index's vid space, spec §4.1). Phase 0 contract:
+// single-threaded for BOTH build and search — the epoch-visited array is
+// mutable state on the read path (data race under concurrent Search,
+// verified with -race). Phase 1 must localize visited state per reader
+// before immutable snapshots publish to concurrent readers; recorded as
+// a spec deviation until then.
 type HNSW struct {
 	metric Metric
 	m      int // max links per node above level 0
@@ -757,6 +760,7 @@ package vector
 import (
 	"fmt"
 	"math/rand"
+	"runtime"
 	"testing"
 )
 
@@ -943,7 +947,7 @@ func TestStateNoPhantomRetention(t *testing.T) {
 	if testing.Short() {
 		t.Skip("short mode")
 	}
-	const n, dim = 8192, 128
+	const n, dim = 8192, 768 // dim matters: at 128 the ~2-3MB fixed overhead (maps, links, slice headers) cannot amortize under 4MB theory and the line is meaningless
 	rng := rand.New(rand.NewSource(41))
 	s := NewState(Cosine, dim, 16, 200, 43)
 	for i := 0; i < n; i++ {
@@ -963,8 +967,6 @@ func TestStateNoPhantomRetention(t *testing.T) {
 	}
 }
 ```
-
-(`runtime` import needed: `"runtime"`.)
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -1546,7 +1548,11 @@ func TestSpikeReport(t *testing.T) {
 		t.Skip("set VECTRA_SPIKE_FULL=1 to run the full spike matrix")
 	}
 	stage := os.Getenv("VECTRA_SPIKE_CELLS")
-	if stage == "" {
+	if stage == "" || stage == "all" {
+		// "all" includes the multi-hour 1M cells; require an explicit choice.
+		t.Skip("set VECTRA_SPIKE_CELLS to one of: 10k | 100k | sweep | all-confirmed (typo-guard: use the exact stage you want)")
+	}
+	if stage == "all-confirmed" {
 		stage = "all"
 	}
 	var cells []cellResult
@@ -1580,6 +1586,7 @@ func TestSpikeReport(t *testing.T) {
 		report += c.row() + "\n"
 	}
 	report += "\nStage: " + stage + "\n"
+	report += "\nNote: for cells measured with overlay injection, liveAmp includes the 2048 overlay vectors (~+2048*dim*4 bytes in the numerator; conservative direction).\n"
 	report += "\nAcceptance (门 2a, spec §10.3), the DefaultC lock, and the verdict are completed by Task 6.\n"
 	path := filepath.Join("..", "..", "docs", "benchmarks", "2026-10-19-vector-spike.md")
 	if err := os.WriteFile(path, []byte(report), 0o644); err != nil {
@@ -1640,7 +1647,7 @@ Each invocation overwrites the report with its own stage's rows — **copy each 
 
 - [ ] **Step 2: Lock DefaultC from the sweep (with termination)**
 
-From the sweep table (100k×768 clustered): collect every sweep ef with recall ≥ 0.95 and derive candidate constants `c_i = ef_i / log2(100_000)`, ascending. For each candidate in order, verify the 1M×768 cell at `ef = AdaptiveEf(10, 1_000_000, c_i)` (re-run the 1M cell once per candidate; a small temporary test or env-driven ef in TestSpikeReport is acceptable — record what you did). The FIRST candidate passing recall ≥ 0.95 at 1M locks `DefaultC`. **Termination:** if no candidate passes (including the largest, c ≈ 192/log2(1e5) ≈ 11.6), stop — the verdict is FAIL, go to Step 3. Do not invent candidates above the sweep range.
+From the sweep table (100k×768 clustered): collect every sweep ef with recall ≥ 0.95 and derive candidate constants `c_i = ef_i / log2(100_000)`, ascending. For each candidate in order, verify the 1M×768 cell at `ef = AdaptiveEf(10, 1_000_000, c_i)`. **Build the 1M state ONCE and loop the candidate efs re-querying only** — a full rebuild per candidate is hours of waste. A small temporary test or an env-driven ef in TestSpikeReport is acceptable; record what you did. The FIRST candidate passing recall ≥ 0.95 at 1M locks `DefaultC`. **Termination:** if no candidate passes (including the largest, c ≈ 192/log2(1e5) ≈ 11.6), stop — the verdict is FAIL, go to Step 3. Do not invent candidates above the sweep range.
 
 Set the value in ef.go:
 
@@ -1675,6 +1682,7 @@ Append to the spec's 实现期偏差记录 (appendix only; adjust to what actual
 - Phase 0 (2026-10-19): dead-vid hit counting (spec §4.3) deferred — no Phase 0 consumer.
 - Phase 0 (2026-10-19): benchmark matrix is Cosine-only; L2/Dot covered by unit tests.
 - Phase 0 (2026-10-19): memory口径 pinned to live HeapAlloc after explicit GC (spec's "常驻"); HeapInuse reported alongside for span-level visibility.
+- Phase 0 (2026-10-19): HNSW is single-threaded for build AND search in Phase 0 — the epoch-visited array is mutable read-path state (data race under concurrent Search, -race verified). Phase 1 must localize visited state per reader before immutable snapshots publish concurrently (spec D1 zero-lock-read prerequisite).
 ```
 
 - [ ] **Step 5: Run the full package once more**
