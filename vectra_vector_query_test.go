@@ -53,6 +53,7 @@ func buildVectorGraph(t *testing.T, n, dim int) (*vectra.Graph, [][]float32) {
 		vecs[i] = v
 		g.AddNode(keyN(i), "m", map[string]any{"emb": v})
 	}
+	g.FlushPend() // publish the absorption window: concurrent-reader tests read a settled generation
 	return g, vecs
 }
 
