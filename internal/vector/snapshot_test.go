@@ -1,0 +1,180 @@
+package vector
+
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"testing"
+)
+
+// buildStateFor builds a live State with n vectors, packing along the way.
+func buildStateFor(t *testing.T, n, dim int, seed int64) (*State, [][]float32) {
+	t.Helper()
+	vecs := genClustered(rand.New(rand.NewSource(seed)), n, dim)
+	s := NewState(Cosine, dim, 16, 100, seed+1)
+	for i, v := range vecs {
+		s.Add(fmt.Sprintf("k%d", i), v)
+		if (i+1)%2048 == 0 {
+			s.Pack(false)
+		}
+	}
+	s.Pack(true)
+	return s, vecs
+}
+
+// TestSnapshotImmutability pins the read-during-write contract: a taken
+// Snapshot keeps returning identical results while the writer Adds,
+// Deletes, and Packs. This is what concurrent Graph readers hold.
+func TestSnapshotImmutability(t *testing.T) {
+	const n, dim = 3000, 32
+	s, vecs := buildStateFor(t, n, dim, 31)
+	queries := perturbedQueries(rand.New(rand.NewSource(33)), vecs, 10)
+	snap := s.Snapshot()
+	r := s.NewReader()
+	before := make([][]VectorHit, len(queries))
+	for qi, q := range queries {
+		before[qi] = snap.Search(q, 10, 64, r)
+		if len(before[qi]) == 0 {
+			t.Fatal("empty snapshot result on a packed 3k index")
+		}
+	}
+
+	// Mutate hard: fresh adds, deletes of indexed keys, a full repack.
+	extra := genClustered(rand.New(rand.NewSource(35)), 500, dim)
+	for i, v := range extra {
+		s.Add(fmt.Sprintf("x%d", i), v)
+	}
+	for i := 0; i < 200; i++ {
+		s.Delete(fmt.Sprintf("k%d", i*3))
+	}
+	s.Pack(true)
+
+	for round := 0; round < 2; round++ {
+		for qi, q := range queries {
+			after := snap.Search(q, 10, 64, r)
+			if len(after) != len(before[qi]) {
+				t.Fatalf("round %d q%d: snapshot changed under mutation: %d hits, was %d",
+					round, qi, len(after), len(before[qi]))
+			}
+			for i := range before[qi] {
+				if after[i] != before[qi][i] {
+					t.Fatalf("round %d q%d [%d]: %+v, was %+v", round, qi, i, after[i], before[qi][i])
+				}
+			}
+		}
+	}
+}
+
+// TestSnapshotConcurrentWithWriter: readers hold an OLD snapshot while
+// the writer mutates and republishes - the zero-lock read contract
+// (spec D1). Snapshot() is a writer-thread call (materialization reads
+// live structures); real readers receive snapshots through the Graph's
+// atomic head. This test pins that no mutable memory is shared between
+// a published snapshot and the writer. -race is the gate.
+func TestSnapshotConcurrentWithWriter(t *testing.T) {
+	const dim = 32
+	s, vecs := buildStateFor(t, 2000, dim, 41)
+	queries := perturbedQueries(rand.New(rand.NewSource(43)), vecs, 10)
+	snap := s.Snapshot() // what a concurrent reader would hold
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := s.NewReader()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				for _, q := range queries {
+					snap.Search(q, 5, 32, r)
+				}
+			}
+		}()
+	}
+	// Writer: adds + deletes + republish, concurrent with the readers.
+	rng := rand.New(rand.NewSource(45))
+	for i := 0; i < 20; i++ {
+		batch := genClustered(rng, 100, dim)
+		for j, v := range batch {
+			s.Add(fmt.Sprintf("w%d_%d", i, j), v)
+		}
+		s.Delete(fmt.Sprintf("k%d", i*7))
+		_ = s.Snapshot() // republish (publish-point rate, not per-Add)
+		if (i+1)%5 == 0 {
+			s.Pack(false)
+		}
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// TestDeadBitsParity: the chunked bitmap must match a plain map on a
+// randomized set/clear/unset sequence, including revive (clear).
+func TestDeadBitsParity(t *testing.T) {
+	rng := rand.New(rand.NewSource(47))
+	ref := map[uint32]bool{}
+	var d deadBits
+	d.chunks = map[uint32][1024]uint64{}
+	for op := 0; op < 3000; op++ {
+		vid := uint32(rng.Intn(300000)) // spans several chunks
+		switch rng.Intn(3) {
+		case 0, 1:
+			d.set(vid)
+			ref[vid] = true
+		case 2:
+			d.unset(vid)
+			delete(ref, vid)
+		}
+	}
+	for vid, want := range ref {
+		if d.has(vid) != want {
+			t.Fatalf("vid %d: has=%v want %v", vid, d.has(vid), want)
+		}
+	}
+	// And every set bit we know about:
+	for vid := range ref {
+		d.unset(vid)
+	}
+	for cid := range d.chunks {
+		chunk := d.chunks[cid]
+		for w, word := range chunk {
+			if word != 0 {
+				t.Fatalf("chunk %d word %d not zero after unsetting all", cid, w)
+			}
+		}
+	}
+}
+
+// TestSnapshotKeysRendered: results carry the original key strings after
+// packing and merging (key arrays on segments, key field on overlay
+// entries - the old path read a shared vid->key map).
+func TestSnapshotKeysRendered(t *testing.T) {
+	const n, dim = 5000, 16
+	s, vecs := buildStateFor(t, n, dim, 51)
+	snap := s.Snapshot()
+	r := s.NewReader()
+	// After 5000 adds with packing there are segments AND a tail overlay.
+	for qi := 0; qi < 20; qi++ {
+		q := vecs[rng2(qi)%n]
+		hits := snap.Search(q, 1, 32, r)
+		if len(hits) != 1 {
+			t.Fatalf("q%d: %d hits", qi, len(hits))
+		}
+		key := hits[0].Key
+		if key == "" {
+			t.Fatal("empty key rendered")
+		}
+		// The key must parse back to an index we inserted.
+		var idx int
+		if _, err := fmt.Sscanf(key, "k%d", &idx); err != nil || idx < 0 || idx >= n {
+			t.Fatalf("bad key %q (err %v)", key, err)
+		}
+	}
+}
+
+func rng2(i int) int64 { return int64(1000 + i*7) }

@@ -259,6 +259,23 @@ func (h *HNSW) pruneTo(maxLinks int, lst []uint32, owner []float32) []uint32 {
 // sequential queries on one goroutine (State.SearchReader loops segments
 // on the same one).
 func (h *HNSW) Search(q []float32, k, ef int, alive func(uint32) bool, r *Reader) []Hit {
+	cands := h.searchIdx(q, k, ef, alive, r)
+	if len(cands) == 0 {
+		return nil
+	}
+	out := make([]Hit, 0, len(cands))
+	for _, c := range cands {
+		out = append(out, Hit{ID: h.ids[c.idx], Score: c.d})
+	}
+	return out
+}
+
+// searchIdx is Search's core returning internal-index cands (idx + d,
+// ascending): the vecView merge needs the internal idx to reach segment
+// key arrays without a shared vid->key map. The returned slice aliases
+// the Reader's results scratch - consume before the next searchIdx call
+// on the same Reader.
+func (h *HNSW) searchIdx(q []float32, k, ef int, alive func(uint32) bool, r *Reader) []cand {
 	if h.entry < 0 || k <= 0 {
 		return nil
 	}
@@ -275,17 +292,21 @@ func (h *HNSW) Search(q []float32, k, ef int, alive func(uint32) bool, r *Reader
 		cur = h.greedyStep(lev, cur, q)
 	}
 	res := h.searchLayer(0, cur, q, ef, alive, r)
-	out := make([]Hit, 0, k)
+	// searchLayer filters alive during expansion but its ENTRY POINT is
+	// pushed unfiltered - re-check at render (a single-node dead segment
+	// would otherwise leak its entry into the merge), then truncate to k.
+	n := 0
 	for _, c := range res {
 		if alive != nil && !alive(h.ids[c.idx]) {
 			continue
 		}
-		out = append(out, Hit{ID: h.ids[c.idx], Score: c.d})
-		if len(out) == k {
+		res[n] = c
+		n++
+		if n == k {
 			break
 		}
 	}
-	return out
+	return res[:n]
 }
 
 type cand struct {
