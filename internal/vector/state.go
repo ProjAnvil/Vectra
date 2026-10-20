@@ -162,7 +162,10 @@ func (s *State) Delete(key string) bool {
 	return true
 }
 
-// OverlayLen returns the pending (not yet packed) vector count.
+// OverlayLen returns the pending (not yet packed) ENTRY count. Same-key
+// re-Adds each count once (newest wins at scan time) - callers using this
+// as a uniqueness threshold see up to re-Add-count inflation; Pack's
+// non-forced gate shares the same entry-count semantics.
 func (s *State) OverlayLen() int { return s.overlayLen }
 
 // Snapshot materializes the current state for concurrent readers. Must

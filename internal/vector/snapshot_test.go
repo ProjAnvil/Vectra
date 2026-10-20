@@ -150,31 +150,77 @@ func TestDeadBitsParity(t *testing.T) {
 	}
 }
 
+// TestSnapshotWithLiveOverlay pins the overlay half of the snapshot
+// contract: a Snapshot taken while the overlay is non-empty must return
+// the overlay's vectors (chunked overlay shared by pointer, tail chunk
+// duplicated), and must stay byte-identical while the writer keeps
+// appending to the tail chunk and packs it away. Without this, a
+// regression dropping the overlay from Snapshot() would pass every other
+// snapshot test (they all pack first).
+func TestSnapshotWithLiveOverlay(t *testing.T) {
+	const dim = 32
+	vecs := genClustered(rand.New(rand.NewSource(61)), 2048, dim) // one full chunk
+	s := NewState(Cosine, dim, 16, 100, 62)
+	for i, v := range vecs {
+		s.Add(fmt.Sprintf("k%d", i), v)
+	}
+	// No Pack: everything lives in the overlay (one frozen full chunk).
+	snap := s.Snapshot()
+	r := s.NewReader()
+	for qi := 0; qi < 10; qi++ {
+		hits := snap.Search(vecs[qi*100], 1, 32, r)
+		if len(hits) != 1 || hits[0].Key != fmt.Sprintf("k%d", qi*100) {
+			t.Fatalf("q%d: overlay key missing from snapshot: %+v", qi, hits)
+		}
+	}
+	before := snap.Search(vecs[0], 10, 64, r)
+
+	// Writer: append a tail chunk, re-add an existing key (newest wins),
+	// then pack everything away.
+	tail := genClustered(rand.New(rand.NewSource(63)), 500, dim)
+	for i, v := range tail {
+		s.Add(fmt.Sprintf("t%d", i), v)
+	}
+	s.Add("k0", vecs[1]) // re-add: newer value must win in LIVE search
+	s.Pack(true)
+	if s.OverlayLen() != 0 {
+		t.Fatal("pack must drain the overlay")
+	}
+
+	after := snap.Search(vecs[0], 10, 64, r)
+	if len(after) != len(before) {
+		t.Fatalf("snapshot changed under overlay append+pack: %d hits, was %d", len(after), len(before))
+	}
+	for i := range before {
+		if after[i] != before[i] {
+			t.Fatalf("[%d]: %+v, was %+v", i, after[i], before[i])
+		}
+	}
+	// Live side sees the re-added value win over the overlay stale entry.
+	live := s.Search(vecs[0], 1, 64)
+	if len(live) != 1 || live[0].Key != "k0" {
+		t.Fatalf("live search after re-add+pack: %+v", live)
+	}
+}
+
 // TestSnapshotKeysRendered: results carry the original key strings after
-// packing and merging (key arrays on segments, key field on overlay
-// entries - the old path read a shared vid->key map).
+// packing and merging (key arrays on segments - the old path read a
+// shared vid->key map; overlay keys are covered by
+// TestSnapshotWithLiveOverlay).
 func TestSnapshotKeysRendered(t *testing.T) {
 	const n, dim = 5000, 16
 	s, vecs := buildStateFor(t, n, dim, 51)
 	snap := s.Snapshot()
 	r := s.NewReader()
-	// After 5000 adds with packing there are segments AND a tail overlay.
 	for qi := 0; qi < 20; qi++ {
-		q := vecs[rng2(qi)%n]
+		q := vecs[(qi*211)%n]
 		hits := snap.Search(q, 1, 32, r)
 		if len(hits) != 1 {
 			t.Fatalf("q%d: %d hits", qi, len(hits))
 		}
-		key := hits[0].Key
-		if key == "" {
-			t.Fatal("empty key rendered")
-		}
-		// The key must parse back to an index we inserted.
 		var idx int
-		if _, err := fmt.Sscanf(key, "k%d", &idx); err != nil || idx < 0 || idx >= n {
-			t.Fatalf("bad key %q (err %v)", key, err)
+		if _, err := fmt.Sscanf(hits[0].Key, "k%d", &idx); err != nil || idx < 0 || idx >= n {
+			t.Fatalf("bad key %q (err %v)", hits[0].Key, err)
 		}
 	}
 }
-
-func rng2(i int) int64 { return int64(1000 + i*7) }
