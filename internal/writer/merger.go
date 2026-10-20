@@ -45,7 +45,33 @@ func (h *Handle) merger() {
 			return
 		case <-h.mergeSig:
 			h.resolveFlight()
+		case <-h.vecSig:
+			h.drainVectors()
 		}
+	}
+}
+
+// drainVectors is the merger's vector lane (spec D10/5.2): pack overlay
+// chunks and swap snapshot heads. Failures back off on the same ladder
+// but never hand work to the writer - vector convergence is lazy; the
+// overlay plus existing segments keep queries correct (spec 5.2-3).
+func (h *Handle) drainVectors() {
+	const chunksPerWake = 8
+	for {
+		more := false
+		for _, vi := range h.g.VectorHandles() {
+			for vi.Drain(chunksPerWake) {
+				more = true
+			}
+		}
+		if !more {
+			return
+		}
+		select {
+		case h.vecSig <- struct{}{}:
+		default:
+		}
+		return // re-signal instead of looping: graph folds get their turn
 	}
 }
 

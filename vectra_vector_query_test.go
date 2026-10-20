@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/projanvil/vectra"
 )
@@ -13,7 +14,22 @@ import (
 // nodes with clustered 64-dim embeddings (in-distribution query protocol).
 func buildVectorGraph(t *testing.T, n, dim int) (*vectra.Graph, [][]float32) {
 	t.Helper()
-	g := vectra.New()
+	return buildVectorGraphAt(t, "", n, dim)
+}
+
+// buildVectorGraphAt builds into a WAL-backed db when path != "".
+func buildVectorGraphAt(t *testing.T, path string, n, dim int) (*vectra.Graph, [][]float32) {
+	t.Helper()
+	var g *vectra.Graph
+	if path == "" {
+		g = vectra.New()
+	} else {
+		var err error
+		g, err = vectra.Open(path, vectra.Options{WALMode: vectra.ModeAlways})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := g.CreateVectorIndex(vectra.VectorIndexDecl{Name: "mem", Prop: "emb", Dim: dim, Metric: "cosine"}); err != nil {
 		t.Fatal(err)
 	}
@@ -243,4 +259,101 @@ func TestQueryVectorConcurrentReaders(t *testing.T) {
 		}(w)
 	}
 	wg.Wait()
+}
+
+// TestVecFolderLaneConvergence: sustained writes over the pack size arm
+// the direct-mode folder lane; the overlay must drain to zero and recall
+// must hold against brute force on the PACKED state (spec 4.2/5.2).
+func TestVecFolderLaneConvergence(t *testing.T) {
+	g, vecs := buildVectorGraph(t, 4096, 64) // exactly two full chunks: the lane drains to zero; a partial tail would legitimately stay (D7 read-your-write)
+	defer g.Close()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if g.VectorOverlayLen("mem") == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := g.VectorOverlayLen("mem"); n != 0 {
+		t.Fatalf("overlay did not drain: %d", n)
+	}
+	// Packed-state recall vs brute force (perturbed queries).
+	rng := rand.New(rand.NewSource(107))
+	recall := 0.0
+	for qi := 0; qi < 20; qi++ {
+		src := vecs[rng.Intn(len(vecs))]
+		q := append([]float32(nil), src...)
+		sigma := 0.35 / 8.0
+		for j := range q {
+			q[j] += float32(rng.NormFloat64() * sigma)
+		}
+		hits, err := g.QueryVector("mem", q, vectra.QueryVectorOptions{K: 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		type kd struct {
+			k string
+			d float64
+		}
+		all := make([]kd, len(vecs))
+		for i, v := range vecs {
+			var dot float64
+			for j := range v {
+				dot += float64(v[j]) * float64(q[j])
+			}
+			all[i] = kd{keyN(i), 1 - dot}
+		}
+		for i := 0; i < 10; i++ {
+			for j := i + 1; j < len(all); j++ {
+				if all[j].d < all[i].d {
+					all[i], all[j] = all[j], all[i]
+				}
+			}
+		}
+		want := map[string]bool{}
+		for i := 0; i < 10; i++ {
+			want[all[i].k] = true
+		}
+		hit := 0
+		for _, h := range hits {
+			if want[h.Key] {
+				hit++
+			}
+		}
+		recall += float64(hit) / 10
+	}
+	if r := recall / 20; r < 0.95 {
+		t.Fatalf("packed recall@10 = %.4f, want >= 0.95", r)
+	}
+}
+
+// TestVecRecoveryDrain: Close+Open leaves every vector in the overlay
+// (snapshot backfill); the lane must rebuild the forest and queries stay
+// correct throughout (spec 7.1 - overlay scan is the brute-force path).
+func TestVecRecoveryDrain(t *testing.T) {
+	dir := t.TempDir()
+	db := dir + "/v.db"
+	g, _ := buildVectorGraphAt(t, db, 4096, 64)
+	if err := g.Close(); err != nil {
+		t.Fatal(err)
+	}
+	g2, err := vectra.Open(db, vectra.Options{WALMode: vectra.ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g2.Close()
+	// Immediately queryable via the overlay (brute-force path).
+	if _, err := g2.QueryVector("mem", make([]float32, 64), vectra.QueryVectorOptions{K: 5}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if g2.VectorOverlayLen("mem") == 0 {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if n := g2.VectorOverlayLen("mem"); n != 0 {
+		t.Fatalf("recovery drain incomplete: %d", n)
+	}
 }

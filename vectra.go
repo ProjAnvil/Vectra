@@ -277,8 +277,8 @@ type Graph struct {
 	// pointer - lock-free reads, writer-thread mutations. Each entry owns
 	// its published snapshot head (spec D1; see vectra_vector.go).
 	vecIdx     atomic.Pointer[[]*vecIndex]
-	onVecSkip  func(key, index string)  // Options.OnVecSkip; nil = silent skip
-	vecReaders sync.Pool                // *vector.Reader scratch for QueryVector
+	onVecSkip  func(key, index string) // Options.OnVecSkip; nil = silent skip
+	vecReaders sync.Pool               // *vector.Reader scratch for QueryVector
 
 	// writer-private published-state mirrors (reconciled at publish)
 	nodes     map[string]nodeRef        // key -> id + visibility
@@ -563,7 +563,7 @@ type pendOp struct {
 	edge     EdgeUpsert
 	edel     EdgeDelete
 	ndel     string
-	idx      string             // opIndex: declared property key
+	idx      string                // opIndex: declared property key
 	vecDecls []wal.VectorIndexDecl // opVecIndex: full declaration list
 }
 
@@ -724,6 +724,7 @@ func (g *Graph) foldLoop() {
 				g.folderRunning.Store(false)
 				return
 			}
+			g.runVecDrain()
 			g.runFold()
 			idle.Reset(foldIdleExit)
 		case <-idle.C:
@@ -737,6 +738,7 @@ func (g *Graph) foldLoop() {
 					g.folderRunning.Store(false)
 					return
 				}
+				g.runVecDrain()
 				g.runFold()
 				idle.Reset(foldIdleExit)
 			default:
@@ -1056,6 +1058,13 @@ func (g *Graph) publishLayer() {
 	}
 	g.view.Store(nv)
 	g.vecPublish() // swap fresh vector snapshots with every generation
+	// Vector lane (D10's direct-mode half): arm the folder wake on overlay
+	// pressure. Every publish path lands here (window cuts, Batch ends,
+	// read-triggered owner flushes) and all of them run on the writer
+	// thread; the wrapper mode arms its own vecSig in afterBatch.
+	if !g.writerAttached.Load() && g.vecOverlayPressure() {
+		g.vecKick()
+	}
 }
 
 // reconcileMirrors applies one published layer to the writer-private
@@ -1675,6 +1684,7 @@ func Open(path string, opts Options) (*Graph, error) {
 		return nil, err
 	}
 	g.wal, g.walDir, g.dbPath = w, walDir, path
+	g.vecKick() // recovery: replays left every vector in the overlay; drain bottom-up (spec 7.1)
 	return g, nil
 }
 
@@ -2325,6 +2335,7 @@ func loadGraph(r io.Reader) (*Graph, error) {
 		}
 		g.applyVecDecls(list)
 	}
+	g.vecKick() // snapshot backfill left every vector in the overlay; drain (spec 7.1)
 	return g, nil
 }
 

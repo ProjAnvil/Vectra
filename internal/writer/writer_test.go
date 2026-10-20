@@ -705,3 +705,53 @@ func TestVolumeCheckpointBoundsWAL(t *testing.T) {
 		t.Fatalf("reopened NodeCount = %d, want 160", got)
 	}
 }
+
+// TestVectorLaneDrains: the wrapper-mode folder's vector lane (spec D10)
+// packs overlay chunks independently of the graph-fold flight. A graph
+// with a declared index receives vector writes through Submit; the
+// overlay must drain below the pack size without any writer-side
+// fallback (vector convergence is lazy, spec 5.2-3).
+func TestVectorLaneDrains(t *testing.T) {
+	g := vectra.New()
+	if err := g.CreateVectorIndex(vectra.VectorIndexDecl{Name: "mem", Prop: "emb", Dim: 8, Metric: "cosine"}); err != nil {
+		t.Fatal(err)
+	}
+	h := writer.Attach(g, writer.Config{MaxLayers: 64, MergeEdges: 1 << 30})
+	defer func() { h.Close() }()
+
+	rng := rand.New(rand.NewSource(11))
+	cs := vectra.Changeset{}
+	for i := 0; i < 4096; i++ { // exactly two chunks: drains to zero (a tail chunk would legitimately stay, spec D7)
+		v := make([]float32, 8)
+		for j := range v {
+			v[j] = rng.Float32()
+		}
+		key := fmt.Sprintf("n%04d", i)
+		cs.Nodes = append(cs.Nodes, vectra.NodeUpsert{Key: key, Label: "m", Props: map[string]any{"emb": v}})
+		if len(cs.Nodes) == 512 {
+			if err := h.Submit(cs); err != nil {
+				t.Fatal(err)
+			}
+			cs = vectra.Changeset{}
+		}
+	}
+	if len(cs.Nodes) > 0 {
+		if err := h.Submit(cs); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if g.VectorOverlayLen("mem") == 0 {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if n := g.VectorOverlayLen("mem"); n != 0 {
+		t.Fatalf("vector lane did not drain: overlay=%d", n)
+	}
+	// Query on the wrapper-mode graph works through the published head.
+	if _, err := g.QueryVector("mem", make([]float32, 8), vectra.QueryVectorOptions{K: 3}); err != nil {
+		t.Fatal(err)
+	}
+}

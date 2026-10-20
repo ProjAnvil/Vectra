@@ -7,6 +7,7 @@ package vectra
 
 import (
 	"errors"
+	"sync"
 	"sync/atomic"
 
 	"github.com/projanvil/vectra/internal/store"
@@ -65,11 +66,41 @@ func vecMetric(s string) (vector.Metric, bool) {
 // folder packs - never mid-Add.
 type vecIndex struct {
 	decl VectorIndexDecl
+	// mu serializes State access between the writer goroutine (Add/Delete
+	// intake) and the folder lane (PackNext/publish). Uncontended on the
+	// writer hot path; readers never take it (they load head).
+	mu   sync.Mutex
 	st   *vector.State
 	head atomic.Pointer[vector.Snapshot]
 }
 
-func (vi *vecIndex) publish() { vi.head.Store(vi.st.Snapshot()) }
+func (vi *vecIndex) publish() {
+	vi.mu.Lock()
+	snap := vi.st.Snapshot()
+	vi.mu.Unlock()
+	vi.head.Store(snap)
+}
+
+// drain packs up to maxChunks overlay chunks and swaps a fresh snapshot
+// head per chunk batch; returns true when more backlog remains. Runs on
+// a folder goroutine; the writer's intake contends only on mu.
+func (vi *vecIndex) drain(maxChunks int) bool {
+	vi.mu.Lock()
+	for c := 0; c < maxChunks && vi.st.PackNext(); c++ {
+	}
+	snap := vi.st.Snapshot()
+	more := vi.st.OverlayLen() >= 2048
+	vi.mu.Unlock()
+	vi.head.Store(snap)
+	return more
+}
+
+// overlayFull reports the pack trigger (folder lane wake signal).
+func (vi *vecIndex) overlayFull() bool {
+	vi.mu.Lock()
+	defer vi.mu.Unlock()
+	return vi.st.OverlayLen() >= 2048
+}
 
 var (
 	ErrVectorIndexExists   = errors.New("vectra: vector index name already declared")
@@ -212,7 +243,9 @@ func (g *Graph) backfillVectorIndex(vi *vecIndex) {
 	for _, n := range nodes {
 		if v, ok := n.Props[vi.decl.Prop]; ok {
 			if fv, ok := vector.NormalizeVec(v, vi.decl.Dim); ok {
+				vi.mu.Lock()
 				vi.st.Add(n.Key, fv)
+				vi.mu.Unlock()
 			} else if g.onVecSkip != nil {
 				g.onVecSkip(n.Key, vi.decl.Name)
 			}
@@ -241,21 +274,27 @@ func (g *Graph) vecIntakeNode(key string, props map[string]any) {
 	for _, vi := range g.vecReg() {
 		if v, ok := props[vi.decl.Prop]; ok {
 			if fv, ok := vector.NormalizeVec(v, vi.decl.Dim); ok {
+				vi.mu.Lock()
 				vi.st.Add(key, fv)
+				vi.mu.Unlock()
 				continue
 			}
 			if g.onVecSkip != nil {
 				g.onVecSkip(key, vi.decl.Name)
 			}
 		}
+		vi.mu.Lock()
 		vi.st.Delete(key)
+		vi.mu.Unlock()
 	}
 }
 
 // vecIntakeDelete tombstones the key in every index (node delete).
 func (g *Graph) vecIntakeDelete(key string) {
 	for _, vi := range g.vecReg() {
+		vi.mu.Lock()
 		vi.st.Delete(key)
+		vi.mu.Unlock()
 	}
 }
 
@@ -410,3 +449,78 @@ func (g *Graph) vecReader() *vector.Reader {
 }
 
 func (g *Graph) putVecReader(r *vector.Reader) { g.vecReaders.Put(r) }
+
+// runVecDrain is the direct-mode folder lane's vector stage: drain every
+// index's overlay in bounded chunks (A6-style time share - the graph
+// fold below still gets its turn), re-arming the wake while backlog
+// remains. Pure State work under each index's mutex; heads swap per
+// batch so partial progress is queryable (spec 7.1).
+func (g *Graph) runVecDrain() {
+	const chunksPerWake = 8
+	for _, vi := range g.vecReg() {
+		for vi.drain(chunksPerWake) {
+			if g.closed.Load() {
+				return
+			}
+		}
+	}
+}
+
+// vecKick signals the folder lane (non-blocking): overlay pressure or a
+// recovery rebuild. Follows the folder's arming protocol - start the
+// goroutine if none is running, else just wake it; the loop's idle-exit
+// re-check makes a signal in the gap never lost. Writer-path and
+// Load/Open only.
+func (g *Graph) vecKick() {
+	if g.folderRunning.CompareAndSwap(false, true) {
+		go g.foldLoop()
+	}
+	select {
+	case g.foldWake <- struct{}{}:
+	default:
+	}
+}
+
+// vecOverlayPressure reports whether any index needs packing.
+func (g *Graph) vecOverlayPressure() bool {
+	for _, vi := range g.vecReg() {
+		if vi.overlayFull() {
+			return true
+		}
+	}
+	return false
+}
+
+// VecHandle is the folder-lane surface of one index for the wrapper-mode
+// writer (spec D10): drain packs overlay chunks and swaps the snapshot
+// head; the return reports remaining backlog.
+type VecHandle struct {
+	vi *vecIndex
+}
+
+func (v *VecHandle) Drain(maxChunks int) bool { return v.vi.drain(maxChunks) }
+
+// VectorHands exposes the folder-lane handles (wrapper merger use).
+func (g *Graph) VectorHandles() []*VecHandle {
+	reg := g.vecReg()
+	out := make([]*VecHandle, 0, len(reg))
+	for _, vi := range reg {
+		out = append(out, &VecHandle{vi: vi})
+	}
+	return out
+}
+
+// VectorOverlayPressure reports whether any index's overlay reached the
+// pack size (the wrapper's afterBatch trigger).
+func (g *Graph) VectorOverlayPressure() bool { return g.vecOverlayPressure() }
+
+// VectorOverlayLen reports one index's pending entry count (folder-lane
+// observability for tests and operators).
+func (g *Graph) VectorOverlayLen(name string) int {
+	if vi := g.vecIndexByName(name); vi != nil {
+		vi.mu.Lock()
+		defer vi.mu.Unlock()
+		return vi.st.OverlayLen()
+	}
+	return -1
+}

@@ -283,6 +283,57 @@ func (v vecView) search(q []float32, k, ef int, r *Reader) []VectorHit {
 	return all
 }
 
+// PackNext packs at most ONE overlay chunk (packSize entries, deduped
+// within the chunk) into a new L0 segment and runs the cascade; it
+// returns false without packing when the overlay holds less than a full
+// chunk. The folder lane loops it to drain recovery or sustained-write
+// backlog chunk by chunk - L0s appear first, so partial progress is
+// already queryable (spec 7.1: bottom-up rebuild). A vid re-added in a
+// later chunk wins at search time (overlay beats segments), so packing
+// an older chunk first is safe.
+func (s *State) PackNext() bool {
+	if s.overlayLen < packSize {
+		return false
+	}
+	chunk := s.overlay[0]
+	// Dedup within the chunk: newest entry wins, first-occurrence order.
+	pos := map[uint32]int{}
+	list := make([]entry, 0, len(chunk))
+	for _, e := range chunk {
+		if i, ok := pos[e.vid]; ok {
+			list[i] = e
+			continue
+		}
+		pos[e.vid] = len(list)
+		list = append(list, e)
+	}
+	seg := &segment{seq: s.seq, h: NewHNSW(s.metric, s.m, s.efc, s.seed+int64(s.seq)), keys: make([]string, 0, len(list))}
+	s.seq++
+	for _, e := range list {
+		if !s.dead.has(e.vid) {
+			seg.h.insertPrepared(e.vid, e.vec)
+			seg.keys = append(seg.keys, e.key)
+		}
+	}
+	s.overlay = s.overlay[1:]
+	s.overlayLen -= len(chunk)
+	carry := seg
+	for i := 0; carry != nil; i++ {
+		for i >= len(s.tiers) {
+			s.tiers = append(s.tiers, nil)
+		}
+		s.tiers[i] = append(s.tiers[i], carry)
+		if len(s.tiers[i]) < tierFactor {
+			break
+		}
+		parts := s.tiers[i]
+		s.tiers[i] = nil
+		carry = s.mergeSegments(parts...)
+	}
+	s.compact()
+	return true
+}
+
 // Pack builds an L0 segment from the overlay once it reached packSize
 // (or force), cascades in-tier merges upward, then compacts dead-heavy
 // segments (spec §4.2/§5.2).

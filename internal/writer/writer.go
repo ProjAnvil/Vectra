@@ -129,6 +129,11 @@ type Handle struct {
 	quit       chan struct{} // closed by Close after loopDone: merger exits
 	mergerDone chan struct{}
 	mergeSig   chan struct{} // buffered 1: wake the merger (single-flight)
+	// vecSig wakes the merger's VECTOR lane (spec D10): an independent
+	// signal, deliberately sharing the merger goroutine but never the
+	// graph-fold flight - the write-stall wait path (signalMerge) must
+	// not observe vector work (vector convergence is lazy by design).
+	vecSig chan struct{} // buffered 1
 
 	// flightMu guards the flight channel: non-nil while a background merge
 	// is wanted or in flight; closed exactly once when it resolves
@@ -167,6 +172,7 @@ func Attach(g *vectra.Graph, cfg Config) *Handle {
 		quit:       make(chan struct{}),
 		mergerDone: make(chan struct{}),
 		mergeSig:   make(chan struct{}, 1),
+		vecSig:     make(chan struct{}, 1),
 	}
 	go h.run()
 	go h.merger()
@@ -310,6 +316,12 @@ func (h *Handle) afterBatch() {
 	}
 	if h.volumeCheckpoint() {
 		return // sealed + checkpointed: layer pressure is already reset
+	}
+	if h.g.VectorOverlayPressure() {
+		select {
+		case h.vecSig <- struct{}{}:
+		default:
+		}
 	}
 	layers, layerEdges := h.g.LayerPressure()
 	switch {
