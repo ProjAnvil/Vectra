@@ -162,7 +162,7 @@ func randVec(rng *rand.Rand, dim int) []float32 {
 func TestRecallSmoke(t *testing.T) {
 	const n, dim = 2000, 64
 	vecs := genClustered(rand.New(rand.NewSource(101)), n, dim)
-	s, _ := buildState(vecs, 16, 200, 103)
+	s, _ := buildState(vecs, 16, 100, 103)
 	// In-distribution queries (perturbed indexed vectors): the old
 	// genClustered(50) made a single off-distribution cluster — probe:
 	// 10k×768 @ef128 recall 0.928 off-dist vs 1.0000 in-dist.
@@ -197,7 +197,7 @@ func runCell(n, dim int, dist string, ef int, measureOverlay bool) cellResult {
 	} else {
 		vecs = genUniform(rng, n, dim)
 	}
-	s, build := buildState(vecs, 16, 200, 999)
+	s, build := buildState(vecs, 16, 100, 999)
 	// In-distribution queries (perturbed indexed vectors): genClustered(50)
 	// made a single off-distribution cluster — probe: 10k×768 @ef128 recall
 	// 0.928 off-dist vs 1.0000 in-dist.
@@ -264,7 +264,7 @@ func TestBuildThroughput(t *testing.T) {
 		n = v
 	}
 	vecs := genClustered(rand.New(rand.NewSource(1000+int64(n))), n, 768)
-	s, d := buildState(vecs, 16, 200, 999)
+	s, d := buildState(vecs, 16, 100, 999)
 	t.Logf("built n=%d dim=768 clustered in %s (%.1f vec/s)",
 		n, d.Round(time.Millisecond), float64(n)/d.Seconds())
 	if os.Getenv("VECTRA_BUILD_SWEEP") != "" {
@@ -328,7 +328,7 @@ func TestSpikeReport(t *testing.T) {
 		run(1_000_000, 768, "clustered", 128, true) // adaptive-ef verification is Task 6 Step 2
 	}
 	report := "# Vector Phase 0 Spike Report (auto-generated)\n\n"
-	report += "Matrix (Cosine, M=16, EfC=200, seeds fixed, independent queries):\n\n"
+	report += "Matrix (Cosine, M=16, EfC=100, seeds fixed, independent queries):\n\n"
 	report += "| N | dim | dist | ef | recall@10 | p50 | p99 | p99(ov2048) | build | liveAmp | inuseAmp |\n|---|---|---|---|---|---|---|---|---|---|---|\n"
 	for _, c := range cells {
 		report += c.row() + "\n"
