@@ -177,7 +177,17 @@ func (v *View) FastAdjacency(dir int) (csr.Adjacency, bool) {
 // come first, then source rows in source order. The returned slice is
 // freshly allocated (callers may hold it unsynchronized).
 func (v *View) Rows(u uint32, dir int) []csr.AdjRow {
-	var out []csr.AdjRow
+	return v.RowsInto(u, dir, nil)
+}
+
+// RowsInto is the buffer-reuse form of Rows: it appends u's visible rows to
+// buf and returns the extended slice. buf (and the returned slice) must be
+// owned by one goroutine — parallel readers each hold their own buffer;
+// the View itself stays safe for unsynchronized concurrent use. Steady
+// state allocates nothing (TestViewRowsIntoZeroAlloc), which is what keeps
+// the many-worker row path off the allocator (v0.8 mixed-read p99 residual).
+func (v *View) RowsInto(u uint32, dir int, buf []csr.AdjRow) []csr.AdjRow {
+	out := buf[:0] // truncate: stale rows from a previous call must not leak
 	if int(u) < v.base.NodeCount() {
 		adj := v.base.AdjacencyF()
 		if dir == ViewDirIn {

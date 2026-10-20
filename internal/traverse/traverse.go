@@ -54,31 +54,54 @@ type RowSource interface {
 	FastAdjacency(dir int) (csr.Adjacency, bool)
 }
 
-// rower is the three-source View's direction-fixed row accessor: rows come
-// from the RowSource zipped into the parallel slices the View-path algorithm
-// bodies consume. The CSR fast path does NOT go through it — the algorithms
-// keep the original direct adj.Row loops (tiny leaf functions the compiler
-// inlines; an interface hop per node measurably regressed small-hot-graph
-// BFS, A1).
-type rower interface {
-	Row(u uint32) (targets, edgeIDs, labels []uint32)
+// rowSink is the optional buffer-reuse surface of a RowSource: sources
+// that can append their rows into a caller-owned buffer implement it
+// (engine.View does). viewRow uses it to keep the row path allocation-free;
+// sources without it fall back to copying Rows() output.
+type rowSink interface {
+	RowsInto(u uint32, dir int, buf []csr.AdjRow) []csr.AdjRow
 }
 
-// viewRow adapts a RowSource and direction.
+// viewRow adapts a RowSource and direction into the parallel-slice row
+// shape the View-path algorithm bodies consume. The CSR fast path does NOT
+// go through it — the algorithms keep the original direct adj.Row loops
+// (tiny leaf functions the compiler inlines; an interface hop per node
+// measurably regressed small-hot-graph BFS, A1).
+//
+// The zip buffers are scratch owned by ONE goroutine and valid only until
+// the next Row call: parallel expansion must fork one viewRow per worker
+// (fork). The v0.8 baseline allocated the four slices per node instead;
+// under 16 concurrent BFS workers that allocator traffic became mheap
+// span-lock contention (42ms mixed-read p99 tail, 2026-10-17 retest).
 type viewRow struct {
-	src RowSource
-	dir int
+	src  RowSource
+	dir  int
+	rows []csr.AdjRow // row fetch scratch, reused across calls
+	tg   []uint32     // zip scratch: valid until the next Row call
+	eids []uint32
+	lbs  []uint32
 }
 
-func (v viewRow) Row(u uint32) ([]uint32, []uint32, []uint32) {
-	rows := v.src.Rows(u, v.dir)
-	tg := make([]uint32, len(rows))
-	eids := make([]uint32, len(rows))
-	lbs := make([]uint32, len(rows))
-	for i, r := range rows {
-		tg[i], eids[i], lbs[i] = r.Target, r.EdgeID, r.LabelID
+// fork returns a copy with fresh scratch, sharing the immutable src/dir.
+func (v *viewRow) fork() viewRow {
+	return viewRow{src: v.src, dir: v.dir}
+}
+
+func (v *viewRow) Row(u uint32) ([]uint32, []uint32, []uint32) {
+	if sink, ok := v.src.(rowSink); ok {
+		v.rows = sink.RowsInto(u, v.dir, v.rows)
+	} else {
+		v.rows = append(v.rows[:0], v.src.Rows(u, v.dir)...)
 	}
-	return tg, eids, lbs
+	v.tg = v.tg[:0]
+	v.eids = v.eids[:0]
+	v.lbs = v.lbs[:0]
+	for _, r := range v.rows {
+		v.tg = append(v.tg, r.Target)
+		v.eids = append(v.eids, r.EdgeID)
+		v.lbs = append(v.lbs, r.LabelID)
+	}
+	return v.tg, v.eids, v.lbs
 }
 
 type Direction uint8
@@ -181,9 +204,9 @@ func BFS(src RowSource, starts []uint32, cfg Config) *Result {
 	for depth := uint32(1); depth <= cfg.MaxDepth && len(frontier) > 0; depth++ {
 		var next []uint32
 		if len(frontier) >= cfg.ParallelThreshold {
-			next = expandRowsParallel(r, cfg, visited, frontier)
+			next = expandRowsParallel(&r, cfg, visited, frontier)
 		} else {
-			next = expandRowsSerial(r, cfg, visited, frontier)
+			next = expandRowsSerial(&r, cfg, visited, frontier)
 		}
 		if len(next) == 0 {
 			break // exhausted: no trailing empty layer (MaxDepth cut has none either)
@@ -280,7 +303,7 @@ func expandLayerParallel(adj csr.Adjacency, cfg Config, visited []uint32, fronti
 
 // expandRowsSerial/expandRowsParallel are the three-source View path: rows
 // come zipped from the rower (View rows per node).
-func expandRowsSerial(r rower, cfg Config, visited []uint32, frontier []uint32) []uint32 {
+func expandRowsSerial(r *viewRow, cfg Config, visited []uint32, frontier []uint32) []uint32 {
 	var next []uint32
 	for _, u := range frontier {
 		tg, _, lb := r.Row(u)
@@ -296,7 +319,7 @@ func expandRowsSerial(r rower, cfg Config, visited []uint32, frontier []uint32) 
 	return next
 }
 
-func expandRowsParallel(r rower, cfg Config, visited []uint32, frontier []uint32) []uint32 {
+func expandRowsParallel(r *viewRow, cfg Config, visited []uint32, frontier []uint32) []uint32 {
 	workers := min(runtime.GOMAXPROCS(0), (len(frontier)+parallelChunk-1)/parallelChunk)
 	if workers <= 1 {
 		return expandRowsSerial(r, cfg, visited, frontier)
@@ -311,9 +334,10 @@ func expandRowsParallel(r rower, cfg Config, visited []uint32, frontier []uint32
 		}
 		hi := min(lo+chunk, len(frontier))
 		wg.Go(func() {
+			rv := r.fork() // own scratch: Row's buffers are per-goroutine
 			local := make([]uint32, 0, (hi-lo)*2)
 			for _, u := range frontier[lo:hi] {
-				tg, _, lb := r.Row(u)
+				tg, _, lb := rv.Row(u)
 				for i, v := range tg {
 					if cfg.LabelMask != nil && !cfg.LabelMask[lb[i]] {
 						continue
@@ -490,16 +514,16 @@ func ShortestPath(src RowSource, from, to uint32) (nodes, edges []uint32, found 
 	fRow, bRow := viewRow{src: src, dir: int(DirOut)}, viewRow{src: src, dir: int(DirIn)}
 	for len(fFront) > 0 && len(bFront) > 0 {
 		if len(fFront) <= len(bFront) {
-			next, meet, ok := expandMeetingRows(fFront, fRow, fVis, bVis, fParent, fBuf)
+			next, meet, ok := expandMeetingRows(fFront, &fRow, fVis, bVis, fParent, fBuf)
 			if ok {
-				nodes, edges := reconstructRows(fRow, meet, fParent, bParent)
+				nodes, edges := reconstructRows(&fRow, meet, fParent, bParent)
 				return nodes, edges, true
 			}
 			fFront, fBuf = next, fFront[:0]
 		} else {
-			next, meet, ok := expandMeetingRows(bFront, bRow, bVis, fVis, bParent, bBuf)
+			next, meet, ok := expandMeetingRows(bFront, &bRow, bVis, fVis, bParent, bBuf)
 			if ok {
-				nodes, edges := reconstructRows(fRow, meet, fParent, bParent)
+				nodes, edges := reconstructRows(&fRow, meet, fParent, bParent)
 				return nodes, edges, true
 			}
 			bFront, bBuf = next, bFront[:0]
@@ -537,7 +561,7 @@ func expandMeeting(frontier []uint32, adj csr.Adjacency, mine, theirs []uint32, 
 	return next, meet, found
 }
 
-func expandMeetingRows(frontier []uint32, r rower, mine, theirs []uint32, parent []uint32, buf []uint32) (next []uint32, meet uint32, found bool) {
+func expandMeetingRows(frontier []uint32, r *viewRow, mine, theirs []uint32, parent []uint32, buf []uint32) (next []uint32, meet uint32, found bool) {
 	next = buf[:0]
 	for _, u := range frontier {
 		for _, v := range neighborsOf(r, u) {
@@ -560,7 +584,7 @@ func expandMeetingRows(frontier []uint32, r rower, mine, theirs []uint32, parent
 
 // neighborsOf is the rower's neighbor view (ShortestPath never needs edge
 // IDs during expansion — only for reconstruction).
-func neighborsOf(r rower, u uint32) []uint32 {
+func neighborsOf(r *viewRow, u uint32) []uint32 {
 	tg, _, _ := r.Row(u)
 	return tg
 }
@@ -595,7 +619,7 @@ func anyEdgeCSR(adj csr.Adjacency, u, v uint32) uint32 {
 	return 0 // path is contiguous by construction; unreachable in practice
 }
 
-func reconstructRows(r rower, meet uint32, fParent, bParent []uint32) ([]uint32, []uint32) {
+func reconstructRows(r *viewRow, meet uint32, fParent, bParent []uint32) ([]uint32, []uint32) {
 	fwd := []uint32{meet} // meet -> from, reversed afterwards
 	for v := fParent[meet]; v != 0; v = fParent[v-1] {
 		fwd = append(fwd, v-1)
