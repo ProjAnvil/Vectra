@@ -2,6 +2,7 @@ package vector
 
 import (
 	"math"
+	"math/rand"
 	"testing"
 )
 
@@ -19,6 +20,34 @@ func TestDistanceKnownValues(t *testing.T) {
 	}
 	if got := Distance(Dot, []float32{2, 1}, []float32{3, 4}); math.Abs(got+10) > 1e-4 {
 		t.Fatalf("dot negated = %v, want -10", got)
+	}
+}
+
+// TestDistanceLongVectors exercises the unrolled kernel body (multiples of
+// 8 plus tails) against a float64 reference across several lengths,
+// including dims that hit every remainder 0-7. Added with the 8-wide
+// accumulator unroll: the known-values test above only covers tails.
+func TestDistanceLongVectors(t *testing.T) {
+	rng := rand.New(rand.NewSource(42))
+	for _, n := range []int{8, 15, 16, 23, 24, 31, 100, 768} {
+		a := make([]float32, n)
+		b := make([]float32, n)
+		var refDot, refL2 float64
+		for i := range a {
+			a[i] = rng.Float32() // [-0,1); magnitudes and signs irrelevant
+			b[i] = rng.Float32()*2 - 1
+			refDot += float64(a[i]) * float64(b[i])
+			refL2 += float64(a[i]-b[i]) * float64(a[i]-b[i])
+		}
+		if got := Distance(Dot, a, b); math.Abs(got+refDot) > 1e-4*float64(n) {
+			t.Fatalf("dot n=%d = %v, want ~%v", n, got, -refDot)
+		}
+		if got := Distance(Cosine, a, b); math.Abs(got-(1-refDot)) > 1e-4*float64(n) {
+			t.Fatalf("cosine n=%d = %v, want ~%v", n, got, 1-refDot)
+		}
+		if got := Distance(L2, a, b); math.Abs(got-refL2) > 1e-3*float64(n) {
+			t.Fatalf("l2 n=%d = %v, want ~%v", n, got, refL2)
+		}
 	}
 }
 
