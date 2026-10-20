@@ -103,8 +103,8 @@ func TestVectorDeclWALRoundtrip(t *testing.T) {
 	}
 	g.FlushPend()
 	// Replay the live WAL before Close: Close checkpoints and Resets the
-	// log (frames move into the v4 snapshot), so post-Close replay is
-	// empty by design.
+	// log (decl frames retire into the v4 snapshot's VectorDecls section),
+	// so post-Close replay is empty by design.
 	var lastDecls []wal.VectorIndexDecl
 	sawFrame := false
 	if _, err := g.wal.Replay(func(fr wal.Frame) error {
@@ -297,5 +297,108 @@ func TestVecReplayParity(t *testing.T) {
 				t.Fatalf("q%d [%d]: a=%+v b=%+v c=%+v", qi, i, ha[i], hb[i], hc[i])
 			}
 		}
+	}
+}
+
+// TestVecCloseReopenKeepsIndex: Close checkpoints (WAL reset) - the
+// declarations and vectors must survive through the v4 snapshot section
+// (audit repro: Save ignored VectorDecls and Close silently dropped
+// every index).
+func TestVecCloseReopenKeepsIndex(t *testing.T) {
+	dir := t.TempDir()
+	db := dir + "/v.db"
+	g, err := Open(db, Options{WALMode: ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.CreateVectorIndex(VectorIndexDecl{Name: "mem", Prop: "emb", Dim: 8, Metric: "cosine"}); err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(21))
+	for i := 0; i < 30; i++ {
+		v := make([]float32, 8)
+		for j := range v {
+			v[j] = rng.Float32()
+		}
+		if _, err := g.AddNode(fmt.Sprintf("n%d", i), "m", map[string]any{"emb": v}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := g.Close(); err != nil {
+		t.Fatal(err)
+	}
+	g2, err := Open(db, Options{WALMode: ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g2.Close()
+	if got := g2.VectorIndexes(); len(got) != 1 || got[0].Name != "mem" || got[0].Dim != 8 {
+		t.Fatalf("reopened decls: %+v", got)
+	}
+	vi := vecStateOf(t, g2, "mem")
+	if vi.st.OverlayLen() != 30 {
+		t.Fatalf("reopened overlay = %d, want 30 vectors from the snapshot backfill", vi.st.OverlayLen())
+	}
+}
+
+// TestVecCreateInBatchRejected: mid-batch declarations would backfill a
+// pre-publish view and miss the batch's own nodes (replay applies decl
+// frames between changesets) - rejected with an error instead.
+func TestVecCreateInBatchRejected(t *testing.T) {
+	g := New()
+	g.Batch(func(g *Graph) {
+		g.AddNode("n", "m", map[string]any{"emb": []float32{1, 0, 0, 0}})
+		if err := g.CreateVectorIndex(VectorIndexDecl{Name: "x", Prop: "emb", Dim: 4, Metric: "cosine"}); err == nil {
+			t.Error("CreateVectorIndex inside Batch must error")
+		}
+	})
+	if got := g.VectorIndexes(); len(got) != 0 {
+		t.Fatalf("rejected create must leave no registry entry: %+v", got)
+	}
+}
+
+// TestVecRecreateSameNameParity: drop + recreate of one name inside a
+// single flush window coalesces into one full-list frame; replay must
+// adopt the NEW parameters (audit repro: name-only reconcile kept the
+// stale Dim-4 State and diverged all later intake).
+func TestVecRecreateSameNameParity(t *testing.T) {
+	dir := t.TempDir()
+	b, err := Open(dir+"/v.db", Options{WALMode: ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyVecOps(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.DropVectorIndex("mem"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.CreateVectorIndex(VectorIndexDecl{Name: "mem", Prop: "emb", Dim: 8, Metric: "cosine"}); err != nil {
+		t.Fatal(err)
+	}
+	b.FlushPend()
+	cp := t.TempDir()
+	walSrc := filepath.Join(dir, "v.db.wal")
+	os.Mkdir(filepath.Join(cp, "v.db.wal"), 0o755)
+	files, _ := os.ReadDir(walSrc)
+	for _, f := range files {
+		if f.IsDir() {
+			continue
+		}
+		in, _ := os.ReadFile(filepath.Join(walSrc, f.Name()))
+		os.WriteFile(filepath.Join(cp, "v.db.wal", f.Name()), in, 0o644)
+	}
+	c, err := Open(cp+"/v.db", Options{WALMode: ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	bv := vecStateOf(t, b, "mem")
+	cv := vecStateOf(t, c, "mem")
+	if bv.decl != cv.decl {
+		t.Fatalf("recreated decl mismatch: live=%+v replay=%+v", bv.decl, cv.decl)
+	}
+	if bv.st.OverlayLen() != cv.st.OverlayLen() {
+		t.Fatalf("recreated overlay: live=%d replay=%d", bv.st.OverlayLen(), cv.st.OverlayLen())
 	}
 }

@@ -1661,7 +1661,10 @@ func Open(path string, opts Options) (*Graph, error) {
 		for _, k := range fr.IndexKeys {
 			g.IndexProperty(k)
 		}
-		if len(fr.VectorIndexes) > 0 {
+		if fr.VectorIndexes != nil {
+			// nil = keys-only frame (pre-Phase-1 or IndexProperty); a
+			// non-nil slice - including empty - is a vector declaration
+			// frame: empty means drop-all.
 			g.applyVecDecls(fr.VectorIndexes)
 		}
 		return nil
@@ -2213,7 +2216,12 @@ func (g *Graph) Save(w io.Writer) error {
 			Props:  e.Props,
 		})
 	}
-	return store.Encode(w, store.Data{Nodes: sn, Edges: se, IndexKeys: indexKeys})
+	reg := g.vecReg()
+	decls := make([]store.VectorIndexDecl, 0, len(reg))
+	for _, vi := range reg {
+		decls = append(decls, vecDeclToStore(vi.decl))
+	}
+	return store.Encode(w, store.Data{Nodes: sn, Edges: se, IndexKeys: indexKeys, VectorDecls: decls})
 }
 
 // SaveFile saves to a path: temp file + fsync + atomic rename, avoiding
@@ -2301,7 +2309,21 @@ func loadGraph(r io.Reader) (*Graph, error) {
 			Src: s, Dst: d, LabelID: intern(e.Label), Props: e.Props,
 		})
 	}
-	return graphFromEngine(nodes, edges, labels, data.IndexKeys)
+	g, err := graphFromEngine(nodes, edges, labels, data.IndexKeys)
+	if err != nil {
+		return nil, err
+	}
+	if len(data.VectorDecls) > 0 {
+		list := make([]wal.VectorIndexDecl, 0, len(data.VectorDecls))
+		for _, d := range data.VectorDecls {
+			list = append(list, wal.VectorIndexDecl{
+				Name: d.Name, Prop: d.Prop, Dim: d.Dim, Metric: d.Metric,
+				M: d.M, EfConstruction: d.EfConstruction,
+			})
+		}
+		g.applyVecDecls(list)
+	}
+	return g, nil
 }
 
 // graphFromEngine builds a Graph whose initial generation is the merged base

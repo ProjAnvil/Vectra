@@ -103,7 +103,11 @@ type IndexDecl struct {
 	// property keys (vector Phase 1, spec §3.3). JSON decoding ignores the
 	// field on old payloads (forward compatible); an old reader skips the
 	// whole frame type by the standing stop-rather-than-guess rule.
-	VectorIndexes []VectorIndexDecl `json:"vectorIndexes,omitempty"`
+	// no omitempty: null = this frame carries no vector declarations
+	// (pre-Phase-1 frames decode this way), while an explicit empty array
+	// means "drop all" - a DropVectorIndex-only flush must survive the
+	// wire (Phase 1 audit: the guard-replay pair used to eat it).
+	VectorIndexes []VectorIndexDecl `json:"vectorIndexes"`
 }
 
 // VectorIndexDecl is the wire form of a vector index declaration

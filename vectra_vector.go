@@ -86,6 +86,15 @@ func (g *Graph) CreateVectorIndex(d VectorIndexDecl) error {
 	if g.closed.Load() {
 		return ErrClosed
 	}
+	if err := g.checkWriter(); err != nil {
+		return err
+	}
+	if g.batching {
+		// Mid-batch backfill would scan a pre-publish view and miss this
+		// batch's own nodes (replay applies decl frames BETWEEN changesets,
+		// never inside one) - reject instead of diverging (audit 2026-10-20).
+		return errors.New("vectra: CreateVectorIndex inside Batch is not supported")
+	}
 	if d.Name == "" || d.Prop == "" {
 		return errors.New("vectra: vector index name and prop are required")
 	}
@@ -118,6 +127,12 @@ func (g *Graph) CreateVectorIndex(d VectorIndexDecl) error {
 func (g *Graph) DropVectorIndex(name string) error {
 	if g.closed.Load() {
 		return ErrClosed
+	}
+	if err := g.checkWriter(); err != nil {
+		return err
+	}
+	if g.batching {
+		return errors.New("vectra: DropVectorIndex inside Batch is not supported")
 	}
 	g.flushPend()
 	reg := g.vecRegistryCopy()
@@ -254,25 +269,42 @@ func (g *Graph) vecPublish() {
 }
 
 // applyVecDecls reconciles the registry to a full declaration list
-// (IndexDecl replay and Task-9 load). Names absent from the list drop;
-// names present upsert. Replay runs with recording detached (g.wal nil),
-// so recordVecDecls no-ops there.
+// (IndexDecl replay and load). Names absent from the list drop; a kept
+// name whose declaration CHANGED (drop+recreate in one frame window)
+// rebuilds from the recorded parameters - a name-only match would keep
+// the stale State (audit 2026-10-20). Duplicate names in one list take
+// the last parameters, first position. Replay runs with recording
+// detached (g.wal nil), so recordVecDecls no-ops there.
 func (g *Graph) applyVecDecls(list []wal.VectorIndexDecl) {
-	want := make(map[string]wal.VectorIndexDecl, len(list))
+	uniq := make([]wal.VectorIndexDecl, 0, len(list))
+	pos := make(map[string]int, len(list))
 	for _, w := range list {
+		if i, ok := pos[w.Name]; ok {
+			uniq[i] = w
+			continue
+		}
+		pos[w.Name] = len(uniq)
+		uniq = append(uniq, w)
+	}
+	want := make(map[string]wal.VectorIndexDecl, len(uniq))
+	for _, w := range uniq {
 		want[w.Name] = w
 	}
-	reg := g.vecRegistryCopy()
-	kept := reg[:0:0]
-	for _, vi := range reg {
-		if _, ok := want[vi.decl.Name]; !ok {
-			continue // dropped by absence
+	kept := make([]*vecIndex, 0, len(uniq))
+	for _, vi := range g.vecReg() {
+		w, ok := want[vi.decl.Name]
+		if !ok || vi.decl != vecDeclFromWal(w) {
+			continue // dropped, or recreated with new parameters
 		}
 		kept = append(kept, vi)
 	}
+	have := make(map[string]bool, len(kept))
+	for _, vi := range kept {
+		have[vi.decl.Name] = true
+	}
 	var fresh []*vecIndex
-	for _, w := range list {
-		if vi := g.vecIndexByName(w.Name); vi != nil {
+	for _, w := range uniq {
+		if have[w.Name] {
 			continue
 		}
 		d := vecDeclFromWal(w)
