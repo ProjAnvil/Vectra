@@ -272,6 +272,12 @@ type edgeRef struct {
 type Graph struct {
 	view atomic.Pointer[genView]
 
+	// vector indexes (Phase 1): copy-on-write registry behind an atomic
+	// pointer - lock-free reads, writer-thread mutations. Each entry owns
+	// its published snapshot head (spec D1; see vectra_vector.go).
+	vecIdx    atomic.Pointer[[]*vecIndex]
+	onVecSkip func(key, index string) // Options.OnVecSkip; nil = silent skip
+
 	// writer-private published-state mirrors (reconciled at publish)
 	nodes     map[string]nodeRef        // key -> id + visibility
 	edges     map[delta.EdgeKey]edgeRef // key -> winner id + visible parallels
@@ -545,16 +551,18 @@ const (
 	opEdgeDelete
 	opNodeDelete
 	opIndex
+	opVecIndex // declaration-class like opIndex: rides IndexDecl frames
 )
 
 // pendOp is one recorded write, kept in original order until flush.
 type pendOp struct {
-	kind opKind
-	node NodeUpsert
-	edge EdgeUpsert
-	edel EdgeDelete
-	ndel string
-	idx  string // opIndex: declared property key
+	kind     opKind
+	node     NodeUpsert
+	edge     EdgeUpsert
+	edel     EdgeDelete
+	ndel     string
+	idx      string             // opIndex: declared property key
+	vecDecls []wal.VectorIndexDecl // opVecIndex: full declaration list
 }
 
 // New returns an empty graph. The initial generation is an empty merged
@@ -1402,14 +1410,19 @@ func (g *Graph) flushPending() error {
 	}
 	i := 0
 	for i < len(g.pendOps) {
-		if g.pendOps[i].kind == opIndex {
+		if g.pendOps[i].kind == opIndex || g.pendOps[i].kind == opVecIndex {
 			j := i
 			keys := make([]string, 0, 4)
-			for j < len(g.pendOps) && g.pendOps[j].kind == opIndex {
-				keys = append(keys, g.pendOps[j].idx)
+			var vecs []wal.VectorIndexDecl
+			for j < len(g.pendOps) && (g.pendOps[j].kind == opIndex || g.pendOps[j].kind == opVecIndex) {
+				if g.pendOps[j].kind == opIndex {
+					keys = append(keys, g.pendOps[j].idx)
+				} else {
+					vecs = g.pendOps[j].vecDecls
+				}
 				j++
 			}
-			if _, err := g.wal.AppendIndex(IndexDecl{Keys: keys}); err != nil {
+			if _, err := g.wal.AppendIndex(IndexDecl{Keys: keys, VectorIndexes: vecs}); err != nil {
 				g.pendOps = append([]pendOp(nil), g.pendOps[i:]...)
 				return err
 			}
@@ -1417,7 +1430,7 @@ func (g *Graph) flushPending() error {
 			continue
 		}
 		j := i + 1
-		for j < len(g.pendOps) && g.pendOps[j].kind != opIndex &&
+		for j < len(g.pendOps) && g.pendOps[j].kind != opIndex && g.pendOps[j].kind != opVecIndex &&
 			g.pendOps[j].kind >= g.pendOps[j-1].kind {
 			j++
 		}
@@ -1629,6 +1642,7 @@ func Open(path string, opts Options) (*Graph, error) {
 		g = New()
 	}
 
+	g.onVecSkip = opts.OnVecSkip
 	w, err := wal.Open(walDir, opts.WALMode)
 	if err != nil {
 		return nil, err

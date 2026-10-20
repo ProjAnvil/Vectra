@@ -17,6 +17,11 @@ const (
 // semantics on an existing snapshot path.
 type Options struct {
 	WALMode Mode
+	// OnVecSkip observes vectors the index rejected at intake (wrong dim,
+	// non-numeric elements, NaN/Inf): called with the node key and index
+	// name, never blocking the write (spec 13-2: skip + warn, no error).
+	// Nil = silent skip.
+	OnVecSkip func(key, index string)
 	// WALDir is the WAL directory. Empty means <path>.wal next to the
 	// snapshot file. Ignored when WALMode is ModeOff.
 	WALDir string
