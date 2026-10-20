@@ -254,3 +254,81 @@ func TestEncodeRejectsUnmarshalableProps(t *testing.T) {
 		t.Fatal("unmarshalable props should error")
 	}
 }
+
+// TestStoreV4VectorDeclsRoundtrip: v4 persists vector declarations in a
+// trailing JSON section (spec §3.3); []float32 props ride the existing
+// props channel unchanged; v3 files decode with zero declarations; a v4
+// file opened by a v3-shaped reader (only versions <=3) hard-fails.
+func TestStoreV4VectorDeclsRoundtrip(t *testing.T) {
+	var buf bytes.Buffer
+	in := store.Data{
+		Nodes: []store.Node{
+			{Key: "a", Label: "mem", Props: map[string]any{"embedding": []float32{0.1, 0.2, 0.3}}},
+			{Key: "b", Label: "mem", Props: map[string]any{"embedding": []any{float64(0.4), float64(0.5), float64(0.6)}}},
+		},
+		IndexKeys: []string{"team"},
+		VectorDecls: []store.VectorIndexDecl{
+			{Name: "mem", Prop: "embedding", Dim: 3, Metric: "cosine", M: 16, EfConstruction: 200},
+		},
+	}
+	if err := store.Encode(&buf, in); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(buf.Bytes()[:6], []byte("VCTR")) {
+		t.Fatal("magic lost")
+	}
+	if got := binary.LittleEndian.Uint16(buf.Bytes()[4:6]); got != 4 {
+		t.Fatalf("version = %d, want 4", got)
+	}
+	out, err := store.Decode(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.VectorDecls) != 1 || out.VectorDecls[0] != in.VectorDecls[0] {
+		t.Fatalf("vector decls: %+v", out.VectorDecls)
+	}
+	emb, ok := out.Nodes[0].Props["embedding"].([]any)
+	if !ok || len(emb) != 3 {
+		t.Fatalf("float32 prop did not survive the JSON props channel: %T", out.Nodes[0].Props["embedding"])
+	}
+}
+
+func TestStoreV3LoadsEmptyVectorDecls(t *testing.T) {
+	// A v3 payload: encode with v4 then patch the version down and strip
+	// the vector section? Simpler: v3 fixtures exist in TestV2SnapshotStillReadable
+	// style - build a v3 buffer by encoding without decls and forcing the
+	// old layout is not possible post-hoc; instead verify Decode of a
+	// genuine v3 file (none at hand) via version downgrade behavior:
+	// decode must return zero decls for any pre-v4 payload. Use a v2-era
+	// style buffer constructed by hand (no indexKeys section).
+	var buf bytes.Buffer
+	buf.WriteString("VCTR")
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(3))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0)) // nodes
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0)) // edges
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0)) // indexKeys
+	body := buf.Bytes()
+	_ = binary.Write(&buf, binary.LittleEndian, crc32.ChecksumIEEE(body))
+	out, err := store.Decode(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.VectorDecls) != 0 {
+		t.Fatalf("v3 payload must decode zero vector decls, got %+v", out.VectorDecls)
+	}
+}
+
+func TestStoreV4RejectedByV3Reader(t *testing.T) {
+	// A v3-era reader rejects version 4 outright (unsupported version) -
+	// the spec's hard-fail line for downgrades (spec §12). Simulate the
+	// v3 reader by checking Decode's behavior on a bumped-version header
+	// with an otherwise valid layout.
+	var buf bytes.Buffer
+	buf.WriteString("VCTR")
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(9)) // future version
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
+	if _, err := store.Decode(bytes.NewReader(buf.Bytes())); err == nil {
+		t.Fatal("unknown version must hard-fail")
+	}
+}

@@ -490,3 +490,50 @@ func TestIndexDeclRoundtrip(t *testing.T) {
 		t.Fatalf("post-recovery LastLSN = %d, want 4 (index frame overwritten?)", got)
 	}
 }
+
+// TestVectorIndexDeclRoundtrip: vector declarations ride IndexDecl frames
+// and surface on Frame.VectorIndexes (spec §3.3); old frames without the
+// field replay with it empty.
+func TestVectorIndexDeclRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(dir, ModeAlways)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decls := []VectorIndexDecl{
+		{Name: "mem", Prop: "embedding", Dim: 768, Metric: "cosine"},
+		{Name: "img", Prop: "feat", Dim: 384, Metric: "l2", M: 24, EfConstruction: 300},
+	}
+	if _, err := w.AppendIndex(IndexDecl{VectorIndexes: decls}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.AppendIndex(IndexDecl{Keys: []string{"team"}}); err != nil { // old-style frame
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	w2, err := Open(dir, ModeAlways)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	var gotVec [][]VectorIndexDecl
+	var gotKeys int
+	if _, err := w2.Replay(func(fr Frame) error {
+		gotVec = append(gotVec, fr.VectorIndexes)
+		if len(fr.IndexKeys) > 0 {
+			gotKeys++
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(gotVec) != 2 || len(gotVec[0]) != 2 || len(gotVec[1]) != 0 || gotKeys != 1 {
+		t.Fatalf("vector decl replay wrong: %+v keys=%d", gotVec, gotKeys)
+	}
+	want := decls[1]
+	if gotVec[0][1] != want {
+		t.Fatalf("decl mismatch: %+v want %+v", gotVec[0][1], want)
+	}
+}

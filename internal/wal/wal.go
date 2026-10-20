@@ -99,6 +99,23 @@ type Changeset struct {
 // window is one checkpoint interval of a mixed-version downgrade.
 type IndexDecl struct {
 	Keys []string `json:"keys"`
+	// VectorIndexes carries vector index declarations alongside the typed
+	// property keys (vector Phase 1, spec §3.3). JSON decoding ignores the
+	// field on old payloads (forward compatible); an old reader skips the
+	// whole frame type by the standing stop-rather-than-guess rule.
+	VectorIndexes []VectorIndexDecl `json:"vectorIndexes,omitempty"`
+}
+
+// VectorIndexDecl is the wire form of a vector index declaration
+// (spec §3.1). Metric: "cosine" | "l2" | "dot"; zero M/EfConstruction
+// mean engine defaults.
+type VectorIndexDecl struct {
+	Name           string `json:"name"`
+	Prop           string `json:"prop"`
+	Dim            int    `json:"dim"`
+	Metric         string `json:"metric"`
+	M              int    `json:"m,omitempty"`
+	EfConstruction int    `json:"efConstruction,omitempty"`
 }
 
 // Mode selects the WAL's durability behavior. The zero value is ModeOff (no
@@ -498,6 +515,9 @@ type Frame struct {
 	LSN       uint64
 	Changeset *Changeset // frameChangeset
 	IndexKeys []string   // frameIndexDecl
+	// VectorIndexes rides frameIndexDecl payloads (spec §3.3): empty on
+	// pre-Phase-1 frames.
+	VectorIndexes []VectorIndexDecl
 }
 
 // Replay applies every frame above the manifest's base LSN to fn, in LSN
@@ -576,6 +596,7 @@ func (w *WAL) replayLSN(fn func(lsn uint64, fr Frame) error) (uint64, error) {
 					return errStopScan
 				}
 				fr.IndexKeys = d.Keys
+				fr.VectorIndexes = d.VectorIndexes
 			} else {
 				var cs Changeset
 				if err := json.Unmarshal(payload, &cs); err != nil {

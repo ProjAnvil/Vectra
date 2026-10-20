@@ -22,6 +22,7 @@ import (
 
 const (
 	magic         = "VCTR"
+	versionV4     = 4 // adds the vector index declaration section
 	versionV3     = 3
 	versionV2     = 2 // no indexKey section, read compatibility only
 	versionLegacy = 1 // no CRC trailer, read compatibility only
@@ -45,13 +46,28 @@ type Edge struct {
 	Props  map[string]any
 }
 
+// VectorIndexDecl is the store mirror of the wire declaration (JSON tags
+// match wal.VectorIndexDecl; spec §3.1/§3.3). Vector payloads themselves
+// ride node props through the existing JSON channel - the intake layer
+// (vector.NormalizeVec) recovers []float32 from the float64 round-trip.
+type VectorIndexDecl struct {
+	Name           string `json:"name"`
+	Prop           string `json:"prop"`
+	Dim            int    `json:"dim"`
+	Metric         string `json:"metric"`
+	M              int    `json:"m,omitempty"`
+	EfConstruction int    `json:"efConstruction,omitempty"`
+}
+
 // Data is the full decoded content of a snapshot: nodes, edges, and the
 // property-index declarations to re-register before Seal. IndexKeys is nil
-// for v1/v2 files (they never persisted any).
+// for v1/v2 files (they never persisted any); VectorDecls is nil for
+// pre-v4 files.
 type Data struct {
-	Nodes     []Node
-	Edges     []Edge
-	IndexKeys []string
+	Nodes       []Node
+	Edges       []Edge
+	IndexKeys   []string
+	VectorDecls []VectorIndexDecl
 }
 
 // crcWriter aggregates the CRC of the written byte stream (appended as a
@@ -117,7 +133,7 @@ func Encode(w io.Writer, d Data) error {
 	if _, err := cw.Write(head[:]); err != nil {
 		return err
 	}
-	if err := binary.Write(cw, binary.LittleEndian, uint16(versionV3)); err != nil {
+	if err := binary.Write(cw, binary.LittleEndian, uint16(versionV4)); err != nil {
 		return err
 	}
 	if err := putU32(cw, uint32(len(d.Nodes))); err != nil {
@@ -156,6 +172,21 @@ func Encode(w io.Writer, d Data) error {
 	}
 	for _, k := range d.IndexKeys {
 		if err := writeString(cw, k); err != nil {
+			return err
+		}
+	}
+	// v4 vector declaration section: count + one JSON blob per decl,
+	// before the CRC trailer. Pre-v4 readers hard-fail on the version
+	// byte instead of misreading this section (spec §12 downgrade line).
+	if err := putU32(cw, uint32(len(d.VectorDecls))); err != nil {
+		return err
+	}
+	for _, vd := range d.VectorDecls {
+		blob, err := json.Marshal(vd)
+		if err != nil {
+			return err
+		}
+		if err := writeString(cw, string(blob)); err != nil {
 			return err
 		}
 	}
@@ -236,7 +267,7 @@ func Decode(r io.Reader) (Data, error) {
 	ver := binary.LittleEndian.Uint16(raw[4:6])
 	body := raw
 	switch ver {
-	case versionV3, versionV2:
+	case versionV4, versionV3, versionV2:
 		body = raw[:len(raw)-4]
 		want := binary.LittleEndian.Uint32(raw[len(raw)-4:])
 		if got := crc32.ChecksumIEEE(body); got != want {
@@ -291,7 +322,7 @@ func Decode(r io.Reader) (Data, error) {
 		}
 	}
 	var indexKeys []string
-	if ver == versionV3 {
+	if ver >= versionV3 {
 		nk, err := rd.u32()
 		if err != nil {
 			return Data{}, err
@@ -308,8 +339,30 @@ func Decode(r io.Reader) (Data, error) {
 			}
 		}
 	}
+	var vecDecls []VectorIndexDecl
+	if ver >= versionV4 {
+		nd, err := rd.u32()
+		if err != nil {
+			return Data{}, err
+		}
+		if int64(nd)*4 > int64(len(rd.b)-rd.i) { // forged-count guard, one u32 length per decl minimum
+			return Data{}, errTruncated
+		}
+		if nd > 0 {
+			vecDecls = make([]VectorIndexDecl, nd)
+			for i := range vecDecls {
+				blob, err := rd.str()
+				if err != nil {
+					return Data{}, err
+				}
+				if err := json.Unmarshal([]byte(blob), &vecDecls[i]); err != nil {
+					return Data{}, err
+				}
+			}
+		}
+	}
 	if rd.i != len(rd.b) {
 		return Data{}, errors.New("store: trailing garbage")
 	}
-	return Data{Nodes: nodes, Edges: edges, IndexKeys: indexKeys}, nil
+	return Data{Nodes: nodes, Edges: edges, IndexKeys: indexKeys, VectorDecls: vecDecls}, nil
 }
