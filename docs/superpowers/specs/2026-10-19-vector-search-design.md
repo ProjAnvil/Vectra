@@ -71,7 +71,7 @@ type VectorIndexDecl struct {
     Dim            int     // 维度，建定时锁定；上限 4096
     Metric         string  // "cosine" | "l2" | "dot"
     M              int     // HNSW 每层最大邻居数，默认 16
-    EfConstruction int     // 建图搜索宽度，默认 100（2026-10-19 锁定：recall 不降、构建 -23%）
+    EfConstruction int     // 建图搜索宽度，默认 200（efc=100 试验过：构建 -23% 但 100k recall@ef32 降至 0.9940，弃用）
 }
 ```
 
@@ -386,4 +386,4 @@ func (g *Graph) QueryVector(index string, vec []float32, o QueryVectorOptions) (
 - Phase 0 (2026-10-19): 500k/1M acceptance runs cancelled by the owner before completion (pivot to build-throughput optimization). 门 2a verdict is conditional on 100k-measured lines + extrapolation; re-measure after the optimization pass.
 - Phase 0 (2026-10-19): build throughput decays superlinearly (~80 vec/s at 10k×768 → ~17 at 100k×768), 10-20x off hnswlib single-thread. Not a 门 2a line but an operational red line: sustained writes above the fold rate back up the overlay, and 1M restart rebuild is impractical. Dedicated optimization session commissioned (see ledger).
 - Amendment (2026-10-19, owner-approved): in-tier merge fan-in raised from 2 to 4 (tier holds ≤3, 4th arrival merges all). Aligns §4.2's capacity column (2048·4^i) with the merge rule; pairwise merging produced half-capacity segments and double the tier count. Write amplification: 5.59x → 2.97x at 100k, 8.19x → 4.42x at 1M. Live-segment upper bound moves 10 → 15; post-build p99 re-measured (see 2026-10-19-vector-build-optimization.md).
-- Amendment (2026-10-19, owner-approved): default EfConstruction 200 → 100. Recall-neutral at the 10k sweep (0.9980/1.0000/1.0000 at ef 32/64/128, identical to efc=200) and re-verified at 100k; build −23% (searchLayer and insert-side candidate pools halve; the prune-side heuristic is efc-independent). hnswlib-lineage knob, now the NewHNSW default and the bench recipe.
+- Amendment (2026-10-19, owner-approved then revised same day): default EfConstruction trialed at 100 (build −23%, recall-neutral at 10k) — but the 100k attribution run showed recall@ef32 dropping to 0.9940 (vs 1.0000 at efc=200; ef 64/128 unaffected). That breaks the optimization session's recall gate ("no point below the pre-optimization curve"), so the default reverts to 200. efc remains a caller knob; the driver exposes VECTRA_BUILD_EFC for sweeps.

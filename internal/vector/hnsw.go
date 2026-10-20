@@ -61,7 +61,7 @@ func NewHNSW(metric Metric, m, efc int, seed int64) *HNSW {
 		m = 16
 	}
 	if efc <= 0 {
-		efc = 100 // recipe locked 2026-10-19: recall-neutral at 10k/100k sweeps, ~23% faster build than 200
+		efc = 200 // 100 was tried 2026-10-19: -23% build but recall@ef32 drops to 0.9940 at 100k; 200 keeps 1.0000
 	}
 	return &HNSW{
 		metric: metric,
