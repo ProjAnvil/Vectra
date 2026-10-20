@@ -536,3 +536,18 @@ func (g *Graph) VectorOverlayLen(name string) int {
 	}
 	return -1
 }
+
+// VectorForNode returns node key's normalized vector under index's
+// declared property (nil when the node lacks a valid vector). Serves
+// similar_to-style queries without exposing the intake layer.
+func (g *Graph) VectorForNode(index, key string) ([]float32, bool) {
+	vi := g.vecIndexByName(index)
+	if vi == nil {
+		return nil, false
+	}
+	n, ok := g.view.Load().nodeWinner(key)
+	if !ok {
+		return nil, false
+	}
+	return vector.NormalizeVec(n.Props[vi.decl.Prop], vi.decl.Dim)
+}

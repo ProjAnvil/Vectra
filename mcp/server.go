@@ -137,7 +137,7 @@ func newServer(svc *service) *mcp.Server {
 			Instructions: "Vectra in-memory graph engine (dependency graphs). Write with inject_batch — " +
 				"writes are immediately visible to every query tool (neighbors: one hop, bfs: multi-hop, " +
 				"shortest_path, reachable: impact set, cycles: dependency cycles, cypher: Cypher-subset " +
-				"pattern queries, stats, get_node, lookup_property). Call seal periodically to merge " +
+				"pattern queries, stats, get_node, lookup_property, vector_search: approximate top-k over a vector index). Call seal periodically to merge " +
 				"micro-layers and checkpoint (in WAL mode it is the durability boundary); it is " +
 				"maintenance, never a query prerequisite.",
 		},
@@ -290,6 +290,24 @@ type cypherOut struct {
 	Total   int              `json:"total" jsonschema:"true total (may be truncated by limit)"`
 }
 
+type vectorSearchIn struct {
+	Index     string    `json:"index" jsonschema:"vector index name (declared via the Go API)"`
+	Vector    []float64 `json:"query_vector,omitempty" jsonschema:"query embedding (mutually exclusive with similar_to)"`
+	SimilarTo string    `json:"similar_to,omitempty" jsonschema:"node key whose indexed vector is the query (mutually exclusive with query_vector)"`
+	K         int       `json:"k,omitempty" jsonschema:"neighbors to return, default 10, max 100"`
+}
+
+type vectorHitOut struct {
+	Key   string  `json:"key"`
+	Score float64 `json:"score" jsonschema:"metric value (cosine/l2/dot as declared); smaller is better"`
+}
+
+type vectorSearchOut struct {
+	Count int            `json:"count" jsonschema:"neighbors returned"`
+	Hits  []vectorHitOut `json:"hits"`
+	Note  string         `json:"note,omitempty" jsonschema:"approximation disclosure"`
+}
+
 // ---- tool registration ----
 
 func registerTools(s *mcp.Server, svc *service) {
@@ -367,6 +385,12 @@ func registerTools(s *mcp.Server, svc *service) {
 			"fixed single hops only. Limit defaults to 1000 (total reports the true size).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.cypher)
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "vector_search",
+		Description: "Approximate top-k nearest-neighbor search over a declared vector index. Results are approximate; order across equal scores is not stable. Params: index, exactly one of query_vector or similar_to, k (default 10, max 100).",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, svc.vectorSearch)
 }
 
 // ---- tool implementations ----
@@ -729,5 +753,50 @@ func (svc *service) cypher(_ context.Context, _ *mcp.CallToolRequest, in cypherI
 		out.Rows = append(out.Rows, r)
 	}
 	out.Count = len(out.Rows)
+	return nil, out, nil
+}
+
+// vectorSearch is the vector_search tool (spec 9.3): top-k approximate
+// neighbors of a query vector or of an existing node's indexed vector.
+// k clamps to 100; the note discloses approximation (spec D8).
+func (svc *service) vectorSearch(_ context.Context, _ *mcp.CallToolRequest, in vectorSearchIn) (*mcp.CallToolResult, vectorSearchOut, error) {
+	g, err := svc.view()
+	if err != nil {
+		return nil, vectorSearchOut{}, err
+	}
+	k := in.K
+	if k <= 0 {
+		k = 10
+	}
+	if k > 100 {
+		k = 100
+	}
+	if (len(in.Vector) == 0) == (in.SimilarTo == "") {
+		return nil, vectorSearchOut{}, errors.New("provide exactly one of query_vector or similar_to")
+	}
+	var q []float32
+	if in.SimilarTo != "" {
+		if _, ok := g.NodeByKey(in.SimilarTo); !ok {
+			return nil, vectorSearchOut{}, fmt.Errorf("node %q not found", in.SimilarTo)
+		}
+		fv, ok := g.VectorForNode(in.Index, in.SimilarTo)
+		if !ok {
+			return nil, vectorSearchOut{}, fmt.Errorf("node %q has no valid vector for index %q", in.SimilarTo, in.Index)
+		}
+		q = fv
+	} else {
+		q = make([]float32, len(in.Vector))
+		for i, x := range in.Vector {
+			q[i] = float32(x)
+		}
+	}
+	hits, err := g.QueryVector(in.Index, q, vectra.QueryVectorOptions{K: k})
+	if err != nil {
+		return nil, vectorSearchOut{}, err
+	}
+	out := vectorSearchOut{Count: len(hits), Note: "results are approximate (ANN); order across equal scores is not stable"}
+	for _, h := range hits {
+		out.Hits = append(out.Hits, vectorHitOut{Key: h.Key, Score: h.Score})
+	}
 	return nil, out, nil
 }
