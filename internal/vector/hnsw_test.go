@@ -41,7 +41,7 @@ func TestHNSWRecallAndBasics(t *testing.T) {
 	}
 	recall := 0.0
 	for _, q := range queries {
-		got := h.Search(q, 10, 64, nil)
+		got := h.Search(q, 10, 64, nil, &Reader{})
 		if len(got) != 10 {
 			t.Fatalf("got %d hits, want 10", len(got))
 		}
@@ -70,13 +70,13 @@ func TestHNSWDeadFilter(t *testing.T) {
 		h.Insert(uint32(i), v)
 	}
 	dead := map[uint32]bool{5: true, 17: true, 100: true}
-	got := h.Search(vecs[5], 10, 64, func(id uint32) bool { return !dead[id] })
+	got := h.Search(vecs[5], 10, 64, func(id uint32) bool { return !dead[id] }, &Reader{})
 	for _, g := range got {
 		if dead[g.ID] {
 			t.Fatalf("dead id %d leaked into results", g.ID)
 		}
 	}
-	if got := h.Search(vecs[0], 0, 64, nil); got != nil {
+	if got := h.Search(vecs[0], 0, 64, nil, &Reader{}); got != nil {
 		t.Fatal("k=0 must return nil")
 	}
 }
@@ -88,7 +88,7 @@ func TestHNSWDeterminism(t *testing.T) {
 		for i := 0; i < 200; i++ {
 			h.Insert(uint32(i), normalizeRand(rng, 8))
 		}
-		return h.Search(normalizeRand(rand.New(rand.NewSource(9)), 8), 10, 64, nil)
+		return h.Search(normalizeRand(rand.New(rand.NewSource(9)), 8), 10, 64, nil, &Reader{})
 	}
 	a, b := build(), build()
 	if len(a) != len(b) {
@@ -103,7 +103,7 @@ func TestHNSWDeterminism(t *testing.T) {
 
 func TestHNSWEmpty(t *testing.T) {
 	h := NewHNSW(L2, 0, 0, 1) // defaults kick in
-	if got := h.Search([]float32{1}, 5, 10, nil); got != nil {
+	if got := h.Search([]float32{1}, 5, 10, nil, &Reader{}); got != nil {
 		t.Fatal("empty index must return nil")
 	}
 }

@@ -120,8 +120,22 @@ func (s *State) alive(vid uint32) bool {
 // Search merges all live segments and the overlay; the same vid resolves
 // to its most recent occurrence (overlay beats segments, higher segment
 // seq beats lower). Returns up to k hits ascending by score. A wrong-dim
-// query returns nil.
+// query returns nil. Convenience form: allocates a fresh Reader per call;
+// hot paths use SearchReader with a pooled Reader.
 func (s *State) Search(q []float32, k, ef int) []VectorHit {
+	return s.SearchReader(q, k, ef, &Reader{})
+}
+
+// NewReader returns a per-goroutine search Reader. One Reader serves
+// sequential queries on one goroutine only; concurrent goroutines each
+// own theirs. Buffers grow on demand (sized to the largest segment
+// visited so far) and are reused across queries.
+func (s *State) NewReader() *Reader { return &Reader{} }
+
+// SearchReader is Search with caller-owned reader state — the
+// concurrent-read contract (spec D1 prerequisite): the graph and its
+// segments stay untouched; every mutable bit lives in r.
+func (s *State) SearchReader(q []float32, k, ef int, r *Reader) []VectorHit {
 	if k <= 0 || len(q) != s.dim {
 		return nil
 	}
@@ -144,7 +158,7 @@ func (s *State) Search(q []float32, k, ef int) []VectorHit {
 	m := map[uint32]best{}
 	for _, tier := range s.tiers {
 		for _, seg := range tier {
-			for _, hit := range seg.h.Search(q, quota, ef, s.alive) {
+			for _, hit := range seg.h.Search(q, quota, ef, s.alive, r) {
 				if b, ok := m[hit.ID]; !ok || seg.seq > b.seq {
 					m[hit.ID] = best{score: hit.Score, seq: seg.seq}
 				}

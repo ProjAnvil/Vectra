@@ -13,13 +13,25 @@ type Hit struct {
 	Score float64
 }
 
+// Reader holds one goroutine's search state: the epoch-stamped visited
+// array and the candidate/result heap scratch. Search is race-free when
+// every goroutine owns its Reader (State.NewReader); buffers grow on
+// demand and are reused across queries and segments — sequential reuse
+// only within one goroutine. Phase 1 concurrency prerequisite: these
+// used to live on HNSW as read-path mutable state (spec deviation log,
+// 2026-10-19 entry, now resolved).
+type Reader struct {
+	visited []uint32 // visited[i] == stamp marks node i seen this searchLayer call
+	stamp   uint32   // wraps at 2^32: full array reset on wrap
+	cands   []cand   // searchLayer min-heap scratch
+	results []cand   // searchLayer max-heap scratch; returned slice aliases it
+}
+
 // HNSW is a hierarchical navigable small-world graph over caller-supplied
-// uint32 ids (the vector index's vid space, spec §4.1). Phase 0 contract:
-// single-threaded for BOTH build and search — the epoch-visited array is
-// mutable state on the read path (data race under concurrent Search,
-// verified with -race). Phase 1 must localize visited state per reader
-// before immutable snapshots publish to concurrent readers; recorded as
-// a spec deviation until then.
+// uint32 ids (the vector index's vid space, spec §4.1). Concurrent-read
+// contract: Search takes the caller's *Reader (per-goroutine state); the
+// graph itself is immutable after build. Build-path scratch (below) is
+// single-writer: one folder lane builds a given HNSW at a time.
 type HNSW struct {
 	metric Metric
 	m      int // max links per node above level 0
@@ -34,26 +46,13 @@ type HNSW struct {
 	links [][][]uint32 // links[node][level] -> internal neighbor indices
 	entry int          // internal index of the entry point, -1 when empty
 
-	// visited is an epoch-stamped array: visited[i] == stamp marks node i
-	// as seen by the current searchLayer call. Cheaper than a per-search
-	// map; the stamp wraps at 2^32 searches, which resets the array.
-	visited []uint32
-	stamp   uint32
-
-	// Scratch buffers reused across neighbor selection (alloc profile
-	// 2026-10-19: selectNeighbors+pruneTo churned 1.3GB per 10k build on
-	// single-use keptVecs/used/cand slices). Valid under the Phase 0
-	// single-threaded contract only; Phase 1 concurrency must move these
-	// into per-call state.
+	// Build-path scratch, reused across insertPrepared's searchLayer calls
+	// (alloc profile 2026-10-19: 1.3GB per 10k build on single-use slices).
+	// Single-writer: the folder lane that packs this segment.
 	snVecs  [][]float32
 	snUsed  []bool
 	prCands []cand
-
-	// searchLayer heap scratch: the returned result set aliases slResults;
-	// callers finish reading it before the next searchLayer invocation
-	// (Insert's per-level loop and Search's final loop both qualify).
-	slCands   []cand
-	slResults []cand
+	build   Reader // searchLayer scratch for insertPrepared (build side)
 }
 
 func NewHNSW(metric Metric, m, efc int, seed int64) *HNSW {
@@ -119,7 +118,6 @@ func (h *HNSW) insertPrepared(id uint32, v []float32) {
 	h.vecs = append(h.vecs, v)
 	h.level = append(h.level, lvl)
 	h.links = append(h.links, make([][]uint32, lvl+1))
-	h.visited = append(h.visited, 0)
 	if h.entry < 0 {
 		h.entry = idx
 		return
@@ -134,7 +132,7 @@ func (h *HNSW) insertPrepared(id uint32, v []float32) {
 		if lev == 0 {
 			maxLinks = h.m0
 		}
-		cands := h.searchLayer(lev, cur, v, h.efc, nil)
+		cands := h.searchLayer(lev, cur, v, h.efc, nil, &h.build)
 		for _, n := range h.selectNeighbors(maxLinks, cands, v) {
 			h.links[idx][lev] = append(h.links[idx][lev], n)
 			lst := append(h.links[n][lev], uint32(idx))
@@ -256,8 +254,11 @@ func (h *HNSW) pruneTo(maxLinks int, lst []uint32, owner []float32) []uint32 {
 }
 
 // Search returns up to k nearest ids, ascending by score. alive may be
-// nil; otherwise it filters both graph expansion and final results.
-func (h *HNSW) Search(q []float32, k, ef int, alive func(uint32) bool) []Hit {
+// nil; otherwise it filters both graph expansion and final results. The
+// caller's Reader carries per-goroutine scratch; one Reader serves
+// sequential queries on one goroutine (State.SearchReader loops segments
+// on the same one).
+func (h *HNSW) Search(q []float32, k, ef int, alive func(uint32) bool, r *Reader) []Hit {
 	if h.entry < 0 || k <= 0 {
 		return nil
 	}
@@ -273,7 +274,7 @@ func (h *HNSW) Search(q []float32, k, ef int, alive func(uint32) bool) []Hit {
 	for lev := h.level[h.entry]; lev > 0; lev-- {
 		cur = h.greedyStep(lev, cur, q)
 	}
-	res := h.searchLayer(0, cur, q, ef, alive)
+	res := h.searchLayer(0, cur, q, ef, alive, r)
 	out := make([]Hit, 0, k)
 	for _, c := range res {
 		if alive != nil && !alive(h.ids[c.idx]) {
@@ -378,19 +379,26 @@ func maxHeapPop(h *[]cand) cand {
 }
 
 // searchLayer expands up to ef best candidates at one level, starting
-// from ep. Returns the result set sorted ascending by distance.
-func (h *HNSW) searchLayer(lev, ep int, q []float32, ef int, alive func(uint32) bool) []cand {
-	h.stamp++
-	if h.stamp == 0 { // wrapped: reset all stamps
-		for i := range h.visited {
-			h.visited[i] = 0
+// from ep. Returns the result set sorted ascending by distance; the
+// returned slice aliases the Reader's results scratch (valid until the
+// next searchLayer call on that Reader).
+func (h *HNSW) searchLayer(lev, ep int, q []float32, ef int, alive func(uint32) bool, r *Reader) []cand {
+	r.stamp++
+	if r.stamp == 0 { // wrapped: reset all stamps
+		for i := range r.visited {
+			r.visited[i] = 0
 		}
-		h.stamp = 1
+		r.stamp = 1
 	}
-	h.visited[ep] = h.stamp
+	if len(r.visited) < len(h.ids) {
+		grown := make([]uint32, len(h.ids))
+		copy(grown, r.visited)
+		r.visited = grown
+	}
+	r.visited[ep] = r.stamp
 	d0 := Distance(h.metric, q, h.vecs[ep])
-	cands := h.slCands[:0]
-	results := h.slResults[:0]
+	cands := r.cands[:0]
+	results := r.results[:0]
 	minHeapPush(&cands, cand{idx: ep, d: d0})
 	maxHeapPush(&results, cand{idx: ep, d: d0})
 	for len(cands) > 0 {
@@ -400,10 +408,10 @@ func (h *HNSW) searchLayer(lev, ep int, q []float32, ef int, alive func(uint32) 
 		}
 		for _, n := range h.links[c.idx][lev] {
 			ni := int(n)
-			if h.visited[ni] == h.stamp {
+			if r.visited[ni] == r.stamp {
 				continue
 			}
-			h.visited[ni] = h.stamp
+			r.visited[ni] = r.stamp
 			if alive != nil && !alive(h.ids[ni]) {
 				continue
 			}
@@ -418,7 +426,7 @@ func (h *HNSW) searchLayer(lev, ep int, q []float32, ef int, alive func(uint32) 
 		}
 	}
 	sort.Slice(results, func(i, j int) bool { return results[i].d < results[j].d })
-	h.slCands = cands
-	h.slResults = results
+	r.cands = cands
+	r.results = results
 	return results
 }
