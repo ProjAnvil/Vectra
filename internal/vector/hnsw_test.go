@@ -108,6 +108,38 @@ func TestHNSWEmpty(t *testing.T) {
 	}
 }
 
+// TestSortCandsAsc locks the typed insertion sort used by pruneTo: sorted
+// output is non-decreasing and preserves the input multiset (indices
+// paired with distances). sort.Slice on these <=33-element slices paid
+// reflect-swapper overhead per call.
+func TestSortCandsAsc(t *testing.T) {
+	rng := rand.New(rand.NewSource(99))
+	cs := make([]cand, 33)
+	for i := range cs {
+		cs[i] = cand{idx: i, d: float64(rng.Intn(100))}
+	}
+	want := map[int]float64{}
+	for _, c := range cs {
+		want[c.idx] = c.d
+	}
+	sortCandsAsc(cs)
+	for i := 1; i < len(cs); i++ {
+		if cs[i-1].d > cs[i].d {
+			t.Fatalf("not ascending at %d: %v > %v", i, cs[i-1].d, cs[i].d)
+		}
+	}
+	if len(cs) != 33 {
+		t.Fatalf("length changed: %d", len(cs))
+	}
+	for _, c := range cs {
+		if want[c.idx] != c.d {
+			t.Fatalf("pairing broken for idx %d", c.idx)
+		}
+	}
+	sortCandsAsc(nil) // empty must not panic
+	sortCandsAsc([]cand{{1, 5}})
+}
+
 // normalizeRand draws a uniform vector and normalizes it.
 func normalizeRand(rng *rand.Rand, dim int) []float32 {
 	v := make([]float32, dim)

@@ -216,6 +216,27 @@ func (h *HNSW) selectNeighbors(maxLinks int, cands []cand, base []float32) []uin
 	return kept
 }
 
+// sortCandsAsc sorts cands ascending by distance. pruneTo calls it once
+// per neighbor per insert on <=maxLinks+1 (<=33) elements, where
+// sort.Slice's reflect swapper cost more than the sort itself; insertion
+// sort wins at this size. Oversized inputs (defensive: link lists are
+// capped at maxLinks) fall back to pdqsort to avoid quadratic blowup.
+func sortCandsAsc(cs []cand) {
+	if len(cs) > 64 {
+		sort.Slice(cs, func(i, j int) bool { return cs[i].d < cs[j].d })
+		return
+	}
+	for i := 1; i < len(cs); i++ {
+		c := cs[i]
+		j := i - 1
+		for j >= 0 && cs[j].d > c.d {
+			cs[j+1] = cs[j]
+			j--
+		}
+		cs[j+1] = c
+	}
+}
+
 // pruneTo re-selects owner's link list with the diversity heuristic.
 func (h *HNSW) pruneTo(maxLinks int, lst []uint32, owner []float32) []uint32 {
 	if len(lst) <= maxLinks {
@@ -230,7 +251,7 @@ func (h *HNSW) pruneTo(maxLinks int, lst []uint32, owner []float32) []uint32 {
 	for i, n := range lst {
 		cs[i] = cand{int(n), Distance(h.metric, owner, h.vecs[n])}
 	}
-	sort.Slice(cs, func(i, j int) bool { return cs[i].d < cs[j].d })
+	sortCandsAsc(cs)
 	return h.selectNeighbors(maxLinks, cs, owner)
 }
 
