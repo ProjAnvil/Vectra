@@ -390,10 +390,12 @@ func (h *HNSW) searchLayer(lev, ep int, q []float32, ef int, alive func(uint32) 
 		}
 		r.stamp = 1
 	}
+	// append-based growth keeps inserts amortized: insertPrepared adds one
+	// node per call, and an exact-length copy here made every insert
+	// re-copy the whole array (measured 9.7GB of alloc churn on a 65k
+	// build, audit 2026-10-20). Zeroed tail entries are safe: stamp >= 1.
 	if len(r.visited) < len(h.ids) {
-		grown := make([]uint32, len(h.ids))
-		copy(grown, r.visited)
-		r.visited = grown
+		r.visited = append(r.visited, make([]uint32, len(h.ids)-len(r.visited))...)
 	}
 	r.visited[ep] = r.stamp
 	d0 := Distance(h.metric, q, h.vecs[ep])
