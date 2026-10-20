@@ -119,16 +119,16 @@ type VectorHit struct {
 | 部分 | 内容 | 构建 | 生命周期 |
 |---|---|---|---|
 | overlay | 未进任何 segment 的已提交向量（目标 ≤ 2048 条） | writer 追加（只存数组，不建图） | 打包时清空 |
-| segment 森林 | 分层小 HNSW。层 i 容量 = 2048·4^i，每层 ≤ 2 个 | folder 把 overlay 打包成 L0；层内 2 个合并为 1 个并晋升 | 构建完只读 |
+| segment 森林 | 分层小 HNSW。层 i 容量 = 2048·4^i，每层 ≤ 3 个 | folder 把 overlay 打包成 L0；层内凑满 4 个合并为 1 个并晋升 | 构建完只读 |
 | base | 顶层 segment 的别名 | 层层晋升的自然结果 | 只读；无独立全量重建路径 |
 
 规则：
 
 - **归并优先级**：overlay > segment；同 vid 出现在多个 segment 时，创建序（seq）新的获胜，旧的丢弃。
 - **死亡集（D6）**：vid 空间的 chunked bitmap。key 删除 → vid 入死亡集，归并时过滤。key 复活 → 清死亡集条目，新向量进 overlay，seq 归并压制旧层残留。
-- **层内合并**：同层第 2 个 segment 到位即合并（取两者 live 向量重建一个 HNSW，成本 O(层容量)），产物晋升上层。1M 向量约 5 层，单向量生命周期摊销约 5 次重建。
+- **层内合并**：同层第 4 个 segment 到位即合并该层全部 4 个（取各段 live 向量重建一个 HNSW，成本 O(层容量)），产物晋升上层。1M 向量约 5 层，单向量生命周期摊销约 3.4 次重建（写放大 4.42x，级联模型实测口径 2026-10-19；pair-wise 为 8.19x）。
 - **死亡压实**：单 segment 内死亡 vid 占比 > 30% 时，单独重建该 segment（O(该段容量)）。全量重建仅手动维护入口（未来 API），常规路径不存在。
-- 查询 = 全部 live segment 搜索 + overlay 线性扫，按 seq 归并 top-k。live segment 数量上界约 10（5 层 × 2）。
+- 查询 = 全部 live segment 搜索 + overlay 线性扫，按 seq 归并 top-k。live segment 数量上界约 15（5 层 × 3）。
 
 这个形态与"sealed base + micro layers + size-tiered fold"逐点同构。读侧永远持有不可变状态，零锁读成立。触发与成本的数量级匹配由 Phase 0 基准复核。
 
@@ -385,3 +385,4 @@ func (g *Graph) QueryVector(index string, vec []float32, o QueryVectorOptions) (
 - Phase 0 (2026-10-19): DefaultC locked at 2 from the in-distribution 100k sweep; the 64 floor dominates in practice.
 - Phase 0 (2026-10-19): 500k/1M acceptance runs cancelled by the owner before completion (pivot to build-throughput optimization). 门 2a verdict is conditional on 100k-measured lines + extrapolation; re-measure after the optimization pass.
 - Phase 0 (2026-10-19): build throughput decays superlinearly (~80 vec/s at 10k×768 → ~17 at 100k×768), 10-20x off hnswlib single-thread. Not a 门 2a line but an operational red line: sustained writes above the fold rate back up the overlay, and 1M restart rebuild is impractical. Dedicated optimization session commissioned (see ledger).
+- Amendment (2026-10-19, owner-approved): in-tier merge fan-in raised from 2 to 4 (tier holds ≤3, 4th arrival merges all). Aligns §4.2's capacity column (2048·4^i) with the merge rule; pairwise merging produced half-capacity segments and double the tier count. Write amplification: 5.59x → 2.97x at 100k, 8.19x → 4.42x at 1M. Live-segment upper bound moves 10 → 15; post-build p99 re-measured (see 2026-10-19-vector-build-optimization.md).

@@ -8,8 +8,11 @@ import (
 // packSize is the overlay target: one pack builds an L0 segment (spec §4.2).
 const packSize = 2048
 
-// tierFactor is the per-tier capacity growth. Tiers hold at most 2
-// segments; a 3rd arrival means the two merge and promote one upward.
+// tierFactor is the per-tier capacity growth and the merge fan-in: tier i
+// holds segments of ~2048·4^i vectors (spec §4.2), at most tierFactor-1 of
+// them; the tierFactor-th arrival merges all of them into one and promotes
+// it upward. 4-way merging keeps write amplification at ~2.97x for 100k
+// (vs 5.59x pairwise, 2026-10-19-vector-build-optimization.md).
 const tierFactor = 4
 
 // entry is one overlay (not yet indexed) vector.
@@ -193,25 +196,26 @@ func (s *State) Pack(force bool) {
 			s.tiers = append(s.tiers, nil)
 		}
 		s.tiers[i] = append(s.tiers[i], carry)
-		if len(s.tiers[i]) < 2 {
+		if len(s.tiers[i]) < tierFactor {
 			break
 		}
-		a, b := s.tiers[i][0], s.tiers[i][1]
+		parts := s.tiers[i]
 		s.tiers[i] = nil // nil, not [:0]: stale segment pointers pin dead graphs
-		carry = s.mergeSegments(a, b)
+		carry = s.mergeSegments(parts...)
 	}
 	s.compact()
 }
 
-// mergeSegments rebuilds one segment from the live vectors of a and b.
-// Same vid in both resolves to b's vector: b is the later-built segment
-// and therefore holds the newer update (spec §4.2).
-func (s *State) mergeSegments(a, b *segment) *segment {
+// mergeSegments rebuilds one segment from the live vectors of the given
+// segments (4-way fan-in per tier). Same vid in several inputs resolves to
+// the newest segment's vector: inputs are visited latest-built first, and
+// seq recency is the update-order rule (spec §4.2).
+func (s *State) mergeSegments(segs ...*segment) *segment {
 	seen := map[uint32]bool{}
 	merged := &segment{seq: s.seq, h: NewHNSW(s.metric, s.m, s.efc, s.seed+int64(s.seq))}
 	s.seq++
-	for _, seg := range []*segment{b, a} {
-		ids, vecs := seg.h.All()
+	for j := len(segs) - 1; j >= 0; j-- { // tiers append oldest-first: reverse = newest-first
+		ids, vecs := segs[j].h.All()
 		for i, id := range ids {
 			if seen[id] || !s.alive(id) {
 				continue

@@ -3,6 +3,7 @@ package vector
 import (
 	"fmt"
 	"math/rand"
+	"reflect"
 	"runtime"
 	"testing"
 )
@@ -107,7 +108,7 @@ func TestStateWrongDimQuery(t *testing.T) {
 }
 
 func TestStateTierCascadeRecall(t *testing.T) {
-	const n, dim = 6000, 32 // 3 packs -> L0 merge -> L1
+	const n, dim = 6000, 32 // 2 full packs + remainder: tier0 holds 3 L0 segments (4-way fan-in)
 	rng := rand.New(rand.NewSource(21))
 	s := NewState(Cosine, dim, 16, 200, 7)
 	vecs := make([][]float32, n)
@@ -139,6 +140,51 @@ func TestStateTierCascadeRecall(t *testing.T) {
 	recall /= 20
 	if recall < 0.9 {
 		t.Fatalf("post-cascade recall@10 = %.3f, want >= 0.9", recall)
+	}
+}
+
+// TestStateTierFourWayCascade locks the 4-way merge fan-in (spec §4.2
+// amendment, 2026-10-19): a tier holds up to 3 segments; the 4th arrival
+// merges all 4 into one and promotes it. Failed under the previous 2-way
+// policy (merge on 2nd arrival), which is the point.
+func TestStateTierFourWayCascade(t *testing.T) {
+	const dim = 8
+	pack := func(s *State, n int, base int, rng *rand.Rand) {
+		for i := 0; i < n; i++ {
+			s.Add(fmt.Sprintf("k%d", base+i), normalizeRand(rng, dim))
+			if s.OverlayLen() >= packSize {
+				s.Pack(false)
+			}
+		}
+	}
+	segLens := func(t *testing.T, s *State) [][]int {
+		out := make([][]int, 0, len(s.tiers))
+		for _, tier := range s.tiers {
+			lens := make([]int, 0, len(tier))
+			for _, seg := range tier {
+				lens = append(lens, seg.h.Len())
+			}
+			out = append(out, lens)
+		}
+		return out
+	}
+
+	s := NewState(Cosine, dim, 16, 100, 51)
+	rng := rand.New(rand.NewSource(52))
+	pack(s, 3*2048, 0, rng) // 3 full packs
+	s.Pack(true)
+	got := segLens(t, s)
+	want := [][]int{{2048, 2048, 2048}} // 3 arrivals: no merge yet
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("after 3 packs: tiers = %v, want %v", got, want)
+	}
+
+	pack(s, 2048, 3*2048, rng) // 4th arrival merges 4 -> 1, promotes
+	s.Pack(true)
+	got = segLens(t, s)
+	want = [][]int{{}, {8192}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("after 4th pack: tiers = %v, want %v", got, want)
 	}
 }
 
