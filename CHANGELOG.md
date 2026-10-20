@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-20
+
+A vector-index and throughput release: the embedded pure-Go HNSW lands
+as Phase 0 internals, its build path gets 7.8x faster after a
+profile-driven optimization pass, and the traversal row path becomes
+allocation-free. 100K x 768 single-threaded builds drop from 1h40m to
+12m54.6s with recall@10 = 1.0000 at ef 32/64/128 and query p99 still
+28-31% better than the pre-optimization baseline; the 1M verification
+builds in 3h38m with gate-2a lines passing directly (recall 0.9960,
+p99 7.78ms at the production ef=64). M-w16 mixed-read p99 42.27 ->
+21.27/22.05ms, QPS +32-38%. Full data:
+`docs/benchmarks/2026-10-19-vector-build-optimization.md` and
+`docs/benchmarks/2026-10-19-row-path-zero-alloc.md`.
+
+### Added
+
+- `internal/vector`: embedded pure-Go HNSW (diversity-heuristic
+  linking, epoch-stamped visited set), tiered segment State (overlay +
+  size-tiered forest + dead set), and the JSON-safe `NormalizeVec`
+  intake layer — the Phase 0 spike of the vector-search design. Not
+  yet wired into the public API (Phase 1); zero new dependencies, no
+  cgo.
+- `engine.View.RowsInto`: buffer-reuse form of `View.Rows` — steady
+  state allocates nothing, keeping concurrent BFS workers off the
+  allocator. `View.Rows` keeps its fresh-allocation contract.
+- Tier-merge fan-in raised from 2 to 4 (tier holds <=3 segments; the
+  4th arrival merges all four — spec 4.2 amended to match its capacity
+  column): write amplification 5.59x -> 2.97x at 100K, 8.19x -> 4.42x
+  at 1M. Live-segment upper bound moves 10 -> 15.
+- Build-rate gate driver `TestBuildThroughput` (`VECTRA_BUILD_BENCH=1`)
+  and kernel micro-bench `BenchmarkDistance`.
+
+### Changed
+
+- Distance kernels unrolled with eight independent accumulators
+  (768-dim cosine 577 -> 92 ns, 6.3x); L2 no longer pays the wasted
+  dot-product loop. Build-path allocation churn cut 2.77GB -> 507MB
+  per 10K build (hand-rolled heaps, per-HNSW scratch, no double
+  normalize on the rebuild path).
+- Traversal row path is allocation-free: `viewRow` carries
+  per-goroutine scratch (parallel expansion forks one per worker) and
+  the single-implementation `rower` interface becomes `*viewRow`.
+- `pruneTo` sorts its <=33-element candidate lists with a typed
+  insertion sort (primitive 4.5x; the reflect-swapper allocation is
+  gone).
+
+### Fixed
+
+- The v0.8.0 documented residual "M-w16 read p99 ~44ms from allocator
+  contention on the row path": 16 parallel BFS workers allocated 4-6
+  slices per expanded node (`View.Rows` append churn plus the
+  three-slice zip); with `RowsInto` and per-worker scratch the
+  mixed-read p99 halves (42.27 -> 21.27/22.05ms across two samples)
+  and QPS rises 32-38%.
+
+[Unreleased]: https://github.com/projanvil/vectra/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/projanvil/vectra/compare/v0.8.0...v0.9.0
+
 ## [0.8.0] - 2026-10-19
 
 A performance-focused release: the read path no longer collapses under
@@ -84,7 +142,6 @@ unbatched import 1.56M edges/s. Full data and methodology:
   M-w16 read p99 ~44ms from allocator contention on the row path; mirror
   string-map constant in the write path (B3).
 
-[Unreleased]: https://github.com/projanvil/vectra/compare/v0.8.0...HEAD
 [0.8.0]: https://github.com/projanvil/vectra/compare/v0.7.1...v0.8.0
 
 ## [0.7.1] - 2026-10-16
