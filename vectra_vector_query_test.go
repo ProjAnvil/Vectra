@@ -357,3 +357,64 @@ func TestVecRecoveryDrain(t *testing.T) {
 		t.Fatalf("recovery drain incomplete: %d", n)
 	}
 }
+
+// TestQueryVectorDuringWritesAndDrain: the exact race window the T8
+// audit verified - concurrent QueryVector while the writer Adds and the
+// folder lane drains. -race is the gate.
+func TestQueryVectorDuringWritesAndDrain(t *testing.T) {
+	g := vectra.New()
+	if err := g.CreateVectorIndex(vectra.VectorIndexDecl{Name: "mem", Prop: "emb", Dim: 32, Metric: "cosine"}); err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+	rng := rand.New(rand.NewSource(201))
+	seed := make([][]float32, 400)
+	for i := range seed {
+		v := make([]float32, 32)
+		for j := range v {
+			v[j] = rng.Float32()
+		}
+		seed[i] = v
+		g.AddNode(keyN(i), "m", map[string]any{"emb": v})
+	}
+	g.FlushPend()
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(int64(1000 + w)))
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				hits, err := g.QueryVector("mem", seed[r.Intn(len(seed))], vectra.QueryVectorOptions{K: 5})
+				if err != nil {
+					t.Errorf("query: %v", err)
+					return
+				}
+				if len(hits) != 5 {
+					t.Errorf("k=5 got %d", len(hits))
+					return
+				}
+			}
+		}(w)
+	}
+	// Writer: 8 more chunks of adds while readers query and the lane drains.
+	for i := 0; i < 8; i++ {
+		for j := 0; j < 512; j++ {
+			v := make([]float32, 32)
+			copy(v, seed[(i*512+j)%len(seed)])
+			for x := range v {
+				v[x] += float32(rng.NormFloat64() * 0.01)
+			}
+			g.AddNode(keyN(400+i*512+j), "m", map[string]any{"emb": v})
+		}
+	}
+	close(stop)
+	wg.Wait()
+}

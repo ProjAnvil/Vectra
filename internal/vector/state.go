@@ -315,6 +315,8 @@ func (s *State) PackNext() bool {
 			seg.keys = append(seg.keys, e.key)
 		}
 	}
+	s.overlay[0] = nil // drop the packed chunk's backing array: a bare [1:]
+	// keeps slot 0 pinning ~packSize entry headers until append reallocs
 	s.overlay = s.overlay[1:]
 	s.overlayLen -= len(chunk)
 	carry := seg
@@ -452,3 +454,7 @@ func (s *State) Len() int {
 	}
 	return n
 }
+
+// FullChunkPending reports whether the overlay holds at least one full
+// pack chunk - the folder lane's trigger.
+func (s *State) FullChunkPending() bool { return s.overlayLen >= packSize }

@@ -52,26 +52,24 @@ func (h *Handle) merger() {
 }
 
 // drainVectors is the merger's vector lane (spec D10/5.2): pack overlay
-// chunks and swap snapshot heads. Failures back off on the same ladder
-// but never hand work to the writer - vector convergence is lazy; the
-// overlay plus existing segments keep queries correct (spec 5.2-3).
+// chunks and swap snapshot heads. Vector convergence is lazy - failures
+// surface as slow convergence only; the overlay plus existing segments
+// keep queries correct (spec 5.2-3).
 func (h *Handle) drainVectors() {
 	const chunksPerWake = 8
-	for {
-		more := false
-		for _, vi := range h.g.VectorHandles() {
-			for vi.Drain(chunksPerWake) {
-				more = true
-			}
+	more := false
+	for _, vi := range h.g.VectorHandles() {
+		if vi.Drain(chunksPerWake) { // one bounded pass per wake; the
+			// re-signal drives continuation so the write-stall wait never
+			// queues behind a full backlog drain (spec D10)
+			more = true
 		}
-		if !more {
-			return
-		}
+	}
+	if more {
 		select {
 		case h.vecSig <- struct{}{}:
 		default:
 		}
-		return // re-signal instead of looping: graph folds get their turn
 	}
 }
 

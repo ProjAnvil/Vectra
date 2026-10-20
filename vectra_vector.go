@@ -76,9 +76,9 @@ type vecIndex struct {
 
 func (vi *vecIndex) publish() {
 	vi.mu.Lock()
-	snap := vi.st.Snapshot()
-	vi.mu.Unlock()
-	vi.head.Store(snap)
+	defer vi.mu.Unlock()
+	vi.head.Store(vi.st.Snapshot()) // store under the lock: a delayed
+	// unlock-then-store could swap an older snapshot over a newer one
 }
 
 // drain packs up to maxChunks overlay chunks and swaps a fresh snapshot
@@ -86,20 +86,27 @@ func (vi *vecIndex) publish() {
 // a folder goroutine; the writer's intake contends only on mu.
 func (vi *vecIndex) drain(maxChunks int) bool {
 	vi.mu.Lock()
+	defer vi.mu.Unlock()
 	for c := 0; c < maxChunks && vi.st.PackNext(); c++ {
 	}
-	snap := vi.st.Snapshot()
-	more := vi.st.OverlayLen() >= 2048
-	vi.mu.Unlock()
-	vi.head.Store(snap)
-	return more
+	vi.head.Store(vi.st.Snapshot())
+	return vi.st.FullChunkPending()
 }
 
 // overlayFull reports the pack trigger (folder lane wake signal).
 func (vi *vecIndex) overlayFull() bool {
 	vi.mu.Lock()
 	defer vi.mu.Unlock()
-	return vi.st.OverlayLen() >= 2048
+	return vi.st.FullChunkPending()
+}
+
+// size is the adaptive-ef input, taken under the lock (an unlocked
+// State read races the folder drain and the writer intake - verified
+// by -race, audit 2026-10-20).
+func (vi *vecIndex) size() int {
+	vi.mu.Lock()
+	defer vi.mu.Unlock()
+	return vi.st.Len()
 }
 
 var (
@@ -404,7 +411,7 @@ func (g *Graph) QueryVector(index string, vec []float32, o QueryVectorOptions) (
 	}
 	ef := o.Ef
 	if ef < k {
-		ef = vector.AdaptiveEf(k, vi.st.Len()+vi.st.OverlayLen(), vector.DefaultC)
+		ef = vector.AdaptiveEf(k, vi.size(), vector.DefaultC)
 	}
 	snap := vi.head.Load()
 	if snap == nil {
@@ -422,10 +429,10 @@ func (g *Graph) QueryVector(index string, vec []float32, o QueryVectorOptions) (
 	}
 	hits := snap.Search(vec, fetch, ef, r)
 	out := make([]VectorHit, 0, k)
+	view := g.view.Load()
 	for _, h := range hits {
 		if o.Label != "" {
-			v := g.view.Load()
-			n, ok := v.nodeWinner(h.Key)
+			n, ok := view.nodeWinner(h.Key)
 			if !ok || n.Label != o.Label {
 				continue
 			}
@@ -457,12 +464,17 @@ func (g *Graph) putVecReader(r *vector.Reader) { g.vecReaders.Put(r) }
 // batch so partial progress is queryable (spec 7.1).
 func (g *Graph) runVecDrain() {
 	const chunksPerWake = 8
+	rearm := false
 	for _, vi := range g.vecReg() {
-		for vi.drain(chunksPerWake) {
-			if g.closed.Load() {
-				return
-			}
+		if vi.drain(chunksPerWake) { // ONE bounded pass per wake: the
+			// re-signal drives continuation, and the graph fold keeps
+			// its turn (audit 2026-10-20 - the looped version held the
+			// lane for the whole backlog)
+			rearm = true
 		}
+	}
+	if rearm && !g.closed.Load() {
+		g.vecKick()
 	}
 }
 
