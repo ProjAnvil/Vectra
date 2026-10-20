@@ -62,8 +62,8 @@ func TestDecodeTruncatedAtEveryLength(t *testing.T) {
 			// fields complete (e.g. at a trailing props boundary) succeeds —
 			// only a few such coincidences are allowed, and the result must
 			// be self-consistent
-			if full[4] == versionV3 {
-				t.Fatalf("v3 prefix cut=%d must not decode successfully", cut)
+			if full[4] >= versionV2 {
+				t.Fatalf("crc'd prefix cut=%d must not decode successfully", cut)
 			}
 		}
 	}

@@ -294,13 +294,9 @@ func TestStoreV4VectorDeclsRoundtrip(t *testing.T) {
 }
 
 func TestStoreV3LoadsEmptyVectorDecls(t *testing.T) {
-	// A v3 payload: encode with v4 then patch the version down and strip
-	// the vector section? Simpler: v3 fixtures exist in TestV2SnapshotStillReadable
-	// style - build a v3 buffer by encoding without decls and forcing the
-	// old layout is not possible post-hoc; instead verify Decode of a
-	// genuine v3 file (none at hand) via version downgrade behavior:
-	// decode must return zero decls for any pre-v4 payload. Use a v2-era
-	// style buffer constructed by hand (no indexKeys section).
+	// A genuine (empty) v3 layout written by hand: header + zero counts +
+	// zero indexKeys + CRC trailer. Pre-v4 payloads must decode with zero
+	// vector declarations (there is no section to read).
 	var buf bytes.Buffer
 	buf.WriteString("VCTR")
 	_ = binary.Write(&buf, binary.LittleEndian, uint16(3))
@@ -318,17 +314,20 @@ func TestStoreV3LoadsEmptyVectorDecls(t *testing.T) {
 	}
 }
 
-func TestStoreV4RejectedByV3Reader(t *testing.T) {
-	// A v3-era reader rejects version 4 outright (unsupported version) -
-	// the spec's hard-fail line for downgrades (spec §12). Simulate the
-	// v3 reader by checking Decode's behavior on a bumped-version header
-	// with an otherwise valid layout.
+func TestV4RejectsForgedVectorDeclCount(t *testing.T) {
+	// Same guard shape as the indexKey count: a decl count that cannot
+	// fit in the remaining bytes must fail as truncated, never allocate
+	// by attacker-controlled size.
 	var buf bytes.Buffer
 	buf.WriteString("VCTR")
-	_ = binary.Write(&buf, binary.LittleEndian, uint16(9)) // future version
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(4))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0)) // nodes
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0)) // edges
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0)) // indexKeys
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0xFFFFFFFF)) // decls
+	body := buf.Bytes()
+	_ = binary.Write(&buf, binary.LittleEndian, crc32.ChecksumIEEE(body))
 	if _, err := store.Decode(bytes.NewReader(buf.Bytes())); err == nil {
-		t.Fatal("unknown version must hard-fail")
+		t.Fatal("forged vector decl count must not decode")
 	}
 }
