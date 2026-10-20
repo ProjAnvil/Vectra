@@ -196,10 +196,18 @@ func TestSnapshotWithLiveOverlay(t *testing.T) {
 			t.Fatalf("[%d]: %+v, was %+v", i, after[i], before[i])
 		}
 	}
-	// Live side sees the re-added value win over the overlay stale entry.
-	live := s.Search(vecs[0], 1, 64)
-	if len(live) != 1 || live[0].Key != "k0" {
-		t.Fatalf("live search after re-add+pack: %+v", live)
+	// Live side sees the re-added value win: k0 now holds vecs[1], the
+	// same vector k1 holds - both sit at distance 0, and tie order is not
+	// guaranteed (spec D8), so assert set membership in the top-2.
+	live := s.Search(vecs[1], 2, 64)
+	foundK0 := false
+	for _, h := range live {
+		if h.Key == "k0" && h.Score == 0 {
+			foundK0 = true
+		}
+	}
+	if !foundK0 {
+		t.Fatalf("re-added k0 (value vecs[1]) missing from top-2: %+v", live)
 	}
 }
 
