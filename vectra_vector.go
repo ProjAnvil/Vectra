@@ -215,3 +215,81 @@ func vecSeed(name string) int64 {
 	}
 	return h
 }
+
+// vecIntakeNode feeds one node's effective props to every index (spec
+// 5.1): valid vector -> Add; prop absent or invalid -> Delete (overwrite
+// to a non-vector kills the old embedding, spec 4.4; Delete of a
+// never-indexed key is a no-op). Runs on the writer thread inside
+// AddNode/applyChangeset - replay parity holds because applyChangeset
+// replays through AddNode itself.
+func (g *Graph) vecIntakeNode(key string, props map[string]any) {
+	for _, vi := range g.vecReg() {
+		if v, ok := props[vi.decl.Prop]; ok {
+			if fv, ok := vector.NormalizeVec(v, vi.decl.Dim); ok {
+				vi.st.Add(key, fv)
+				continue
+			}
+			if g.onVecSkip != nil {
+				g.onVecSkip(key, vi.decl.Name)
+			}
+		}
+		vi.st.Delete(key)
+	}
+}
+
+// vecIntakeDelete tombstones the key in every index (node delete).
+func (g *Graph) vecIntakeDelete(key string) {
+	for _, vi := range g.vecReg() {
+		vi.st.Delete(key)
+	}
+}
+
+// vecPublish swaps fresh snapshots into every index head. Called at
+// generation publish points (publishLayer) - per batch boundary, never
+// per Add (spec 5.3: the writer path only appends).
+func (g *Graph) vecPublish() {
+	for _, vi := range g.vecReg() {
+		vi.publish()
+	}
+}
+
+// applyVecDecls reconciles the registry to a full declaration list
+// (IndexDecl replay and Task-9 load). Names absent from the list drop;
+// names present upsert. Replay runs with recording detached (g.wal nil),
+// so recordVecDecls no-ops there.
+func (g *Graph) applyVecDecls(list []wal.VectorIndexDecl) {
+	want := make(map[string]wal.VectorIndexDecl, len(list))
+	for _, w := range list {
+		want[w.Name] = w
+	}
+	reg := g.vecRegistryCopy()
+	kept := reg[:0:0]
+	for _, vi := range reg {
+		if _, ok := want[vi.decl.Name]; !ok {
+			continue // dropped by absence
+		}
+		kept = append(kept, vi)
+	}
+	var fresh []*vecIndex
+	for _, w := range list {
+		if vi := g.vecIndexByName(w.Name); vi != nil {
+			continue
+		}
+		d := vecDeclFromWal(w)
+		metric, ok := vecMetric(d.Metric)
+		if !ok {
+			continue // malformed replay entry: skip, never crash recovery
+		}
+		nv := &vecIndex{decl: d, st: vector.NewState(metric, d.Dim, d.M, d.EfConstruction, vecSeed(d.Name))}
+		kept = append(kept, nv)
+		fresh = append(fresh, nv)
+	}
+	g.setVecRegistry(kept)
+	g.recordVecDecls()
+	// Replay parity: a decl frame at op position P must see every node
+	// written before P (live CreateVectorIndex backfills the same way).
+	for _, vi := range fresh {
+		g.backfillVectorIndex(vi)
+		vi.publish()
+	}
+}

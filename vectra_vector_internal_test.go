@@ -1,8 +1,14 @@
 package vectra
 
 import (
+	"fmt"
+	"math/rand"
+	"os"
+	"path/filepath"
+	"sort"
 	"testing"
 
+	"github.com/projanvil/vectra/internal/vector"
 	"github.com/projanvil/vectra/internal/wal"
 )
 
@@ -61,8 +67,8 @@ func TestVectorDeclBackfill(t *testing.T) {
 	g := New()
 	g.AddNode("a", "mem", map[string]any{"emb": []float32{1, 0, 0, 0}})
 	g.AddNode("b", "mem", map[string]any{"emb": []float32{0, 1, 0, 0}})
-	g.AddNode("c", "mem", map[string]any{"emb": []float32{1, 2}})     // wrong dim: skipped
-	g.AddNode("d", "mem", map[string]any{"other": 1})                 // no prop: not indexed
+	g.AddNode("c", "mem", map[string]any{"emb": []float32{1, 2}}) // wrong dim: skipped
+	g.AddNode("d", "mem", map[string]any{"other": 1})             // no prop: not indexed
 	if err := g.CreateVectorIndex(VectorIndexDecl{Name: "mem", Prop: "emb", Dim: 4, Metric: "cosine"}); err != nil {
 		t.Fatal(err)
 	}
@@ -120,5 +126,176 @@ func TestVectorDeclWALRoundtrip(t *testing.T) {
 	// drop = absence.
 	if len(lastDecls) != 1 || lastDecls[0].Name != "two" {
 		t.Fatalf("last decl frame: %+v, want [two]", lastDecls)
+	}
+}
+
+// TestVecIntakeSemantics: live-write intake - add, overwrite to scalar,
+// revive, delete - and OnVecSkip reporting (spec 4.4, 13-2).
+func TestVecIntakeSemantics(t *testing.T) {
+	dir := t.TempDir()
+	var skipped []string
+	g, err := Open(dir+"/v.db", Options{WALMode: ModeAlways, OnVecSkip: func(key, index string) {
+		skipped = append(skipped, key+"/"+index)
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+	if err := g.CreateVectorIndex(VectorIndexDecl{Name: "mem", Prop: "emb", Dim: 4, Metric: "cosine"}); err != nil {
+		t.Fatal(err)
+	}
+	vi := vecStateOf(t, g, "mem")
+	g.AddNode("a", "m", map[string]any{"emb": []float32{1, 0, 0, 0}})
+	if vi.st.OverlayLen() != 1 {
+		t.Fatalf("after add: overlay=%d", vi.st.OverlayLen())
+	}
+	// Overwrite to a non-vector: tombstone (search must not return a).
+	g.AddNode("a", "m", map[string]any{"emb": "oops"})
+	if got := vi.st.Search([]float32{1, 0, 0, 0}, 1, 32); len(got) != 0 {
+		t.Fatalf("overwritten-to-scalar key leaked: %+v", got)
+	}
+	// Revive with a valid vector.
+	g.AddNode("a", "m", map[string]any{"emb": []float32{0, 1, 0, 0}})
+	got := vi.st.Search([]float32{0, 1, 0, 0}, 1, 32)
+	if len(got) != 1 || got[0].Key != "a" {
+		t.Fatalf("revive: %+v", got)
+	}
+	// Delete: gone again.
+	g.DeleteNode("a")
+	if got := vi.st.Search([]float32{0, 1, 0, 0}, 1, 32); len(got) != 0 {
+		t.Fatalf("deleted key leaked: %+v", got)
+	}
+	// Invalid payload at write: skipped + reported, no error.
+	if _, err := g.AddNode("b", "m", map[string]any{"emb": []float32{1, 2, 3}}); err != nil {
+		t.Fatal(err)
+	}
+	// Two skips: the a->"oops" overwrite (invalid payload reports too,
+	// spec 13-2) and b's wrong-dim write.
+	if len(skipped) != 2 || skipped[0] != "a/mem" || skipped[1] != "b/mem" {
+		t.Fatalf("OnVecSkip calls: %v", skipped)
+	}
+}
+
+// applyVecOps drives one deterministic op stream through a graph.
+func applyVecOps(g *Graph) error {
+	if err := g.CreateVectorIndex(VectorIndexDecl{Name: "mem", Prop: "emb", Dim: 8, Metric: "cosine"}); err != nil {
+		return err
+	}
+	rng := rand.New(rand.NewSource(7)) // continuous values: tie-free scores
+	for i := 0; i < 60; i++ {
+		key := fmt.Sprintf("n%d", i)
+		vec := make([]float32, 8)
+		for j := range vec {
+			vec[j] = rng.Float32()
+		}
+		if _, err := g.AddNode(key, "m", map[string]any{"emb": vec, "id": i}); err != nil {
+			return err
+		}
+	}
+	// Declares AFTER nodes exist: backfill path.
+	if err := g.CreateVectorIndex(VectorIndexDecl{Name: "late", Prop: "id2", Dim: 4, Metric: "l2"}); err != nil {
+		return err
+	}
+	for i := 0; i < 20; i++ {
+		key := fmt.Sprintf("m%d", i)
+		v2 := []float32{float32(i), 1, 1, 1}
+		if _, err := g.AddNode(key, "m2", map[string]any{"id2": v2}); err != nil {
+			return err
+		}
+	}
+	// Overwrites, deletes, revives, wrong-dim skips.
+	g.AddNode("n0", "m", map[string]any{"emb": []float32{1, 1, 1, 1, 1, 1, 1, 1}})
+	g.DeleteNode("n1")
+	g.DeleteNode("m2")
+	g.AddNode("n2", "m", map[string]any{"emb": []float32{9, 9, 9, 9}})
+	g.AddNode("n3", "m", map[string]any{"emb": []float32{1, 2}}) // skip
+	if err := g.DropVectorIndex("late"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// TestVecReplayParity: the same op stream applied (1) live without WAL,
+// (2) live with WAL, (3) replayed from a mid-session copy of that WAL,
+// must yield identical per-index query results - the differential oracle
+// pattern FoldLayers used.
+func TestVecReplayParity(t *testing.T) {
+	a := New()
+	if err := applyVecOps(a); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	b, err := Open(dir+"/v.db", Options{WALMode: ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyVecOps(b); err != nil {
+		t.Fatal(err)
+	}
+	b.FlushPend()
+	// Copy the fsynced WAL segments (ModeAlways) and replay into a third
+	// graph. No checkpoint exists, so Open takes the segments-only path.
+	// Copy only the WAL directory (segment files, no manifest): the copy
+	// opens on the segments-only path and must rebuild purely by replay.
+	cp := t.TempDir()
+	walSrc := filepath.Join(dir, "v.db.wal")
+	os.Mkdir(filepath.Join(cp, "v.db.wal"), 0o755)
+	files, _ := os.ReadDir(walSrc)
+	for _, f := range files {
+		if f.IsDir() {
+			continue
+		}
+		in, _ := os.ReadFile(filepath.Join(walSrc, f.Name()))
+		os.WriteFile(filepath.Join(cp, "v.db.wal", f.Name()), in, 0o644)
+	}
+	c, err := Open(cp+"/v.db", Options{WALMode: ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if len(c.VectorIndexes()) != 1 {
+		t.Fatalf("replayed decls: %+v (want only mem; late dropped)", c.VectorIndexes())
+	}
+	qrng := rand.New(rand.NewSource(9))
+	queries := make([][]float32, 12)
+	for i := range queries {
+		q := make([]float32, 8)
+		for j := range q {
+			q[j] = qrng.Float32()
+		}
+		queries[i] = q
+	}
+	snapA := vecStateOf(t, a, "mem").head.Load()
+	snapB := vecStateOf(t, b, "mem").head.Load()
+	snapC := vecStateOf(t, c, "mem").head.Load()
+	if snapA == nil || snapB == nil || snapC == nil {
+		t.Fatal("unpublished head(s)")
+	}
+	// Compare as (score, key)-sorted sets: equal scores across distinct
+	// keys are common in this data, and tie ORDER is not guaranteed (spec
+	// D8) - the oracle pins set-level parity, not presentation order.
+	norm := func(hs []vector.VectorHit) []vector.VectorHit {
+		sort.Slice(hs, func(i, j int) bool {
+			if hs[i].Score != hs[j].Score {
+				return hs[i].Score < hs[j].Score
+			}
+			return hs[i].Key < hs[j].Key
+		})
+		return hs
+	}
+	r := vecStateOf(t, a, "mem").st.NewReader()
+	for qi, q := range queries {
+		ha := norm(snapA.Search(q, 5, 64, r))
+		hb := norm(snapB.Search(q, 5, 64, r))
+		hc := norm(snapC.Search(q, 5, 64, r))
+		if len(ha) == 0 || len(hb) == 0 || len(hc) == 0 {
+			t.Fatalf("q%d: empty results %d/%d/%d", qi, len(ha), len(hb), len(hc))
+		}
+		for i := range ha {
+			if ha[i] != hb[i] || ha[i] != hc[i] {
+				t.Fatalf("q%d [%d]: a=%+v b=%+v c=%+v", qi, i, ha[i], hb[i], hc[i])
+			}
+		}
 	}
 }

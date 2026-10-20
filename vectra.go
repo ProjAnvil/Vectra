@@ -1053,6 +1053,7 @@ func (g *Graph) publishLayer() {
 		g.prebuildView(nv, from) // fill the slot first; forceMerge's publish is superseded at once
 	}
 	g.view.Store(nv)
+	g.vecPublish() // swap fresh vector snapshots with every generation
 }
 
 // reconcileMirrors applies one published layer to the writer-private
@@ -1161,6 +1162,7 @@ func (g *Graph) AddNode(key, label string, props map[string]any) (NodeID, error)
 	if err := g.builder.UpsertNode(key, label, props); err != nil {
 		return 0, err // unreachable for a fresh builder; surfaced anyway
 	}
+	g.vecIntakeNode(key, props)
 	g.finishOp(0)
 	return NodeID(id), nil
 }
@@ -1311,6 +1313,7 @@ func (g *Graph) DeleteNode(key string) (int, error) {
 		return 0, err
 	}
 	g.bLiveNodes[key] = false
+	g.vecIntakeDelete(key)
 	for _, k := range hookKeys {
 		// mark the hook's published parallels killed (one per emitted copy) so
 		// later same-batch upserts draw fresh IDs (ratchet discipline) and
@@ -1657,6 +1660,9 @@ func Open(path string, opts Options) (*Graph, error) {
 		}
 		for _, k := range fr.IndexKeys {
 			g.IndexProperty(k)
+		}
+		if len(fr.VectorIndexes) > 0 {
+			g.applyVecDecls(fr.VectorIndexes)
 		}
 		return nil
 	}); err != nil {
