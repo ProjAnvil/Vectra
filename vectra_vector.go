@@ -325,3 +325,88 @@ func (g *Graph) applyVecDecls(list []wal.VectorIndexDecl) {
 		vi.publish()
 	}
 }
+
+// QueryVectorOptions tunes one top-k query (spec §9.1). K defaults to 10
+// (hard upper bound callers enforce themselves); Ef 0 selects the
+// adaptive default max(64, c·log2 n) (spec §4.3); Label applies the
+// post-filter with 3x oversampling (spec §13-1: pre-filter is a
+// non-goal - callers widen K instead).
+type QueryVectorOptions struct {
+	K     int
+	Ef    int
+	Label string
+}
+
+// VectorHit is one approximate-nearest-neighbor result (spec §3.2).
+// Results are approximate and their order is not stable across calls
+// (spec D8/§4.5).
+type VectorHit struct {
+	Key   string
+	Score float64
+}
+
+// QueryVector returns up to K approximate nearest keys for vec in the
+// named index (spec §9.1). Direct mode flushes at entry first
+// (read-your-write, spec D7); wrapper mode reads the last published
+// generation, matching every other query API. Zero-lock on the read
+// path: the snapshot head plus a pooled per-goroutine Reader.
+func (g *Graph) QueryVector(index string, vec []float32, o QueryVectorOptions) ([]VectorHit, error) {
+	vi := g.vecIndexByName(index)
+	if vi == nil {
+		return nil, ErrVectorIndexNotFound
+	}
+	if len(vec) != vi.decl.Dim {
+		return nil, errors.New("vectra: query vector dim does not match the index declaration")
+	}
+	g.flushPend() // read-your-write (direct mode); no-op cost in wrapper mode
+	k := o.K
+	if k <= 0 {
+		k = 10
+	}
+	ef := o.Ef
+	if ef < k {
+		ef = vector.AdaptiveEf(k, vi.st.Len()+vi.st.OverlayLen(), vector.DefaultC)
+	}
+	snap := vi.head.Load()
+	if snap == nil {
+		vi.publish()
+		snap = vi.head.Load()
+	}
+	r := g.vecReader()
+	defer g.putVecReader(r)
+	fetch := k
+	if o.Label != "" {
+		fetch = 3 * k // oversample for the post-filter (spec 13-1)
+		if ef < fetch {
+			ef = fetch
+		}
+	}
+	hits := snap.Search(vec, fetch, ef, r)
+	out := make([]VectorHit, 0, k)
+	for _, h := range hits {
+		if o.Label != "" {
+			v := g.view.Load()
+			n, ok := v.nodeWinner(h.Key)
+			if !ok || n.Label != o.Label {
+				continue
+			}
+		}
+		out = append(out, VectorHit(h))
+		if len(out) == k {
+			break
+		}
+	}
+	return out, nil
+}
+
+// Pooled per-goroutine search readers: buffers are index-agnostic
+// scratch (they grow to the largest segment seen), so one pool serves
+// every index on the graph.
+func (g *Graph) vecReader() *vector.Reader {
+	if r, ok := g.vecReaders.Get().(*vector.Reader); ok && r != nil {
+		return r
+	}
+	return &vector.Reader{}
+}
+
+func (g *Graph) putVecReader(r *vector.Reader) { g.vecReaders.Put(r) }

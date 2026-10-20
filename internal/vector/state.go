@@ -389,3 +389,15 @@ func (s *State) compact() {
 		}
 	}
 }
+
+// Len returns the total vector count across segments plus the overlay
+// (entry count). Feeds the adaptive ef formula; approximate is fine.
+func (s *State) Len() int {
+	n := s.overlayLen
+	for _, tier := range s.tiers {
+		for _, seg := range tier {
+			n += seg.h.Len()
+		}
+	}
+	return n
+}

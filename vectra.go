@@ -53,6 +53,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -275,8 +276,9 @@ type Graph struct {
 	// vector indexes (Phase 1): copy-on-write registry behind an atomic
 	// pointer - lock-free reads, writer-thread mutations. Each entry owns
 	// its published snapshot head (spec D1; see vectra_vector.go).
-	vecIdx    atomic.Pointer[[]*vecIndex]
-	onVecSkip func(key, index string) // Options.OnVecSkip; nil = silent skip
+	vecIdx     atomic.Pointer[[]*vecIndex]
+	onVecSkip  func(key, index string)  // Options.OnVecSkip; nil = silent skip
+	vecReaders sync.Pool                // *vector.Reader scratch for QueryVector
 
 	// writer-private published-state mirrors (reconciled at publish)
 	nodes     map[string]nodeRef        // key -> id + visibility
