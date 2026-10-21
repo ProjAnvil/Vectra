@@ -45,7 +45,11 @@ loads in 455ms where it used to rebuild for 7m19s. Reference docs:
   byte one. v0.10 binaries hard-fail on v5 snapshots - migrated
   libraries cannot be downgraded (release notes: finish migration
   before any downgrade attempt; a failed migration leaves the library
-  v4-readable and retried on next open).
+  v4-readable and retried on next open). The last pre-migration
+  watermark snapshot is retained as a `<name>-v4.bak` rollback
+  artifact (copied before the migration seal; recovery never reads
+  it, later seals never delete it); the migration open transiently
+  costs ~3x snapshot size on disk (old + new + copy).
 - Default CheckpointBytes 4MiB -> 64MiB (measured cadence:
   `docs/benchmarks/2026-10-21-wrapper-checkpoint-cadence.md`).
 - /v1/batch and /v1/txn now accept JSON numeric arrays as vector props

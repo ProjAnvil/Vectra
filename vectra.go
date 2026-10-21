@@ -1595,9 +1595,10 @@ func (g *Graph) Batch(fn func(*Graph)) error {
 // hard-fails at the snapshot version byte instead of silently truncating
 // unknown (type-4 vector) WAL frames. Reopening a v5 library seals nothing
 // (idempotent). ModeOff Opens never migrate (see the branch below). The
-// manifest-named pre-migration watermark survives the migration seal as
-// <name>-v<ver>.bak (rollback artifact: recovery never reads it, later seals
-// never delete it).
+// pre-migration watermark is retained as a copy <name>-v<ver>.bak before the
+// migration seal (rollback artifact: recovery never reads it, later seals
+// never delete it; the original stays in place until the seal's own cleanup
+// removes it, so no crash window opens).
 //
 // Checkpoints never write `path` in place: each one writes a watermark
 // snapshot <path minus ext>-<lsn>.db next to path and atomically points the
@@ -1764,13 +1765,13 @@ func Open(path string, opts Options) (*Graph, error) {
 	// v5 no-migration session).
 	if snapVer < store.VersionV5 {
 		// Rollback artifact: the Seal's checkpoint deletes the pre-migration
-		// watermark via cleanupSnapshots — rename it aside first (.bak never
-		// matches the cleanup pattern), and on Seal failure rename it back so
-		// the retry Open still finds the manifest-named snapshot. Rename
-		// failures are ignored (best effort, cleanup discipline).
-		restore := retainLegacyArtifact(legacySnap, snapVer)
+		// watermark via cleanupSnapshots — COPY it aside first (the manifest
+		// still names the original until the seal's WriteManifest lands, so a
+		// rename would open a crash window; .bak never matches the cleanup
+		// pattern, and a failed seal keeps the .bak as the artifact). Copy
+		// errors are ignored (best effort, cleanup discipline).
+		retainLegacyArtifact(legacySnap, snapVer)
 		if err := g.Seal(); err != nil {
-			restore()
 			w.Close()
 			return nil, fmt.Errorf("vectra: migrating %s to snapshot v5: %w", path, err)
 		}
@@ -1816,27 +1817,46 @@ func (g *Graph) cleanupSnapshots(keep string) {
 	}
 }
 
-// retainLegacyArtifact sets the pre-migration watermark snapshot aside as a
-// rollback artifact — path -> path-v<ver>.bak in the same directory — before
-// the migration Seal's cleanupSnapshots deletes the last v<ver>-encoded
-// bytes (pg_upgrade keeps the old cluster; this keeps the old watermark). The
-// .bak suffix fails cleanup's HasSuffix(".db") gate, so every LATER seal
-// spares it too, and recovery never sees it: Open loads only what the
-// manifest names. The returned restore renames it back for the Seal-failure
-// path — a failed migration must leave the manifest-named snapshot in place
-// or the retry Open cannot load it. Best effort, cleanupSnapshots discipline:
-// rename errors are ignored (a missing artifact degrades rollback, never
-// migration) and an empty path (nothing was loaded from a manifest) is a
-// no-op.
-func retainLegacyArtifact(path string, ver uint16) (restore func()) {
+// retainLegacyArtifact copies the pre-migration watermark snapshot aside as a
+// rollback artifact — path -> path-v<ver>.bak in the same directory, via
+// temp+fsync+rename (SaveFile discipline) — before the migration Seal. COPY,
+// never rename: until the seal's WriteManifest lands the on-disk manifest
+// still names `path`, so the original must survive every crash in that window
+// (the checkpoint invariant above holds — old watermarks are deleted only
+// after the new manifest lands; the seal's own cleanupSnapshots then removes
+// the original, on success only). The .bak suffix fails cleanup's
+// HasSuffix(".db") gate, so later seals spare it too, and recovery never sees
+// it (Open loads only what the manifest names). A failed seal leaves the .bak
+// as a harmless kept artifact — the next migration attempt overwrites it.
+// Best effort, cleanupSnapshots discipline: copy errors are ignored (a
+// missing artifact degrades rollback, never migration) and an empty path
+// (nothing was loaded from a manifest) is a no-op.
+func retainLegacyArtifact(path string, ver uint16) {
 	if path == "" {
-		return func() {}
+		return
 	}
 	bak := fmt.Sprintf("%s-v%d.bak", path, ver)
-	if err := os.Rename(path, bak); err != nil {
-		return func() {}
+	tmp := bak + ".tmp"
+	in, err := os.Open(path)
+	if err != nil {
+		return
 	}
-	return func() { os.Rename(bak, path) }
+	out, err := os.Create(tmp)
+	if err != nil {
+		in.Close()
+		return
+	}
+	_, cpErr := io.Copy(out, in)
+	syncErr := out.Sync()
+	closeErr := out.Close()
+	in.Close()
+	if cpErr != nil || syncErr != nil || closeErr != nil {
+		os.Remove(tmp)
+		return
+	}
+	if err := os.Rename(tmp, bak); err != nil {
+		os.Remove(tmp)
+	}
 }
 
 // Close ends a session. With a WAL attached, Close is a mandatory checkpoint:

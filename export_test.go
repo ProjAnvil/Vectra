@@ -8,7 +8,8 @@ package vectra
 // from the snapshot (false).
 func (g *Graph) VecForestLoadedForTest() bool { return g.vecForestLoaded }
 
-// RetainLegacyArtifactForTest exposes the migration rollback-artifact helper
-// (rename-aside + restore func) so external tests can pin its restore
-// semantics directly — Open has no cheap Seal-failure injection seam.
+// RetainLegacyArtifactForTest exposes the migration rollback-artifact copy
+// helper so external tests can pin its copy semantics directly (original
+// stays in place; .bak holds the bytes) — Open has no cheap Seal-failure
+// injection seam.
 var RetainLegacyArtifactForTest = retainLegacyArtifact
