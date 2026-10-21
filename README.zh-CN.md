@@ -64,9 +64,9 @@ v0.7 溶解了密封快照门。每次写入（或 `Batch`）把变更物化为�
 
 **ID 口径：**节点/边 ID 在世代内稳定（删除消耗号段）；merge 时稠密重编号，因此跨 `Seal`/`Compact`/后台折叠 ID 可能变化——与 v0.6 的跨 merge 契约一致，未变。
 
-**写者纪律：**零锁引擎假设单写者 goroutine。直接模式（自己调 `AddNode`/`Batch`/...）下就是你任意一个单一 goroutine——并发裸写是数据竞争且会交错 WAL 帧。未分组的逐 op 写累积进**吸收窗口**（一次 flush 物化一个微层——下次查询、边界或容量上限触发——而非每写一层），批量导入不再强制 `Batch`；WAL 下 `Batch`（或包装层 changeset）仍是最快形态：每边界一组帧而非每写一帧。结构化形态是单写者包装层（`internal/writer.Attach` → `Handle.Submit`）：有界队列、Badger 式组提交（每抽干批一组帧一次 fsync）、带层顶停顿的后台合并、以及 WAL 自上次 checkpoint ≥4 MiB 时的容量触发 checkpoint。附加期间，非 release 构建会以 `ErrNotWriter` 拒绝裸写与非写者 goroutine 的 `Seal`/`Compact`/`Cycles`；release 构建编译掉该检查，依赖本契约。
+**写者纪律：**零锁引擎假设单写者 goroutine。直接模式（自己调 `AddNode`/`Batch`/...）下就是你任意一个单一 goroutine——并发裸写是数据竞争且会交错 WAL 帧。未分组的逐 op 写累积进**吸收窗口**（一次 flush 物化一个微层——下次查询、边界或容量上限触发——而非每写一层），批量导入不再强制 `Batch`；WAL 下 `Batch`（或包装层 changeset）仍是最快形态：每边界一组帧而非每写一帧。结构化形态是单写者包装层（`internal/writer.Attach` → `Handle.Submit`）：有界队列、Badger 式组提交（每抽干批一组帧一次 fsync）、带层顶停顿的后台合并、以及 WAL 自上次 checkpoint ≥64 MiB 时的容量触发 checkpoint。附加期间，非 release 构建会以 `ErrNotWriter` 拒绝裸写与非写者 goroutine 的 `Seal`/`Compact`/`Cycles`；release 构建编译掉该检查，依赖本契约。
 
-**写前日志（可选）：**`Open(path, Options{WALMode, WALDir})` 开启持久会话——整帧 JSON changeset，`ModeAlways` 下每个 `Batch` 边界一次 fsync（`ModeInterval` 只在显式边界 fsync；零值 `ModeOff` 恰为 v0.6 快照行为）。checkpoint——`Seal`/`Compact`/`Close` 时或包装层的 ≥4 MiB 容量触发——写水位快照 `<db>-<lsn>.db`、原子翻 manifest、重置日志；恢复 = 载入水位快照 + 重放其上的帧（撕裂尾在首个坏帧处停止；checkpoint 失败保留 WAL 供下次尝试）。磁盘上这是快照文件旁的 `wal` 旁路目录：旧版本二进制读新目录会无害忽略；v0.7 面对没有 wal 目录的旧目录则直接加载快照——v3 快照格式本身不变。
+**写前日志（可选）：**`Open(path, Options{WALMode, WALDir})` 开启持久会话——整帧 JSON changeset，`ModeAlways` 下每个 `Batch` 边界一次 fsync（`ModeInterval` 只在显式边界 fsync；零值 `ModeOff` 恰为 v0.6 快照行为）。checkpoint——`Seal`/`Compact`/`Close` 时或包装层的 ≥64 MiB 容量触发——写水位快照 `<db>-<lsn>.db`、原子翻 manifest、重置日志；恢复 = 载入水位快照 + 重放其上的帧（撕裂尾在首个坏帧处停止；checkpoint 失败保留 WAL 供下次尝试）。磁盘上这是快照文件旁的 `wal` 旁路目录：旧版本二进制读新目录会无害忽略；v0.7 面对没有 wal 目录的旧目录则直接加载快照——v3 快照格式本身不变。
 
 **内存：**merge 在旧世代成为垃圾前先分配新 base，1M/10M 档的峰值 RSS 接近 4.1 GB 活集的 2 倍（瞬时 9–11 GB；spec §9 R11）。merge 密集的 1M 档负载请预算 ≥16 GB 内存，或启用包装层的 `GCTune`（merge 前后把 GOGC 降到 50）。
 
