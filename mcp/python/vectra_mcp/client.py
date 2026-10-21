@@ -63,3 +63,32 @@ class Client:
 
     def cypher(self, query: str) -> dict:
         return self._check(self._http.post("/v1/cypher", json={"query": query}))
+
+    # vector (indexes declared per prop; search results are approximate)
+    def vector_search(self, index: str, query_vector: list[float] | None = None,
+                      similar_to: str = "", k: int = 10, ef: int = 0, label: str = "") -> dict:
+        body: dict[str, Any] = {"index": index, "k": k}
+        if query_vector:
+            body["query_vector"] = query_vector
+        if similar_to:
+            body["similar_to"] = similar_to
+        if ef:
+            body["ef"] = ef
+        if label:
+            body["label"] = label
+        return self._check(self._http.post("/v1/vector/search", json=body))
+
+    def vector_index_create(self, name: str, prop: str, dim: int, metric: str = "cosine",
+                            m: int = 0, ef_construction: int = 0) -> dict:
+        body: dict[str, Any] = {"name": name, "prop": prop, "dim": dim, "metric": metric}
+        if m:
+            body["m"] = m
+        if ef_construction:
+            body["efConstruction"] = ef_construction
+        return self._check(self._http.post("/v1/vector/indexes", json=body))
+
+    def vector_index_drop(self, name: str) -> dict:
+        return self._check(self._http.delete(f"/v1/vector/indexes/{name}"))
+
+    def vector_index_list(self) -> dict:
+        return self._check(self._http.get("/v1/vector/indexes"))

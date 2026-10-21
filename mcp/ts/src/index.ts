@@ -43,7 +43,7 @@ const server = new McpServer(
       "Vectra dependency-graph engine via its HTTP API. Writes go through inject_batch " +
       "(raft-replicated); reads serve from the published snapshot. Tools: neighbors (1-hop), " +
       "bfs (multi-hop), shortest_path, reachable (blast radius), cycles, cypher (Cypher-subset " +
-      "pattern queries), stats.",
+      "pattern queries), stats, vector_search (approximate top-k over a declared vector index).",
   },
 );
 
@@ -172,6 +172,70 @@ server.tool(
     };
   },
 );
+
+server.tool(
+  "vector_search",
+  "Approximate top-k nearest-neighbor search over a declared vector index. Results are approximate; " +
+    "order across equal scores is not stable. Provide exactly one of query_vector or similar_to. " +
+    "Params: index, query_vector|similar_to, k (default 10, max 100), ef, label.",
+  {
+    index: z.string().describe("vector index name (declare one with vector_index_create)"),
+    query_vector: z.array(z.number()).optional().describe("query embedding (exactly one of query_vector/similar_to)"),
+    similar_to: z.string().optional().describe("node key whose indexed vector is the query (exactly one of query_vector/similar_to)"),
+    k: z.number().int().optional().default(10).describe("neighbors to return, default 10, max 100"),
+    ef: z.number().int().optional().describe("HNSW search beam width; 0 = adaptive default"),
+    label: z.string().optional().describe("restrict the search to nodes with this label"),
+  },
+  async ({ index, query_vector, similar_to, k, ef, label }) => {
+    const body: Record<string, unknown> = { index, k };
+    if (query_vector?.length) body.query_vector = query_vector;
+    if (similar_to) body.similar_to = similar_to;
+    if (ef) body.ef = ef;
+    if (label) body.label = label;
+    const res = await api<{ count: number; hits: { key: string; score: number }[] }>("/v1/vector/search", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    return { content: [{ type: "text", text: JSON.stringify(res) }] };
+  },
+);
+
+server.tool(
+  "vector_index_create",
+  "Declare a vector index over a node property (HNSW). dim is 1..4096; metric is cosine|l2|dot " +
+    "(default cosine); m/efConstruction of 0 take the engine defaults 16/200. Declarations are " +
+    "raft-replicated; re-declaring an existing name is a 409 error.",
+  {
+    name: z.string().describe("index name"),
+    prop: z.string().describe("node property holding the vectors"),
+    dim: z.number().int().describe("vector dimensionality, 1..4096"),
+    metric: z.enum(["cosine", "l2", "dot"]).optional().default("cosine"),
+    m: z.number().int().optional().describe("HNSW connectivity; 0 = engine default 16"),
+    efConstruction: z.number().int().optional().describe("construction beam width; 0 = engine default 200"),
+  },
+  async ({ name, prop, dim, metric, m, efConstruction }) => {
+    const body: Record<string, unknown> = { name, prop, dim, metric };
+    if (m) body.m = m;
+    if (efConstruction) body.efConstruction = efConstruction;
+    const res = await api("/v1/vector/indexes", { method: "POST", body: JSON.stringify(body) });
+    return { content: [{ type: "text", text: JSON.stringify(res) }] };
+  },
+);
+
+server.tool(
+  "vector_index_drop",
+  "Drop a declared vector index by name. Declarations are raft-replicated; dropping an unknown name is a 404 error.",
+  { name: z.string().describe("index name") },
+  async ({ name }) => {
+    const res = await api(`/v1/vector/indexes/${encodeURIComponent(name)}`, { method: "DELETE" });
+    return { content: [{ type: "text", text: JSON.stringify(res) }] };
+  },
+);
+
+server.tool("vector_index_list", "List declared vector indexes (name, prop, dim, metric, m, efConstruction).", {}, async () => {
+  const res = await api("/v1/vector/indexes");
+  return { content: [{ type: "text", text: JSON.stringify(res) }] };
+});
 
 async function main() {
   const transport = new StdioServerTransport();

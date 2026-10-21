@@ -24,7 +24,8 @@ mcp: FastMCP = FastMCP(
         "inject_batch (raft-replicated by the server); reads are served from "
         "the server's published snapshot. Tools: neighbors (1-hop), bfs "
         "(multi-hop), shortest_path, reachable (blast radius), cycles, cypher "
-        "(Cypher-subset pattern queries), stats."
+        "(Cypher-subset pattern queries), stats, vector_search (approximate "
+        "top-k over a declared vector index)."
     ),
 )
 
@@ -119,6 +120,40 @@ def cypher(query: str, limit: int = 1000) -> dict:
         "total": len(rows),
         "rows": rows[:limit],
     }
+
+
+@mcp.tool
+def vector_search(index: str, query_vector: list[float] | None = None,
+                  similar_to: str = "", k: int = 10, ef: int = 0,
+                  label: str = "") -> dict:
+    """Approximate top-k nearest-neighbor search over a declared vector
+    index. Results are approximate; order across equal scores is not
+    stable. Provide exactly one of query_vector or similar_to. Params:
+    index, query_vector|similar_to, k (default 10, max 100), ef, label."""
+    return _c().vector_search(index, query_vector, similar_to, k, ef, label)
+
+
+@mcp.tool
+def vector_index_create(name: str, prop: str, dim: int, metric: str = "cosine",
+                        m: int = 0, ef_construction: int = 0) -> dict:
+    """Declare a vector index over a node property (HNSW). dim is 1..4096;
+    metric is cosine|l2|dot (default cosine); m/ef_construction of 0 take
+    the engine defaults 16/200. Declarations are raft-replicated;
+    re-declaring an existing name is a 409 error."""
+    return _c().vector_index_create(name, prop, dim, metric, m, ef_construction)
+
+
+@mcp.tool
+def vector_index_drop(name: str) -> dict:
+    """Drop a declared vector index by name. Declarations are
+    raft-replicated; dropping an unknown name is a 404 error."""
+    return _c().vector_index_drop(name)
+
+
+@mcp.tool
+def vector_index_list() -> dict:
+    """List declared vector indexes (name, prop, dim, metric, m, efConstruction)."""
+    return _c().vector_index_list()
 
 
 def main() -> None:
