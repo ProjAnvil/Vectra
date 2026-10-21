@@ -88,6 +88,13 @@ func vecDefaults(m, efc int) (int, int) {
 // State (single-writer), and the published snapshot head concurrent
 // readers load (spec D1). head updates at publish points and after
 // folder packs - never mid-Add.
+//
+// Read-only mounts (Graph.Clone, ruling #5): a mounted index carries
+// decl+seed+head with st nil from birth — no writer State exists, so no
+// write path can touch the source through it. st is assigned only at
+// construction (or whole-swapped by mountVecForest, never nil on either
+// side of the swap), so an unlocked nil check races nothing: nil today
+// means nil forever.
 type vecIndex struct {
 	decl VectorIndexDecl
 	seed int64 // State's seed, for the folder's lock-free builds
@@ -102,6 +109,9 @@ type vecIndex struct {
 func (vi *vecIndex) publish() {
 	vi.mu.Lock()
 	defer vi.mu.Unlock()
+	if vi.st == nil { // read-only mount: the installed head IS the state
+		return
+	}
 	vi.head.Store(vi.st.Snapshot()) // store under the lock: a delayed
 	// unlock-then-store could swap an older snapshot over a newer one
 }
@@ -110,6 +120,9 @@ func (vi *vecIndex) publish() {
 // head per chunk batch; returns true when more backlog remains. Runs on
 // a folder goroutine; the writer's intake contends only on mu.
 func (vi *vecIndex) drain(maxChunks int) bool {
+	if vi.st == nil { // read-only mount: no backlog, nothing to publish
+		return false
+	}
 	for c := 0; c < maxChunks; c++ {
 		vi.mu.Lock()
 		plan := vi.st.BeginPack()
@@ -138,6 +151,9 @@ func (vi *vecIndex) drain(maxChunks int) bool {
 
 // overlayFull reports the pack trigger (folder lane wake signal).
 func (vi *vecIndex) overlayFull() bool {
+	if vi.st == nil { // read-only mount: never pressurizes the folder lane
+		return false
+	}
 	vi.mu.Lock()
 	defer vi.mu.Unlock()
 	return vi.st.FullChunkPending()
@@ -149,6 +165,12 @@ func (vi *vecIndex) overlayFull() bool {
 func (vi *vecIndex) size() int {
 	vi.mu.Lock()
 	defer vi.mu.Unlock()
+	if vi.st == nil { // read-only mount: size from the published head
+		if s := vi.head.Load(); s != nil {
+			return s.Len()
+		}
+		return 0
+	}
 	return vi.st.Len()
 }
 
@@ -348,6 +370,9 @@ func vecSeed(name string) int64 {
 // replays through AddNode itself.
 func (g *Graph) vecIntakeNode(key string, props map[string]any) {
 	for _, vi := range g.vecReg() {
+		if vi.st == nil { // read-only mount (Clone): writes never touch it
+			continue
+		}
 		if v, ok := props[vi.decl.Prop]; ok {
 			if fv, ok := vector.NormalizeVec(v, vi.decl.Dim); ok {
 				vi.mu.Lock()
@@ -368,6 +393,9 @@ func (g *Graph) vecIntakeNode(key string, props map[string]any) {
 // vecIntakeDelete tombstones the key in every index (node delete).
 func (g *Graph) vecIntakeDelete(key string) {
 	for _, vi := range g.vecReg() {
+		if vi.st == nil { // read-only mount (Clone): writes never touch it
+			continue
+		}
 		vi.mu.Lock()
 		vi.st.Delete(key)
 		vi.mu.Unlock()
@@ -603,6 +631,9 @@ func (g *Graph) VectorOverlayLen(name string) int {
 	if vi := g.vecIndexByName(name); vi != nil {
 		vi.mu.Lock()
 		defer vi.mu.Unlock()
+		if vi.st == nil {
+			return 0 // read-only mount: no overlay, no backlog
+		}
 		return vi.st.OverlayLen()
 	}
 	return -1
@@ -716,6 +747,17 @@ func (g *Graph) writeVecForest(lsn uint64) error {
 			return err
 		}
 		return nil
+	}
+	for _, vi := range reg {
+		if vi.st == nil {
+			// A read-only mount has no writer State to encode: a Snapshot
+			// image would decode with an empty vid space (vidOf/nextVID are
+			// State-private), and every later Add would resurrect duplicate
+			// live vids. Skip the cache. Unreachable today — only
+			// WAL-attached graphs checkpoint, and WALs attach at Open, never
+			// on a clone — kept as a hard guard over the mount's lifetime.
+			return nil
+		}
 	}
 	b, err := g.encodeVecForest(lsn)
 	if err != nil {

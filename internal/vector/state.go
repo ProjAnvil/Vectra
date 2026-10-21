@@ -406,6 +406,21 @@ func (s *State) Len() int {
 // pack chunk - the folder lane's trigger.
 func (s *State) FullChunkPending() bool { return s.overlayLen >= packSize }
 
+// Len returns the total vector count across the snapshot's segments plus
+// its overlay entries - the read-only counterpart of State.Len. Mounted
+// snapshots (Graph.Clone's read-only indexes) answer adaptive-ef sizing
+// from here, where the writer side has no State to consult.
+func (s *Snapshot) Len() int {
+	n := 0
+	for _, seg := range s.v.segs {
+		n += seg.h.Len()
+	}
+	for _, ch := range s.v.overlay {
+		n += len(ch)
+	}
+	return n
+}
+
 // PackPlan is a two-phase drain (spec D5: the writer must never wait on
 // graph building). BeginPack captures immutable inputs under a short
 // lock; Build does every HNSW construction lock-free on the folder

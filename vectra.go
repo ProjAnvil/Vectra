@@ -2596,15 +2596,41 @@ func (g *Graph) IndexedPropertyKeys() []string {
 // Clone deep-copies into a graph that can keep taking writes: the union
 // records (base ∪ layers) build the clone's fresh base, so the clone starts
 // fully merged and writable. Props maps share references per the sharing
-// contract (relies on "replace, don't mutate" discipline). The server
-// module's hot-swap publisher uses it to clone the live graph. The entry
-// materializes the caller's absorption window first.
+// contract (relies on "replace, don't mutate" discipline). Vector indexes
+// mount read-only (ruling #5): each live index's declaration plus its
+// currently published snapshot head ride along — never the writer State —
+// so the clone answers QueryVector identically and stays frozen at the
+// cloned generation no matter what the source writes next. The server
+// module's hot-swap publisher uses it to clone the live graph (reads are
+// served from published clones). The entry materializes the caller's
+// absorption window first.
 func (g *Graph) Clone() *Graph {
 	g.flushPend()
 	nodes, edges, labels, indexKeys := g.unionRecords()
 	c, err := graphFromEngine(nodes, edges, labels, indexKeys)
 	if err != nil { // engine.Seal of valid records cannot fail; fail loud over corrupt state
 		panic(fmt.Errorf("vectra: clone merge: %w", err))
+	}
+	if reg := g.vecReg(); len(reg) > 0 {
+		mounted := make([]*vecIndex, len(reg))
+		for i, vi := range reg {
+			h := vi.head.Load()
+			if h == nil {
+				// Index declared but not yet published (the CreateVectorIndex
+				// window): publish on the spot — the same fallback a racing
+				// QueryVector reader uses.
+				vi.publish()
+				h = vi.head.Load()
+			}
+			nv := &vecIndex{decl: vi.decl, seed: vi.seed} // st nil: read-only
+			nv.head.Store(h)
+			mounted[i] = nv
+		}
+		// Pointer-cheap by State.Snapshot's design: segments and frozen
+		// chunks are shared, only the tail and dead bits were copied at the
+		// source's publish. Isolation is the head pointer itself: later
+		// source publishes swap the source's head, never the clone's.
+		c.setVecRegistry(mounted)
 	}
 	return c
 }
