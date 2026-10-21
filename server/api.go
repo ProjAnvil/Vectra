@@ -69,6 +69,10 @@ func (n *Node) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/reachable", n.handleReachable)
 	mux.HandleFunc("GET /v1/path", n.handlePath)
 	mux.HandleFunc("GET /v1/cycles", n.handleCycles)
+	mux.HandleFunc("POST /v1/vector/search", n.handleVectorSearch)
+	mux.HandleFunc("GET /v1/vector/indexes", n.handleVectorIndexList)
+	mux.HandleFunc("POST /v1/vector/indexes", n.handleVectorIndexCreate)
+	mux.HandleFunc("DELETE /v1/vector/indexes/{name}", n.handleVectorIndexDelete)
 	mux.Handle("/debug/vars", expvar.Handler())
 	n.registerExpvar()
 
@@ -121,6 +125,71 @@ func (n *Node) graph(w http.ResponseWriter) *vectra.Graph {
 	return ps.graph
 }
 
+// writeApplyErr maps an n.Apply error onto the write-endpoint error faces
+// shared by every raft-backed handler: non-leader → 503 with leader hint +
+// Retry-After, shutdown → 503, timeout → 504, anything else → 500.
+// Endpoint-specific classifiers (vector declaration ops) run before this
+// and take precedence.
+func (n *Node) writeApplyErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrNotLeader) {
+		if hint := n.LeaderHint(); hint != "" {
+			w.Header().Set("X-Vectra-Leader", hint)
+		}
+		w.Header().Set("Retry-After", "1")
+		writeErr(w, http.StatusServiceUnavailable, "NOT_LEADER", "send writes to the leader")
+		return
+	}
+	if errors.Is(err, ErrShutdown) {
+		w.Header().Set("Retry-After", "5")
+		writeErr(w, http.StatusServiceUnavailable, "SHUTTING_DOWN", "node is shutting down; retry another node")
+		return
+	}
+	if errors.Is(err, ErrTimeout) {
+		writeErr(w, http.StatusGatewayTimeout, "TIMEOUT", err.Error())
+		return
+	}
+	writeErr(w, http.StatusInternalServerError, "INTERNAL", err.Error())
+}
+
+// wireableProps rewrites JSON-decoded numeric arrays in props in place:
+// encoding/json decodes every JSON array into []any, and encoding/gob (the
+// raft log codec) has no concrete type registered for []any, so a vector
+// prop would fail the whole batch at encode with "type not registered".
+// Uniform numeric arrays become []float64 — gob-native, and the engine
+// ingests it identically (vector.NormalizeVec). Non-numeric arrays are left
+// untouched and fail at encode as before.
+func wireableProps(props map[string]any) {
+	for k, v := range props {
+		arr, ok := v.([]any)
+		if !ok {
+			continue
+		}
+		out := make([]float64, len(arr))
+		for i, e := range arr {
+			f, ok := e.(float64)
+			if !ok {
+				out = nil
+				break
+			}
+			out[i] = f
+		}
+		if out != nil {
+			props[k] = out
+		}
+	}
+}
+
+// wireableBatchProps applies the JSON-boundary normalization to a decoded
+// write request's node and edge props.
+func wireableBatchProps(nodes []NodeUpsert, edges []EdgeUpsert) {
+	for i := range nodes {
+		wireableProps(nodes[i].Props)
+	}
+	for i := range edges {
+		wireableProps(edges[i].Props)
+	}
+}
+
 func (n *Node) handleBatch(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Nodes       []NodeUpsert `json:"nodes"`
@@ -132,6 +201,7 @@ func (n *Node) handleBatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "VALIDATION", "bad request body: "+err.Error())
 		return
 	}
+	wireableBatchProps(req.Nodes, req.Edges)
 	res, err := n.Apply(r.Context(), Batch{
 		Version:     batchVersion,
 		Nodes:       req.Nodes,
@@ -140,24 +210,7 @@ func (n *Node) handleBatch(w http.ResponseWriter, r *http.Request) {
 		NodeDeletes: req.NodeDeletes,
 	})
 	if err != nil {
-		if errors.Is(err, ErrNotLeader) {
-			if hint := n.LeaderHint(); hint != "" {
-				w.Header().Set("X-Vectra-Leader", hint)
-			}
-			w.Header().Set("Retry-After", "1")
-			writeErr(w, http.StatusServiceUnavailable, "NOT_LEADER", "send writes to the leader")
-			return
-		}
-		if errors.Is(err, ErrShutdown) {
-			w.Header().Set("Retry-After", "5")
-			writeErr(w, http.StatusServiceUnavailable, "SHUTTING_DOWN", "node is shutting down; retry another node")
-			return
-		}
-		if errors.Is(err, ErrTimeout) {
-			writeErr(w, http.StatusGatewayTimeout, "TIMEOUT", err.Error())
-			return
-		}
-		writeErr(w, http.StatusInternalServerError, "INTERNAL", err.Error())
+		n.writeApplyErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -200,6 +253,7 @@ func (n *Node) handleTxn(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("readEdges exceeds %d keys", maxReadSet))
 		return
 	}
+	wireableBatchProps(req.Nodes, req.Edges)
 	res, err := n.Apply(r.Context(), Batch{
 		Version:     batchVersion,
 		Nodes:       req.Nodes,
@@ -209,24 +263,7 @@ func (n *Node) handleTxn(w http.ResponseWriter, r *http.Request) {
 		Txn:         req.Txn,
 	})
 	if err != nil {
-		if errors.Is(err, ErrNotLeader) {
-			if hint := n.LeaderHint(); hint != "" {
-				w.Header().Set("X-Vectra-Leader", hint)
-			}
-			w.Header().Set("Retry-After", "1")
-			writeErr(w, http.StatusServiceUnavailable, "NOT_LEADER", "send writes to the leader")
-			return
-		}
-		if errors.Is(err, ErrShutdown) {
-			w.Header().Set("Retry-After", "5")
-			writeErr(w, http.StatusServiceUnavailable, "SHUTTING_DOWN", "node is shutting down; retry another node")
-			return
-		}
-		if errors.Is(err, ErrTimeout) {
-			writeErr(w, http.StatusGatewayTimeout, "TIMEOUT", err.Error())
-			return
-		}
-		writeErr(w, http.StatusInternalServerError, "INTERNAL", err.Error())
+		n.writeApplyErr(w, err)
 		return
 	}
 	if !res.Committed {
@@ -554,6 +591,223 @@ func (n *Node) handleCycles(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"cycles": out})
+}
+
+// ---- vector endpoints (spec 2026-10-21 §3.3) ---------------------------------
+//
+// Reads (search, list) serve from the published clone like every other
+// read: eventually consistent on followers, no special handling. Writes
+// (create, drop) ride a raft Batch{VectorIndexOps} (leader-only).
+
+// k bounds for POST /v1/vector/search, copied from the MCP vector_search
+// tool's semantics: k <= 0 selects the default 10, k above 100 clamps to
+// 100 — never a client error (spec Review Focus #5 "k>100 限幅").
+const (
+	defaultVectorK = 10
+	maxVectorK     = 100
+)
+
+// vectorSearchRequest is the request body of POST /v1/vector/search: exactly
+// one of query_vector / similar_to (the MCP tool's mutual-exclusion rule).
+type vectorSearchRequest struct {
+	Index     string    `json:"index"`
+	Vector    []float32 `json:"query_vector,omitempty"`
+	SimilarTo string    `json:"similar_to,omitempty"`
+	K         int       `json:"k,omitempty"`
+	Ef        int       `json:"ef,omitempty"` // 0 = adaptive default
+	Label     string    `json:"label,omitempty"`
+}
+
+// vectorHitOut is one search result (smaller score is better, as declared).
+type vectorHitOut struct {
+	Key   string  `json:"key"`
+	Score float64 `json:"score"`
+}
+
+// handleVectorSearch serves approximate top-k search over a declared vector
+// index. Error faces: unknown index → 404 (the handleNode resource-not-found
+// precedent), dim mismatch / request-shape violations → 400, similar_to on a
+// missing node → 400 NODE_NOT_FOUND (the handleQuery body-reference
+// precedent) and on a node without a valid vector → 400.
+func (n *Node) handleVectorSearch(w http.ResponseWriter, r *http.Request) {
+	var req vectorSearchRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "bad request body: "+err.Error())
+		return
+	}
+	if req.Index == "" {
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "missing index")
+		return
+	}
+	if (len(req.Vector) == 0) == (req.SimilarTo == "") {
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "provide exactly one of query_vector or similar_to")
+		return
+	}
+	g := n.graph(w)
+	if g == nil {
+		return
+	}
+	n.queryCount.Add(1)
+	k := req.K
+	if k <= 0 {
+		k = defaultVectorK
+	}
+	if k > maxVectorK {
+		k = maxVectorK
+	}
+	// Resolve the declaration first so the unknown-index face (404) wins
+	// over similar_to / dim errors in either query mode.
+	dim, found := 0, false
+	for _, d := range g.VectorIndexes() {
+		if d.Name == req.Index {
+			dim, found = d.Dim, true
+			break
+		}
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, "VECTOR_INDEX_NOT_FOUND", "vector index not found")
+		return
+	}
+	var q []float32
+	if req.SimilarTo != "" {
+		if _, ok := g.NodeByKey(req.SimilarTo); !ok {
+			writeErr(w, http.StatusBadRequest, "NODE_NOT_FOUND", "similar_to node not found: "+req.SimilarTo)
+			return
+		}
+		fv, ok := g.VectorForNode(req.Index, req.SimilarTo)
+		if !ok {
+			writeErr(w, http.StatusBadRequest, "VALIDATION",
+				fmt.Sprintf("node %q has no valid vector for index %q", req.SimilarTo, req.Index))
+			return
+		}
+		q = fv
+	} else {
+		if len(req.Vector) != dim {
+			writeErr(w, http.StatusBadRequest, "VALIDATION",
+				fmt.Sprintf("query_vector dim %d does not match index %q dim %d", len(req.Vector), req.Index, dim))
+			return
+		}
+		q = req.Vector
+	}
+	hits, err := g.QueryVector(req.Index, q, vectra.QueryVectorOptions{K: k, Ef: req.Ef, Label: req.Label})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "INTERNAL", err.Error())
+		return
+	}
+	out := struct {
+		Count int            `json:"count"`
+		Hits  []vectorHitOut `json:"hits"`
+	}{Count: len(hits), Hits: make([]vectorHitOut, 0, len(hits))}
+	for _, h := range hits {
+		out.Hits = append(out.Hits, vectorHitOut{Key: h.Key, Score: h.Score})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// vectorIndexRequest is the request body of POST /v1/vector/indexes (a
+// declaration; zero M/EfConstruction take the engine defaults 16/200).
+type vectorIndexRequest struct {
+	Name           string `json:"name"`
+	Prop           string `json:"prop"`
+	Dim            int    `json:"dim"`
+	Metric         string `json:"metric"`
+	M              int    `json:"m,omitempty"`
+	EfConstruction int    `json:"efConstruction,omitempty"`
+}
+
+// vectorIndexOut is the JSON shape of a declaration (GET list, POST create).
+type vectorIndexOut struct {
+	Name           string `json:"name"`
+	Prop           string `json:"prop"`
+	Dim            int    `json:"dim"`
+	Metric         string `json:"metric"`
+	M              int    `json:"m"`
+	EfConstruction int    `json:"efConstruction"`
+}
+
+func vecIndexOut(d vectra.VectorIndexDecl) vectorIndexOut {
+	return vectorIndexOut{
+		Name: d.Name, Prop: d.Prop, Dim: d.Dim, Metric: d.Metric,
+		M: d.M, EfConstruction: d.EfConstruction,
+	}
+}
+
+// handleVectorIndexCreate declares a vector index through raft as
+// Batch{VectorIndexOps:[{Create}]} (leader-only; the shared apply error
+// faces apply). Validation mirrors the engine's declaration rules so bad
+// requests fail fast as 400 instead of a committed no-op entry surfacing
+// as 500; the engine's duplicate-name error replays deterministically on
+// every replica and maps to 409.
+func (n *Node) handleVectorIndexCreate(w http.ResponseWriter, r *http.Request) {
+	var req vectorIndexRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "bad request body: "+err.Error())
+		return
+	}
+	if req.Name == "" || req.Prop == "" {
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "vector index name and prop are required")
+		return
+	}
+	if req.Dim < 1 || req.Dim > 4096 {
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "vector index dim must be 1..4096")
+		return
+	}
+	switch req.Metric {
+	case "", "cosine", "l2", "dot": // "" = cosine, the engine default
+	default:
+		writeErr(w, http.StatusBadRequest, "VALIDATION", "vector index metric must be cosine, l2, or dot")
+		return
+	}
+	decl := vectra.VectorIndexDecl{
+		Name: req.Name, Prop: req.Prop, Dim: req.Dim, Metric: req.Metric,
+		M: req.M, EfConstruction: req.EfConstruction,
+	}
+	if _, err := n.Apply(r.Context(), Batch{
+		Version:        batchVersion,
+		VectorIndexOps: []VectorIndexOp{{Create: &decl}},
+	}); err != nil {
+		if errors.Is(err, vectra.ErrVectorIndexExists) {
+			writeErr(w, http.StatusConflict, "VECTOR_INDEX_EXISTS", "vector index name already declared")
+			return
+		}
+		n.writeApplyErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"index": vecIndexOut(decl)})
+}
+
+// handleVectorIndexList serves the declared indexes from the published clone.
+func (n *Node) handleVectorIndexList(w http.ResponseWriter, r *http.Request) {
+	g := n.graph(w)
+	if g == nil {
+		return
+	}
+	n.queryCount.Add(1)
+	decls := g.VectorIndexes()
+	out := make([]vectorIndexOut, len(decls))
+	for i, d := range decls {
+		out[i] = vecIndexOut(d)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"indexes": out})
+}
+
+// handleVectorIndexDelete drops a declared index through raft as
+// Batch{VectorIndexOps:[{Drop}]} (leader-only). The engine's not-found error
+// replays deterministically on every replica and maps to 404.
+func (n *Node) handleVectorIndexDelete(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if _, err := n.Apply(r.Context(), Batch{
+		Version:        batchVersion,
+		VectorIndexOps: []VectorIndexOp{{Drop: name}},
+	}); err != nil {
+		if errors.Is(err, vectra.ErrVectorIndexNotFound) {
+			writeErr(w, http.StatusNotFound, "VECTOR_INDEX_NOT_FOUND", "vector index not found")
+			return
+		}
+		n.writeApplyErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"dropped": name})
 }
 
 // alreadyMember checks whether nodeID is already in the cluster configuration (idempotent join check).
