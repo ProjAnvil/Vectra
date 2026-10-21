@@ -58,8 +58,9 @@ type Config struct {
 	// post-batch hook runs the full Seal pipeline (merge + watermark
 	// snapshot + manifest + WAL reset) on the writer goroutine. Queries
 	// stay lock-free throughout; Submits observe a checkpoint-shaped
-	// pause. Default 4 MiB; negative disables the volume trigger (explicit
-	// Seal/Compact/Close only). A failed volume checkpoint is sticky: the
+	// pause. Default 64 MiB (measured cadence, see withDefaults); negative
+	// disables the volume trigger (explicit Seal/Compact/Close only). A
+	// failed volume checkpoint is sticky: the
 	// error surfaces from Close and the trigger disables itself — an
 	// ailing disk must not turn every batch into a retry storm.
 	CheckpointBytes int64
@@ -92,7 +93,13 @@ func (c Config) withDefaults() Config {
 		c.MergeEdges = 65536
 	}
 	if c.CheckpointBytes == 0 {
-		c.CheckpointBytes = 4 << 20 // spec §4: WAL ≥4MB since last checkpoint
+		// 64 MiB, measured (docs/benchmarks/2026-10-21-wrapper-checkpoint-
+		// cadence.md): binary frames put a 768-dim vector at ~3.07KB, so the
+		// old 4 MiB default sealed every ~1360 vectors — 76% of ingestion
+		// wall (10.2k/s vs 44.8k/s at 64 MiB); plain-write deployments
+		// checkpoint every few hundred thousand ops; layer folding is
+		// MergeEdges-driven and unaffected.
+		c.CheckpointBytes = 64 << 20
 	}
 	return c
 }
