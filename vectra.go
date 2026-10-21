@@ -1594,7 +1594,10 @@ func (g *Graph) Batch(fn func(*Graph)) error {
 // checkpoint, so the on-disk state a v0.10 downgrade would open always
 // hard-fails at the snapshot version byte instead of silently truncating
 // unknown (type-4 vector) WAL frames. Reopening a v5 library seals nothing
-// (idempotent). ModeOff Opens never migrate (see the branch below).
+// (idempotent). ModeOff Opens never migrate (see the branch below). The
+// manifest-named pre-migration watermark survives the migration seal as
+// <name>-v<ver>.bak (rollback artifact: recovery never reads it, later seals
+// never delete it).
 //
 // Checkpoints never write `path` in place: each one writes a watermark
 // snapshot <path minus ext>-<lsn>.db next to path and atomically points the
@@ -1670,6 +1673,10 @@ func Open(path string, opts Options) (*Graph, error) {
 	// (0 = nothing was loaded: fresh library, or WAL-only recovery). Open's
 	// v5/tripwire gate at the end reads it.
 	var snapVer uint16
+	// legacySnap is the manifest-named watermark snapshot when one was loaded:
+	// the pre-migration bytes the v5 gate at the end must retain as a rollback
+	// artifact before its Seal's cleanup deletes them ("" otherwise).
+	var legacySnap string
 	loadSnapshot := func(p string) error {
 		f, err := os.Open(p)
 		if err != nil {
@@ -1697,6 +1704,7 @@ func Open(path string, opts Options) (*Graph, error) {
 		if err := loadSnapshot(snap); err != nil {
 			return nil, fmt.Errorf("vectra: manifest at %s references snapshot %s: %w", walDir, snap, err)
 		}
+		legacySnap = snap
 	case hasSegs:
 		// WAL-only recovery: start empty, replay everything below.
 	default:
@@ -1755,7 +1763,14 @@ func Open(path string, opts Options) (*Graph, error) {
 	// of truth, a manifest that already landed makes the next Open a clean
 	// v5 no-migration session).
 	if snapVer < store.VersionV5 {
+		// Rollback artifact: the Seal's checkpoint deletes the pre-migration
+		// watermark via cleanupSnapshots — rename it aside first (.bak never
+		// matches the cleanup pattern), and on Seal failure rename it back so
+		// the retry Open still finds the manifest-named snapshot. Rename
+		// failures are ignored (best effort, cleanup discipline).
+		restore := retainLegacyArtifact(legacySnap, snapVer)
 		if err := g.Seal(); err != nil {
+			restore()
 			w.Close()
 			return nil, fmt.Errorf("vectra: migrating %s to snapshot v5: %w", path, err)
 		}
@@ -1799,6 +1814,29 @@ func (g *Graph) cleanupSnapshots(keep string) {
 		}
 		os.Remove(filepath.Join(dir, e.Name()))
 	}
+}
+
+// retainLegacyArtifact sets the pre-migration watermark snapshot aside as a
+// rollback artifact — path -> path-v<ver>.bak in the same directory — before
+// the migration Seal's cleanupSnapshots deletes the last v<ver>-encoded
+// bytes (pg_upgrade keeps the old cluster; this keeps the old watermark). The
+// .bak suffix fails cleanup's HasSuffix(".db") gate, so every LATER seal
+// spares it too, and recovery never sees it: Open loads only what the
+// manifest names. The returned restore renames it back for the Seal-failure
+// path — a failed migration must leave the manifest-named snapshot in place
+// or the retry Open cannot load it. Best effort, cleanupSnapshots discipline:
+// rename errors are ignored (a missing artifact degrades rollback, never
+// migration) and an empty path (nothing was loaded from a manifest) is a
+// no-op.
+func retainLegacyArtifact(path string, ver uint16) (restore func()) {
+	if path == "" {
+		return func() {}
+	}
+	bak := fmt.Sprintf("%s-v%d.bak", path, ver)
+	if err := os.Rename(path, bak); err != nil {
+		return func() {}
+	}
+	return func() { os.Rename(bak, path) }
 }
 
 // Close ends a session. With a WAL attached, Close is a mandatory checkpoint:

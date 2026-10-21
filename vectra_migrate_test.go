@@ -232,3 +232,93 @@ func TestMigratedLibRejectedByV4Decode(t *testing.T) {
 		t.Fatal("Decode must hard-fail on an unknown snapshot version (version dispatch)")
 	}
 }
+
+// TestMigrationRetainsV4Artifact (industry fix: pg_upgrade keeps the old
+// cluster, ArangoDB advises a pre-upgrade backup): the migration Seal's
+// checkpoint cleanup must not leave the library un-downgradable with no
+// rollback bytes — the manifest-named v4 watermark survives as
+// <name>-v4.bak, still probing v4. The artifact must also be invisible to
+// recovery (reopen is clean) and spare later seals (Close's own checkpoint
+// cleanup must not match the .bak).
+func TestMigrationRetainsV4Artifact(t *testing.T) {
+	dir := t.TempDir()
+	copyTree(t, "testdata/legacy-v4", dir)
+	db := filepath.Join(dir, "v.db")
+
+	g, err := vectra.Open(db, vectra.Options{WALMode: vectra.ModeAlways}) // migrates
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ver := headSnapshot(t, db); ver != store.VersionV5 {
+		t.Fatalf("head snapshot version after Open = %d, want 5", ver)
+	}
+	// The pre-migration watermark (fixture manifest names v-2.db) survives as
+	// a rollback artifact whose bytes still probe v4.
+	bak := filepath.Join(dir, "v-2.db-v4.bak")
+	bf, err := os.Open(bak)
+	if err != nil {
+		t.Fatalf("migration deleted the pre-migration watermark without a rollback artifact: %v", err)
+	}
+	bakVer, err := store.ProbeVersion(bf)
+	bf.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bakVer != 4 {
+		t.Fatalf("rollback artifact %s probes v%d, want 4", bak, bakVer)
+	}
+	if err := g.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen (idempotent — no second migration) plus the Close-checkpoint's
+	// own cleanupSnapshots must both spare the artifact: unchanged
+	// size+mtime across the cycle proves no later seal touched it.
+	before := mustStat(t, bak)
+	g2, err := vectra.Open(db, vectra.Options{WALMode: vectra.ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	after := mustStat(t, bak)
+	if !before.ModTime().Equal(after.ModTime()) || before.Size() != after.Size() {
+		t.Fatalf("reopen/Close cycle rewrote rollback artifact %s (mtime %v -> %v): later seals must spare it",
+			bak, before.ModTime(), after.ModTime())
+	}
+}
+
+// TestRetainLegacyArtifactRestore pins the failure-path contract at unit
+// level: Open offers no cheap Seal-failure injection (an unwritable directory
+// breaks the artifact rename itself), so the rename-aside/restore mechanics
+// of retainLegacyArtifact are tested directly.
+func TestRetainLegacyArtifactRestore(t *testing.T) {
+	t.Run("rename aside and restore", func(t *testing.T) {
+		orig := filepath.Join(t.TempDir(), "v-2.db")
+		if err := os.WriteFile(orig, []byte("legacy-bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		bak := orig + "-v4.bak"
+		restore := vectra.RetainLegacyArtifactForTest(orig, 4)
+		if _, err := os.Stat(orig); !os.IsNotExist(err) {
+			t.Fatalf("retain must move the manifest-named file aside: stat err=%v", err)
+		}
+		if b, err := os.ReadFile(bak); err != nil || string(b) != "legacy-bytes" {
+			t.Fatalf("artifact after retain = %q err=%v, want legacy-bytes", b, err)
+		}
+		restore()
+		if b, err := os.ReadFile(orig); err != nil || string(b) != "legacy-bytes" {
+			t.Fatalf("restore must put the manifest-named file back for the retry Open: %q err=%v", b, err)
+		}
+		if _, err := os.Stat(bak); !os.IsNotExist(err) {
+			t.Fatalf("restore must consume the artifact: stat err=%v", err)
+		}
+	})
+	t.Run("no-op paths never panic", func(t *testing.T) {
+		// Empty path (nothing loaded from a manifest) and a failed rename
+		// (missing source) must yield a no-op restore.
+		vectra.RetainLegacyArtifactForTest("", 4)()
+		vectra.RetainLegacyArtifactForTest(filepath.Join(t.TempDir(), "missing.db"), 4)()
+	})
+}
