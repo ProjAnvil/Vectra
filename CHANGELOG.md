@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-20
+
+Vector Phase 1: the index becomes a first-class embedded subsystem.
+Declarations persist (WAL + store v4), writes intake through the skip-
+and-warn rules, queries run zero-lock over immutable snapshots, and
+background folder lanes pack without ever blocking the writer. Gate 2b:
+write throughput 23-26k/s against the 20k line, plain-write p50 within
+101% of an unindexed graph, integrated recall@10 = 1.0000 at ef
+32/64/128. Full data: `docs/benchmarks/2026-10-20-vector-phase1-gate2b.md`.
+
+### Added
+
+- `Graph.CreateVectorIndex` / `DropVectorIndex` / `VectorIndexes` /
+  `QueryVector` (+ `QueryVectorOptions`, `VectorHit`,
+  `Graph.VectorForNode`, `Options.OnVecSkip`): declaration API and
+  zero-lock top-k with adaptive ef and the 3x-oversample label
+  post-filter (spec §9.1/§13-1). Mid-batch declarations are rejected
+  (their replay semantics would diverge); documentation on the methods.
+- WAL `IndexDecl.VectorIndexes`: full-list declaration frames, drop =
+  absence; `null` vs empty-array keeps keys-only frames byte-identical
+  (old binaries replay them untouched).
+- Store format v4: vector declaration section after indexKeys. v3/v2/v1
+  files load unchanged; **a v4 file opened by a pre-v0.10 binary hard-
+  fails on the version byte** - plan upgrades before downgrades.
+- Folder lanes (spec D10): direct mode packs inside the fold loop;
+  wrapper mode gets an independent vecSig on the merger goroutine that
+  the write-stall path never observes. Draining is two-phase (short
+  lock to capture, lock-free HNSW build, short lock to commit) - the
+  writer's intake never waits on graph building (spec D5; the
+  single-lock first cut measured 601/s, the two-phase cut 26k/s).
+- `internal/vector`: per-goroutine search Reader (concurrent-search
+  prerequisite), immutable Snapshot model (chunked overlay, chunked
+  dead bitmap, key arrays off the read path), recovery drain with the
+  overlay as the exact fallback.
+- MCP tool #12 `vector_search` (query_vector or similar_to, k ≤ 100,
+  approximation note on every response).
+
+### Changed
+
+- Recovery rebuilds vector forests bottom-up after Load/Open (spec
+  §7.1); until fully packed, the overlay's linear scan serves queries
+  exactly.
+
+### Fixed
+
+- None beyond the above; the audit trail (five code-reviewer audits,
+  every must-fix landed with a regression test) is in the commit log.
+
+[Unreleased]: https://github.com/projanvil/vectra/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/projanvil/vectra/compare/v0.9.0...v0.10.0
+
 ## [0.9.0] - 2026-10-20
 
 A vector-index and throughput release: the embedded pure-Go HNSW lands
