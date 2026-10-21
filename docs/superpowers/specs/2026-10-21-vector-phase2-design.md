@@ -196,7 +196,8 @@ deadBits），连同声明一起挂到 clone 的注册表；clone 的 `QueryVect
 
 - `POST /v1/vector/search`：入参 `{index, query_vector | similar_to, k,
   ef?, label?}`；出参 hits（key/score）。published clone 上执行。k 默认
-  10、上限 100（对齐 MCP 面）。
+  10、上限 1000（对齐 MCP 面；据行业对比自 100 上调——FalkorDB/Weaviate
+  无硬上限、Qdrant 可配置，超限仍静默限幅）。
 - `POST /v1/vector/indexes`：声明；`DELETE /v1/vector/indexes/{name}`：删
   除。两者是写路径，经 raft。
 - `GET /v1/vector/indexes`：列出（clone 上读）。

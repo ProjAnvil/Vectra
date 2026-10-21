@@ -39,6 +39,16 @@ var Version = "0.11.0"
 // a safe default practice for database MCPs).
 const defaultLimit = 1000
 
+// vectorDefaultK / vectorMaxK bound the vector_search tool's k: k <= 0
+// selects the default, k above the cap clamps silently (never an error).
+// The cap is 1000 (raised from 100 after an industry comparison:
+// FalkorDB/Weaviate impose no hard cap and Qdrant's is configurable, so
+// silently truncating k>100 requests was a footgun).
+const (
+	vectorDefaultK = 10
+	vectorMaxK     = 1000
+)
+
 // Options configures the MCP service.
 type Options struct {
 	// SnapshotPath, when non-empty: loaded at startup, saved after each seal (single-file snapshot).
@@ -294,7 +304,7 @@ type vectorSearchIn struct {
 	Index     string    `json:"index" jsonschema:"vector index name (declared via the Go API)"`
 	Vector    []float64 `json:"query_vector,omitempty" jsonschema:"query embedding (mutually exclusive with similar_to)"`
 	SimilarTo string    `json:"similar_to,omitempty" jsonschema:"node key whose indexed vector is the query (mutually exclusive with query_vector)"`
-	K         int       `json:"k,omitempty" jsonschema:"neighbors to return, default 10, max 100"`
+	K         int       `json:"k,omitempty" jsonschema:"neighbors to return, default 10, max 1000"`
 }
 
 type vectorHitOut struct {
@@ -388,7 +398,7 @@ func registerTools(s *mcp.Server, svc *service) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "vector_search",
-		Description: "Approximate top-k nearest-neighbor search over a declared vector index. Results are approximate; order across equal scores is not stable. Params: index, exactly one of query_vector or similar_to, k (default 10, max 100).",
+		Description: "Approximate top-k nearest-neighbor search over a declared vector index. Results are approximate; order across equal scores is not stable. Params: index, exactly one of query_vector or similar_to, k (default 10, max 1000).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.vectorSearch)
 }
@@ -758,7 +768,7 @@ func (svc *service) cypher(_ context.Context, _ *mcp.CallToolRequest, in cypherI
 
 // vectorSearch is the vector_search tool (spec 9.3): top-k approximate
 // neighbors of a query vector or of an existing node's indexed vector.
-// k clamps to 100; the note discloses approximation (spec D8).
+// k clamps to vectorMaxK; the note discloses approximation (spec D8).
 func (svc *service) vectorSearch(_ context.Context, _ *mcp.CallToolRequest, in vectorSearchIn) (*mcp.CallToolResult, vectorSearchOut, error) {
 	g, err := svc.view()
 	if err != nil {
@@ -766,10 +776,10 @@ func (svc *service) vectorSearch(_ context.Context, _ *mcp.CallToolRequest, in v
 	}
 	k := in.K
 	if k <= 0 {
-		k = 10
+		k = vectorDefaultK
 	}
-	if k > 100 {
-		k = 100
+	if k > vectorMaxK {
+		k = vectorMaxK
 	}
 	if (len(in.Vector) == 0) == (in.SimilarTo == "") {
 		return nil, vectorSearchOut{}, errors.New("provide exactly one of query_vector or similar_to")

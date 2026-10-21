@@ -108,12 +108,37 @@ func TestVectorSearchValidation(t *testing.T) {
 	mustErr(map[string]any{"index": "mem", "query_vector": floats64(make([]float32, 32)), "similar_to": "n0"}) // both
 	mustErr(map[string]any{"index": "nope", "query_vector": floats64(make([]float32, 32))})                    // unknown index
 	mustErr(map[string]any{"index": "mem", "query_vector": floats64(make([]float32, 8))})                      // dim mismatch
-	// k clamps to 100 rather than erroring.
+	// k above the cap clamps rather than erroring (counts pinned in
+	// TestVectorSearchKClamp).
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "vector_search", Arguments: map[string]any{
 		"index": "mem", "query_vector": floats64(make([]float32, 32)), "k": 5000,
 	}})
 	if err != nil || res.IsError {
 		t.Fatalf("k clamp should pass: err=%v isError=%v", err, res.IsError)
+	}
+}
+
+// TestVectorSearchKClamp pins the k bounds: values between the old cap
+// (100) and the new one (1000) pass through unclamped, k above 1000
+// clamps silently to 1000, and k <= 0 selects the default 10.
+func TestVectorSearchKClamp(t *testing.T) {
+	cs, vecs := newVectorSession(t, 1200)
+	search := func(k int) int {
+		out := call[struct {
+			Count int `json:"count"`
+		}](t, cs, "vector_search", map[string]any{
+			"index": "mem", "query_vector": floats64(vecs[0]), "k": k,
+		})
+		return out.Count
+	}
+	if n := search(500); n != 500 {
+		t.Fatalf("k=500 must pass through unclamped, got count=%d", n)
+	}
+	if n := search(5000); n != 1000 {
+		t.Fatalf("k=5000 must clamp to 1000, got count=%d", n)
+	}
+	if n := search(0); n != 10 {
+		t.Fatalf("k=0 must select the default 10, got count=%d", n)
 	}
 }
 

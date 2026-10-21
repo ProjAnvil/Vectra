@@ -201,7 +201,7 @@
 - Test: `mcp/vector_test.go` (new)
 
 **Interfaces:**
-- Tool: `vector_search` — in: `{index string, query_vector []float64 | similar_to string, k int (default 10, max 100)}`; out: `{count, results: [{key, score}]}`; description states results are approximate (D8). Handler: reads via svc.view()-equivalent (svc.live), `similar_to` reads the node's indexed prop then queries.
+- Tool: `vector_search` — in: `{index string, query_vector []float64 | similar_to string, k int (default 10, max 100; raised to 1000 on 2026-10-21 per industry comparison)}`; out: `{count, results: [{key, score}]}`; description states results are approximate (D8). Handler: reads via svc.view()-equivalent (svc.live), `similar_to` reads the node's indexed prop then queries.
 
 - [ ] **Step 1: Failing test** — inject graph with vector index + 500 vectors, tool returns top-k with scores; k clamp 100; similar_to path; both-param/none-param errors.
 - [ ] **Step 2: Implement, green, Instructions updated (12 tools), commit** — `feat(mcp): vector_search tool`.

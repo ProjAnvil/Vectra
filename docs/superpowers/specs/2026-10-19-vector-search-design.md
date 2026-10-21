@@ -255,7 +255,7 @@ func (g *Graph) QueryVector(index string, vec []float32, o QueryVectorOptions) (
 
 - 新工具 `vector_search`。现有工具面 11 个，它成为第 12 个。
 - 入参两种：`query_vector`（浮点数组）或 `similar_to`（节点 key，用其索引属性向量）。
-- 限幅：k 默认 10，上限 100。结果带 score。
+- 限幅：k 默认 10，上限 1000（据行业对比自 100 上调，超限静默限幅）。结果带 score。
 - 描述文案明示"近似结果"。
 
 ## 10. 测试与基准

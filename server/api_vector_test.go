@@ -168,9 +168,9 @@ func TestAPIVectorSearchKSemantics(t *testing.T) {
 		t.Fatalf("create index: %d %v", resp.StatusCode, out)
 	}
 
-	// 120 distinct directions: enough corpus that k bounds, not the data,
-	// bound the result count.
-	const corpus = 120
+	// 1200 distinct directions: enough corpus that k bounds, not the data,
+	// bound the result count (k=500 unclamped and k=5000 clamped to 1000).
+	const corpus = 1200
 	nodes := make([]map[string]any, corpus)
 	for i := 0; i < corpus; i++ {
 		theta := 2 * math.Pi * float64(i) / corpus
@@ -185,13 +185,20 @@ func TestAPIVectorSearchKSemantics(t *testing.T) {
 
 	query := []float32{1, 0, 0, 0}
 
-	// k above the cap clamps to 100 (the MCP vector_search precedent; spec
-	// Review Focus #5 "k>100 限幅"), never a client error.
+	// k between the old cap (100) and the new one (1000) passes through
+	// unclamped — the behavioral fix; k above the cap clamps silently to
+	// 1000, never a client error.
 	resp, out = postJSON(t, leader.URL()+"/v1/vector/search", map[string]any{
 		"index": "mem", "query_vector": query, "k": 500,
 	})
-	if resp.StatusCode != http.StatusOK || out["count"] != float64(100) {
-		t.Fatalf("k=500 search: %d count=%v, want 200/100 (clamped)", resp.StatusCode, out["count"])
+	if resp.StatusCode != http.StatusOK || out["count"] != float64(500) {
+		t.Fatalf("k=500 search: %d count=%v, want 200/500 (unclamped)", resp.StatusCode, out["count"])
+	}
+	resp, out = postJSON(t, leader.URL()+"/v1/vector/search", map[string]any{
+		"index": "mem", "query_vector": query, "k": 5000,
+	})
+	if resp.StatusCode != http.StatusOK || out["count"] != float64(1000) {
+		t.Fatalf("k=5000 search: %d count=%v, want 200/1000 (clamped)", resp.StatusCode, out["count"])
 	}
 
 	// k omitted defaults to 10; explicit k=0 selects the same default.

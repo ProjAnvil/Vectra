@@ -600,11 +600,13 @@ func (n *Node) handleCycles(w http.ResponseWriter, r *http.Request) {
 // (create, drop) ride a raft Batch{VectorIndexOps} (leader-only).
 
 // k bounds for POST /v1/vector/search, copied from the MCP vector_search
-// tool's semantics: k <= 0 selects the default 10, k above 100 clamps to
-// 100 — never a client error (spec Review Focus #5 "k>100 限幅").
+// tool's semantics: k <= 0 selects the default 10, k above the cap clamps
+// silently — never a client error. The cap is 1000 (raised from 100 after
+// an industry comparison: FalkorDB/Weaviate impose no hard cap and Qdrant's
+// is configurable, so silently truncating k>100 requests was a footgun).
 const (
 	defaultVectorK = 10
-	maxVectorK     = 100
+	maxVectorK     = 1000
 )
 
 // vectorSearchRequest is the request body of POST /v1/vector/search: exactly

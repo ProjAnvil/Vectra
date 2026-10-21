@@ -177,12 +177,12 @@ server.tool(
   "vector_search",
   "Approximate top-k nearest-neighbor search over a declared vector index. Results are approximate; " +
     "order across equal scores is not stable. Provide exactly one of query_vector or similar_to. " +
-    "Params: index, query_vector|similar_to, k (default 10, max 100), ef, label.",
+    "Params: index, query_vector|similar_to, k (default 10, max 1000), ef, label.",
   {
     index: z.string().describe("vector index name (declare one with vector_index_create)"),
     query_vector: z.array(z.number()).optional().describe("query embedding (exactly one of query_vector/similar_to)"),
     similar_to: z.string().optional().describe("node key whose indexed vector is the query (exactly one of query_vector/similar_to)"),
-    k: z.number().int().optional().default(10).describe("neighbors to return, default 10, max 100"),
+    k: z.number().int().optional().default(10).describe("neighbors to return, default 10, max 1000"),
     ef: z.number().int().optional().describe("HNSW search beam width; 0 = adaptive default"),
     label: z.string().optional().describe("restrict the search to nodes with this label"),
   },

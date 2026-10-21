@@ -129,7 +129,7 @@ def vector_search(index: str, query_vector: list[float] | None = None,
     """Approximate top-k nearest-neighbor search over a declared vector
     index. Results are approximate; order across equal scores is not
     stable. Provide exactly one of query_vector or similar_to. Params:
-    index, query_vector|similar_to, k (default 10, max 100), ef, label."""
+    index, query_vector|similar_to, k (default 10, max 1000), ef, label."""
     return _c().vector_search(index, query_vector, similar_to, k, ef, label)
 
 
