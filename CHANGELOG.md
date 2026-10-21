@@ -98,7 +98,7 @@ write throughput 23-26k/s against the 20k line, plain-write p50 within
   prerequisite), immutable Snapshot model (chunked overlay, chunked
   dead bitmap, key arrays off the read path), recovery drain with the
   overlay as the exact fallback.
-- MCP tool #12 `vector_search` (query_vector or similar_to, k ≤ 100,
+- MCP tool #12 `vector_search` (query_vector or similar_to, k ≤ 1000,
   approximation note on every response).
 
 ### Changed
