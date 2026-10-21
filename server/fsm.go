@@ -135,6 +135,15 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	if err != nil {
 		return err
 	}
+	// Vector index ops are shape-validated against log content alone before
+	// anything mutates: a malformed op (neither create nor drop set, or
+	// both) fails the entry exactly like a decode failure — deterministically
+	// on every replica and on replay, with no partial effects.
+	for i, op := range b.VectorIndexOps {
+		if !op.exactlyOneSet() {
+			return fmt.Errorf("server: batch vectorIndexOps[%d]: exactly one of create/drop must be set", i)
+		}
+	}
 	res := ApplyResult{}
 	f.mu.Lock()
 	wNodes, wEdges := f.effectiveWriteSet(b) // always: blind writes version too
@@ -143,6 +152,28 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 			f.mu.Unlock()
 			f.metrics.TxnConflicts.Add(1)
 			return ApplyResult{Committed: false, Index: l.Index, Conflicts: conflicts, ConflictTotal: total}
+		}
+	}
+	// Vector index declaration ops apply BEFORE the changesets and OUTSIDE
+	// the g.Batch closure below (the engine rejects decl calls mid-batch) —
+	// the writer-lane precedent (internal/writer applyBatch): declarations
+	// land ahead of the group's changesets, so the batch's own nodes ingest
+	// through live intake, and a Drop takes effect before this entry's data
+	// lands. The fsm's live graph carries no writer claim (Apply is its only
+	// mutator), so the direct decl APIs pass the writer discipline here. A
+	// failing op aborts the entry before the changesets replay; the failure
+	// is a function of log content and log-derived state, so every replica
+	// (and replay) aborts identically — no divergence.
+	for i, op := range b.VectorIndexOps {
+		var opErr error
+		if op.Create != nil {
+			opErr = f.live.CreateVectorIndex(*op.Create)
+		} else {
+			opErr = f.live.DropVectorIndex(op.Drop)
+		}
+		if opErr != nil {
+			f.mu.Unlock()
+			return fmt.Errorf("server: batch vectorIndexOps[%d]: %w", i, opErr)
 		}
 	}
 	// One Batch boundary per committed entry: the replay materializes as a

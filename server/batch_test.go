@@ -42,11 +42,15 @@ type flatBatch struct {
 	Txn         *TxnGuard
 }
 
-// fullBatch fills every changeset field plus Txn.
+// fullBatch fills every changeset field plus Txn and vector index ops.
 func fullBatch() Batch {
 	return Batch{
 		Version: 3,
-		Nodes:   []NodeUpsert{{Key: "a", Label: "Svc", Props: map[string]any{"w": 2}}},
+		VectorIndexOps: []VectorIndexOp{
+			{Create: &vectra.VectorIndexDecl{Name: "vemb", Prop: "emb", Dim: 8, Metric: "cosine"}},
+			{Drop: "vold"},
+		},
+		Nodes: []NodeUpsert{{Key: "a", Label: "Svc", Props: map[string]any{"w": 2}}},
 		Edges: []EdgeUpsert{
 			{SrcKey: "a", DstKey: "b", Label: "CALLS", Props: map[string]any{"w": 1}},
 			{SrcKey: "a", DstKey: "b", Label: "CALLS", AllowParallel: true},
@@ -108,8 +112,15 @@ func TestBatchGobLegacyRoundtrip(t *testing.T) {
 	if got.Txn == nil || got.Txn.Snapshot != 7 || !got.Txn.SER || len(got.Txn.ReadEdges) != 1 {
 		t.Fatalf("txn = %+v", got.Txn)
 	}
+	// Old frames carry no VectorIndexOps field at all: the new field decodes
+	// nil (no declaration change), NOT an empty reconciliation list.
+	if got.VectorIndexOps != nil {
+		t.Fatalf("vectorIndexOps from legacy frame = %+v, want nil", got.VectorIndexOps)
+	}
 
-	// New writer -> old reader.
+	// New writer -> old reader. The frame now carries VectorIndexOps; gob
+	// discards unknown fields on decode, so the legacy struct still reads
+	// every field it knows.
 	data, err := encodeBatch(want)
 	if err != nil {
 		t.Fatal(err)
@@ -122,6 +133,18 @@ func TestBatchGobLegacyRoundtrip(t *testing.T) {
 		len(back.Edges) != 2 || back.Edges[1].AllowParallel != true ||
 		len(back.EdgeDeletes) != 1 || len(back.NodeDeletes) != 1 || back.Txn.Snapshot != 7 {
 		t.Fatalf("legacy decode of new batch = %+v", back)
+	}
+
+	// New writer -> new reader: the ops survive a round-trip verbatim.
+	rt, err := decodeBatch(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.VectorIndexOps) != 2 ||
+		rt.VectorIndexOps[0].Create == nil || rt.VectorIndexOps[0].Create.Name != "vemb" ||
+		rt.VectorIndexOps[0].Create.Dim != 8 || rt.VectorIndexOps[0].Drop != "" ||
+		rt.VectorIndexOps[1].Create != nil || rt.VectorIndexOps[1].Drop != "vold" {
+		t.Fatalf("vectorIndexOps roundtrip = %+v", rt.VectorIndexOps)
 	}
 }
 

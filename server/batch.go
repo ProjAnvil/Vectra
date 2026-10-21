@@ -56,9 +56,29 @@ type TxnGuard struct {
 	ReadEdges []EdgeRef `json:"readEdges"`
 }
 
+// VectorIndexOp is one explicit vector-index declaration change carried in
+// a Batch (spec 2026-10-21 §3.4, rulings #6/#7): exactly one of Create/Drop
+// is set per op. An op with neither set (or both) is invalid and rejected
+// at Apply with a clear error. Create is a pointer so a nil Create is
+// distinguishable from a zero-valued declaration on the wire.
+//
+// This is an op list, NOT a full-list reconciliation: nil/empty
+// VectorIndexOps means "no declaration change this batch" — the WAL
+// IndexDecl frame's nil-vs-empty (full-list) semantics do NOT apply here.
+type VectorIndexOp struct {
+	Create *vectra.VectorIndexDecl `json:"create,omitempty"`
+	Drop   string                  `json:"drop,omitempty"`
+}
+
+// exactlyOneSet reports the op's shape validity: exactly one of Create/Drop
+// must be set (Apply rejects entries violating it before any mutation).
+func (op VectorIndexOp) exactlyOneSet() bool {
+	return (op.Create != nil) != (op.Drop != "")
+}
+
 // Batch is a changeset carried by one raft log. Fixed apply order
-// (deterministic replay): node upserts → edge upserts → edge deletes →
-// node deletes.
+// (deterministic replay): vector index ops → node upserts → edge upserts →
+// edge deletes → node deletes.
 //
 // Wire-compatibility note (deviation from the v0.7 spec's stated mechanism,
 // same contract): the spec proposed `struct { vectra.Changeset; Txn }`
@@ -79,6 +99,12 @@ type Batch struct {
 	EdgeDeletes []EdgeDelete
 	NodeDeletes []string
 	Txn         *TxnGuard // Txn != nil enables optimistic validation (nil = auto-commit, pre-0.4 behavior)
+	// VectorIndexOps are explicit create/drop declaration ops, applied
+	// BEFORE this batch's changesets at replay (ops-first, the writer-lane
+	// precedent — see fsm.Apply). Nil/empty = no declaration change.
+	// gob add-only evolution: the field is absent from older logs (decodes
+	// nil there) and silently ignored by older readers of new logs.
+	VectorIndexOps []VectorIndexOp
 }
 
 // ChangesetOf returns the batch's core changeset projection (WAL frames,
