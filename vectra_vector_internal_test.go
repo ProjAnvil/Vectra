@@ -245,6 +245,13 @@ func TestVecReplayParity(t *testing.T) {
 		if f.IsDir() {
 			continue
 		}
+		// Segments only, per the comment above: since the fresh-library
+		// tripwire (Open's v5 migration seal), the source WAL dir also holds
+		// a manifest naming the checkpoint snapshot — copying it would send
+		// the copy down the manifest path and fail on the uncopied snapshot.
+		if f.Name() == "manifest.json" {
+			continue
+		}
 		in, _ := os.ReadFile(filepath.Join(walSrc, f.Name()))
 		os.WriteFile(filepath.Join(cp, "v.db.wal", f.Name()), in, 0o644)
 	}
@@ -383,6 +390,13 @@ func TestVecRecreateSameNameParity(t *testing.T) {
 	files, _ := os.ReadDir(walSrc)
 	for _, f := range files {
 		if f.IsDir() {
+			continue
+		}
+		// Segments only, per the comment above: since the fresh-library
+		// tripwire (Open's v5 migration seal), the source WAL dir also holds
+		// a manifest naming the checkpoint snapshot — copying it would send
+		// the copy down the manifest path and fail on the uncopied snapshot.
+		if f.Name() == "manifest.json" {
 			continue
 		}
 		in, _ := os.ReadFile(filepath.Join(walSrc, f.Name()))

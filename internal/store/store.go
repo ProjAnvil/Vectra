@@ -44,6 +44,11 @@ const (
 	headerSize    = 6 // magic(4) + version(2); count fields start after this
 )
 
+// VersionV5 exports the current snapshot version: vectra.Open probes the
+// recovered head's version to decide the v5 migration / fresh tripwire seal
+// (spec 2026-10-21 §1.3).
+const VersionV5 = versionV5
+
 // Node / Edge use string keys rather than internal NodeIDs: the snapshot is
 // decoupled from ID assignment order and rebuilt on load. props serialize to
 // JSON (numbers become float64 on roundtrip, a known limitation — see the

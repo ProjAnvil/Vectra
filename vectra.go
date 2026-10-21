@@ -1579,6 +1579,15 @@ func (g *Graph) Batch(fn func(*Graph)) error {
 // micro-layer per frame), with no recording during replay. Merging is
 // deferred to the checkpoint at Close or an explicit Seal.
 //
+// v5 migration + fresh-library tripwire (spec 2026-10-21 §1.3, rulings
+// #4/#9): a WAL-mode Open ENDS with one Seal unless the recovered head is
+// already a v5 snapshot — legacy (v1-v4) libraries migrate in place, and
+// fresh or WAL-only libraries (no snapshot head) get an empty/full v5
+// checkpoint, so the on-disk state a v0.10 downgrade would open always
+// hard-fails at the snapshot version byte instead of silently truncating
+// unknown (type-4 vector) WAL frames. Reopening a v5 library seals nothing
+// (idempotent). ModeOff Opens never migrate (see the branch below).
+//
 // Checkpoints never write `path` in place: each one writes a watermark
 // snapshot <path minus ext>-<lsn>.db next to path and atomically points the
 // manifest at it (old watermarks are deleted only after the new manifest
@@ -1603,6 +1612,14 @@ func Open(path string, opts Options) (*Graph, error) {
 	if opts.WALMode == ModeOff {
 		// v0.6 behavior: snapshot-only. Existing file loads merged; a missing
 		// file starts a fresh writable graph (durability via Seal+SaveFile).
+		//
+		// No v5 migration here (spec §1.3 scopes it to WAL-mode Opens): Seal
+		// without a WAL is merge-only — it never writes a snapshot — so an
+		// in-place migration would be a SaveFile behind the caller's back,
+		// changing ModeOff's read-only Open contract. ModeOff also never
+		// replays a WAL, which is where the silent-truncation hazard lives;
+		// Decode reads v1-v5 transparently and any caller-side SaveFile
+		// writes v5 through the same Encode path.
 		if _, err := os.Stat(path); err == nil {
 			return LoadFile(path)
 		} else if !errors.Is(err, fs.ErrNotExist) {
@@ -1625,12 +1642,22 @@ func Open(path string, opts Options) (*Graph, error) {
 	}
 
 	var g *Graph
+	// snapVer is the store version of the snapshot recovery loads below
+	// (0 = nothing was loaded: fresh library, or WAL-only recovery). Open's
+	// v5/tripwire gate at the end reads it.
+	var snapVer uint16
 	loadSnapshot := func(p string) error {
 		f, err := os.Open(p)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
+		if snapVer, err = store.ProbeVersion(f); err != nil {
+			return err
+		}
+		if _, err = f.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
 		lg, err := loadGraph(f)
 		if err != nil {
 			return err
@@ -1690,6 +1717,25 @@ func Open(path string, opts Options) (*Graph, error) {
 	}
 	g.wal, g.walDir, g.dbPath = w, walDir, path
 	g.vecKick() // recovery: replays left every vector in the overlay; drain bottom-up (spec 7.1)
+	// v5 migration + fresh-library tripwire (spec §1.3, rulings #4/#9), at
+	// the END of Open: no writer is attached and no reader holds the graph
+	// yet, so one Seal runs uncontended. The replayed tail may contain v2
+	// (type-4) frames that a v0.10 binary silently truncates, and fresh or
+	// WAL-only recoveries leave no snapshot head at all — folding the
+	// recovered state into a v5 watermark snapshot closes both: old readers
+	// hard-fail on the version byte instead of misreading the layout. The
+	// gate is exact (snapVer==5 ⇒ nothing), so reopening a v5 library is
+	// write-free. A failed seal fails Open — the library must not pretend to
+	// be fine while its head stays downgrade-truncatable; recovery state
+	// survives either way (pre-manifest failures keep the WAL as the source
+	// of truth, a manifest that already landed makes the next Open a clean
+	// v5 no-migration session).
+	if snapVer < store.VersionV5 {
+		if err := g.Seal(); err != nil {
+			w.Close()
+			return nil, fmt.Errorf("vectra: migrating %s to snapshot v5: %w", path, err)
+		}
+	}
 	return g, nil
 }
 

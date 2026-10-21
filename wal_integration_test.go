@@ -374,8 +374,16 @@ func TestCloseCheckpointFailureKeepsWAL(t *testing.T) {
 	if err := g.Close(); err == nil {
 		t.Fatal("Close must fail when the snapshot cannot be persisted")
 	}
-	if _, err := os.Stat(filepath.Join(walDir, "manifest.json")); !os.IsNotExist(err) {
-		t.Fatal("no manifest may be written on failed checkpoint")
+	// The failed checkpoint must not commit. Since the fresh-library
+	// tripwire (Open's v5 migration seal) a manifest exists from byte one —
+	// the assertion is that Close left it naming that lsn-0 checkpoint,
+	// never the aborted lsn-3 one.
+	man, ok, err := wal.ReadManifest(walDir)
+	if err != nil || !ok {
+		t.Fatalf("manifest after failed checkpoint: ok=%v err=%v", ok, err)
+	}
+	if man.LSN != 0 || man.Snapshot != "graph-0.db" {
+		t.Fatalf("manifest = %+v, want the tripwire checkpoint graph-0.db at lsn 0 (failed Close must not commit)", man)
 	}
 	if ok, err := wal.HasSegments(walDir); err != nil || !ok {
 		t.Fatalf("WAL segments must survive failed checkpoint: ok=%v err=%v", ok, err)
