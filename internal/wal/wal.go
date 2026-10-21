@@ -12,8 +12,9 @@
 //
 //	[8B header: uint64, low 56 bits = len(type+payload), high bits reserved 0]
 //	[4B CRC32C (Castagnoli) over type byte || payload]
-//	[1B type: 1 = Changeset, 2 = Marker]
-//	[JSON payload]
+//	[1B type: 1 = Changeset, 2 = Marker, 3 = IndexDecl, 4 = ChangesetV2]
+//	[payload: JSON for types 1-3; a self-describing binary vector envelope
+//	 for type 4 — see AppendHoisted]
 //
 // Durability: Append fsyncs per frame in ModeAlways only; ModeInterval leaves
 // fsync to the caller's boundaries (Sync / checkpoint / Close). There are no
@@ -30,18 +31,22 @@
 package wal
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
+
+	"github.com/projanvil/vectra/internal/vecbin"
 )
 
 // NodeUpsert / EdgeUpsert / EdgeDelete are the atomic items of a Changeset.
@@ -140,8 +145,14 @@ var segmentSize = 64 << 20
 const (
 	frameChangeset = 1
 	frameMarker    = 2
-	frameIndexDecl = 3  // v0.7.1: index declarations (spec errata III) — see IndexDecl
-	headerLen      = 12 // 8B length + 4B CRC
+	frameIndexDecl = 3 // v0.7.1: index declarations (spec errata III) — see IndexDecl
+	// frameChangesetV2 is a Changeset whose declared vector props left the
+	// JSON channel for a raw float32 section (vector Phase 2, spec §1.2).
+	// Old readers stop replay at it — the standing silent-truncation rule
+	// for unknown types; the store v5 version tripwire is what actually
+	// blocks downgrades (spec §1.3).
+	frameChangesetV2 = 4
+	headerLen        = 12 // 8B length + 4B CRC
 	// rolloverHeadroom: a frame may only trigger a rollover once the segment
 	// holds more than this many bytes (i.e. past its leading marker).
 	rolloverHeadroom = 64
@@ -368,8 +379,10 @@ func scanSegmentFile(dir string, n int) (segScan, error) {
 		}
 		// every non-marker frame type consumes an LSN — nframes must count
 		// them all or the write head parks early (next Append would
-		// overwrite a valid frame) and w.lsn regresses
-		if typ != frameChangeset && typ != frameIndexDecl {
+		// overwrite a valid frame) and w.lsn regresses. Payloads are not
+		// decoded here: a v2 frame with a forged ref still parks the head
+		// after it and Replay is what reports the damage.
+		if typ != frameChangeset && typ != frameIndexDecl && typ != frameChangesetV2 {
 			return errStopScan
 		}
 		sc.nframes++
@@ -479,6 +492,84 @@ func (w *WAL) AppendIndex(d IndexDecl) (uint64, error) {
 	return w.writeFrame(frameIndexDecl, payload)
 }
 
+// AppendHoisted writes cs as a frameChangesetV2 frame when any node's
+// declared prop hoists (vecbin.Hoist over Nodes), else a plain v1
+// frameChangeset frame. The v2 payload envelope is self-describing:
+// [4B "VVB2"][u16 nProps][u16 nameLen+name+u16 dim]*[u32 jsonLen]
+// [json skeleton][raw float32 LE section].
+//
+// The hint section names only the props actually hoisted in THIS frame, so
+// Replay restores with zero cross-frame state: the WAL stays stateless and
+// declaration (IndexDecl) frames are not required to precede data frames —
+// a fresh segment after Reset replays v2 frames on its own. Edge props are
+// never indexed (spec §1.2) and stay JSON; undeclared numeric arrays are
+// data and stay JSON. cs is never mutated, and the fallback path reuses
+// Append verbatim so pure-graph changesets keep byte-identical v1 frames.
+func (w *WAL) AppendHoisted(cs Changeset, decls vecbin.PropDecls) (uint64, error) {
+	if len(decls) == 0 || len(cs.Nodes) == 0 {
+		return w.Append(cs)
+	}
+	// Detection is declaration-based, never Go-type-based (spec §1.2): a hit
+	// is a declared prop holding a numeric array — exactly vecbin.Hoist's
+	// predicate, probed here with the allocation-free NumericArray so the v1
+	// fallback costs nothing. The recorded dim is what this frame's values
+	// actually carry (per-frame truth, not the declared dim); the hint is
+	// descriptive only, each "$vec" ref holds the authoritative off/dim.
+	hintDims := map[string]int{}
+	for _, n := range cs.Nodes {
+		for k, v := range n.Props {
+			if _, declared := decls[k]; !declared {
+				continue
+			}
+			if dim, ok := vecbin.NumericArray(v); ok {
+				hintDims[k] = dim
+			}
+		}
+	}
+	if len(hintDims) == 0 {
+		return w.Append(cs)
+	}
+	// Hoist pass. The section's run order within a node follows map
+	// iteration; refs address runs absolutely, so the layout is irrelevant.
+	// nodes is a clone — the caller's slice elements keep their props.
+	var sec []float32
+	nodes := make([]NodeUpsert, len(cs.Nodes))
+	copy(nodes, cs.Nodes)
+	for i, n := range nodes {
+		p, ok := vecbin.Hoist(n.Props, decls, &sec)
+		if ok {
+			nodes[i].Props = p
+		}
+	}
+	// v1 rejects non-finite floats at json.Marshal time; the binary section
+	// would carry them silently, so v2 refuses them too (spec §1.2: NaN/Inf
+	// behavior matches v1 — NormalizeVec makes this unreachable in practice,
+	// the guard covers direct callers).
+	for _, f := range sec {
+		if math.IsNaN(float64(f)) || math.IsInf(float64(f), 0) {
+			return 0, fmt.Errorf("wal: hoisted vector section holds non-finite float %v (JSON channel rejects it; so does v2)", f)
+		}
+	}
+	skeleton, err := json.Marshal(Changeset{Version: cs.Version, Nodes: nodes, Edges: cs.Edges,
+		EdgeDeletes: cs.EdgeDeletes, NodeDeletes: cs.NodeDeletes})
+	if err != nil {
+		return 0, err
+	}
+	if len(hintDims) > 0xFFFF {
+		return 0, fmt.Errorf("wal: %d hoisted vector props overflow the u16 hint count", len(hintDims))
+	}
+	hints := make([]v2Hint, 0, len(hintDims))
+	for name, dim := range hintDims {
+		if len(name) > 0xFFFF || dim > 0xFFFF {
+			return 0, fmt.Errorf("wal: vector prop hint %q (dim %d) overflows the u16 envelope fields", name, dim)
+		}
+		hints = append(hints, v2Hint{name: name, dim: dim})
+	}
+	// Sorted names keep v2 frame bytes reproducible despite map iteration.
+	slices.SortFunc(hints, func(a, b v2Hint) int { return strings.Compare(a.name, b.name) })
+	return w.writeFrame(frameChangesetV2, appendV2Envelope(nil, hints, skeleton, sec))
+}
+
 // writeFrame is the shared append path: rollover check, write, LSN
 // assignment, ModeAlways fsync.
 func (w *WAL) writeFrame(typ byte, payload []byte) (uint64, error) {
@@ -578,7 +669,7 @@ func (w *WAL) replayLSN(fn func(lsn uint64, fr Frame) error) (uint64, error) {
 				}
 				return nil
 			}
-			if typ != frameChangeset && typ != frameIndexDecl {
+			if typ != frameChangeset && typ != frameIndexDecl && typ != frameChangesetV2 {
 				stopped = true
 				return errStopScan
 			}
@@ -601,6 +692,18 @@ func (w *WAL) replayLSN(fn func(lsn uint64, fr Frame) error) (uint64, error) {
 				}
 				fr.IndexKeys = d.Keys
 				fr.VectorIndexes = d.VectorIndexes
+			} else if typ == frameChangesetV2 {
+				// A CRC-intact frame whose envelope still fails to decode
+				// (bad magic, torn hint section, forged out-of-range $vec
+				// ref) is not a crash artifact — real torn tails die in
+				// scanFrames and end replay silently by design — so surface
+				// it as an error instead of silently dropping every frame
+				// behind it.
+				cs, derr := decodeV2Changeset(payload)
+				if derr != nil {
+					return fmt.Errorf("wal: lsn %d: %w", lsn, derr)
+				}
+				fr.Changeset = cs
 			} else {
 				var cs Changeset
 				if err := json.Unmarshal(payload, &cs); err != nil {
@@ -721,8 +824,8 @@ func scanFrames(buf []byte, fn func(typ byte, payload []byte) error) (int64, err
 			break // corrupt frame
 		}
 		typ := buf[off+12]
-		if typ != frameChangeset && typ != frameMarker && typ != frameIndexDecl {
-			break
+		if typ != frameChangeset && typ != frameMarker && typ != frameIndexDecl && typ != frameChangesetV2 {
+			break // unknown type: old-reader silent truncation (spec §1.3); 4 is known
 		}
 		if err := fn(typ, buf[off+13:end]); err != nil {
 			if errors.Is(err, errStopScan) {
@@ -733,4 +836,122 @@ func scanFrames(buf []byte, fn func(typ byte, payload []byte) error) (int64, err
 		off = end
 	}
 	return int64(off), nil
+}
+
+// --- changeset v2 codec ------------------------------------------------------
+
+// v2Magic prefixes every frameChangesetV2 payload; a type-4 payload without
+// it is corruption (old readers cannot produce type 4 at all).
+var v2Magic = [4]byte{'V', 'V', 'B', '2'}
+
+// v2Hint is one hint-section entry: a prop name actually hoisted in this
+// frame plus the dim its values carried. The authoritative addressing lives
+// in each "$vec" ref; the hint exists so Replay can rebuild the declared-prop
+// set from the frame alone — the envelope is self-describing and the WAL
+// stays stateless (no IndexDecl frame needs to precede data frames).
+type v2Hint struct {
+	name string
+	dim  int
+}
+
+// appendV2Envelope lays out a frameChangesetV2 payload:
+// [4B "VVB2"][u16 nProps][u16 nameLen+name+u16 dim]*[u32 jsonLen]
+// [json skeleton][raw float32 LE section]. Every part but the float section
+// is length-prefixed, so the split is unambiguous and the section's size is
+// implied by the payload tail. Callers pre-validate the u16 fields (name
+// length, dim) — a silent uint16 truncation would forge a corrupt frame.
+func appendV2Envelope(dst []byte, hints []v2Hint, skeleton []byte, sec []float32) []byte {
+	dst = append(dst, v2Magic[:]...)
+	var b [4]byte
+	binary.LittleEndian.PutUint16(b[:2], uint16(len(hints)))
+	dst = append(dst, b[:2]...)
+	for _, h := range hints {
+		binary.LittleEndian.PutUint16(b[:2], uint16(len(h.name)))
+		dst = append(dst, b[:2]...)
+		dst = append(dst, h.name...)
+		binary.LittleEndian.PutUint16(b[:2], uint16(h.dim))
+		dst = append(dst, b[:2]...)
+	}
+	binary.LittleEndian.PutUint32(b[:], uint32(len(skeleton)))
+	dst = append(dst, b[:]...)
+	dst = append(dst, skeleton...)
+	for _, f := range sec {
+		dst = binary.LittleEndian.AppendUint32(dst, math.Float32bits(f))
+	}
+	return dst
+}
+
+// splitV2Envelope parses a frameChangesetV2 payload back into its restore
+// inputs: the declared-prop hints, the JSON skeleton and the raw float32
+// section. Every bound is checked (hint counts, name lengths, jsonLen, float
+// alignment); a violation is corruption.
+func splitV2Envelope(p []byte) (decls vecbin.PropDecls, skeleton []byte, sec []float32, err error) {
+	if len(p) < len(v2Magic)+2 || !bytes.Equal(p[:4], v2Magic[:]) {
+		return nil, nil, nil, fmt.Errorf("bad v2 magic % x", p[:min(4, len(p))])
+	}
+	off := len(v2Magic)
+	nProps := int(binary.LittleEndian.Uint16(p[off:]))
+	off += 2
+	decls = make(vecbin.PropDecls, nProps)
+	for i := 0; i < nProps; i++ {
+		if off+2 > len(p) {
+			return nil, nil, nil, fmt.Errorf("v2 hint %d: truncated name length", i)
+		}
+		nameLen := int(binary.LittleEndian.Uint16(p[off:]))
+		off += 2
+		if off+nameLen+2 > len(p) {
+			return nil, nil, nil, fmt.Errorf("v2 hint %d: name length %d overruns payload", i, nameLen)
+		}
+		name := string(p[off : off+nameLen])
+		off += nameLen
+		decls[name] = int(binary.LittleEndian.Uint16(p[off:]))
+		off += 2
+	}
+	if off+4 > len(p) {
+		return nil, nil, nil, fmt.Errorf("v2 envelope: truncated json length")
+	}
+	jsonLen := uint64(binary.LittleEndian.Uint32(p[off:])) // uint64: u32 must not sign-flip a 32-bit int
+	off += 4
+	if jsonLen > uint64(len(p)-off) {
+		return nil, nil, nil, fmt.Errorf("v2 jsonLen %d overruns payload (len %d)", jsonLen, len(p)-off)
+	}
+	skeleton = p[off : off+int(jsonLen)]
+	off += int(jsonLen)
+	rest := p[off:]
+	if len(rest)%4 != 0 {
+		return nil, nil, nil, fmt.Errorf("v2 float section len %d is not a float32 multiple", len(rest))
+	}
+	sec = make([]float32, len(rest)/4) // copy: the payload buffer is scan scratch
+	for i := range sec {
+		sec[i] = math.Float32frombits(binary.LittleEndian.Uint32(rest[4*i:]))
+	}
+	return decls, skeleton, sec, nil
+}
+
+// decodeV2Changeset restores a frameChangesetV2 payload to the Changeset the
+// caller handed AppendHoisted: split the envelope, JSON-decode the skeleton,
+// then resolve every node's "$vec" refs against the section (bounds-checked
+// by vecbin.Restore — out of range is corruption). Edge props never hoisted,
+// so they never restore. Frame is unchanged: callers see a fully materialized
+// Changeset and are unaware of the envelope.
+func decodeV2Changeset(payload []byte) (*Changeset, error) {
+	decls, skeleton, sec, err := splitV2Envelope(payload)
+	if err != nil {
+		return nil, err
+	}
+	var cs Changeset
+	if err := json.Unmarshal(skeleton, &cs); err != nil {
+		return nil, fmt.Errorf("v2 skeleton: %w", err)
+	}
+	for i := range cs.Nodes {
+		if cs.Nodes[i].Props == nil {
+			continue // nil props stay nil, exactly as a v1 frame decodes them
+		}
+		p, rerr := vecbin.Restore(cs.Nodes[i].Props, decls, sec)
+		if rerr != nil {
+			return nil, fmt.Errorf("node %q: %w", cs.Nodes[i].Key, rerr)
+		}
+		cs.Nodes[i].Props = p
+	}
+	return &cs, nil
 }
