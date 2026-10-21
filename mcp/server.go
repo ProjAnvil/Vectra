@@ -27,12 +27,12 @@ import (
 // hybrid: -ldflags for the semver, source default as fallback for plain
 // `go build`/`go install`, which cannot carry flags):
 //
-//	go build -ldflags "-X github.com/projanvil/vectra/mcp.Version=v0.10.0" ./cmd/vectra-mcp
+//	go build -ldflags "-X github.com/projanvil/vectra/mcp.Version=v0.11.0" ./cmd/vectra-mcp
 //
 // The Makefile build target injects `git describe --tags --always --dirty`.
 // The source default still gets bumped at release (chore(release) commits),
 // so unbuilt checkouts and `go install` from a tag report a truthful value.
-var Version = "0.10.0"
+var Version = "0.11.0"
 
 // defaultLimit is the default cap on nodes returned by bfs/reachable
 // (results are capped; the total field still reflects the true size,

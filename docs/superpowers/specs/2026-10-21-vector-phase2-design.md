@@ -120,7 +120,7 @@ break，与撕裂尾不可区分）。带内信号无法让旧代码报错，只
 
 ### 2.2 文件与时机
 
-- 每库一个 `vectors.vec`（与快照同目录，多索引 = 文件内多 section）。
+- 每库一个森林缓存文件，按库路径命名：`<db-minus-ext>.vec`（与快照同目录，多索引 = 文件内多 section；实现相对本行原文有命名偏离，见父规格偏离记录）。
 - 写入时机：Seal 流水线内、快照写完后（temp + fsync + rename，同样的原
   子性纪律）。快照与森林文件在同一 checkpoint 批次产生。
 - 内容：每个索引的 State 全量——配置（metric/dim/m/efc/seed）、

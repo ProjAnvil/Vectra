@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-21
+
+Vector Phase 2: vectors ride a binary WAL/store channel, the HNSW
+forest persists across restarts, and the vector surface reaches REST
+and MCP. 768-dim frames shrink to a third of their JSON size, vector
+write throughput goes 26k/s -> 68.8k/s, and a 100k-vector restart
+loads in 455ms where it used to rebuild for 7m19s. Reference docs:
+`docs/benchmarks/2026-10-21-vector-phase2-p21.md`,
+`docs/benchmarks/2026-10-21-vector-phase2-p22.md`,
+`docs/benchmarks/2026-10-21-wrapper-checkpoint-cadence.md`.
+
+### Added
+
+- Binary vector channel: WAL frame type 4 (`VVB2` self-describing
+  envelope) and store v5 snapshots (declarations-first, binary float
+  section) - 768-dim frames shrink 9.29KB -> 3.07KB, snapshots
+  74.1MB -> 24.4MB @8192 vectors; vector write throughput 26k/s ->
+  68.8k/s, batch-boundary p50 21ms -> 7.0ms.
+- Forest persistence (`<db>.vec`, watermark-gated): 100k-vector
+  restart 7m19s rebuild -> 455ms load (964x); WAL tail replays onto
+  the loaded forest; mismatched/corrupt caches rebuild transparently.
+- Vector REST endpoints: POST /v1/vector/search (query_vector |
+  similar_to, k≤100), POST/GET /v1/vector/indexes, DELETE
+  /v1/vector/indexes/{name}; raft-replicated explicit index ops;
+  TS/Python MCP clients gain vector_search, vector_index_create/drop/
+  list.
+- `writer.Handle.DeclareVectorIndex` / `DropVectorIndex` (embedded
+  wrapper declaration lane).
+- `Graph.Clone()` mounts read-only vector snapshots (server clones
+  serve vector queries).
+
+### Changed
+
+- Migration-on-open: legacy (v4) libraries checkpoint to v5
+  immediately on first open; fresh libraries write a v5 tripwire from
+  byte one. v0.10 binaries hard-fail on v5 snapshots - migrated
+  libraries cannot be downgraded (release notes: finish migration
+  before any downgrade attempt; a failed migration leaves the library
+  v4-readable and retried on next open).
+- Default CheckpointBytes 4MiB -> 64MiB (measured cadence:
+  `docs/benchmarks/2026-10-21-wrapper-checkpoint-cadence.md`).
+- /v1/batch and /v1/txn now accept JSON numeric arrays as vector props
+  (previously failed at raft encoding).
+
+### Unsupported
+
+- Mixed-version raft clusters: v0.11 leaders produce v5 raft snapshots
+  that v0.10 followers hard-fail to restore. Upgrade all nodes
+  together (stop-the-world, or all followers before the leader).
+
+[Unreleased]: https://github.com/projanvil/vectra/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/projanvil/vectra/compare/v0.10.0...v0.11.0
+
 ## [0.10.0] - 2026-10-20
 
 Vector Phase 1: the index becomes a first-class embedded subsystem.
