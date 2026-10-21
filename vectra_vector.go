@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"github.com/projanvil/vectra/internal/store"
+	"github.com/projanvil/vectra/internal/vecbin"
 	"github.com/projanvil/vectra/internal/vector"
 	"github.com/projanvil/vectra/internal/wal"
 )
@@ -237,6 +238,24 @@ func (g *Graph) vecRegistryCopy() []*vecIndex {
 }
 
 func (g *Graph) setVecRegistry(reg []*vecIndex) { g.vecIdx.Store(&reg) }
+
+// vecPropDecls snapshots the registry as a vecbin.PropDecls (prop name →
+// declared dim) for the WAL's v2 frame selection. Built fresh at every
+// logging call — never cached: declarations can change between batches.
+// The dim is nominal (Hoist records what each value actually carries);
+// nil for an empty registry so plain graphs pay no allocation and
+// AppendHoisted falls straight through to the v1 frame.
+func (g *Graph) vecPropDecls() vecbin.PropDecls {
+	reg := g.vecReg()
+	if len(reg) == 0 {
+		return nil
+	}
+	decls := make(vecbin.PropDecls, len(reg))
+	for _, vi := range reg {
+		decls[vi.decl.Prop] = vi.decl.Dim
+	}
+	return decls
+}
 
 func (g *Graph) vecIndexByName(name string) *vecIndex {
 	for _, vi := range g.vecReg() {

@@ -1461,7 +1461,12 @@ func (g *Graph) flushPending() error {
 				cs.NodeDeletes = append(cs.NodeDeletes, op.ndel)
 			}
 		}
-		if _, err := g.wal.Append(cs); err != nil {
+		// Frame selection (spec 2026-10-21 §1.2): declared vector props ride
+		// the v2 binary section; anything else falls back inside AppendHoisted
+		// to the byte-identical v1 frame. Decls are computed here, at the
+		// logging call — declarations can change between batches and a cached
+		// map would go stale.
+		if _, err := g.wal.AppendHoisted(cs, g.vecPropDecls()); err != nil {
 			g.pendOps = append([]pendOp(nil), g.pendOps[i:]...)
 			return err
 		}
