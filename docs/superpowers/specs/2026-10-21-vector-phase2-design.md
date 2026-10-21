@@ -1,8 +1,10 @@
 # Vectra 向量 Phase 2 设计增补（2026-10-21）
 
-状态：待用户裁决范围后生效。本文按推荐范围撰写（P2-1/P2-2/P2-3 三项）；
-Cypher CALL（spec §9.2）建议移 Phase 3 单独 brainstorm。SIMD 不做（用户裁决
-2026-10-21，不再列入任何阶段）。
+状态：**已裁决生效（2026-10-21，owner）**——按推荐范围执行（P2-1/P2-2/P2-3 三
+项）；§7-1 范围=三项、CALL 移 Phase 3；§7-2 store v5 顺带二进制化快照向量；
+§7-3 CheckpointBytes 默认 64MiB 随 P2-1 发；§7-4 接受裁定 #10（server 混合版
+本不支持）。Cypher CALL（spec §9.2）Phase 3 单独 brainstorm。SIMD 不做（用户
+裁决 2026-10-21，不再列入任何阶段）。
 
 母 spec：`2026-10-19-vector-search-design.md`（v3 + 偏差记录）。本文只写增量
 设计；语义冲突时以本文为准并回写母 spec 偏差记录。
