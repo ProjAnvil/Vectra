@@ -91,7 +91,7 @@ background packing builds the segment forest without blocking writes
 and unordered across ties. Declarations persist through the WAL and
 store v4; recovery rebuilds bottom-up with the overlay as the exact
 fallback. The MCP server exposes it as `vector_search` (query_vector or
-similar_to, k ≤ 100). Gate 2b numbers:
+similar_to, k ≤ 1000). Gate 2b numbers:
 [docs/benchmarks/2026-10-20-vector-phase1-gate2b.md](docs/benchmarks/2026-10-20-vector-phase1-gate2b.md).
 
 ## Cypher-subset queries
