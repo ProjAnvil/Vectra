@@ -6,7 +6,14 @@
 package vectra
 
 import (
+	"bytes"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
+	"hash/crc32"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 
@@ -59,6 +66,22 @@ func vecMetric(s string) (vector.Metric, bool) {
 		return vector.Dot, true
 	}
 	return 0, false
+}
+
+// vecDefaults applies the engine's zero-means-default build parameters
+// (M 16, EfConstruction 200 — the same values NewHNSW substitutes per
+// build) at State creation. NewState keeps m/efc verbatim, and the forest
+// codec rejects m/efc of 0 on decode, so the State must carry the effective
+// config from birth; every consumer of State.m/State.efc feeds NewHNSW,
+// which normalizes identically, so this is behavior-neutral.
+func vecDefaults(m, efc int) (int, int) {
+	if m <= 0 {
+		m = 16
+	}
+	if efc <= 0 {
+		efc = 200
+	}
+	return m, efc
 }
 
 // vecIndex is one registered index: the declaration, the writer-side
@@ -170,10 +193,11 @@ func (g *Graph) CreateVectorIndex(d VectorIndexDecl) error {
 		}
 	}
 	seed := vecSeed(d.Name)
+	m, efc := vecDefaults(d.M, d.EfConstruction)
 	vi := &vecIndex{
 		decl: d,
 		seed: seed,
-		st:   vector.NewState(metric, d.Dim, d.M, d.EfConstruction, seed),
+		st:   vector.NewState(metric, d.Dim, m, efc, seed),
 	}
 	g.setVecRegistry(append(g.vecRegistryCopy(), vi))
 	g.recordVecDecls()
@@ -283,9 +307,14 @@ func (g *Graph) recordVecDecls() {
 }
 
 // backfillVectorIndex ingests every existing node's declared prop through
-// the intake rules. One union scan per Create; recovery (Load/Open)
-// reuses it for the store-loaded base.
+// the intake rules. One union scan per Create; recovery (Load/Open) reuses
+// it for the store-loaded base. Suppressed while Open's forest gate is
+// deciding (vecSkipBackfill): a mounted cache replaces these states whole,
+// and a failed gate re-runs this with the flag back down.
 func (g *Graph) backfillVectorIndex(vi *vecIndex) {
+	if g.vecSkipBackfill {
+		return
+	}
 	nodes, _, _, _ := g.unionRecords()
 	for _, n := range nodes {
 		if v, ok := n.Props[vi.decl.Prop]; ok {
@@ -399,7 +428,8 @@ func (g *Graph) applyVecDecls(list []wal.VectorIndexDecl) {
 			continue // malformed replay entry: skip, never crash recovery
 		}
 		seed := vecSeed(d.Name)
-		nv := &vecIndex{decl: d, seed: seed, st: vector.NewState(metric, d.Dim, d.M, d.EfConstruction, seed)}
+		m, efc := vecDefaults(d.M, d.EfConstruction)
+		nv := &vecIndex{decl: d, seed: seed, st: vector.NewState(metric, d.Dim, m, efc, seed)}
 		kept = append(kept, nv)
 		fresh = append(fresh, nv)
 	}
@@ -592,4 +622,285 @@ func (g *Graph) VectorForNode(index, key string) ([]float32, bool) {
 		return nil, false
 	}
 	return vector.NormalizeVec(n.Props[vi.decl.Prop], vi.decl.Dim)
+}
+
+// ---- vectors.vec forest cache (Phase 2, spec §2.2-2.3) ------------------------
+//
+// One cache file per library directory, written inside the checkpoint batch
+// (after the snapshot and the manifest) and mounted by Open behind the
+// watermark gate. The file is a pure cache: declarations live in the store
+// snapshot and the WAL, so any gate failure discards it and Open takes the
+// ordinary rebuild path. Format ("VCVF1"):
+//
+//	magic "VCVF1" | u64 checkpointLSN | u32 declCount
+//	  per decl:  u32 jsonLen | wal.VectorIndexDecl JSON | u64 seed
+//	  per index: u32 blobLen | internal/vector "VCS1" State blob
+//	u32 CRC32 (IEEE) over everything before it
+//
+// The per-State CRCs stay nested inside their blobs — harmless double
+// integrity, and the wrapper stays free of State internals.
+
+const (
+	vecForestName  = "vectors.vec"
+	vecForestMagic = "VCVF1"
+)
+
+// vecForestPath is the cache location: one file per database directory,
+// next to the checkpoint snapshots (spec §2.2).
+func vecForestPath(dbPath string) string {
+	return filepath.Join(filepath.Dir(dbPath), vecForestName)
+}
+
+func vecForestPutU32(w *bytes.Buffer, v uint32) {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], v)
+	w.Write(b[:])
+}
+
+func vecForestPutU64(w *bytes.Buffer, v uint64) {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], v)
+	w.Write(b[:])
+}
+
+// encodeVecForest renders the registry as one cache image. State capture
+// runs under each index's mutex: a checkpoint must never tear a State, and
+// interleaving with the folder lane is safe — BeginPack leaves the chunk in
+// the overlay until CommitPack swaps the built segment in, so every
+// interleaving is a complete ≤LSN image (overlay or segment, never both
+// missing).
+func (g *Graph) encodeVecForest(lsn uint64) ([]byte, error) {
+	reg := g.vecReg()
+	blobs := make([][]byte, len(reg))
+	for i, vi := range reg {
+		var b bytes.Buffer
+		vi.mu.Lock()
+		err := vi.st.Encode(&b)
+		vi.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		blobs[i] = b.Bytes()
+	}
+	var out bytes.Buffer
+	out.WriteString(vecForestMagic)
+	vecForestPutU64(&out, lsn)
+	vecForestPutU32(&out, uint32(len(reg)))
+	for _, vi := range reg {
+		decl, err := json.Marshal(vi.decl.toWal())
+		if err != nil {
+			return nil, err
+		}
+		vecForestPutU32(&out, uint32(len(decl)))
+		out.Write(decl)
+		vecForestPutU64(&out, uint64(vi.seed))
+	}
+	for _, b := range blobs {
+		vecForestPutU32(&out, uint32(len(b)))
+		out.Write(b)
+	}
+	vecForestPutU32(&out, crc32.ChecksumIEEE(out.Bytes()))
+	return out.Bytes(), nil
+}
+
+// writeVecForest persists the cache as part of the checkpoint batch: temp +
+// fsync + rename + directory fsync, SaveFile's atomicity discipline. An
+// index-less graph removes a stale cache instead — the load gate would
+// discard it anyway (empty declaration set vs the file's), but removing
+// keeps reopen cheap.
+func (g *Graph) writeVecForest(lsn uint64) error {
+	path := vecForestPath(g.dbPath)
+	reg := g.vecReg()
+	if len(reg) == 0 {
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	b, err := g.encodeVecForest(lsn)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	// Best-effort directory fsync, as in SaveFile: the rename is not durable
+	// everywhere until the parent directory is.
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		d.Sync()
+		d.Close()
+	}
+	return nil
+}
+
+var errVecForestCorrupt = errors.New("vectra: corrupt vectors.vec")
+
+// vecForestReader is a bounds-checked cursor over the cache body; a sticky
+// error turns every later read into a no-op, keeping the parse flat.
+type vecForestReader struct {
+	b   []byte
+	i   int
+	err error
+}
+
+func (r *vecForestReader) take(n int) []byte {
+	if r.err != nil || n < 0 || len(r.b)-r.i < n {
+		if r.err == nil {
+			r.err = errVecForestCorrupt
+		}
+		return nil
+	}
+	p := r.b[r.i : r.i+n]
+	r.i += n
+	return p
+}
+
+func (r *vecForestReader) u32() uint32 {
+	if p := r.take(4); p != nil {
+		return binary.LittleEndian.Uint32(p)
+	}
+	return 0
+}
+
+func (r *vecForestReader) u64() uint64 {
+	if p := r.take(8); p != nil {
+		return binary.LittleEndian.Uint64(p)
+	}
+	return 0
+}
+
+func (r *vecForestReader) remain() int { return len(r.b) - r.i }
+
+// vecForestEntry is one decoded declaration section: the wire declaration
+// plus the HNSW seed the index ran with (name-derived; stored and compared
+// anyway, so a renamed-and-recreated index never mounts stale sections).
+type vecForestEntry struct {
+	decl wal.VectorIndexDecl
+	seed int64
+}
+
+// vecForestImage is one parsed cache file; blobs[i] belongs to entries[i].
+type vecForestImage struct {
+	path    string
+	lsn     uint64
+	entries []vecForestEntry
+	blobs   [][]byte
+}
+
+// readVecForest loads and CRC-verifies the cache at path. A missing file is
+// (nil, nil) — no cache, the ordinary rebuild path. Every other failure is
+// reported as an error the caller treats as "discard and rebuild".
+func readVecForest(path string) (*vecForestImage, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	// magic + lsn + declCount + at least one zero-length section + trailer
+	if len(raw) < len(vecForestMagic)+8+4+4+4 {
+		return nil, errVecForestCorrupt
+	}
+	if want := binary.LittleEndian.Uint32(raw[len(raw)-4:]); crc32.ChecksumIEEE(raw[:len(raw)-4]) != want {
+		return nil, errVecForestCorrupt
+	}
+	rd := &vecForestReader{b: raw[:len(raw)-4]}
+	if string(rd.take(len(vecForestMagic))) != vecForestMagic {
+		return nil, errVecForestCorrupt
+	}
+	img := &vecForestImage{path: path, lsn: rd.u64()}
+	n := int(rd.u32())
+	// Forged-count guard: a declaration section carries at least a 4-byte
+	// JSON length + 8 bytes of seed, and its index a 4-byte blob length.
+	if int64(n)*16 > int64(rd.remain()) {
+		return nil, errVecForestCorrupt
+	}
+	img.entries = make([]vecForestEntry, n)
+	for i := range img.entries {
+		dl := int(rd.u32())
+		db := rd.take(dl)
+		if err := json.Unmarshal(db, &img.entries[i].decl); err != nil {
+			return nil, errVecForestCorrupt
+		}
+		img.entries[i].seed = int64(rd.u64())
+	}
+	img.blobs = make([][]byte, n)
+	for i := range img.blobs {
+		bl := int(rd.u32())
+		img.blobs[i] = rd.take(bl)
+	}
+	if rd.err != nil || rd.remain() != 0 {
+		return nil, errVecForestCorrupt
+	}
+	return img, nil
+}
+
+// discardVecForest removes an unusable cache file. Best effort: a removal
+// failure only costs the next Open one wasted gate check — the gates
+// discard the file again.
+func discardVecForest(path string) { _ = os.Remove(path) }
+
+// mountVecForest swaps the cache's decoded States into the registry,
+// replacing the fresh empty ones applyVecDecls built, and publishes their
+// snapshot heads. Every gate must hold (spec §2.3): the file's declaration
+// set must equal the registry's EXACTLY — name, prop, dim, metric, m,
+// efConstruction, and the stored seed — with one section per index and
+// every section decodable. Declarations are authoritative in the store
+// snapshot and the WAL; the file is a pure cache, so any mismatch removes
+// it and returns false — the caller backfills from the snapshot instead
+// (the rebuild path). The WAL tail replays after loadGraph returns, onto
+// whichever states won, through the normal intake.
+func (g *Graph) mountVecForest(img *vecForestImage) bool {
+	reg := g.vecReg()
+	if len(reg) == 0 || len(reg) != len(img.entries) {
+		discardVecForest(img.path)
+		return false
+	}
+	byName := make(map[string]int, len(img.entries))
+	for i, e := range img.entries {
+		byName[e.decl.Name] = i
+	}
+	// Decode everything before swapping anything in: a bad section must
+	// leave the registry untouched for the caller's rebuild.
+	states := make([]*vector.State, len(reg))
+	for i, vi := range reg {
+		j, ok := byName[vi.decl.Name]
+		if !ok || vecDeclFromWal(img.entries[j].decl) != vi.decl || img.entries[j].seed != vi.seed {
+			discardVecForest(img.path)
+			return false
+		}
+		st, err := vector.DecodeState(bytes.NewReader(img.blobs[j]))
+		if err != nil {
+			discardVecForest(img.path)
+			return false
+		}
+		states[i] = st
+	}
+	for i, vi := range reg {
+		vi.mu.Lock()
+		vi.st = states[i]
+		vi.head.Store(states[i].Snapshot())
+		vi.mu.Unlock()
+	}
+	return true
 }

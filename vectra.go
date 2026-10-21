@@ -280,6 +280,14 @@ type Graph struct {
 	onVecSkip  func(key, index string) // Options.OnVecSkip; nil = silent skip
 	vecReaders sync.Pool               // *vector.Reader scratch for QueryVector
 
+	// vectors.vec forest-cache state (Phase 2, spec §2.2-2.3), writer-thread
+	// only, touched exclusively inside Open/loadGraph. vecSkipBackfill
+	// suppresses backfillVectorIndex while the load gate is deciding between
+	// mounting the persisted forest and the rebuild path; vecForestLoaded
+	// records which path won (surfaced through export_test.go).
+	vecSkipBackfill bool
+	vecForestLoaded bool
+
 	// writer-private published-state mirrors (reconciled at publish)
 	nodes     map[string]nodeRef        // key -> id + visibility
 	edges     map[delta.EdgeKey]edgeRef // key -> winner id + visible parallels
@@ -1641,6 +1649,22 @@ func Open(path string, opts Options) (*Graph, error) {
 		return nil, err
 	}
 
+	// Forest-cache pre-gate (spec §2.3): CRC and watermark must hold before
+	// the snapshot load; the declaration-set gate runs later, in loadGraph,
+	// once the registry exists to compare against. Without a manifest there
+	// is no watermark to check (WAL-only recovery, fresh library, v0.6
+	// adoption), so a present cache is unusable. Every failure discards the
+	// file — the cache is never a source of truth; the store snapshot and
+	// the WAL are, and the rebuild path serves both cases.
+	var ff *vecForestImage
+	if img, err := readVecForest(vecForestPath(path)); img != nil || err != nil {
+		if err == nil && hasMan && img.lsn == man.LSN {
+			ff = img
+		} else {
+			discardVecForest(vecForestPath(path))
+		}
+	}
+
 	var g *Graph
 	// snapVer is the store version of the snapshot recovery loads below
 	// (0 = nothing was loaded: fresh library, or WAL-only recovery). Open's
@@ -1658,7 +1682,7 @@ func Open(path string, opts Options) (*Graph, error) {
 		if _, err = f.Seek(0, io.SeekStart); err != nil {
 			return err
 		}
-		lg, err := loadGraph(f)
+		lg, err := loadGraphForest(f, ff)
 		if err != nil {
 			return err
 		}
@@ -1837,6 +1861,13 @@ func (g *Graph) Close() error {
 		Segment:  g.wal.Segment(),
 		LSN:      lsn,
 	}); err != nil {
+		return err
+	}
+	// Forest cache, checkpoint-batch discipline as in checkpoint(). Placed
+	// before the committed marker: a failure here keeps Close retryable and
+	// loses nothing — the WAL survives until the Reset below, and a stale
+	// cache only costs the next Open one gate check.
+	if err := g.writeVecForest(lsn); err != nil {
 		return err
 	}
 	// The manifest has landed: this checkpoint is committed. From here on a
@@ -2235,7 +2266,8 @@ func (g *Graph) Compact() error {
 }
 
 // checkpoint persists the merged state: watermark snapshot + atomic manifest
-// + WAL reset + old-watermark cleanup. The WAL stays open for the session.
+// + forest cache + WAL reset + old-watermark cleanup. The WAL stays open for
+// the session.
 func (g *Graph) checkpoint(lsn uint64) error {
 	snap := g.snapshotFile(lsn)
 	if err := g.SaveFile(snap); err != nil {
@@ -2246,6 +2278,13 @@ func (g *Graph) checkpoint(lsn uint64) error {
 		Segment:  g.wal.Segment(),
 		LSN:      lsn,
 	}); err != nil {
+		return err
+	}
+	// The forest cache joins the checkpoint batch here: snapshot and manifest
+	// have landed, so a crash before the cache rename below leaves the OLD
+	// cache (watermark mismatch → discard at Open) or none at all — both
+	// recover through the rebuild path (spec §2.3).
+	if err := g.writeVecForest(lsn); err != nil {
 		return err
 	}
 	if err := g.wal.Reset(lsn); err != nil && !errors.Is(err, wal.ErrClosed) {
@@ -2335,6 +2374,18 @@ func Load(r io.Reader) (*Graph, error) {
 }
 
 func loadGraph(r io.Reader) (*Graph, error) {
+	return loadGraphForest(r, nil)
+}
+
+// loadGraphForest is loadGraph with the forest-cache decision (Open's
+// watermark path only; img nil everywhere else). img non-nil means the CRC
+// and LSN gates already passed in Open: the declaration backfill is
+// suppressed while applyVecDecls builds the registry, then mountVecForest
+// compares declaration sets and swaps the decoded States in. Any gate
+// failure falls through to the ordinary backfill — the pre-existing rebuild
+// path, unchanged. The WAL tail replays afterwards, on top of whichever
+// states won, through the normal intake (vecIntakeNode).
+func loadGraphForest(r io.Reader, img *vecForestImage) (*Graph, error) {
 	data, err := store.Decode(r)
 	if err != nil {
 		return nil, err
@@ -2384,9 +2435,26 @@ func loadGraph(r io.Reader) (*Graph, error) {
 				M: d.M, EfConstruction: d.EfConstruction,
 			})
 		}
+		if img != nil {
+			g.vecSkipBackfill = true // forest gate pending: empty states only
+		}
 		g.applyVecDecls(list)
+		g.vecSkipBackfill = false
 	}
-	g.vecKick() // snapshot backfill left every vector in the overlay; drain (spec 7.1)
+	if img != nil {
+		if g.mountVecForest(img) {
+			g.vecForestLoaded = true
+		} else {
+			// Rebuild: the registry states are fresh and empty (the backfill
+			// was suppressed); populate them exactly as applyVecDecls would
+			// have — the path a forest-less Open takes.
+			for _, vi := range g.vecReg() {
+				g.backfillVectorIndex(vi)
+				vi.publish()
+			}
+		}
+	}
+	g.vecKick() // backfill or forest load left every vector in the overlay; drain (spec 7.1)
 	return g, nil
 }
 
