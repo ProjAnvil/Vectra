@@ -1,14 +1,24 @@
 // Package store implements Vectra's single-file binary snapshot. Under the
 // small-graph all-in-memory assumption the disk only serves crash recovery:
 // whole-graph rewrite, rebuild CSR/SCC on load, no incremental WAL.
-// Format v3 (little-endian): "VCTR" | u16 version(3) | u32 node count | u32 edge count |
-// node{ key string, label string, props JSON }* | edge{ srcKey, dstKey, label, props }*
-// | u32 indexKey count | key string* | u32 CRC32(IEEE, covering all preceding bytes).
+// Format v5 (little-endian): "VCTR" | u16 version(5) | u32 node count | u32 edge count |
+// u32 vector-decl count | decl JSON string* | node{ key string, label string, props JSON }* |
+// edge{ srcKey, dstKey, label, props }* | u32 indexKey count | key string* |
+// u32 float count | float32 LE* | u32 CRC32(IEEE, covering all preceding bytes).
 // string = u32 length + bytes; props = u32 JSON length + JSON (0 = nil).
-// The indexKey section persists the property-index declarations so a reloaded
-// graph can rebuild them at Seal time (without it, Load-based services such as
-// vectra-mcp -snapshot lose every lookup index). v2 (no indexKey section) and
-// v1 (additionally no CRC trailer) remain readable; dispatched by header version.
+// The vector declarations precede the nodes (spec 2026-10-21 §1.4, ruling
+// #2) so the decoder knows the declared-prop set while resolving per-node
+// "$vec" refs: Encode hoists declared vector props ([]float32 and
+// float64-source []any alike, ruling #1) out of the JSON channel via
+// vecbin.Hoist into ONE shared trailing float32 section; Decode restores
+// them as []float32. Undeclared numeric arrays are data and stay JSON; edge
+// props are never hoisted. The indexKey section persists the property-index
+// declarations so a reloaded graph can rebuild them at Seal time (without
+// it, Load-based services such as vectra-mcp -snapshot lose every lookup
+// index). v4 (vector decls trailing, vectors in the JSON channel), v3, v2
+// (no indexKey section) and v1 (additionally no CRC trailer) remain
+// readable; dispatched by header version. Pre-v5 readers hard-fail on the
+// version byte instead of misreading the layout.
 package store
 
 import (
@@ -16,13 +26,18 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
+
+	"github.com/projanvil/vectra/internal/vecbin"
 )
 
 const (
 	magic         = "VCTR"
-	versionV4     = 4 // adds the vector index declaration section
+	versionV5     = 5 // declarations-first layout + shared binary float32 section
+	versionV4     = 4 // adds the vector index declaration section (trailing)
 	versionV3     = 3
 	versionV2     = 2 // no indexKey section, read compatibility only
 	versionLegacy = 1 // no CRC trailer, read compatibility only
@@ -62,7 +77,9 @@ type VectorIndexDecl struct {
 // Data is the full decoded content of a snapshot: nodes, edges, and the
 // property-index declarations to re-register before Seal. IndexKeys is nil
 // for v1/v2 files (they never persisted any); VectorDecls is nil for
-// pre-v4 files.
+// pre-v4 files. In v5 files declared vector props come back as []float32
+// (restored from the binary section); in v4-and-older files they arrive via
+// JSON as []any.
 type Data struct {
 	Nodes       []Node
 	Edges       []Edge
@@ -101,6 +118,14 @@ func putU32(w io.Writer, v uint32) error {
 	return err
 }
 
+// putF32 appends one float32 section entry (raw LE bits, no JSON detour).
+func putF32(w io.Writer, f float32) error {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], math.Float32bits(f))
+	_, err := w.Write(b[:])
+	return err
+}
+
 func writeString(w io.Writer, s string) error {
 	if err := putU32(w, uint32(len(s))); err != nil {
 		return err
@@ -124,8 +149,11 @@ func writeProps(w io.Writer, props map[string]any) error {
 	return err
 }
 
-// Encode writes the whole graph to w in v3 format (indexKey section + CRC32
-// trailer).
+// Encode writes the whole graph to w in v5 format: the vector-declaration
+// section precedes the nodes (ruling #2) and declared vector props hoist out
+// of the JSON channel into one shared trailing float32 section (ruling #1);
+// the CRC trailer covers everything. Pre-v5 readers hard-fail on the version
+// byte instead of misreading the layout (same downgrade line as v4).
 func Encode(w io.Writer, d Data) error {
 	cw := &crcWriter{bw: bufio.NewWriter(w)}
 	var head [4]byte
@@ -133,7 +161,7 @@ func Encode(w io.Writer, d Data) error {
 	if _, err := cw.Write(head[:]); err != nil {
 		return err
 	}
-	if err := binary.Write(cw, binary.LittleEndian, uint16(versionV4)); err != nil {
+	if err := binary.Write(cw, binary.LittleEndian, uint16(versionV5)); err != nil {
 		return err
 	}
 	if err := putU32(cw, uint32(len(d.Nodes))); err != nil {
@@ -142,6 +170,31 @@ func Encode(w io.Writer, d Data) error {
 	if err := putU32(cw, uint32(len(d.Edges))); err != nil {
 		return err
 	}
+	// v5 vector declaration section, relocated from v4's tail to ahead of
+	// the nodes (ruling #2): the decoder needs the declared-prop set to
+	// resolve "$vec" refs while reading nodes. Same encoding as v4: count +
+	// one JSON blob per decl.
+	if err := putU32(cw, uint32(len(d.VectorDecls))); err != nil {
+		return err
+	}
+	for _, vd := range d.VectorDecls {
+		blob, err := json.Marshal(vd)
+		if err != nil {
+			return err
+		}
+		if err := writeString(cw, string(blob)); err != nil {
+			return err
+		}
+	}
+	// Hoisting pass: declared vector props ([]float32 and float64 sources
+	// alike) leave the JSON channel as "$vec" refs into ONE section shared
+	// by all nodes. Undeclared numeric arrays are data and stay JSON; edge
+	// props are never indexed (spec §1.2) and stay JSON.
+	decls := make(vecbin.PropDecls, len(d.VectorDecls))
+	for _, vd := range d.VectorDecls {
+		decls[vd.Prop] = vd.Dim
+	}
+	var sec []float32
 	for _, n := range d.Nodes {
 		if err := writeString(cw, n.Key); err != nil {
 			return err
@@ -149,7 +202,13 @@ func Encode(w io.Writer, d Data) error {
 		if err := writeString(cw, n.Label); err != nil {
 			return err
 		}
-		if err := writeProps(cw, n.Props); err != nil {
+		props := n.Props
+		if len(decls) > 0 && n.Props != nil {
+			if p, ok := vecbin.Hoist(n.Props, decls, &sec); ok {
+				props = p
+			}
+		}
+		if err := writeProps(cw, props); err != nil {
 			return err
 		}
 	}
@@ -175,22 +234,40 @@ func Encode(w io.Writer, d Data) error {
 			return err
 		}
 	}
-	// v4 vector declaration section: count + one JSON blob per decl,
-	// before the CRC trailer. Pre-v4 readers hard-fail on the version
-	// byte instead of misreading this section (spec §12 downgrade line).
-	if err := putU32(cw, uint32(len(d.VectorDecls))); err != nil {
+	// v1-v4 reject non-finite floats at json.Marshal time; the binary
+	// section would carry them silently, so v5 refuses them too (WAL v2
+	// frames enforce the same line — NormalizeVec makes this unreachable
+	// from the engine, the guard covers direct callers).
+	for _, f := range sec {
+		if math.IsNaN(float64(f)) || math.IsInf(float64(f), 0) {
+			return fmt.Errorf("store: hoisted vector section holds non-finite float %v (the JSON channel rejects it; so does v5)", f)
+		}
+	}
+	// Trailing float32 section: u32 count + raw LE bits. The count keeps the
+	// stream self-delimiting, so the trailing-garbage guard stays exact.
+	if err := putU32(cw, uint32(len(sec))); err != nil {
 		return err
 	}
-	for _, vd := range d.VectorDecls {
-		blob, err := json.Marshal(vd)
-		if err != nil {
-			return err
-		}
-		if err := writeString(cw, string(blob)); err != nil {
+	for _, f := range sec {
+		if err := putF32(cw, f); err != nil {
 			return err
 		}
 	}
 	return cw.finish()
+}
+
+// ProbeVersion reads only the header (magic + version) and reports the
+// file's version. It does not validate the body or CRC; callers use it to
+// pick a migration/rebuild path before committing to a full Decode.
+func ProbeVersion(r io.Reader) (uint16, error) {
+	var head [headerSize]byte
+	if _, err := io.ReadFull(r, head[:]); err != nil {
+		return 0, err
+	}
+	if string(head[:4]) != magic {
+		return 0, errors.New("store: bad magic")
+	}
+	return binary.LittleEndian.Uint16(head[4:6]), nil
 }
 
 // reader consumes a byte slice directly: every length field is bounds-checked
@@ -251,6 +328,58 @@ func (rd *reader) props() (map[string]any, error) {
 	return m, nil
 }
 
+// vectorDecls reads the declaration section shared by v5 (leading, before
+// the nodes) and v4 (trailing, after indexKeys): u32 count + one JSON blob
+// per decl. The forged-count guard bounds the preallocation (one u32 length
+// per decl minimum).
+func (rd *reader) vectorDecls() ([]VectorIndexDecl, error) {
+	nd, err := rd.u32()
+	if err != nil {
+		return nil, err
+	}
+	if int64(nd)*4 > int64(len(rd.b)-rd.i) {
+		return nil, errTruncated
+	}
+	if nd == 0 {
+		return nil, nil
+	}
+	decls := make([]VectorIndexDecl, nd)
+	for i := range decls {
+		blob, err := rd.str()
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(blob), &decls[i]); err != nil {
+			return nil, err
+		}
+	}
+	return decls, nil
+}
+
+// floatSection reads the v5 trailing float32 section: u32 count + raw
+// little-endian bits, with the same forged-count guard (4 bytes per float).
+func (rd *reader) floatSection() ([]float32, error) {
+	nf, err := rd.u32()
+	if err != nil {
+		return nil, err
+	}
+	if int64(nf)*4 > int64(len(rd.b)-rd.i) {
+		return nil, errTruncated
+	}
+	if nf == 0 {
+		return nil, nil
+	}
+	sec := make([]float32, nf)
+	for i := range sec {
+		p, err := rd.take(4)
+		if err != nil {
+			return nil, err
+		}
+		sec[i] = math.Float32frombits(binary.LittleEndian.Uint32(p))
+	}
+	return sec, nil
+}
+
 // Decode restores the snapshot content. Reads fully first; v3/v2 verify the
 // CRC; v2 and v1 are accepted for compatibility (they carry no index keys).
 func Decode(r io.Reader) (Data, error) {
@@ -267,7 +396,7 @@ func Decode(r io.Reader) (Data, error) {
 	ver := binary.LittleEndian.Uint16(raw[4:6])
 	body := raw
 	switch ver {
-	case versionV4, versionV3, versionV2:
+	case versionV5, versionV4, versionV3, versionV2:
 		body = raw[:len(raw)-4]
 		want := binary.LittleEndian.Uint32(raw[len(raw)-4:])
 		if got := crc32.ChecksumIEEE(body); got != want {
@@ -293,6 +422,14 @@ func Decode(r io.Reader) (Data, error) {
 	// (a CRC'd file can be forged by anyone who computes the CRC themselves).
 	if int64(nn)*12+int64(ne)*16 > int64(len(rd.b)) {
 		return Data{}, errTruncated
+	}
+	// v5 hoists the declaration section ahead of the nodes (ruling #2): the
+	// declared-prop set must be known before node props resolve "$vec" refs.
+	var vecDecls []VectorIndexDecl
+	if ver >= versionV5 {
+		if vecDecls, err = rd.vectorDecls(); err != nil {
+			return Data{}, err
+		}
 	}
 	nodes := make([]Node, nn)
 	for i := range nodes {
@@ -339,26 +476,35 @@ func Decode(r io.Reader) (Data, error) {
 			}
 		}
 	}
-	var vecDecls []VectorIndexDecl
-	if ver >= versionV4 {
-		nd, err := rd.u32()
+	// vecDecls was read before the nodes on v5; on v4 it trails here.
+	if ver >= versionV5 {
+		sec, err := rd.floatSection()
 		if err != nil {
 			return Data{}, err
 		}
-		if int64(nd)*4 > int64(len(rd.b)-rd.i) { // forged-count guard, one u32 length per decl minimum
-			return Data{}, errTruncated
-		}
-		if nd > 0 {
-			vecDecls = make([]VectorIndexDecl, nd)
-			for i := range vecDecls {
-				blob, err := rd.str()
-				if err != nil {
-					return Data{}, err
-				}
-				if err := json.Unmarshal([]byte(blob), &vecDecls[i]); err != nil {
-					return Data{}, err
-				}
+		// Restore only when a declaration exists: refs resolve solely on
+		// declared props (vecbin), and a decl-free v5 file hoisted nothing.
+		if len(vecDecls) > 0 {
+			decls := make(vecbin.PropDecls, len(vecDecls))
+			for _, vd := range vecDecls {
+				decls[vd.Prop] = vd.Dim
 			}
+			for i := range nodes {
+				if nodes[i].Props == nil {
+					continue // nil props stay nil, exactly as pre-hoist layouts decode them
+				}
+				p, rerr := vecbin.Restore(nodes[i].Props, decls, sec)
+				if rerr != nil {
+					return Data{}, fmt.Errorf("store: node %q: %w", nodes[i].Key, rerr)
+				}
+				nodes[i].Props = p
+			}
+		}
+	} else if ver == versionV4 {
+		// v4 kept the declaration section at the tail; its vectors rode the
+		// JSON channel (no float section, nothing to restore).
+		if vecDecls, err = rd.vectorDecls(); err != nil {
+			return Data{}, err
 		}
 	}
 	if rd.i != len(rd.b) {

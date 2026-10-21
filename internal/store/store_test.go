@@ -102,15 +102,14 @@ func TestV3RejectsForgedIndexKeyCount(t *testing.T) {
 }
 
 func TestV3RejectsTruncatedIndexKeys(t *testing.T) {
-	var buf bytes.Buffer
-	if err := store.Encode(&buf, store.Data{IndexKeys: []string{"env"}}); err != nil {
-		t.Fatal(err)
-	}
-	full := buf.Bytes()
-	// drop the CRC and the last byte of the key string, re-append a valid CRC
-	tampered := full[:len(full)-5]
-	tampered = binary.LittleEndian.AppendUint32(tampered, crc32.ChecksumIEEE(tampered))
-	if _, err := store.Decode(bytes.NewReader(tampered)); err == nil {
+	// handcrafted v3: an indexKey count of 1 with no key string behind it
+	// (Encode writes v5 now, so legacy layouts are built literally)
+	body := []byte{'V', 'C', 'T', 'R', 3, 0}         // magic + version 3
+	body = binary.LittleEndian.AppendUint32(body, 0) // 0 nodes
+	body = binary.LittleEndian.AppendUint32(body, 0) // 0 edges
+	body = binary.LittleEndian.AppendUint32(body, 1) // 1 indexKey, nothing follows
+	body = binary.LittleEndian.AppendUint32(body, crc32.ChecksumIEEE(body))
+	if _, err := store.Decode(bytes.NewReader(body)); err == nil {
 		t.Fatal("truncated indexKey string should be rejected")
 	}
 }
@@ -255,43 +254,10 @@ func TestEncodeRejectsUnmarshalableProps(t *testing.T) {
 	}
 }
 
-// TestStoreV4VectorDeclsRoundtrip: v4 persists vector declarations in a
-// trailing JSON section (spec §3.3); []float32 props ride the existing
-// props channel unchanged; v3 files decode with zero declarations; a v4
-// file opened by a v3-shaped reader (only versions <=3) hard-fails.
-func TestStoreV4VectorDeclsRoundtrip(t *testing.T) {
-	var buf bytes.Buffer
-	in := store.Data{
-		Nodes: []store.Node{
-			{Key: "a", Label: "mem", Props: map[string]any{"embedding": []float32{0.1, 0.2, 0.3}}},
-			{Key: "b", Label: "mem", Props: map[string]any{"embedding": []any{float64(0.4), float64(0.5), float64(0.6)}}},
-		},
-		IndexKeys: []string{"team"},
-		VectorDecls: []store.VectorIndexDecl{
-			{Name: "mem", Prop: "embedding", Dim: 3, Metric: "cosine", M: 16, EfConstruction: 200},
-		},
-	}
-	if err := store.Encode(&buf, in); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(buf.Bytes()[:6], []byte("VCTR")) {
-		t.Fatal("magic lost")
-	}
-	if got := binary.LittleEndian.Uint16(buf.Bytes()[4:6]); got != 4 {
-		t.Fatalf("version = %d, want 4", got)
-	}
-	out, err := store.Decode(bytes.NewReader(buf.Bytes()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(out.VectorDecls) != 1 || out.VectorDecls[0] != in.VectorDecls[0] {
-		t.Fatalf("vector decls: %+v", out.VectorDecls)
-	}
-	emb, ok := out.Nodes[0].Props["embedding"].([]any)
-	if !ok || len(emb) != 3 {
-		t.Fatalf("float32 prop did not survive the JSON props channel: %T", out.Nodes[0].Props["embedding"])
-	}
-}
+// TestStoreV4VectorDeclsRoundtrip was removed with the v5 format: Encode no
+// longer emits v4 (decls trailing, vectors in the JSON channel). Its v4-read
+// coverage moved to store_v5_test.go's TestV4StillReadable, which builds the
+// v4 bytes literally via writeV4.
 
 func TestStoreV3LoadsEmptyVectorDecls(t *testing.T) {
 	// A genuine (empty) v3 layout written by hand: header + zero counts +
@@ -321,9 +287,9 @@ func TestV4RejectsForgedVectorDeclCount(t *testing.T) {
 	var buf bytes.Buffer
 	buf.WriteString("VCTR")
 	_ = binary.Write(&buf, binary.LittleEndian, uint16(4))
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(0)) // nodes
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(0)) // edges
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(0)) // indexKeys
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0))          // nodes
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0))          // edges
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0))          // indexKeys
 	_ = binary.Write(&buf, binary.LittleEndian, uint32(0xFFFFFFFF)) // decls
 	body := buf.Bytes()
 	_ = binary.Write(&buf, binary.LittleEndian, crc32.ChecksumIEEE(body))
