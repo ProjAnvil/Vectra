@@ -1,9 +1,9 @@
 package vectra
 
-// Test-only surface for the vectors.vec forest cache (Phase 2, spec §2.3):
+// Test-only surface for the .vec forest cache (Phase 2, spec §2.3):
 // lets external-package tests assert which Open path a session took.
 
 // VecForestLoadedForTest reports whether the last Open mounted the
-// vectors.vec forest cache (true) or discarded it and rebuilt the indexes
+// .vec forest cache (true) or discarded it and rebuilt the indexes
 // from the snapshot (false).
 func (g *Graph) VecForestLoadedForTest() bool { return g.vecForestLoaded }

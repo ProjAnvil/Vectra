@@ -280,7 +280,7 @@ type Graph struct {
 	onVecSkip  func(key, index string) // Options.OnVecSkip; nil = silent skip
 	vecReaders sync.Pool               // *vector.Reader scratch for QueryVector
 
-	// vectors.vec forest-cache state (Phase 2, spec §2.2-2.3), writer-thread
+	// .vec forest-cache state (Phase 2, spec §2.2-2.3), writer-thread
 	// only, touched exclusively inside Open/loadGraph. vecSkipBackfill
 	// suppresses backfillVectorIndex while the load gate is deciding between
 	// mounting the persisted forest and the rebuild path; vecForestLoaded

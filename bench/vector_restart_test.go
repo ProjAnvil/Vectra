@@ -1,7 +1,8 @@
 package bench
 
 // Restart load-vs-rebuild comparison (P2-2, Task 9): since Task 8, Close's
-// checkpoint writes vectors.vec next to the db, and Open mounts the saved
+// checkpoint writes the .vec forest cache next to the db (dbPath-scoped:
+// v.db -> v.vec), and Open mounts the saved
 // segment forest when the gates hold (CRC ok, file LSN == manifest LSN,
 // declaration set identical) — restart loads the prebuilt HNSW segments
 // instead of re-ingesting every snapshot vector. This harness quantifies
@@ -10,8 +11,8 @@ package bench
 //	build n x 768 clustered vectors (batched writes, folder lane drained to
 //	convergence) -> Close -> restart twice, each on a pristine walk-copy
 //	of the library directory:
-//	  1. vectors.vec present  -> load path (mount the saved forest)
-//	  2. vectors.vec deleted  -> rebuild path (backfillVectorIndex
+//	  1. v.vec present  -> load path (mount the saved forest)
+//	  2. v.vec deleted  -> rebuild path (backfillVectorIndex
 //	     re-intakes all n snapshot vectors)
 //
 // What is timed: restart-to-ready, wall clock from the start of Open until
@@ -30,7 +31,7 @@ package bench
 // export_test.go, which is visible only inside the vectra package's own
 // test binary — package bench cannot see export_test hooks, and the public
 // API is not extended for a bench. The distinction is evidenced instead
-// through public behavior: (a) vectors.vec presence before each Open
+// through public behavior: (a) forest-cache presence before each Open
 // (stat), (b) overlay length at Open return — the mounted forest carries
 // only the sub-2048 tail, a rebuild re-intakes all n (asserted below when
 // n >= 2048), and (c) the ready-time gap, load << rebuild on the same
@@ -128,7 +129,7 @@ func TestVectorRestartLoadVsRebuild(t *testing.T) {
 	for _, p := range probes { // baseline: correct before any restart
 		restartSelfQuery(t, g, vecs, p)
 	}
-	if err := g.Close(); err != nil { // checkpoint: snapshot + manifest + vectors.vec
+	if err := g.Close(); err != nil { // checkpoint: snapshot + manifest + v.vec
 		t.Fatal(err)
 	}
 	t.Logf("build: n=%d in %s, overlay tail=%d", n,
@@ -142,7 +143,7 @@ func TestVectorRestartLoadVsRebuild(t *testing.T) {
 	// right after Open returned (the which-path evidence).
 	restart := func(dir string, dropCache bool) (openDur, readyDur time.Duration, overlayAtOpen int) {
 		if dropCache {
-			if err := os.Remove(filepath.Join(dir, "vectors.vec")); err != nil {
+			if err := os.Remove(restartForestPath(dir)); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -170,16 +171,16 @@ func TestVectorRestartLoadVsRebuild(t *testing.T) {
 		return
 	}
 
-	// ---- run 1: load path (vectors.vec present) ----
+	// ---- run 1: load path (v.vec present) ----
 	loadDir := t.TempDir()
 	restartCopyTree(t, dir, loadDir)
-	fi, err := os.Stat(filepath.Join(loadDir, "vectors.vec"))
+	fi, err := os.Stat(restartForestPath(loadDir))
 	if err != nil {
-		t.Fatalf("load-path copy has no vectors.vec (Close must checkpoint it): %v", err)
+		t.Fatalf("load-path copy has no v.vec forest cache (Close must checkpoint it): %v", err)
 	}
 	loadOpen, loadReady, loadOverlay := restart(loadDir, false)
 
-	// ---- run 2: rebuild path (vectors.vec deleted) ----
+	// ---- run 2: rebuild path (v.vec deleted) ----
 	rebuildDir := t.TempDir()
 	restartCopyTree(t, dir, rebuildDir)
 	rebuildOpen, rebuildReady, rebuildOverlay := restart(rebuildDir, true)
@@ -192,7 +193,7 @@ func TestVectorRestartLoadVsRebuild(t *testing.T) {
 			t.Errorf("load path opened with overlay=%d (>=2048): the forest cache did not mount — this was a rebuild", loadOverlay)
 		}
 		if rebuildOverlay < 2048 {
-			t.Errorf("rebuild path opened with overlay=%d (<2048): nothing re-intaked — vectors.vec deletion did not force a rebuild", rebuildOverlay)
+			t.Errorf("rebuild path opened with overlay=%d (<2048): nothing re-intaked — v.vec deletion did not force a rebuild", rebuildOverlay)
 		}
 	}
 	// Sanity only: the timing lines carry the verdict (speedup is logged,
@@ -203,7 +204,7 @@ func TestVectorRestartLoadVsRebuild(t *testing.T) {
 	if rebuildReady <= 0 {
 		t.Errorf("rebuild ready time %s <= 0", rebuildReady)
 	}
-	t.Logf("vectors.vec: %.1fMB | overlay at open: load=%d rebuild=%d (of n=%d)",
+	t.Logf("v.vec: %.1fMB | overlay at open: load=%d rebuild=%d (of n=%d)",
 		float64(fi.Size())/(1<<20), loadOverlay, rebuildOverlay, n)
 	t.Logf("open-only: load=%s rebuild=%s (Add is O(1); the rebuild cost is the post-open drain)",
 		loadOpen.Round(time.Millisecond), rebuildOpen.Round(time.Millisecond))
@@ -211,6 +212,12 @@ func TestVectorRestartLoadVsRebuild(t *testing.T) {
 		loadReady.Round(time.Millisecond), rebuildReady.Round(time.Millisecond),
 		float64(rebuildReady)/float64(loadReady))
 }
+
+// restartForestPath is this harness's copy of the engine's (unexported)
+// vecForestPath rule: the forest cache is dbPath-scoped — <dbPath minus
+// ext>.vec — and the db below is v.db, so v.vec. Deleting this file is
+// what forces the rebuild path.
+func restartForestPath(dir string) string { return filepath.Join(dir, "v.vec") }
 
 // restartSelfQuery asserts the exact-vector invariant: querying vecs[i]
 // must return gate2bKey(i) as hit #1 with cosine distance ~0 (scores are
@@ -236,7 +243,7 @@ func restartSelfQuery(t *testing.T, g *vectra.Graph, vecs [][]float32, i int) {
 }
 
 // restartCopyTree copies the whole library directory verbatim (snapshot,
-// the .wal dir with manifest and segment, vectors.vec) — the fixture
+// the .wal dir with manifest and segment, the v.vec forest cache) — the fixture
 // consumer test's walk-copy, so each timed restart runs on a pristine
 // copy and the two runs cannot pollute each other.
 func restartCopyTree(t *testing.T, src, dst string) {

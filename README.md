@@ -216,6 +216,16 @@ docs/benchmarks/     stress-test design + results
 
 The core module has **zero third-party dependencies** (`go.sum` absent). The `server` module adds hashicorp/raft v1.8.0 + raft-boltdb/v2; the `mcp` module adds the official MCP Go SDK. Choose what you deploy.
 
+## Benchmark & gate commands
+
+Standard gate: `go test . -count=1 && go test ./bench/ -count=1 && go vet .` (the `bench/` acceptance runs are env-gated — e.g. `VECTRA_RESTART=1` — and skip otherwise). The race gate is per package and **pins an explicit timeout**: `internal/vector` measures ~1100s under `-race` (content clean), past Go's 600s default, so the bare `go test -race` form times out spuriously. Use one shape everywhere:
+
+```
+go test -race ./internal/vector/ -count=1 -timeout 40m
+go test -race ./internal/writer/ -count=1 -timeout 40m   # same shape; finishes well under the cap
+go test -race .                -count=1 -timeout 40m     # same shape; finishes well under the cap
+```
+
 ## Not in scope (deliberately)
 
 Online writes crossing into the server module — raft replication still runs the clone/publish model, because merges renumber IDs and replica replay must stay deterministic (the v0.7 micro-layer engine is embedded-only); disk spill beyond 10M edges; a full GQL parser in core; sharding. The old "online writes / delta-CSR" exclusion is resolved: v0.7 ships them as micro-layer generations without giving up either core bet (in-memory CSR, lock-free reads). The roadmap holds: k-hop precomputation.

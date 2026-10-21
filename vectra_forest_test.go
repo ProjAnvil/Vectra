@@ -1,6 +1,6 @@
 package vectra
 
-// vectors.vec forest persistence tests (Phase 2, spec §2.2-2.3): Seal
+// .vec forest persistence tests (Phase 2, spec §2.2-2.3): Seal
 // writes the cache inside the checkpoint batch, Open mounts it behind the
 // watermark gate (CRC + LSN + exact declaration set), and the WAL tail
 // replays onto the loaded forest through the ordinary intake. Sizes stay
@@ -123,6 +123,95 @@ func forestCopyTree(t *testing.T, src, dst string) {
 			t.Fatal(err)
 		}
 	}
+}
+
+// scopedKey namespaces the two libraries' key spaces: TestVecForestPathScopedToDB
+// reuses one key SHAPE across both, and the bug under test must surface as
+// wrong CONTENT (the other library's keys), so the spaces stay disjoint by
+// prefix.
+func scopedKey(tag string, i int) string { return fmt.Sprintf("%s%06d", tag, i) }
+
+// TestVecForestPathScopedToDB: the forest cache file is named from the dbPath
+// (snapshotFile's <base>-<lsn>.db pattern → <base>.vec), NOT shared per
+// directory. Two libraries opened from ONE directory — same index name "mem"
+// (the HNSW seed derives from the name), same watermark LSN (identical frame
+// sequence: one declaration + one batch), but disjoint vector sets and key
+// spaces — must each mount their OWN forest on reopen. With a
+// directory-scoped name, the second library's checkpoint overwrote the
+// first's cache and the first reopen mounted the wrong forest: the load gate
+// (file LSN == manifest LSN, declaration set, seed) holds for either.
+func TestVecForestPathScopedToDB(t *testing.T) {
+	dir := t.TempDir()
+	const n = 48 // < 2048: overlay-only, exact scan, deterministic top-1
+	// build runs the SAME frame sequence for every library (one decl + one
+	// batch of n adds), so both checkpoints land on the SAME watermark LSN —
+	// the LSN gate cannot tell the two caches apart, only the file name can.
+	build := func(db string, tag string, base int) [][]float32 {
+		g, err := Open(db, Options{WALMode: ModeAlways})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := g.CreateVectorIndex(VectorIndexDecl{Name: "mem", Prop: "v", Dim: 8, Metric: "cosine"}); err != nil {
+			t.Fatal(err)
+		}
+		vecs := make([][]float32, n)
+		if err := g.Batch(func(g *Graph) {
+			for i := 0; i < n; i++ {
+				vecs[i] = forestVec(base+i, 8)
+				if _, err := g.AddNode(scopedKey(tag, i), "N", map[string]any{"v": vecs[i]}); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return vecs
+	}
+	aVecs := build(filepath.Join(dir, "a.db"), "a", 0)
+	bVecs := build(filepath.Join(dir, "b.db"), "b", 100000)
+
+	// dbPath-scoped cache files: a.vec and b.vec, one per library.
+	for _, name := range []string{"a.vec", "b.vec"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("no dbPath-scoped forest cache %s: %v", name, err)
+		}
+	}
+
+	// Reopen both: each self query must return its OWN key as top-1 with
+	// cosine distance ~0. With the shared name, b's checkpoint clobbered
+	// a's cache, so a's reopen mounted b's forest — a's query would answer
+	// "b..." keys.
+	reopen := func(db, tag string, vecs [][]float32) {
+		g, err := Open(db, Options{WALMode: ModeAlways})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer g.Close()
+		if !g.VecForestLoadedForTest() {
+			t.Fatalf("%s: reopen must mount its own cache", db)
+		}
+		for _, i := range []int{0, n / 3, n - 1} {
+			hits, err := g.QueryVector("mem", vecs[i], QueryVectorOptions{K: 1, Ef: 64})
+			if err != nil {
+				t.Fatalf("%s: query %d: %v", db, i, err)
+			}
+			if len(hits) != 1 {
+				t.Fatalf("%s: query %d: %d hits, want 1", db, i, len(hits))
+			}
+			if want := scopedKey(tag, i); hits[0].Key != want {
+				t.Fatalf("%s: self query %d: top-1 = %s (score %.4f), want %s — mounted the other library's forest",
+					db, i, hits[0].Key, hits[0].Score, want)
+			}
+			if hits[0].Score > 1e-6 {
+				t.Fatalf("%s: self query %d: top-1 score %.6f, want cosine distance ~0", db, i, hits[0].Score)
+			}
+		}
+	}
+	reopen(filepath.Join(dir, "a.db"), "a", aVecs)
+	reopen(filepath.Join(dir, "b.db"), "b", bVecs)
 }
 
 // TestForestRestartIdentity: Close checkpoints the forest; Open mounts it

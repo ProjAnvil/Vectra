@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import urllib.parse
 from typing import Any
 
 import httpx
@@ -35,7 +36,7 @@ class Client:
         return self._check(self._http.get("/v1/stats"))
 
     def node(self, key: str) -> dict:
-        return self._check(self._http.get(f"/v1/nodes/{key}"))
+        return self._check(self._http.get(f"/v1/nodes/{urllib.parse.quote(key, safe='')}"))
 
     def neighbors(self, key: str, direction: str = "out", label: str = "") -> dict:
         params = {"key": key, "dir": direction}
@@ -88,7 +89,7 @@ class Client:
         return self._check(self._http.post("/v1/vector/indexes", json=body))
 
     def vector_index_drop(self, name: str) -> dict:
-        return self._check(self._http.delete(f"/v1/vector/indexes/{name}"))
+        return self._check(self._http.delete(f"/v1/vector/indexes/{urllib.parse.quote(name, safe='')}"))
 
     def vector_index_list(self) -> dict:
         return self._check(self._http.get("/v1/vector/indexes"))

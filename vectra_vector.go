@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -655,10 +656,11 @@ func (g *Graph) VectorForNode(index, key string) ([]float32, bool) {
 	return vector.NormalizeVec(n.Props[vi.decl.Prop], vi.decl.Dim)
 }
 
-// ---- vectors.vec forest cache (Phase 2, spec §2.2-2.3) ------------------------
+// ---- .vec forest cache (Phase 2, spec §2.2-2.3) -------------------------------
 //
-// One cache file per library directory, written inside the checkpoint batch
-// (after the snapshot and the manifest) and mounted by Open behind the
+// One cache file per database (dbPath-scoped, like the snapshots), written
+// inside the checkpoint batch (after the snapshot and the manifest) and
+// mounted by Open behind the
 // watermark gate. The file is a pure cache: declarations live in the store
 // snapshot and the WAL, so any gate failure discards it and Open takes the
 // ordinary rebuild path. Format ("VCVF1"):
@@ -672,14 +674,19 @@ func (g *Graph) VectorForNode(index, key string) ([]float32, bool) {
 // integrity, and the wrapper stays free of State internals.
 
 const (
-	vecForestName  = "vectors.vec"
+	vecForestExt   = ".vec"
 	vecForestMagic = "VCVF1"
 )
 
-// vecForestPath is the cache location: one file per database directory,
-// next to the checkpoint snapshots (spec §2.2).
+// vecForestPath is the cache location: <dbPath minus ext>.vec — named from
+// the dbPath exactly like the checkpoint snapshots (snapshotFile's pattern),
+// so every library owns its own cache file. A directory-shared name would
+// let one library's checkpoint overwrite another's forest, and when two
+// libraries share an index name (the HNSW seed derives from it) and land on
+// equal watermark LSNs, the load gate passes and Open mounts the WRONG
+// forest.
 func vecForestPath(dbPath string) string {
-	return filepath.Join(filepath.Dir(dbPath), vecForestName)
+	return strings.TrimSuffix(dbPath, filepath.Ext(dbPath)) + vecForestExt
 }
 
 func vecForestPutU32(w *bytes.Buffer, v uint32) {
@@ -794,7 +801,7 @@ func (g *Graph) writeVecForest(lsn uint64) error {
 	return nil
 }
 
-var errVecForestCorrupt = errors.New("vectra: corrupt vectors.vec")
+var errVecForestCorrupt = errors.New("vectra: corrupt vector forest cache")
 
 // vecForestReader is a bounds-checked cursor over the cache body; a sticky
 // error turns every later read into a no-op, keeping the parse flat.
