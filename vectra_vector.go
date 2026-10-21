@@ -66,8 +66,9 @@ func vecMetric(s string) (vector.Metric, bool) {
 // folder packs - never mid-Add.
 type vecIndex struct {
 	decl VectorIndexDecl
+	seed int64 // State's seed, for the folder's lock-free builds
 	// mu serializes State access between the writer goroutine (Add/Delete
-	// intake) and the folder lane (PackNext/publish). Uncontended on the
+	// intake) and the folder lane (drain/publish). Uncontended on the
 	// writer hot path; readers never take it (they load head).
 	mu   sync.Mutex
 	st   *vector.State
@@ -85,10 +86,28 @@ func (vi *vecIndex) publish() {
 // head per chunk batch; returns true when more backlog remains. Runs on
 // a folder goroutine; the writer's intake contends only on mu.
 func (vi *vecIndex) drain(maxChunks int) bool {
+	for c := 0; c < maxChunks; c++ {
+		vi.mu.Lock()
+		plan := vi.st.BeginPack()
+		vi.mu.Unlock()
+		if plan == nil {
+			break
+		}
+		// Lock-free build on the folder goroutine: the writer's intake
+		// only contends on the short capture/commit windows (spec D5 -
+		// an 8-chunk hold here once stalled writes for whole HNSW builds).
+		metric, _ := vecMetric(vi.decl.Metric)
+		plan.Build(metric, vi.decl.M, vi.decl.EfConstruction, vi.seed)
+		vi.mu.Lock()
+		ok := vi.st.CommitPack(plan)
+		vi.mu.Unlock()
+		if !ok {
+			continue // head moved (cannot happen today; the writer never
+			// removes chunks) - retry with fresh inputs
+		}
+	}
 	vi.mu.Lock()
 	defer vi.mu.Unlock()
-	for c := 0; c < maxChunks && vi.st.PackNext(); c++ {
-	}
 	vi.head.Store(vi.st.Snapshot())
 	return vi.st.FullChunkPending()
 }
@@ -149,9 +168,11 @@ func (g *Graph) CreateVectorIndex(d VectorIndexDecl) error {
 			return ErrVectorIndexExists
 		}
 	}
+	seed := vecSeed(d.Name)
 	vi := &vecIndex{
 		decl: d,
-		st:   vector.NewState(metric, d.Dim, d.M, d.EfConstruction, vecSeed(d.Name)),
+		seed: seed,
+		st:   vector.NewState(metric, d.Dim, d.M, d.EfConstruction, seed),
 	}
 	g.setVecRegistry(append(g.vecRegistryCopy(), vi))
 	g.recordVecDecls()
@@ -358,7 +379,8 @@ func (g *Graph) applyVecDecls(list []wal.VectorIndexDecl) {
 		if !ok {
 			continue // malformed replay entry: skip, never crash recovery
 		}
-		nv := &vecIndex{decl: d, st: vector.NewState(metric, d.Dim, d.M, d.EfConstruction, vecSeed(d.Name))}
+		seed := vecSeed(d.Name)
+		nv := &vecIndex{decl: d, seed: seed, st: vector.NewState(metric, d.Dim, d.M, d.EfConstruction, seed)}
 		kept = append(kept, nv)
 		fresh = append(fresh, nv)
 	}
@@ -512,7 +534,7 @@ type VecHandle struct {
 
 func (v *VecHandle) Drain(maxChunks int) bool { return v.vi.drain(maxChunks) }
 
-// VectorHands exposes the folder-lane handles (wrapper merger use).
+// VectorHandles exposes the folder-lane handles (wrapper merger use).
 func (g *Graph) VectorHandles() []*VecHandle {
 	reg := g.vecReg()
 	out := make([]*VecHandle, 0, len(reg))
@@ -541,6 +563,7 @@ func (g *Graph) VectorOverlayLen(name string) int {
 // declared property (nil when the node lacks a valid vector). Serves
 // similar_to-style queries without exposing the intake layer.
 func (g *Graph) VectorForNode(index, key string) ([]float32, bool) {
+	g.flushPend() // read-your-write, matching NodeByKey/QueryVector
 	vi := g.vecIndexByName(index)
 	if vi == nil {
 		return nil, false

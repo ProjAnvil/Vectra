@@ -558,6 +558,3 @@ func (s *State) CommitPack(p *PackPlan) bool {
 	s.seq = p.seqEnd
 	return true
 }
-
-// Len returns the total vector count across segments plus the overlay
-// (entry count). Feeds the adaptive ef formula; approximate is fine.
