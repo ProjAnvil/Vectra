@@ -97,11 +97,26 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
-// request is one queued changeset. err carries the per-changeset outcome
+// opKind tags a queued request. Vector index declarations and drops ride
+// the same lane as changesets (ruling #8): Attach claims the graph, so the
+// app goroutine has no legal direct declaration entry, and a shared queue
+// makes the order against Submits total.
+type opKind uint8
+
+const (
+	opChangeset opKind = iota // the zero value: Submit's construction stays unchanged
+	opDeclare
+	opDrop
+)
+
+// request is one queued operation. err carries the per-request outcome
 // resolved inside the batch; replyCh (buffered, exactly one send) returns
 // it to the submitter.
 type request struct {
-	cs      vectra.Changeset
+	op      opKind
+	cs      vectra.Changeset       // opChangeset
+	decl    vectra.VectorIndexDecl // opDeclare
+	name    string                 // opDrop
 	replyCh chan error
 	err     error
 }
@@ -201,6 +216,31 @@ func (h *Handle) SubmitAsync(cs vectra.Changeset) <-chan error {
 	return reply
 }
 
+// DeclareVectorIndex declares a vector index through the writer lane
+// (ruling #8): while attached, the Handle is the only legal declaration
+// surface (direct CreateVectorIndex from another goroutine hits
+// ErrNotWriter in debug builds). The request rides writeCh with changesets,
+// so the order against Submits is total — a Submit that returns after this
+// does so with the index installed and its vectors ingested.
+func (h *Handle) DeclareVectorIndex(d vectra.VectorIndexDecl) error {
+	reply := make(chan error, 1)
+	if err := h.send(request{op: opDeclare, decl: d, replyCh: reply}); err != nil {
+		return err
+	}
+	return <-reply
+}
+
+// DropVectorIndex removes a vector index through the writer lane, with the
+// same total order as Submit: a Submit queued after the drop applies with
+// the index already gone (later queries report ErrVectorIndexNotFound).
+func (h *Handle) DropVectorIndex(name string) error {
+	reply := make(chan error, 1)
+	if err := h.send(request{op: opDrop, name: name, replyCh: reply}); err != nil {
+		return err
+	}
+	return <-reply
+}
+
 // send enqueues under the sender lock; after Close it reports ErrClosed.
 func (h *Handle) send(r request) error {
 	h.sendMu.RLock()
@@ -275,13 +315,33 @@ func (h *Handle) run() {
 // other keys; stamping one into this batch's layer would put two live
 // records on a single ID. RepairAfterRebase folds the generation once and
 // rebuilds the mirrors (a no-op without a rebase).
+//
+// Declaration ops in the group apply on this goroutine AFTER the repair and
+// BEFORE the changeset batch, through the graph's own decl APIs — outside
+// the g.Batch closure, which they refuse (mid-batch backfill would scan a
+// pre-publish view and miss the batch's own nodes). Landing every IndexDecl
+// frame ahead of the group's changeset frames is replay-faithful either way
+// the lane interleaved them: replay re-declares at the frame position, then
+// the changesets ingest at apply time — the same path live intake takes —
+// and the group's replies all go out after the whole group applied, so no
+// submitter can observe the collapsed order.
 func (h *Handle) applyBatch(pending []request) {
 	h.pubMu.Lock()
 	batchErr := h.g.RepairAfterRebase()
 	if batchErr == nil {
+		for i := range pending {
+			switch pending[i].op {
+			case opDeclare:
+				pending[i].err = h.g.CreateVectorIndex(pending[i].decl)
+			case opDrop:
+				pending[i].err = h.g.DropVectorIndex(pending[i].name)
+			}
+		}
 		batchErr = h.g.Batch(func(g *vectra.Graph) {
 			for i := range pending {
-				pending[i].err = applyChangeset(g, pending[i].cs)
+				if pending[i].op == opChangeset {
+					pending[i].err = applyChangeset(g, pending[i].cs)
+				}
 			}
 		})
 	}
