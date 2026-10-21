@@ -29,7 +29,7 @@ loads in 455ms where it used to rebuild for 7m19s. Reference docs:
   restart 7m19s rebuild -> 455ms load (964x); WAL tail replays onto
   the loaded forest; mismatched/corrupt caches rebuild transparently.
 - Vector REST endpoints: POST /v1/vector/search (query_vector |
-  similar_to, k≤100), POST/GET /v1/vector/indexes, DELETE
+  similar_to, k≤1000), POST/GET /v1/vector/indexes, DELETE
   /v1/vector/indexes/{name}; raft-replicated explicit index ops;
   TS/Python MCP clients gain vector_search, vector_index_create/drop/
   list.
@@ -46,14 +46,17 @@ loads in 455ms where it used to rebuild for 7m19s. Reference docs:
   libraries cannot be downgraded (release notes: finish migration
   before any downgrade attempt; a failed migration leaves the library
   v4-readable and retried on next open). The last pre-migration
-  watermark snapshot is retained as a `<name>-v4.bak` rollback
-  artifact (copied before the migration seal; recovery never reads
-  it, later seals never delete it); the migration open transiently
-  costs ~3x snapshot size on disk (old + new + copy).
+  watermark snapshot is retained as a `<watermark>-v<version>.bak`
+  rollback artifact (e.g. `v-2.db-v4.bak`; copied before the migration
+  seal; recovery never reads it, later seals never delete it); the
+  migration open transiently costs ~3x snapshot size on disk (old +
+  new + copy).
 - Default CheckpointBytes 4MiB -> 64MiB (measured cadence:
   `docs/benchmarks/2026-10-21-wrapper-checkpoint-cadence.md`).
 - /v1/batch and /v1/txn now accept JSON numeric arrays as vector props
   (previously failed at raft encoding).
+- Vector search k cap raised 100 -> 1000 (default 10 unchanged)
+  across REST and MCP surfaces, per industry comparison.
 
 ### Unsupported
 
@@ -98,7 +101,7 @@ write throughput 23-26k/s against the 20k line, plain-write p50 within
   prerequisite), immutable Snapshot model (chunked overlay, chunked
   dead bitmap, key arrays off the read path), recovery drain with the
   overlay as the exact fallback.
-- MCP tool #12 `vector_search` (query_vector or similar_to, k ≤ 1000,
+- MCP tool #12 `vector_search` (query_vector or similar_to, k ≤ 100,
   approximation note on every response).
 
 ### Changed
