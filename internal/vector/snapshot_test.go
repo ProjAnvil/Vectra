@@ -3,6 +3,7 @@ package vector
 import (
 	"fmt"
 	"math/rand"
+	"sort"
 	"sync"
 	"testing"
 )
@@ -231,4 +232,87 @@ func TestSnapshotKeysRendered(t *testing.T) {
 			t.Fatalf("bad key %q (err %v)", hits[0].Key, err)
 		}
 	}
+}
+
+// TestTwoPhasePackParity: the two-phase drain (BeginPack/Build/CommitPack)
+// must produce the same query results as the classic whole-overlay Pack at
+// a scale that exercises the 4-way cascade (n=10000: tier0 fills and
+// promotes). Written after integrated gate-2b recall collapsed: every
+// small lane test (4096 = two chunks, no cascade) passed.
+func TestTwoPhasePackParity(t *testing.T) {
+	const n, dim = 10000, 64
+	vecs := genClustered(rand.New(rand.NewSource(71)), n, dim)
+	build := func(twoPhase bool) *State {
+		s := NewState(Cosine, dim, 16, 100, 72)
+		for i, v := range vecs {
+			s.Add(fmt.Sprintf("k%d", i), v)
+		}
+		if !twoPhase {
+			s.Pack(true)
+			return s
+		}
+		for {
+			p := s.BeginPack()
+			if p == nil {
+				break
+			}
+			p.Build(Cosine, 16, 100, 72)
+			if !s.CommitPack(p) {
+				t.Fatal("commit rejected on a quiescent state")
+			}
+		}
+		// Tail below one chunk stays by design; Pack(true) drains it. The
+		// parity target is the SEGMENT forest, so force-drain both to the
+		// same final shape: pack the tail via the classic path.
+		s.Pack(true)
+		return s
+	}
+	a := build(false)
+	b := build(true)
+	if a.Len() != b.Len() || a.OverlayLen() != 0 || b.OverlayLen() != 0 {
+		t.Fatalf("shape: old len=%d overlay=%d; new len=%d overlay=%d", a.Len(), a.OverlayLen(), b.Len(), b.OverlayLen())
+	}
+	queries := perturbedQueries(rand.New(rand.NewSource(73)), vecs, 30)
+	ra, rb := a.NewReader(), b.NewReader()
+	for qi, q := range queries {
+		ha := normHits(a.SearchReader(q, 10, 64, ra))
+		hb := normHits(b.SearchReader(q, 10, 64, rb))
+		if len(ha) == 0 {
+			t.Fatalf("q%d: old path empty", qi)
+		}
+		if len(ha) != len(hb) {
+			t.Fatalf("q%d: %d vs %d hits", qi, len(ha), len(hb))
+		}
+		for i := range ha {
+			if ha[i] != hb[i] {
+				t.Fatalf("q%d [%d]: old=%+v new=%+v", qi, i, ha[i], hb[i])
+			}
+		}
+	}
+	// And against brute force: the new path must hold the recall line too.
+	hit := 0
+	for _, q := range queries {
+		want := map[string]bool{}
+		for _, i := range bruteTopIDs(vecs, q, 10) {
+			want[fmt.Sprintf("k%d", i)] = true
+		}
+		for _, h := range b.SearchReader(q, 10, 128, rb) {
+			if want[h.Key] {
+				hit++
+			}
+		}
+	}
+	if r := float64(hit) / float64(len(queries)*10); r < 0.95 {
+		t.Fatalf("two-phase recall@10 (ef128) = %.4f, want >= 0.95", r)
+	}
+}
+
+func normHits(hs []VectorHit) []VectorHit {
+	sort.Slice(hs, func(i, j int) bool {
+		if hs[i].Score != hs[j].Score {
+			return hs[i].Score < hs[j].Score
+		}
+		return hs[i].Key < hs[j].Key
+	})
+	return hs
 }

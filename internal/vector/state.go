@@ -283,59 +283,6 @@ func (v vecView) search(q []float32, k, ef int, r *Reader) []VectorHit {
 	return all
 }
 
-// PackNext packs at most ONE overlay chunk (packSize entries, deduped
-// within the chunk) into a new L0 segment and runs the cascade; it
-// returns false without packing when the overlay holds less than a full
-// chunk. The folder lane loops it to drain recovery or sustained-write
-// backlog chunk by chunk - L0s appear first, so partial progress is
-// already queryable (spec 7.1: bottom-up rebuild). A vid re-added in a
-// later chunk wins at search time (overlay beats segments), so packing
-// an older chunk first is safe.
-func (s *State) PackNext() bool {
-	if s.overlayLen < packSize {
-		return false
-	}
-	chunk := s.overlay[0]
-	// Dedup within the chunk: newest entry wins, first-occurrence order.
-	pos := map[uint32]int{}
-	list := make([]entry, 0, len(chunk))
-	for _, e := range chunk {
-		if i, ok := pos[e.vid]; ok {
-			list[i] = e
-			continue
-		}
-		pos[e.vid] = len(list)
-		list = append(list, e)
-	}
-	seg := &segment{seq: s.seq, h: NewHNSW(s.metric, s.m, s.efc, s.seed+int64(s.seq)), keys: make([]string, 0, len(list))}
-	s.seq++
-	for _, e := range list {
-		if !s.dead.has(e.vid) {
-			seg.h.insertPrepared(e.vid, e.vec)
-			seg.keys = append(seg.keys, e.key)
-		}
-	}
-	s.overlay[0] = nil // drop the packed chunk's backing array: a bare [1:]
-	// keeps slot 0 pinning ~packSize entry headers until append reallocs
-	s.overlay = s.overlay[1:]
-	s.overlayLen -= len(chunk)
-	carry := seg
-	for i := 0; carry != nil; i++ {
-		for i >= len(s.tiers) {
-			s.tiers = append(s.tiers, nil)
-		}
-		s.tiers[i] = append(s.tiers[i], carry)
-		if len(s.tiers[i]) < tierFactor {
-			break
-		}
-		parts := s.tiers[i]
-		s.tiers[i] = nil
-		carry = s.mergeSegments(parts...)
-	}
-	s.compact()
-	return true
-}
-
 // Pack builds an L0 segment from the overlay once it reached packSize
 // (or force), cascades in-tier merges upward, then compacts dead-heavy
 // segments (spec §4.2/§5.2).
@@ -458,3 +405,159 @@ func (s *State) Len() int {
 // FullChunkPending reports whether the overlay holds at least one full
 // pack chunk - the folder lane's trigger.
 func (s *State) FullChunkPending() bool { return s.overlayLen >= packSize }
+
+// PackPlan is a two-phase drain (spec D5: the writer must never wait on
+// graph building). BeginPack captures immutable inputs under a short
+// lock; Build does every HNSW construction lock-free on the folder
+// goroutine; CommitPack identity-checks and swaps under another short
+// lock. Inputs are immutable by construction - a full overlay chunk
+// freezes forever, built segments never mutate - so the check is a
+// pointer identity, not a deep compare. The writer's intake only
+// appends tail chunks and flips dead bits, neither of which
+// invalidates a plan: a delete racing the build leaves a since-dead vid
+// inside the packed segment, and every snapshot's dead copy filters it
+// at search time.
+type PackPlan struct {
+	chunk   []entry      // frozen chunk being packed
+	chunkID *entry       // &chunk[0]: commit-time identity
+	tiers   [][]*segment // deep-copied tier snapshot
+	dead    map[uint32][1024]uint64
+	seq     uint64 // segment seq allocator at begin
+
+	newTiers [][]*segment // Build output
+	seqEnd   uint64
+}
+
+// BeginPack captures one chunk's pack inputs; nil when no full chunk
+// is pending. Under the State lock.
+func (s *State) BeginPack() *PackPlan {
+	if s.overlayLen < packSize {
+		return nil
+	}
+	tiers := make([][]*segment, len(s.tiers))
+	for i, t := range s.tiers {
+		tiers[i] = append([]*segment(nil), t...)
+	}
+	dead := make(map[uint32][1024]uint64, len(s.dead.chunks))
+	for c, bits := range s.dead.chunks {
+		dead[c] = bits
+	}
+	chunk := s.overlay[0]
+	return &PackPlan{chunk: chunk, chunkID: &chunk[0], tiers: tiers, dead: dead, seq: s.seq}
+}
+
+// Build constructs the L0 segment, the 4-way cascade, and the dead
+// compaction over the captured inputs - all lock-free. HNSW building is
+// the entire cost; nothing here touches the State.
+func (p *PackPlan) Build(metric Metric, m, efc int, seed int64) {
+	dead := deadBits{chunks: p.dead}
+	newSeg := func() *segment {
+		sg := &segment{seq: p.seq, h: NewHNSW(metric, m, efc, seed+int64(p.seq))}
+		p.seq++
+		return sg
+	}
+	packSeg := func(entries []entry) *segment {
+		pos := map[uint32]int{}
+		list := make([]entry, 0, len(entries))
+		for _, e := range entries {
+			if i, ok := pos[e.vid]; ok {
+				list[i] = e
+				continue
+			}
+			pos[e.vid] = len(list)
+			list = append(list, e)
+		}
+		sg := newSeg()
+		for _, e := range list {
+			if !dead.has(e.vid) {
+				sg.h.insertPrepared(e.vid, e.vec)
+				sg.keys = append(sg.keys, e.key)
+			}
+		}
+		return sg
+	}
+	mergeSeg := func(parts []*segment) *segment {
+		sg := newSeg()
+		seen := map[uint32]bool{}
+		for j := len(parts) - 1; j >= 0; j-- { // tiers append oldest-first
+			ids, vecs := parts[j].h.All()
+			for i, id := range ids {
+				if seen[id] || dead.has(id) {
+					continue
+				}
+				seen[id] = true
+				sg.h.insertPrepared(id, vecs[i])
+				sg.keys = append(sg.keys, parts[j].keys[i])
+			}
+		}
+		return sg
+	}
+
+	tiers := p.tiers
+	if len(tiers) == 0 {
+		tiers = append(tiers, nil)
+	}
+	tiers[0] = append(tiers[0], packSeg(p.chunk))
+	i := 0
+	for {
+		for i >= len(tiers) {
+			tiers = append(tiers, nil)
+		}
+		if len(tiers[i]) < tierFactor {
+			break
+		}
+		carry := mergeSeg(tiers[i])
+		tiers[i] = nil
+		i++
+		for i >= len(tiers) { // the promoted segment lands at i
+			tiers = append(tiers, nil)
+		}
+		tiers[i] = append(tiers[i], carry)
+	}
+	// Dead compaction over the copy (30% line, spec 4.2).
+	for ti, tier := range tiers {
+		for si, seg := range tier {
+			ids, _ := seg.h.All()
+			if len(ids) == 0 {
+				continue
+			}
+			deadc := 0
+			for _, id := range ids {
+				if dead.has(id) {
+					deadc++
+				}
+			}
+			if deadc == 0 || float64(deadc)/float64(len(ids)) <= 0.3 {
+				continue
+			}
+			fresh := newSeg()
+			ids2, vecs := seg.h.All()
+			for j, id := range ids2 {
+				if !dead.has(id) {
+					fresh.h.insertPrepared(id, vecs[j])
+					fresh.keys = append(fresh.keys, seg.keys[j])
+				}
+			}
+			tiers[ti][si] = fresh
+		}
+	}
+	p.newTiers = tiers
+	p.seqEnd = p.seq
+}
+
+// CommitPack swaps the built plan in. Under the State lock; false when
+// the captured chunk is no longer the overlay head (retry).
+func (s *State) CommitPack(p *PackPlan) bool {
+	if len(s.overlay) == 0 || len(s.overlay[0]) == 0 || &s.overlay[0][0] != p.chunkID {
+		return false
+	}
+	s.overlay[0] = nil // drop the packed chunk's backing array
+	s.overlay = s.overlay[1:]
+	s.overlayLen -= len(p.chunk)
+	s.tiers = p.newTiers
+	s.seq = p.seqEnd
+	return true
+}
+
+// Len returns the total vector count across segments plus the overlay
+// (entry count). Feeds the adaptive ef formula; approximate is fine.

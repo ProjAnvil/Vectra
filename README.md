@@ -73,6 +73,27 @@ v0.7 dissolves the sealed-snapshot gate. Every write (or `Batch`) materializes i
 
 **⚠️ Upgrading to 0.5.0.** Store snapshots are now written in the v3 format. The incompatibility is one-directional: v1/v2 files remain readable, but pre-0.5 binaries cannot read v3 files — embedded and MCP users who exchange `.vg` snapshots across versions need both sides on 0.5+. The raft cluster mixed-version policy is unchanged (already unsupported).
 
+## Vector search (v0.9, Phase 1)
+
+Declare an index over a node property and query it with approximate top-k
+(embedded HNSW, pure Go, zero new dependencies — full design in
+[docs/superpowers/specs/2026-10-19-vector-search-design.md](docs/superpowers/specs/2026-10-19-vector-search-design.md)):
+
+```go
+g.CreateVectorIndex(vectra.VectorIndexDecl{Name: "mem", Prop: "embedding", Dim: 768, Metric: "cosine"})
+g.AddNode("thought-1", "Memory", map[string]any{"embedding": someVec}) // []float32 prop
+hits, _ := g.QueryVector("mem", queryVec, vectra.QueryVectorOptions{K: 10, Label: "Memory"})
+```
+
+Committed vectors are immediately queryable (the overlay's exact scan);
+background packing builds the segment forest without blocking writes
+(writer intake never waits on graph building). Results are approximate
+and unordered across ties. Declarations persist through the WAL and
+store v4; recovery rebuilds bottom-up with the overlay as the exact
+fallback. The MCP server exposes it as `vector_search` (query_vector or
+similar_to, k ≤ 100). Gate 2b numbers:
+[docs/benchmarks/2026-10-20-vector-phase1-gate2b.md](docs/benchmarks/2026-10-20-vector-phase1-gate2b.md).
+
 ## Cypher-subset queries
 
 Sealed graphs answer openCypher/GQL-style pattern queries — the DSL compiles onto the same CSR traversal primitives (`bfs` / `neighbors` / `lookup_property` are the physical operators):
