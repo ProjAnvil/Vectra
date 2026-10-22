@@ -1,7 +1,8 @@
 // Package vecbin implements the value-level vector codec shared by the WAL
-// frame format v2 and the store v5 snapshot: declared vector props leave the
-// JSON props channel and live in a contiguous float32 section, represented
-// inside props as {"$vec":[off,dim]} refs into that section.
+// frame format v2 and the store snapshot's contiguous float32 section (the
+// v5 layout, still current under the v6 version-only stamp): declared
+// vector props leave the JSON props channel and live in that section,
+// represented inside props as {"$vec":[off,dim]} refs into it.
 //
 // Detection is declaration-based, never Go-type-based: a prop is a vector
 // candidate only when its name appears in PropDecls AND its value is a

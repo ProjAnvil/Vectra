@@ -1587,18 +1587,21 @@ func (g *Graph) Batch(fn func(*Graph)) error {
 // micro-layer per frame), with no recording during replay. Merging is
 // deferred to the checkpoint at Close or an explicit Seal.
 //
-// v5 migration + fresh-library tripwire (spec 2026-10-21 §1.3, rulings
-// #4/#9): a WAL-mode Open ENDS with one Seal unless the recovered head is
-// already a v5 snapshot — legacy (v1-v4) libraries migrate in place, and
-// fresh or WAL-only libraries (no snapshot head) get an empty/full v5
-// checkpoint, so the on-disk state a v0.10 downgrade would open always
-// hard-fails at the snapshot version byte instead of silently truncating
-// unknown (type-4 vector) WAL frames. Reopening a v5 library seals nothing
-// (idempotent). ModeOff Opens never migrate (see the branch below). The
-// pre-migration watermark is retained as a copy <name>-v<ver>.bak before the
-// migration seal (rollback artifact: recovery never reads it, later seals
-// never delete it; the original stays in place until the seal's own cleanup
-// removes it, so no crash window opens).
+// v6 migration + fresh-library tripwire (spec 2026-10-21 §1.3, rulings
+// #4/#9; target lifted v5 -> v6 by the 2026-10-22 retained-WAL checkpoint
+// plan): a WAL-mode Open ENDS with one Seal unless the recovered head is
+// already a v6 snapshot — legacy (v1-v5) libraries migrate in place, and
+// fresh or WAL-only libraries (no snapshot head) get an empty/full v6
+// checkpoint, so the on-disk state an older binary would open always
+// hard-fails at the snapshot version byte instead of silently losing data
+// (a v0.10 binary truncates unknown type-4 WAL frames; a v0.11.1 binary
+// ignores manifest v2's RetainFrom and would read a light-checkpointed
+// base alone, missing the retained chain). Reopening a v6 library seals
+// nothing (idempotent). ModeOff Opens never migrate (see the branch
+// below). The pre-migration watermark is retained as a copy
+// <name>-v<ver>.bak before the migration seal (rollback artifact: recovery
+// never reads it, later seals never delete it; the original stays in place
+// until the seal's own cleanup removes it, so no crash window opens).
 //
 // Checkpoints never write `path` in place: each one writes a watermark
 // snapshot <path minus ext>-<lsn>.db next to path and atomically points the

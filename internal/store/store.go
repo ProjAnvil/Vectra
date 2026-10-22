@@ -50,11 +50,12 @@ const (
 	headerSize    = 6 // magic(4) + version(2); count fields start after this
 )
 
-// VersionV5 exports the v5 baseline of the Open-time migration gate: vectra.Open
-// probes the recovered head's version and seals anything below it (spec
-// 2026-10-21 §1.3). Encode stamps v6 (a version-only bump over v5); v6 heads
-// pass this gate untouched, and the migration chain to v6 is Task 5 of the
-// 2026-10-22 checkpoint plan.
+// VersionV5 is the retired baseline of the 2026-10-21 Open-time migration
+// gate: vectra.Open then probed the recovered head's version and sealed
+// anything below v5 (spec 2026-10-21 §1.3). Since the 2026-10-22 checkpoint
+// plan the live gate is VersionV6 — Encode stamps the version-only v6 bump
+// and Open migrates v1-v5 heads to it — so this constant now only pins the
+// bottom of that chain (tests forge "one version past the product" from it).
 const VersionV5 = versionV5
 
 // VersionV6 exports the v6 tripwire version (2026-10-22 checkpoint plan): a
