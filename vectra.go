@@ -1655,16 +1655,57 @@ func Open(path string, opts Options) (*Graph, error) {
 		return nil, err
 	}
 
-	// Forest-cache pre-gate (spec §2.3): CRC and watermark must hold before
-	// the snapshot load; the declaration-set gate runs later, in loadGraph,
-	// once the registry exists to compare against. Without a manifest there
-	// is no watermark to check (WAL-only recovery, fresh library, v0.6
-	// adoption), so a present cache is unusable. Every failure discards the
-	// file — the cache is never a source of truth; the store snapshot and
-	// the WAL are, and the rebuild path serves both cases.
+	// Forest-cache pre-gate (spec §2.3, stale-tolerant since v0.11.2): CRC
+	// must hold and the cache's LSN must be AT OR PAST the manifest's
+	// compact boundary (img.lsn >= man.LSN) before the snapshot load; the
+	// declaration-set gate runs later, in loadGraph, once the registry
+	// exists to compare against. Without a manifest there is no boundary to
+	// check (WAL-only recovery, fresh library, v0.6 adoption), so a present
+	// cache is unusable. Every failure discards the file — the cache is
+	// never a source of truth; the store snapshot and the WAL are, and the
+	// rebuild path serves both cases.
+	//
+	// Why >= and not == (plan review focus #4): the compact tier writes
+	// its manifest and its forest at the SAME lsn and the light tier moves
+	// neither, so every rested pipeline state has img.lsn == man.LSN — the
+	// exact-match fast path over an empty chain, behavior unchanged. The
+	// reachable divergence is the compact crash window where the manifest
+	// landed but the forest rename did not (img.lsn < man.LSN): discard,
+	// as before — that forest is missing frames the base snapshot already
+	// absorbed, and replay never re-delivers them (wal.Replay skips every
+	// frame at or below the manifest LSN), so mounting it would silently
+	// lose the window. img.lsn > man.LSN — a manifest rolled back beneath
+	// a newer forest — is a valid PREFIX of the recoverable history: the
+	// retained-chain replay re-applies the (man.LSN, forestLSN] window onto
+	// the mounted forest and applies everything above forestLSN as fresh
+	// increments.
+	//
+	// Idempotency of that re-application, verified against internal/vector
+	// State semantics and the vecIntake paths:
+	//   - the forest serializes the whole State — vidOf, nextVID, deadBits,
+	//     overlay, tiers — so a re-Add of a key the mounted forest already
+	//     knows reuses its vid and appends an overlay entry carrying the
+	//     identical normalized vector;
+	//   - the read path collapses duplicates by vid (vecView.search merges
+	//     into a map[vid]best; overlay entries assign in scan order, so the
+	//     newest occurrence wins and identical vectors score identically),
+	//     and Pack/packSeg dedup by vid with newest-wins while never
+	//     inserting dead vids — re-applied entries never surface as
+	//     duplicates in queries or packed segments;
+	//   - Delete re-sets an idempotent dead bit and no-ops on unknown keys,
+	//     Add clears it (revive), so LSN-ordered replay — the same order
+	//     the forest state absorbed — re-derives the identical final dead
+	//     set and live overlay;
+	//   - replay reaches State only through vecIntakeNode/vecIntakeDelete
+	//     on the writer thread (applyChangeset -> AddNode/DeleteNode), the
+	//     same funnel that produced the forest, so normalization and
+	//     ordering match exactly.
+	// Re-application costs O(chain window), bounded by the compaction
+	// threshold; skipping vector ops for frames <= forestLSN is
+	// deliberately out of scope (correctness over speed).
 	var ff *vecForestImage
 	if img, err := readVecForest(vecForestPath(path)); img != nil || err != nil {
-		if err == nil && hasMan && img.lsn == man.LSN {
+		if err == nil && hasMan && img.lsn >= man.LSN {
 			ff = img
 		} else {
 			discardVecForest(vecForestPath(path))
@@ -2570,12 +2611,15 @@ func loadGraph(r io.Reader) (*Graph, error) {
 
 // loadGraphForest is loadGraph with the forest-cache decision (Open's
 // watermark path only; img nil everywhere else). img non-nil means the CRC
-// and LSN gates already passed in Open: the declaration backfill is
+// gate and the stale-tolerant LSN gate (file LSN >= the manifest's compact
+// boundary, v0.11.2) already passed in Open: the declaration backfill is
 // suppressed while applyVecDecls builds the registry, then mountVecForest
 // compares declaration sets and swaps the decoded States in. Any gate
 // failure falls through to the ordinary backfill — the pre-existing rebuild
 // path, unchanged. The WAL tail replays afterwards, on top of whichever
-// states won, through the normal intake (vecIntakeNode).
+// states won, through the normal intake (vecIntakeNode); frames at or below
+// the forest's own LSN re-apply idempotently (the verification note lives
+// at Open's gate above).
 func loadGraphForest(r io.Reader, img *vecForestImage) (*Graph, error) {
 	data, err := store.Decode(r)
 	if err != nil {

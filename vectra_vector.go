@@ -918,7 +918,10 @@ func discardVecForest(path string) { _ = os.Remove(path) }
 // snapshot and the WAL; the file is a pure cache, so any mismatch removes
 // it and returns false — the caller backfills from the snapshot instead
 // (the rebuild path). The WAL tail replays after loadGraph returns, onto
-// whichever states won, through the normal intake.
+// whichever states won, through the normal intake; with the stale-tolerant
+// LSN gate (v0.11.2, file LSN >= the manifest boundary) frames at or below
+// the forest's own LSN re-apply idempotently — the verification note lives
+// at Open's gate in vectra.go.
 func (g *Graph) mountVecForest(img *vecForestImage) bool {
 	reg := g.vecReg()
 	if len(reg) == 0 || len(reg) != len(img.entries) {
