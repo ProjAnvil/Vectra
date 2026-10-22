@@ -314,6 +314,98 @@ func TestCompactionAbsorbsRetained(t *testing.T) {
 	}
 }
 
+// TestZeroFirstSegmentForcesCompact pins the structural guard (review
+// constraint: the light tier must NEVER emit a manifest with RetainFrom 0).
+// A light v2 manifest with RetainFrom 0 makes the next recovery floor at
+// man.Segment (0 is the v1 sentinel) and silently skip the entire retained
+// chain — the total-loss class. The shape is unreachable through the
+// pipeline (every LSN>0 manifest descends from a compact whose Reset
+// restarts the chain at ≥1), so this fixture hand-crafts it: compact
+// normally, then rename the chain's only segment down to 0 and retarget the
+// manifest to match. The next Open parks the head at segment 0
+// (FirstSegment()==0) with the v6 base and LSN>0 manifest intact, and Seal
+// must answer COMPACT, not light.
+func TestZeroFirstSegmentForcesCompact(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "graph.db")
+	g, err := Open(db, Options{WALMode: ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.AddNode("a", "Svc", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Close(); err != nil { // compact #1: v6 base + LSN>0 manifest
+		t.Fatal(err)
+	}
+	man1 := readManifest(t, db)
+
+	// Hand-craft the hazard shape: retarget the manifest at segment 0 and
+	// rename the live chain's only segment (fresh from Reset) down to 0.
+	// Recovery then walks from 0, parks the head there, and FirstSegment()
+	// reports 0 — with every light-eligibility check otherwise green.
+	man1.Segment = 0
+	if err := wal.WriteManifest(db+".wal", man1); err != nil {
+		t.Fatal(err)
+	}
+	segs := listSegments(t, db+".wal")
+	if len(segs) != 1 {
+		t.Fatalf("fixture precondition: want exactly one live segment, got %v", segs)
+	}
+	if err := os.Rename(
+		filepath.Join(db+".wal", segs[0]),
+		filepath.Join(db+".wal", "wal-0.log"),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	g2, err := Open(db, Options{WALMode: ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fs := g2.wal.FirstSegment(); fs != 0 {
+		t.Fatalf("fixture precondition: FirstSegment = %d, want 0", fs)
+	}
+	if _, err := g2.AddNode("b", "Svc", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := g2.Seal(); err != nil {
+		t.Fatal(err)
+	}
+
+	// COMPACT, not light: a fresh v6 base appeared and the manifest stayed
+	// v1-shaped (RetainFrom 0, Format 2) — rather than a light manifest whose
+	// RetainFrom 0 would orphan the 0-headed retained chain.
+	man2 := readManifest(t, db)
+	if man2.RetainFrom != 0 {
+		t.Fatalf("Seal over a 0-headed chain emitted RetainFrom = %d, want the compact tier (0)", man2.RetainFrom)
+	}
+	if man2.Format != 2 {
+		t.Fatalf("manifest Format = %d, want 2", man2.Format)
+	}
+	if man2.Snapshot == man1.Snapshot {
+		t.Fatalf("the guard must force a fresh base, kept %q", man2.Snapshot)
+	}
+	if v := snapshotVersion(t, db, man2.Snapshot); v != store.VersionV6 {
+		t.Fatalf("fresh base version = %d, want v6", v)
+	}
+	if got := listWatermarks(t, db); len(got) != 1 || got[0] != man2.Snapshot {
+		t.Fatalf("watermarks after the guard's compact = %v, want only %q", got, man2.Snapshot)
+	}
+	if err := g2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	g3, err := Open(db, Options{WALMode: ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := g3.NodeCount(); n != 2 {
+		t.Fatalf("recovered nodes = %d, want 2", n)
+	}
+	if err := g3.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestRestartOverRetainedChain pins replay correctness: after light
 // checkpoints the next Open must see writes from BOTH sides of every boundary
 // — the compact base, the retained chain, and the active tail all apply.

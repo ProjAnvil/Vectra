@@ -2374,9 +2374,15 @@ var compactBytes = DefaultCompactBytes
 // user checkpoint still compacts; (b) the named base is not a store-v6
 // snapshot — a pre-v6 base kept alive under a manifest v2 is the silent-loss
 // downgrade hazard (a pre-0.11.2 binary ignores RetainFrom and reads the base
-// alone), so migration and tripwire seals always compact; or (c) the live
+// alone), so migration and tripwire seals always compact; (c) the live
 // chain's retained bytes have reached the compaction threshold, bounding the
-// recovery replay volume.
+// recovery replay volume; or (d) the live chain's first segment is 0 —
+// RetainFrom 0 is the v1 sentinel, so a light manifest (which copies
+// FirstSegment verbatim) would floor recovery at Segment and silently skip
+// the whole retained chain. Structurally unreachable through the pipeline
+// (every LSN>0 manifest descends from a compact whose Reset restarts the
+// chain at ≥1), but enforced at the tier decision so no future writer — the
+// migration seal next — can ever emit it.
 func (g *Graph) checkpoint(lsn uint64) error {
 	compact, man, err := g.compactTier()
 	if err != nil {
@@ -2398,7 +2404,7 @@ func (g *Graph) compactTier() (compact bool, man wal.Manifest, err error) {
 		return false, man, err
 	}
 	if !ok || man.Snapshot == "" || man.LSN == 0 || !g.snapshotIsV6(man) ||
-		g.wal.RetainedBytes() >= compactBytes {
+		g.wal.RetainedBytes() >= compactBytes || g.wal.FirstSegment() == 0 {
 		return true, man, nil
 	}
 	return false, man, nil

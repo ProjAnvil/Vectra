@@ -872,8 +872,10 @@ func (w *WAL) RetainedBytes() int64 { return w.retained.Load() }
 // (the first segment Open's walk accepted — never a manifest floor naming an
 // already-deleted segment) and by Reset (the chain restarts at the fresh
 // segment); Rotate and in-segment rollovers never change it. 0 means the
-// chain starts at segment 0 — inexpressible as RetainFrom (the v1 sentinel),
-// which is one reason a lineage's first checkpoint must compact.
+// chain starts at segment 0 — inexpressible as RetainFrom (the v1 sentinel).
+// The invariant is enforced at the tier decision, not just advised: a 0 here
+// forces the compacting checkpoint, so the light tier can never emit a
+// RetainFrom-0 manifest that orphans the retained chain.
 func (w *WAL) FirstSegment() int { return w.startSeg }
 
 // --- frame codec -------------------------------------------------------------
