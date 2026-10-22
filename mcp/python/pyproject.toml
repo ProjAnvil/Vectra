@@ -1,6 +1,6 @@
 [project]
 name = "vectra-mcp-python"
-version = "0.11.0"
+version = "0.11.1"
 description = "MCP server for the Vectra dependency-graph engine (wraps the Vectra HTTP API)"
 requires-python = ">=3.10"
 license = "MIT"
