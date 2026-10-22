@@ -15,13 +15,13 @@ type stubSource struct {
 	rows map[uint32][]csr.AdjRow
 }
 
-func (s *stubSource) NodeCount() int                         { return s.n }
+func (s *stubSource) NodeCount() int                            { return s.n }
 func (s *stubSource) NodeInfo(id uint32) (engine.NodeRec, bool) { return engine.NodeRec{}, true }
 func (s *stubSource) EdgeInfo(id uint32) (uint32, uint32, string, map[string]any, bool) {
 	return 0, 0, "", nil, false
 }
-func (s *stubSource) LabelCount() int                            { return 1 }
-func (s *stubSource) LabelID(name string) (uint32, bool)         { return 0, true }
+func (s *stubSource) LabelCount() int                                { return 1 }
+func (s *stubSource) LabelID(name string) (uint32, bool)             { return 0, true }
 func (s *stubSource) LookupIndex(key, value string) ([]uint32, bool) { return nil, false }
 func (s *stubSource) LookupNumber(key string, value float64) ([]uint32, bool) {
 	return nil, false

@@ -248,7 +248,7 @@ func (s cypherSource) EdgeInfo(id uint32) (uint32, uint32, string, map[string]an
 func (s cypherSource) LabelCount() int                             { return s.ev.LabelCount() }
 func (s cypherSource) LabelID(name string) (uint32, bool)          { return s.ev.LabelID(name) }
 func (s cypherSource) FastAdjacency(dir int) (csr.Adjacency, bool) { return s.ev.FastAdjacency(dir) }
-func (s cypherSource) Rows(u uint32, dir int) []csr.AdjRow { return s.ev.Rows(u, dir) }
+func (s cypherSource) Rows(u uint32, dir int) []csr.AdjRow         { return s.ev.Rows(u, dir) }
 
 // RowsInto is the buffer-reuse form of Rows (engine.View's zero-alloc row
 // path): satisfying cypher's optional rowSink lets the view-path expansion
