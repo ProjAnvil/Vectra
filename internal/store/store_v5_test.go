@@ -94,8 +94,10 @@ func TestV5RoundTripWithVectors(t *testing.T) {
 	if err := store.Encode(&buf, in); err != nil {
 		t.Fatal(err)
 	}
-	if got := binary.LittleEndian.Uint16(buf.Bytes()[4:6]); got != 5 {
-		t.Fatalf("version = %d, want 5", got)
+	// v6 is a version-only bump over this v5 layout (retained-WAL tripwire,
+	// 2026-10-22 plan Task 1): the stamp moved to 6, the bytes did not.
+	if got := binary.LittleEndian.Uint16(buf.Bytes()[4:6]); got != 6 {
+		t.Fatalf("version = %d, want 6", got)
 	}
 	// ruling #2 pinned on the wire: the decl blob physically precedes the
 	// node section (external v5 readers rely on the byte order, not just on
@@ -155,8 +157,8 @@ func TestV5HoistsFloat64Props(t *testing.T) {
 	if err := store.Encode(&v5, in); err != nil {
 		t.Fatal(err)
 	}
-	if got := binary.LittleEndian.Uint16(v5.Bytes()[4:6]); got != 5 {
-		t.Fatalf("version = %d, want 5", got)
+	if got := binary.LittleEndian.Uint16(v5.Bytes()[4:6]); got != 6 { // version-only v6 bump; layout is still v5's
+		t.Fatalf("version = %d, want 6", got)
 	}
 	if v4 := writeV4(t, in); len(v5.Bytes()) >= len(v4) {
 		t.Errorf("v5 = %d bytes >= v4 = %d bytes: hoisting must shrink the stream", len(v5.Bytes()), len(v4))
@@ -217,15 +219,15 @@ func TestV4StillReadable(t *testing.T) {
 	}
 }
 
-// TestProbeVersion: the header-only probe recognizes v4 and v5 files; a bad
-// magic (or a header too short to hold one) errors.
+// TestProbeVersion: the header-only probe recognizes the written v6 product
+// and v4 files; a bad magic (or a header too short to hold one) errors.
 func TestProbeVersion(t *testing.T) {
 	var buf bytes.Buffer
 	if err := store.Encode(&buf, store.Data{}); err != nil {
 		t.Fatal(err)
 	}
-	if v, err := store.ProbeVersion(bytes.NewReader(buf.Bytes())); err != nil || v != 5 {
-		t.Fatalf("probe v5 = %d, %v; want 5, nil", v, err)
+	if v, err := store.ProbeVersion(bytes.NewReader(buf.Bytes())); err != nil || v != 6 {
+		t.Fatalf("probe v6 = %d, %v; want 6, nil", v, err)
 	}
 	if v, err := store.ProbeVersion(bytes.NewReader(writeV4(t, store.Data{}))); err != nil || v != 4 {
 		t.Fatalf("probe v4 = %d, %v; want 4, nil", v, err)
@@ -238,10 +240,11 @@ func TestProbeVersion(t *testing.T) {
 	}
 }
 
-// TestUnsupportedVersionFails: a v6 header hard-fails with the dispatch
-// error — old readers never misread a newer layout.
+// TestUnsupportedVersionFails: a v7 header hard-fails with the dispatch
+// error — old readers never misread a newer layout. (v6 was this test's
+// forged version until the retained-WAL tripwire made it real: store_v6_test.go.)
 func TestUnsupportedVersionFails(t *testing.T) {
-	data := []byte("VCTR\x06\x00" + "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+	data := []byte("VCTR\x07\x00" + "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
 	_, err := store.Decode(bytes.NewReader(data))
 	if err == nil || !strings.Contains(err.Error(), "unsupported version") {
 		t.Fatalf("err = %v, want unsupported version", err)

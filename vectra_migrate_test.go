@@ -90,8 +90,8 @@ func TestMigrateV4LibraryOnOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ver := headSnapshot(t, db); ver != store.VersionV5 {
-		t.Fatalf("head snapshot version after Open = %d, want 5", ver)
+	if _, ver := headSnapshot(t, db); ver != 6 { // v6 tripwire (2026-10-22 plan Task 1)
+		t.Fatalf("head snapshot version after Open = %d, want 6", ver)
 	}
 	// Migration is transparent to reads: the sealed snapshot rows (keys
 	// n00..n23 + plain) and the replayed tail (n24..n31) all answer.
@@ -138,14 +138,14 @@ func TestFreshLibraryHasV5Tripwire(t *testing.T) {
 		t.Fatal(err)
 	}
 	p, ver := headSnapshot(t, db)
-	if ver != store.VersionV5 {
-		t.Fatalf("fresh head %s version = %d, want 5 (tripwire must exist before Close)", p, ver)
+	if ver != 6 { // v6 tripwire (2026-10-22 plan Task 1): fresh seals stamp 6
+		t.Fatalf("fresh head %s version = %d, want 6 (tripwire must exist before Close)", p, ver)
 	}
 	if err := g.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, ver := headSnapshot(t, db); ver != store.VersionV5 {
-		t.Fatalf("post-Close head version = %d, want 5", ver)
+	if _, ver := headSnapshot(t, db); ver != 6 {
+		t.Fatalf("post-Close head version = %d, want 6", ver)
 	}
 }
 
@@ -164,8 +164,8 @@ func TestMigrationIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Precondition: the first Open itself migrated the head (no Close yet).
-	if _, ver := headSnapshot(t, db); ver != store.VersionV5 {
-		t.Fatalf("head version after first Open = %d, want 5", ver)
+	if _, ver := headSnapshot(t, db); ver != 6 { // v6 tripwire (2026-10-22 plan Task 1)
+		t.Fatalf("head version after first Open = %d, want 6", ver)
 	}
 	if err := g.Close(); err != nil {
 		t.Fatal(err)
@@ -214,8 +214,8 @@ func TestMigratedLibRejectedByV4Decode(t *testing.T) {
 	// The migration product is the head Open left on disk — before any
 	// Close, whose own checkpoint would write v5 regardless.
 	snapPath, ver := headSnapshot(t, db)
-	if ver != store.VersionV5 {
-		t.Fatalf("migrated head version = %d, want 5 (Open alone must produce it)", ver)
+	if ver != 6 { // v6 tripwire (2026-10-22 plan Task 1): migration products stamp 6
+		t.Fatalf("migrated head version = %d, want 6 (Open alone must produce it)", ver)
 	}
 	raw, err := os.ReadFile(snapPath)
 	if err != nil {
@@ -227,7 +227,9 @@ func TestMigratedLibRejectedByV4Decode(t *testing.T) {
 	}
 	// ...and hard-fails on an unknown version byte instead of misreading it.
 	forged := append([]byte(nil), raw...)
-	binary.LittleEndian.PutUint16(forged[4:6], store.VersionV5+1)
+	// v6 is a real supported version since the 2026-10-22 Task 1 tripwire;
+	// v7 is the unknown-header proxy now.
+	binary.LittleEndian.PutUint16(forged[4:6], store.VersionV5+2)
 	if _, err := store.Decode(bytes.NewReader(forged)); err == nil {
 		t.Fatal("Decode must hard-fail on an unknown snapshot version (version dispatch)")
 	}
@@ -250,8 +252,8 @@ func TestMigrationRetainsV4Artifact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ver := headSnapshot(t, db); ver != store.VersionV5 {
-		t.Fatalf("head snapshot version after Open = %d, want 5", ver)
+	if _, ver := headSnapshot(t, db); ver != 6 { // v6 tripwire (2026-10-22 plan Task 1)
+		t.Fatalf("head snapshot version after Open = %d, want 6", ver)
 	}
 	// The pre-migration watermark (fixture manifest names v-2.db) survives as
 	// a rollback artifact whose bytes still probe v4, while the successful
@@ -326,8 +328,8 @@ func TestMigrationCrashBeforeSealRecovers(t *testing.T) {
 	if n := g.Stats().Nodes; n != 33 {
 		t.Fatalf("nodes after crash-recovery migration = %d, want 33", n)
 	}
-	if _, ver := headSnapshot(t, db); ver != store.VersionV5 {
-		t.Fatalf("head version after crash-recovery migration = %d, want 5", ver)
+	if _, ver := headSnapshot(t, db); ver != 6 { // v6 tripwire (2026-10-22 plan Task 1)
+		t.Fatalf("head version after crash-recovery migration = %d, want 6", ver)
 	}
 	if _, err := os.Stat(bak); err != nil {
 		t.Fatalf("rollback artifact must survive the retried migration: %v", err)

@@ -1,7 +1,8 @@
 // Package store implements Vectra's single-file binary snapshot. Under the
 // small-graph all-in-memory assumption the disk only serves crash recovery:
 // whole-graph rewrite, rebuild CSR/SCC on load, no incremental WAL.
-// Format v5 (little-endian): "VCTR" | u16 version(5) | u32 node count | u32 edge count |
+// Layout (v5, still current under the v6 stamp; little-endian):
+// "VCTR" | u16 version(6) | u32 node count | u32 edge count |
 // u32 vector-decl count | decl JSON string* | node{ key string, label string, props JSON }* |
 // edge{ srcKey, dstKey, label, props }* | u32 indexKey count | key string* |
 // u32 float count | float32 LE* | u32 CRC32(IEEE, covering all preceding bytes).
@@ -17,8 +18,12 @@
 // it, Load-based services such as vectra-mcp -snapshot lose every lookup
 // index). v4 (vector decls trailing, vectors in the JSON channel), v3, v2
 // (no indexKey section) and v1 (additionally no CRC trailer) remain
-// readable; dispatched by header version. Pre-v5 readers hard-fail on the
-// version byte instead of misreading the layout.
+// readable; dispatched by header version. Pre-v6 readers hard-fail on the
+// version byte instead of misreading the layout. v6 is a VERSION-ONLY bump
+// over v5 (byte layout identical): the retained-WAL checkpoint chain keeps
+// the base snapshot on disk while WAL segments carry the increments, and a
+// v0.11.1 binary would silently load only that base — the v6 stamp makes it
+// hard-fail on the version byte instead of losing the retained segments.
 package store
 
 import (
@@ -36,6 +41,7 @@ import (
 
 const (
 	magic         = "VCTR"
+	versionV6     = 6 // version-only bump over v5: retained-WAL checkpoint tripwire (see package doc)
 	versionV5     = 5 // declarations-first layout + shared binary float32 section
 	versionV4     = 4 // adds the vector index declaration section (trailing)
 	versionV3     = 3
@@ -44,9 +50,11 @@ const (
 	headerSize    = 6 // magic(4) + version(2); count fields start after this
 )
 
-// VersionV5 exports the current snapshot version: vectra.Open probes the
-// recovered head's version to decide the v5 migration / fresh tripwire seal
-// (spec 2026-10-21 §1.3).
+// VersionV5 exports the v5 baseline of the Open-time migration gate: vectra.Open
+// probes the recovered head's version and seals anything below it (spec
+// 2026-10-21 §1.3). Encode stamps v6 (a version-only bump over v5); v6 heads
+// pass this gate untouched, and the migration chain to v6 is Task 5 of the
+// 2026-10-22 checkpoint plan.
 const VersionV5 = versionV5
 
 // Node / Edge use string keys rather than internal NodeIDs: the snapshot is
@@ -154,11 +162,13 @@ func writeProps(w io.Writer, props map[string]any) error {
 	return err
 }
 
-// Encode writes the whole graph to w in v5 format: the vector-declaration
-// section precedes the nodes (ruling #2) and declared vector props hoist out
-// of the JSON channel into one shared trailing float32 section (ruling #1);
-// the CRC trailer covers everything. Pre-v5 readers hard-fail on the version
-// byte instead of misreading the layout (same downgrade line as v4).
+// Encode writes the whole graph to w stamped v6 (byte-identical to the v5
+// layout — the version-only retained-WAL tripwire, see package doc): the
+// vector-declaration section precedes the nodes (ruling #2) and declared
+// vector props hoist out of the JSON channel into one shared trailing
+// float32 section (ruling #1); the CRC trailer covers everything. Pre-v6
+// readers hard-fail on the version byte instead of misreading the layout
+// (same downgrade line as v4 -> v5).
 func Encode(w io.Writer, d Data) error {
 	cw := &crcWriter{bw: bufio.NewWriter(w)}
 	var head [4]byte
@@ -166,7 +176,7 @@ func Encode(w io.Writer, d Data) error {
 	if _, err := cw.Write(head[:]); err != nil {
 		return err
 	}
-	if err := binary.Write(cw, binary.LittleEndian, uint16(versionV5)); err != nil {
+	if err := binary.Write(cw, binary.LittleEndian, uint16(versionV6)); err != nil {
 		return err
 	}
 	if err := putU32(cw, uint32(len(d.Nodes))); err != nil {
@@ -401,7 +411,7 @@ func Decode(r io.Reader) (Data, error) {
 	ver := binary.LittleEndian.Uint16(raw[4:6])
 	body := raw
 	switch ver {
-	case versionV5, versionV4, versionV3, versionV2:
+	case versionV6, versionV5, versionV4, versionV3, versionV2:
 		body = raw[:len(raw)-4]
 		want := binary.LittleEndian.Uint32(raw[len(raw)-4:])
 		if got := crc32.ChecksumIEEE(body); got != want {
