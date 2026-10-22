@@ -43,6 +43,8 @@ type Result struct {
 // three-source property lookups for pattern anchoring, and adjacency rows
 // (with the empty-delta CSR fast path). The root facade implements it over
 // one immutable generation; engine.View supplies the row half structurally.
+// Sources may optionally also implement rowSink (below): the buffer-reuse
+// form of Rows that keeps the view-path expansion allocation-free.
 type Source interface {
 	NodeCount() int
 	NodeInfo(id uint32) (engine.NodeRec, bool)
@@ -54,6 +56,14 @@ type Source interface {
 	LookupBool(key string, value bool) ([]uint32, bool)
 	FastAdjacency(dir int) (csr.Adjacency, bool)
 	Rows(u uint32, dir int) []csr.AdjRow
+}
+
+// rowSink is Source's optional buffer-reuse surface: sources that can
+// append their adjacency rows into a caller-owned buffer implement it (the
+// root facade does, over engine.View.RowsInto). directions() fills its
+// executor scratch through it; sources without it keep the Rows copy path.
+type rowSink interface {
+	RowsInto(u uint32, dir int, buf []csr.AdjRow) []csr.AdjRow
 }
 
 // Run parses and executes q against the sealed snapshot (the merged-base
@@ -161,6 +171,16 @@ type executor struct {
 	depths []uint32
 	gen    []uint32
 	genNow uint32
+	// view-path expansion scratch (directions' row accessors): rowBuf feeds
+	// RowsInto (or the Rows copy for sink-less sources); the zip slices are
+	// what the accessors return, valid only until the executor's next
+	// accessor call — both call sites (expand's fixed-hop loop,
+	// reachableWithin's BFS) consume them inline. One executor per
+	// Run/RunView call keeps this per-query, per-goroutine: no locks.
+	rowBuf  []csr.AdjRow
+	rowTg   []uint32
+	rowEids []uint32
+	rowLbs  []uint32
 }
 
 // The three-source dispatch helpers: RunView's source answers, Run's
@@ -263,7 +283,35 @@ func (ex *executor) matchRows(m *MatchClause) ([]row, error) {
 	return rows, nil
 }
 
+// dedupPairwiseMax is the batch size below which dedupRows compares rows
+// pairwise instead of building string keys: small expansion batches (the
+// common shape) dedup with zero allocations — the key path spent ~9 allocs
+// per row on Sprintf/Join (3 strings per binding), which dominated the
+// view-path query budget. Above it, the map path's O(n) beats O(n²).
+const dedupPairwiseMax = 64
+
+// dedupRows drops exact duplicates (same frontier position and identical
+// node/edge bindings), keeping first occurrences in order. Small batches
+// compare pairwise against the kept prefix — allocation-free and exactly
+// the seen-key semantics, since a row IS its bindings (dedupKey encodes
+// nothing else); large batches keep the string-key map.
 func dedupRows(rows []row) []row {
+	if len(rows) <= dedupPairwiseMax {
+		out := rows[:0]
+		for _, r := range rows {
+			dup := false
+			for j := range out {
+				if sameRow(out[j], r) {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				out = append(out, r)
+			}
+		}
+		return out
+	}
 	seen := make(map[string]bool, len(rows))
 	out := rows[:0]
 	for _, r := range rows {
@@ -274,6 +322,25 @@ func dedupRows(rows []row) []row {
 		}
 	}
 	return out
+}
+
+// sameRow is full binding-tuple equality (the pairwise form of dedupKey:
+// same position, same node bindings, same edge bindings).
+func sameRow(a, b row) bool {
+	if a.pos != b.pos || len(a.nodes) != len(b.nodes) || len(a.edges) != len(b.edges) {
+		return false
+	}
+	for k, v := range a.nodes {
+		if bv, ok := b.nodes[k]; !ok || bv != v {
+			return false
+		}
+	}
+	for k, v := range a.edges {
+		if bv, ok := b.edges[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
 }
 
 // runPath evaluates one path pattern against the incoming rows (empty for
@@ -392,6 +459,9 @@ func intersectIDs(a, b []uint32) []uint32 {
 // nodePred is a node pattern's own predicate: label equality plus property-map
 // equality (numbers compared after normalization). The pseudo-props "key" and
 // "label" read the node's identity fields, shadowing any same-named property.
+// The identity fields compare WITHOUT boxing into any: the anchor scan runs
+// nodePred once per node per pattern, and string boxing there was ~100
+// allocs/query on the view path (zero-row MATCH baseline).
 func (ex *executor) nodePred(np *NodePattern, id uint32) bool {
 	rec, ok := ex.nodeInfo(id)
 	if !ok {
@@ -401,17 +471,22 @@ func (ex *executor) nodePred(np *NodePattern, id uint32) bool {
 		return false
 	}
 	for k, want := range np.Props {
-		var got any
-		var present bool
+		var match bool
 		switch k {
 		case "key":
-			got, present = rec.Key, true
+			// litEq on a string reduces to want being the same string; the
+			// unboxed form must stay equivalent (a numeric want is a
+			// definite mismatch).
+			ws, isStr := want.(string)
+			match = isStr && rec.Key == ws
 		case "label":
-			got, present = rec.Label, true
+			ws, isStr := want.(string)
+			match = isStr && rec.Label == ws
 		default:
-			got, present = rec.Props[k]
+			got, present := rec.Props[k]
+			match = present && litEq(got, want)
 		}
-		if !present || !litEq(got, want) {
+		if !match {
 			return false
 		}
 	}
@@ -523,19 +598,29 @@ func (ex *executor) expand(rows []row, ep *EdgePattern, np *NodePattern) ([]row,
 
 // directions returns the adjacency-row accessors for the edge direction.
 // On the CSR fast path (adjF/adjR set) these are the plain slice-zip Row
-// closures; on the three-source path each call zips the View's AdjRow slice
-// into the parallel arrays the expansion loops consume.
+// closures; on the three-source path each accessor zips the View's AdjRow
+// slice into the parallel arrays the expansion loops consume — through
+// executor scratch filled via the source's optional rowSink (a Rows copy
+// for sources without it), so steady state allocates nothing per expanded
+// node (TestDirectionsZeroAllocSteadyState). The returned slices are that
+// scratch: valid only until the executor's next accessor call, which both
+// call sites honor by consuming rows inline before the next pass.
 func (ex *executor) directions(dir int) []func(uint32) ([]uint32, []uint32, []uint32) {
 	viewRow := func(d int) func(uint32) ([]uint32, []uint32, []uint32) {
+		sink, canSink := ex.src.(rowSink) // resolved once per accessor, not per node
 		return func(u uint32) ([]uint32, []uint32, []uint32) {
-			rows := ex.src.Rows(u, d)
-			tg := make([]uint32, len(rows))
-			eids := make([]uint32, len(rows))
-			lbs := make([]uint32, len(rows))
-			for i, r := range rows {
-				tg[i], eids[i], lbs[i] = r.Target, r.EdgeID, r.LabelID
+			if canSink {
+				ex.rowBuf = sink.RowsInto(u, d, ex.rowBuf)
+			} else {
+				ex.rowBuf = append(ex.rowBuf[:0], ex.src.Rows(u, d)...)
 			}
-			return tg, eids, lbs
+			ex.rowTg, ex.rowEids, ex.rowLbs = ex.rowTg[:0], ex.rowEids[:0], ex.rowLbs[:0]
+			for _, r := range ex.rowBuf {
+				ex.rowTg = append(ex.rowTg, r.Target)
+				ex.rowEids = append(ex.rowEids, r.EdgeID)
+				ex.rowLbs = append(ex.rowLbs, r.LabelID)
+			}
+			return ex.rowTg, ex.rowEids, ex.rowLbs
 		}
 	}
 	if ex.src != nil && !ex.fastAdj {
