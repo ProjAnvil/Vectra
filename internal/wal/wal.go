@@ -217,12 +217,19 @@ type WAL struct {
 	lsn     uint64 // last assigned LSN
 
 	baseLSN  uint64 // from manifest: frames with lsn <= this are skipped on replay
-	startSeg int    // from manifest: segments below this number are ignored
+	startSeg int    // first segment of the live chain: recovery floors here, and a light checkpoint copies it into manifest RetainFrom
 
 	// bytes counts VALID frame bytes across the lineage since the last
 	// Reset (preallocated zero tails are not frames). Atomic so Size is
 	// safe to call from any goroutine; only the single writer mutates it.
 	bytes atomic.Int64
+
+	// retained counts the same frames as bytes but NEVER resets on Rotate —
+	// it is the summed valid frame bytes of the whole live chain (retained
+	// segments and current segment alike), i.e. the replay volume the next
+	// recovery pays. Only Reset (the compacting form, which deletes the
+	// chain) zeroes it. Atomic for the same reason as bytes.
+	retained atomic.Int64
 }
 
 // --- manifest --------------------------------------------------------------
@@ -446,6 +453,7 @@ func Open(dir string, mode Mode) (*WAL, error) {
 	// Walk the contiguous, salt-continuous chain of valid segments to find
 	// the write head. Anything past the first break is tail damage.
 	prev := -1
+	firstSeg := -1
 	var (
 		head       *segScan
 		headSeg    int
@@ -468,6 +476,9 @@ func Open(dir string, mode Mode) (*WAL, error) {
 		if prev >= 0 && sc.salt != head.salt+1 {
 			break
 		}
+		if prev < 0 {
+			firstSeg = s // first segment the walk accepted = live-chain head
+		}
 		prev = s
 		head, headSeg = &sc, s
 		chainBytes += sc.valid
@@ -483,7 +494,9 @@ func Open(dir string, mode Mode) (*WAL, error) {
 		if w.lsn < w.baseLSN {
 			w.lsn = w.baseLSN // manifest ahead of the files: never reuse an LSN
 		}
+		w.startSeg = firstSeg // tighten the manifest floor to the first LIVE segment
 		w.bytes.Store(chainBytes)
+		w.retained.Store(chainBytes)
 		return w, nil
 	}
 
@@ -497,6 +510,7 @@ func Open(dir string, mode Mode) (*WAL, error) {
 	if err := w.createSegment(n, uint32(n), w.baseLSN+1); err != nil {
 		return nil, err
 	}
+	w.startSeg = n // the fresh segment is the whole live chain
 	return w, nil
 }
 
@@ -616,6 +630,7 @@ func (w *WAL) writeFrame(typ byte, payload []byte) (uint64, error) {
 	}
 	w.off += int64(len(frame))
 	w.bytes.Add(int64(len(frame)))
+	w.retained.Add(int64(len(frame)))
 	w.lsn++
 	if w.mode == ModeAlways {
 		if err := w.f.Sync(); err != nil {
@@ -774,6 +789,8 @@ func (w *WAL) Reset(baseLSN uint64) error {
 	}
 	w.lsn = baseLSN
 	w.bytes.Store(0) // the checkpoint owns everything logged so far
+	w.retained.Store(0)
+	w.startSeg = newSeg // the chain restarts at the fresh segment; everything older is deleted below
 	segs, err := listSegments(w.dir)
 	if err != nil {
 		return err
@@ -798,7 +815,9 @@ func (w *WAL) Reset(baseLSN uint64) error {
 // so LSN continuity, the recovery salt chain and torn-tail discipline are
 // exactly a Reset's. bytes zeroes because the checkpoint boundary now owns
 // the volume logged so far — the volume trigger must restart from the new
-// segment. The caller persists the v2 manifest after Rotate returns.
+// segment — while retained keeps counting (see RetainedBytes: the chain-wide
+// replay volume survives the rotation, and the compaction trigger reads it).
+// The caller persists the v2 manifest after Rotate returns.
 func (w *WAL) Rotate() error {
 	if w.f == nil {
 		return ErrClosed
@@ -828,12 +847,34 @@ func (w *WAL) LastLSN() uint64 { return w.lsn }
 func (w *WAL) Segment() int { return w.segment }
 
 // Size reports the valid frame bytes logged since the last checkpoint
-// (Reset, or Rotate's light form): the input for volume-triggered
+// boundary (Reset, or Rotate's light form): the input for volume-triggered
 // checkpoints (spec §4's "WAL ≥4MB" trigger). Preallocated zero tails never
-// count; recovery initializes it from the scanned segment chain's valid
-// prefix — with a retained chain that is the whole RetainFrom..head window,
-// which never understates the pending replay volume.
+// count. NOTE: after an in-process Rotate this restarts at zero even though
+// the retained chain is still on disk — callers that need the whole live
+// chain's replay volume (compaction triggers) must read RetainedBytes
+// instead, never Size.
 func (w *WAL) Size() int64 { return w.bytes.Load() }
+
+// RetainedBytes reports the summed valid frame bytes across the live chain —
+// every segment from FirstSegment() to the head, retained and current alike —
+// which is exactly the replay volume the next recovery pays. Unlike Size(),
+// an in-process Rotate does not reset it (the retained chain keeps counting),
+// so a compaction trigger reading RetainedBytes can never be fooled into
+// never firing by a sequence of light checkpoints. Only Reset (the compacting
+// form, which deletes the chain) zeroes it, and recovery initializes it from
+// the same walk that parks the head. Segment marker frames count (recovery's
+// walk counts them too; the overshoot is one small marker per segment, which
+// errs toward earlier compaction — the safe side).
+func (w *WAL) RetainedBytes() int64 { return w.retained.Load() }
+
+// FirstSegment reports the first segment of the live chain: the value a light
+// checkpoint copies into manifest RetainFrom. It is maintained by recovery
+// (the first segment Open's walk accepted — never a manifest floor naming an
+// already-deleted segment) and by Reset (the chain restarts at the fresh
+// segment); Rotate and in-segment rollovers never change it. 0 means the
+// chain starts at segment 0 — inexpressible as RetainFrom (the v1 sentinel),
+// which is one reason a lineage's first checkpoint must compact.
+func (w *WAL) FirstSegment() int { return w.startSeg }
 
 // --- frame codec -------------------------------------------------------------
 

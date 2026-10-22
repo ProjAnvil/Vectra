@@ -506,7 +506,12 @@ func TestCheckpointUsesWatermarkSnapshots(t *testing.T) {
 		t.Fatal("Close must never write the session path in place (that is the crash-window hazard)")
 	}
 
-	// The next checkpoint rolls the watermark and deletes the previous one.
+	// The next checkpoint is LIGHT (v0.11.2 retained-WAL tiering): the first
+	// Close above compacted a real checkpoint (lsn 2 > 0, v6 base, under the
+	// compaction threshold), so the second Close only rotates the WAL and
+	// rewrites the manifest — the watermark and snapshot stay at the compact
+	// boundary, and the increment lives in the retained segment chain the
+	// manifest's RetainFrom anchors.
 	g2 := mustOpen(t, db, vectra.ModeAlways)
 	g2.AddNode("c", "Svc", nil)
 	if err := g2.Close(); err != nil {
@@ -516,11 +521,23 @@ func TestCheckpointUsesWatermarkSnapshots(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("manifest after second Close: ok=%v err=%v", ok, err)
 	}
-	if man2.Snapshot != "graph-3.db" || man2.LSN != man1.LSN+1 {
-		t.Fatalf("manifest2 = %+v, want snapshot graph-3.db at lsn %d", man2, man1.LSN+1)
+	if man2.Snapshot != man1.Snapshot || man2.LSN != man1.LSN {
+		t.Fatalf("manifest2 = %+v, want the compact boundary held (snapshot %q at lsn %d)",
+			man2, man1.Snapshot, man1.LSN)
+	}
+	if man2.RetainFrom <= 0 || man2.Format != 2 {
+		t.Fatalf("manifest2 = %+v, want a manifest-v2 retained chain (RetainFrom>0, Format 2)", man2)
 	}
 	if n := countWatermarkSnapshots(t, dir, "graph"); n != 1 {
 		t.Fatalf("watermark snapshots after second checkpoint = %d, want exactly the current one", n)
+	}
+	// The retained chain still carries node c to the next recovery.
+	g3 := mustOpen(t, db, vectra.ModeAlways)
+	if g3.NodeCount() != 3 {
+		t.Fatalf("recovered nodes = %d, want 3 across the retained chain", g3.NodeCount())
+	}
+	if err := g3.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -571,12 +588,17 @@ func TestCheckpointCrashWindowParallelNotDoubled(t *testing.T) {
 		t.Fatalf("recovered parallel edges = %d, want exactly 2 (no double-apply)", n)
 	}
 
-	// The next checkpoint overwrites the stale window file and cleans up.
+	// The next Close is a LIGHT checkpoint (v0.11.2): it rotates the WAL and
+	// rewrites the manifest but runs no stale-watermark cleanup — the window
+	// file graph-<lsn>.db survives until the next COMPACT-tier checkpoint
+	// (forced by the retained-bytes threshold; see
+	// TestCompactionAbsorbsRetained). Recovery is unaffected meanwhile: the
+	// manifest never names the stale file.
 	if err := g3.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if n := countWatermarkSnapshots(t, dir, "graph"); n != 1 {
-		t.Fatalf("watermark snapshots after cleanup = %d, want 1", n)
+	if n := countWatermarkSnapshots(t, dir, "graph"); n != 2 {
+		t.Fatalf("watermark snapshots after light close = %d, want 2 (current + stale window file)", n)
 	}
 }
 

@@ -57,6 +57,13 @@ const (
 // 2026-10-22 checkpoint plan.
 const VersionV5 = versionV5
 
+// VersionV6 exports the v6 tripwire version (2026-10-22 checkpoint plan): a
+// light checkpoint keeps the base snapshot alive under a manifest v2, so the
+// base's version byte is the ONLY hard downgrade gate — vectra's checkpoint
+// tiering probes it to decide whether a light checkpoint is expressible at
+// all (pre-v6 bases must recompact).
+const VersionV6 = versionV6
+
 // Node / Edge use string keys rather than internal NodeIDs: the snapshot is
 // decoupled from ID assignment order and rebuilt on load. props serialize to
 // JSON (numbers become float64 on roundtrip, a known limitation — see the

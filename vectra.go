@@ -1618,8 +1618,10 @@ func (g *Graph) Batch(fn func(*Graph)) error {
 //     session that never Closed): recovery starts from an empty graph and
 //     replays every frame — the WAL is the source of truth.
 //
-// Close checkpoints (merge → SaveFile → manifest → WAL reset); a checkpoint
-// failure returns an error and keeps the WAL for the next recovery attempt.
+// Close checkpoints (tiered, v0.11.2: light rotation under the compaction
+// threshold, full merge → SaveFile → manifest → WAL reset otherwise); a
+// checkpoint failure returns an error and keeps the WAL for the next
+// recovery attempt.
 func Open(path string, opts Options) (*Graph, error) {
 	if opts.WALMode == ModeOff {
 		// v0.6 behavior: snapshot-only. Existing file loads merged; a missing
@@ -1859,20 +1861,28 @@ func retainLegacyArtifact(path string, ver uint16) {
 	}
 }
 
-// Close ends a session. With a WAL attached, Close is a mandatory checkpoint:
-// flush pending frames + fsync → merge → SaveFile(<dbPath minus ext>-<lsn>.db)
-// → manifest (atomically pointing at that watermark) → WAL reset → delete
-// older watermark snapshots.
+// Close ends a session. With a WAL attached, Close is a mandatory checkpoint
+// in whichever tier checkpoint() picks (v0.11.2): the first checkpoint of a
+// lineage, any pre-v6 base, and every library whose retained chain reached
+// DefaultCompactBytes take the COMPACT tier — merge → SaveFile(<dbPath minus
+// ext>-<lsn>.db) → manifest → forest → WAL reset (deletes the retained chain)
+// → old-watermark cleanup — while every later Close under the threshold takes
+// the LIGHT tier: WAL rotate + manifest-v2 rewrite, no snapshot write, no
+// merge (the in-memory layer stack already answers post-Close queries; the
+// retained chain carries the increment on disk).
 //
 // Failure semantics:
 //   - before the manifest lands, any failure returns the error WITHOUT
 //     deleting the WAL — the next Open recovers from it, and Close can be
-//     retried (merge and SaveFile are safe on an already-merged graph);
-//   - once the manifest has landed the checkpoint is committed: later
-//     failures (segment rollover, fd close) are surfaced but the session is
-//     already closed, so a retry is a clean no-op — it can never wedge;
-//   - a WAL handle that died mid-checkpoint (wal.ErrClosed from Sync/Reset/
-//     Close) is treated as benign: the manifest gates the un-reset segments.
+//     retried (merge and SaveFile are safe on an already-merged graph; a
+//     retried light Close at worst leaves one extra empty segment, which
+//     recovery chain-continues into);
+//   - once the manifest has landed the checkpoint is committed and the
+//     session is marked closed: later failures (segment deletion, fd close)
+//     are surfaced but a retry is a clean no-op — it can never wedge;
+//   - a WAL handle that died mid-checkpoint (wal.ErrClosed from Sync/Rotate/
+//     Reset/Close) is treated as benign: the manifest gates the un-reset
+//     segments.
 //
 // Append/fsync failure discipline (see the op-recorder comment): if a frame
 // Append ever returned an error, the caller must retry the flush (Batch/
@@ -1906,43 +1916,32 @@ func (g *Graph) Close() error {
 	if err := g.wal.Sync(); err != nil && !errors.Is(err, wal.ErrClosed) {
 		return err
 	}
-	lsn := g.wal.LastLSN()
-	if err := g.forceMerge(); err != nil {
+	compact, man, err := g.compactTier()
+	if err != nil {
 		return err
 	}
-	snap := g.snapshotFile(lsn)
-	if err := g.SaveFile(snap); err != nil {
-		return err
-	}
-	if err := wal.WriteManifest(g.walDir, wal.Manifest{
-		Snapshot: filepath.Base(snap),
-		Segment:  g.wal.Segment(),
-		LSN:      lsn,
-	}); err != nil {
-		return err
-	}
-	// Forest cache, checkpoint-batch discipline as in checkpoint(). Placed
-	// before the committed marker: a failure here keeps Close retryable and
-	// loses nothing — the WAL survives until the Reset below, and a stale
-	// cache only costs the next Open one gate check.
-	if err := g.writeVecForest(lsn); err != nil {
+	if compact {
+		// The compact tier exports the merged view: fold first (SaveFile can
+		// merge on demand, but the merge also re-densifies IDs and drops the
+		// endpoint registry — the v0.11.1 Close contract).
+		if err := g.forceMerge(); err != nil {
+			return err
+		}
+		if err := g.compactCheckpoint(g.wal.LastLSN()); err != nil {
+			return err
+		}
+	} else if err := g.lightCheckpoint(man); err != nil {
 		return err
 	}
 	// The manifest has landed: this checkpoint is committed. From here on a
 	// failure is surfaced but must never leave the session retryable-but-
 	// unwritable — mark closed so a retry is a clean no-op.
 	g.closed.Store(true)
-	if err := g.wal.Reset(lsn); err != nil && !errors.Is(err, wal.ErrClosed) {
-		g.wal.Close()
-		g.wal = nil
-		return err
-	}
 	if err := g.wal.Close(); err != nil && !errors.Is(err, wal.ErrClosed) {
 		g.wal = nil
 		return err
 	}
 	g.wal = nil
-	g.cleanupSnapshots(filepath.Base(snap))
 	return nil
 }
 
@@ -2282,15 +2281,16 @@ func (g *Graph) forceMerge() error {
 }
 
 // Seal is an explicit merge: unmerged layers fold into a fresh immutable
-// base (IDs may be renumbered, R1) and — when a WAL is attached — a
-// checkpoint follows (watermark snapshot + manifest + WAL reset). Idempotent:
-// on an already-merged graph it is at most a checkpoint. Writes after Seal
-// are legal (they open a new generation); this method no longer makes the
-// graph read-only. Seal is a write-path method guarded by the writer
-// discipline: in wrapper mode it must run on the writer goroutine (debug
-// builds return ErrNotWriter otherwise), and concurrent-safe only via the
-// writer handle or single-goroutine discipline — it rebuilds writer-private
-// state.
+// base (IDs may be renumbered, R1) and — when a WAL is attached — a tiered
+// checkpoint follows (v0.11.2: light rotation under the compaction
+// threshold, full watermark snapshot + WAL reset otherwise — see
+// checkpoint). Idempotent: on an already-merged graph it is at most a
+// checkpoint. Writes after Seal are legal (they open a new generation); this
+// method no longer makes the graph read-only. Seal is a write-path method
+// guarded by the writer discipline: in wrapper mode it must run on the
+// writer goroutine (debug builds return ErrNotWriter otherwise), and
+// concurrent-safe only via the writer handle or single-goroutine
+// discipline — it rebuilds writer-private state.
 func (g *Graph) Seal() error {
 	if err := g.checkWriter(); err != nil {
 		return err
@@ -2311,22 +2311,122 @@ func (g *Graph) Seal() error {
 
 // Compact is the explicit compaction entry point (spec §6): fold every
 // unmerged layer into a fresh immutable base and — when a WAL is attached —
-// checkpoint (watermark snapshot + manifest + WAL reset). Spec §3.1's
-// "deep compaction renumbering" is absorbed by the merge itself: folding
-// already rebuilds node and edge IDs densely (R1), so Compact runs the
-// exact same pipeline as Seal and the two are semantically equivalent.
-// Like Seal it is a write-path method guarded by the writer discipline
-// (ErrNotWriter off-writer in debug builds): concurrent-safe only via the
-// writer handle or single-goroutine discipline — it rebuilds
-// writer-private state.
+// run the COMPACT checkpoint tier unconditionally (v6 watermark snapshot +
+// manifest + forest + WAL reset deleting the retained chain), whatever the
+// retained volume: the caller asked for a full checkpoint, not a rotation.
+// Spec §3.1's "deep compaction renumbering" is absorbed by the merge itself:
+// folding already rebuilds node and edge IDs densely (R1). Seal differs only
+// in its checkpoint tiering (light under the compaction threshold); the
+// merge halves are the same pipeline. Like Seal it is a write-path method
+// guarded by the writer discipline (ErrNotWriter off-writer in debug
+// builds): concurrent-safe only via the writer handle or single-goroutine
+// discipline — it rebuilds writer-private state.
 func (g *Graph) Compact() error {
-	return g.Seal()
+	if err := g.checkWriter(); err != nil {
+		return err
+	}
+	if g.wal != nil {
+		if err := g.flushPending(); err != nil {
+			return err
+		}
+	}
+	if err := g.forceMerge(); err != nil {
+		return err
+	}
+	if g.wal == nil {
+		return nil
+	}
+	return g.compactCheckpoint(g.wal.LastLSN())
 }
 
-// checkpoint persists the merged state: watermark snapshot + atomic manifest
-// + forest cache + WAL reset + old-watermark cleanup. The WAL stays open for
-// the session.
+// DefaultCompactBytes is the retained-WAL volume at which a checkpoint flips
+// from the light tier (O(1): WAL rotate + manifest rewrite) to the compacting
+// tier (full v6 snapshot + retained-chain deletion + forest). The bound
+// exists for RECOVERY, not for the write path: every retained byte is a byte
+// the next Open must replay, so an unbounded chain would trade checkpoint
+// latency for unbounded restart cost. 256MB follows the RocksDB
+// max_total_wal_size precedent of capping total WAL volume to bound recovery;
+// shrinking it trades checkpoint pauses for faster restarts, growing it the
+// reverse.
+const DefaultCompactBytes int64 = 256 << 20
+
+// compactBytes is the runtime copy of DefaultCompactBytes. It is a var (not
+// the const itself) purely so the internal test suite can force the
+// compacting tier on tiny libraries; production code never writes it.
+var compactBytes = DefaultCompactBytes
+
+// checkpoint persists the session durably in one of two tiers (v0.11.2):
+//
+//   - light: Rotate the WAL and rewrite the manifest (v2, RetainFrom>0) so
+//     recovery widens its replay to the retained chain — O(1): no snapshot,
+//     no forest, no cleanup. The manifest's Snapshot/LSN stay AT THE COMPACT
+//     BOUNDARY: the LSN watermark is the only application gate, and moving it
+//     forward without a fresh base would silently drop every frame in
+//     between. The retained segment chain IS the increment.
+//   - compact: the full v0.11.1 pipeline — v6 watermark snapshot, manifest
+//     (v1-shaped: RetainFrom cleared, Format 2), forest cache, Reset (which
+//     deletes the retained chain), old-watermark cleanup.
+//
+// The compact tier is forced when (a) no manifest-named snapshot exists yet —
+// the FIRST checkpoint of a lineage must compact because RetainFrom 0 is the
+// v1 sentinel and a retained chain is then inexpressible; a boundary LSN of 0
+// means only the byte-one tripwire seal's empty base exists, so the first
+// user checkpoint still compacts; (b) the named base is not a store-v6
+// snapshot — a pre-v6 base kept alive under a manifest v2 is the silent-loss
+// downgrade hazard (a pre-0.11.2 binary ignores RetainFrom and reads the base
+// alone), so migration and tripwire seals always compact; or (c) the live
+// chain's retained bytes have reached the compaction threshold, bounding the
+// recovery replay volume.
 func (g *Graph) checkpoint(lsn uint64) error {
+	compact, man, err := g.compactTier()
+	if err != nil {
+		return err
+	}
+	if compact {
+		return g.compactCheckpoint(lsn)
+	}
+	return g.lightCheckpoint(man)
+}
+
+// compactTier decides the next checkpoint's tier. The CURRENT on-disk
+// manifest — the exact bytes recovery would read — is the single source for
+// the compact boundary the light tier must carry unchanged (Snapshot/LSN) and
+// for the base-snapshot name whose store version gates light eligibility.
+func (g *Graph) compactTier() (compact bool, man wal.Manifest, err error) {
+	man, ok, err := wal.ReadManifest(g.walDir)
+	if err != nil {
+		return false, man, err
+	}
+	if !ok || man.Snapshot == "" || man.LSN == 0 || !g.snapshotIsV6(man) ||
+		g.wal.RetainedBytes() >= compactBytes {
+		return true, man, nil
+	}
+	return false, man, nil
+}
+
+// snapshotIsV6 reports whether the manifest-named base snapshot is a store-v6
+// file — the hard downgrade tripwire. A light checkpoint keeps the base, so
+// it is legal only over v6: an older base under a manifest v2 is silently
+// lossy for pre-0.11.2 binaries (they ignore RetainFrom and open the base
+// alone), so v1-v5 bases force the compacting tier, which rewrites the base
+// as v6. Any probe failure also forces compaction — the compact tier rewrites
+// the base and self-heals.
+func (g *Graph) snapshotIsV6(man wal.Manifest) bool {
+	f, err := os.Open(filepath.Join(filepath.Dir(g.dbPath), man.Snapshot))
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	v, err := store.ProbeVersion(f)
+	return err == nil && v == store.VersionV6
+}
+
+// compactCheckpoint is the full-snapshot tier: SaveFile (v6) → manifest →
+// forest → Reset (deletes the retained chain only now, after the manifest
+// landed — a crash before the manifest leaves the old base plus the old
+// retained chain fully replayable) → old-watermark cleanup. Order and failure
+// semantics are exactly the v0.11.1 pipeline, retargeted at manifest v2.
+func (g *Graph) compactCheckpoint(lsn uint64) error {
 	snap := g.snapshotFile(lsn)
 	if err := g.SaveFile(snap); err != nil {
 		return err
@@ -2335,6 +2435,7 @@ func (g *Graph) checkpoint(lsn uint64) error {
 		Snapshot: filepath.Base(snap),
 		Segment:  g.wal.Segment(),
 		LSN:      lsn,
+		Format:   2, // RetainFrom stays 0: omitempty renders a v1-shaped file
 	}); err != nil {
 		return err
 	}
@@ -2350,6 +2451,32 @@ func (g *Graph) checkpoint(lsn uint64) error {
 	}
 	g.cleanupSnapshots(filepath.Base(snap))
 	return nil
+}
+
+// lightCheckpoint is the O(1) tier: Rotate FIRST, manifest second. A crash in
+// between leaves the old manifest plus one empty extra segment — recovery
+// chain-continues into it, parks the head, and loses nothing (the rotated
+// segment's marker fsyncs before Rotate returns, so the chain never breaks).
+// The manifest keeps the compact boundary's Snapshot/LSN, names the NEW
+// current segment, and anchors the retained chain at the first live segment
+// the WAL recovered/created. Nothing else is written: no snapshot, no
+// forest, no cleanup.
+func (g *Graph) lightCheckpoint(man wal.Manifest) error {
+	retainFrom := g.wal.FirstSegment()
+	// A dead WAL handle (wal.ErrClosed from Rotate) is benign, exactly as it
+	// is for Reset in the compact tier: the manifest rewrite below is still
+	// correct — Segment names the same head, the chain on disk is unchanged —
+	// and it is what gates recovery.
+	if err := g.wal.Rotate(); err != nil && !errors.Is(err, wal.ErrClosed) {
+		return err
+	}
+	return wal.WriteManifest(g.walDir, wal.Manifest{
+		Snapshot:   man.Snapshot,    // the compact boundary — unchanged
+		LSN:        man.LSN,         // the application watermark — unchanged
+		Segment:    g.wal.Segment(), // the NEW current (post-rotate) segment
+		RetainFrom: retainFrom,
+		Format:     2,
+	})
 }
 
 // ---- snapshot I/O -------------------------------------------------------------

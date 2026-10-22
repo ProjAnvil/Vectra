@@ -503,6 +503,12 @@ func TestForestDiscardClasses(t *testing.T) {
 
 	t.Run("last index dropped", func(t *testing.T) {
 		db, _, _ := build(t)
+		// v0.11.2 tiering: this Close is the library's SECOND checkpoint
+		// (build's Close compacted the first), so it would take the LIGHT
+		// tier — which writes no forest and runs no stale-cache removal (the
+		// declaration gate discards the file at the next Open anyway). The
+		// removal contract belongs to the compact tier, so force it here.
+		forceCompactTier(t)
 		g, err := Open(db, Options{WALMode: ModeAlways})
 		if err != nil {
 			t.Fatal(err)
