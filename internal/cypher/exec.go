@@ -141,7 +141,10 @@ type row struct {
 // own* helpers restore isolation exactly where a write actually happens.
 // Both the source and the child are marked shared so a later write on
 // either side copies first — siblings and parent never observe each
-// other's bindings.
+// other's bindings. (In practice every executor call site clones from a
+// transient copy — a range-loop copy or a value-receiver pass — so the
+// parent side is protected by the never-mutate-after-clone row
+// discipline above, not by the receiver-side flagging.)
 func (r *row) clone() row {
 	if r.nodes != nil {
 		r.nodesShared = true

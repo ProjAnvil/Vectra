@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-10-22
+
+Checkpoint goes O(1): the retained-WAL incremental chain replaces the
+full snapshot on every seal, wrapper-mode vector ingestion and Close
+stop paying the O(N) snapshot tax, and Close no longer blocks on the
+vector drain. Full data: `docs/benchmarks/2026-10-22-v0112-checkpoint.md`.
+
+### Performance
+
+- Interruptible vector drain at Close: `drainVectors` now checks quit
+  at chunk boundaries, so shutdown waits at most one in-flight chunk
+  (vector convergence stays lazy per spec D10 - a reopen resumes it in
+  the background). Wrapper Close 39.2s -> 3.0s on the slow reference
+  box [9c8c8fb].
+- Cypher copy-on-write row bindings: `row.clone()` shares the parent's
+  binding maps and copies exactly once, lazily, at the first write
+  (anonymous expansion 243 -> 177 allocs/query; join-branch clones are
+  free) [4c7ddd3].
+
+### Added
+
+- O(1) light checkpoints - the retained-WAL incremental chain. A
+  checkpoint now rotates the WAL (`wal.Rotate`) and rewrites the
+  manifest (v2 `RetainFrom` names the first retained segment) instead
+  of writing a snapshot; recovery replays base + retained chain + live
+  tail. Compaction (the full-snapshot tier) fires at 256MiB of
+  retained bytes, bounding recovery replay volume. Wrapper
+  default-config vector ingestion 10.2k/s -> **27.4k/s**, seal stall
+  p50 119.8ms -> **10.8ms** (a WAL-segment rotation, not a snapshot),
+  Close 7.4-9.8s -> **~1s**; gate-2b lines and the 100k restart
+  parity (498ms load vs 7m39.1s rebuild, 922.9x) held.
+
+### Changed
+
+- Store snapshots stamp **v6** (version-only bump; layout identical)
+  and the WAL manifest is v2. v0.11.1 and older binaries hard-fail on
+  v6 bases - libraries checkpointed by v0.11.2 cannot be downgraded
+  (same discipline as v5). v4/v5 libraries migrate in place on first
+  open (the pre-migration watermark snapshot is retained as a
+  `<watermark>-v<version>.bak` artifact); fresh libraries write a v6
+  tripwire from byte one. Downgrade-before-migration is safe; after,
+  not.
+
 ## [0.11.1] - 2026-10-22
 
 ### Performance
@@ -78,7 +121,9 @@ loads in 455ms where it used to rebuild for 7m19s. Reference docs:
   that v0.10 followers hard-fail to restore. Upgrade all nodes
   together (stop-the-world, or all followers before the leader).
 
-[Unreleased]: https://github.com/projanvil/vectra/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/projanvil/vectra/compare/v0.11.2...HEAD
+[0.11.2]: https://github.com/projanvil/vectra/compare/v0.11.1...v0.11.2
+[0.11.1]: https://github.com/projanvil/vectra/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/projanvil/vectra/compare/v0.10.0...v0.11.0
 
 ## [0.10.0] - 2026-10-20
