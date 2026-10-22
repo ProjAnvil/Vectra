@@ -1,7 +1,9 @@
 // Package wal implements Vectra's embedded logical write-ahead log.
 //
 // Layout: segments live at <dir>/wal-<N>.log with N strictly increasing
-// (numbers never wrap; a Reset allocates N+1 and deletes everything older).
+// (numbers never wrap; a Reset allocates N+1 and deletes everything older,
+// while a Rotate allocates N+1 and keeps the older segments as the retained
+// increment chain a manifest-v2 RetainFrom anchors).
 // Every segment starts with a Marker frame carrying the segment's salt (the
 // number of segment creations before it in this lineage — it increments on
 // every rollover and Reset) and the LSN its first Changeset frame will carry.
@@ -184,6 +186,22 @@ type Manifest struct {
 	Snapshot string `json:"snapshot"` // snapshot file name (basename)
 	Segment  int    `json:"segment"`  // current segment at checkpoint time
 	LSN      uint64 `json:"lsn"`      // last LSN contained in the snapshot
+	// RetainFrom is the manifest-v2 increment anchor: the first live
+	// retained segment of the chain a light checkpoint (Rotate) left behind.
+	// A light checkpoint writes no snapshot — the retained chain IS the
+	// increment over the still-named Snapshot — so recovery must scan from
+	// RetainFrom while the LSN watermark still gates application. 0/absent
+	// keeps v1 semantics (Segment is the scan floor); a compacting
+	// checkpoint (Reset) clears it, which omitempty renders as a v1-shaped
+	// file. Callers must keep the first checkpoint after any lineage start
+	// compacting, or the chain's head (segment 0) is inexpressible here.
+	RetainFrom int `json:"retainFrom,omitempty"`
+	// Format marks the writer generation: 2 = retained-WAL checkpoints
+	// (v0.11.2+), 0/absent = v1. Advisory/diagnostic only — the hard
+	// downgrade tripwire is the snapshot's store version (v6), not this
+	// field: an old binary that ignores both new fields reads the v6 base
+	// and fails there instead of silently losing the increment.
+	Format int `json:"format,omitempty"`
 }
 
 // WAL is an append-only logical log. Single writer, no internal
@@ -408,6 +426,17 @@ func Open(dir string, mode Mode) (*WAL, error) {
 		return nil, err
 	} else if ok {
 		w.baseLSN, w.startSeg = man.LSN, man.Segment
+		// Manifest v2: a light checkpoint kept every older segment, so the
+		// salt-continuous chain to recover starts at RetainFrom, below the
+		// active Segment. Widening the floor only ADDS segments to the
+		// scanned set — the baseLSN watermark still refuses frames the
+		// checkpoint already contains, so application behavior is gated
+		// exactly as in v1. The >0 guard (not a bare min) is what keeps a
+		// v1 manifest's zero field from flooring the scan at segment 0 and
+		// resurrecting deleted pre-checkpoint segments.
+		if man.RetainFrom > 0 && man.RetainFrom < w.startSeg {
+			w.startSeg = man.RetainFrom
+		}
 	}
 	segs, err := listSegments(dir)
 	if err != nil {
@@ -759,6 +788,28 @@ func (w *WAL) Reset(baseLSN uint64) error {
 	return nil
 }
 
+// Rotate starts a fresh segment (salt+1, marker base lsn+1) and KEEPS every
+// older segment on disk: the retained segment chain is the incremental
+// checkpoint a manifest-v2 RetainFrom anchor names — replaying it over the
+// last full snapshot reproduces state without writing one (the O(1) light
+// checkpoint; recovery cost is bounded by the caller's compaction trigger
+// over the retained bytes instead). Reset stays the compacting form and
+// remains the only deleter; Rotate differs from it solely by not deleting,
+// so LSN continuity, the recovery salt chain and torn-tail discipline are
+// exactly a Reset's. bytes zeroes because the checkpoint boundary now owns
+// the volume logged so far — the volume trigger must restart from the new
+// segment. The caller persists the v2 manifest after Rotate returns.
+func (w *WAL) Rotate() error {
+	if w.f == nil {
+		return ErrClosed
+	}
+	if err := w.createSegment(w.segment+1, w.salt+1, w.lsn+1); err != nil {
+		return err
+	}
+	w.bytes.Store(0)
+	return nil
+}
+
 // Close releases the segment file handle (idempotent). It does not fsync —
 // callers checkpoint first.
 func (w *WAL) Close() error {
@@ -777,9 +828,11 @@ func (w *WAL) LastLSN() uint64 { return w.lsn }
 func (w *WAL) Segment() int { return w.segment }
 
 // Size reports the valid frame bytes logged since the last checkpoint
-// (Reset): the input for volume-triggered checkpoints (spec §4's "WAL ≥4MB"
-// trigger). Preallocated zero tails never count; recovery initializes it
-// from the segment chain's valid prefix.
+// (Reset, or Rotate's light form): the input for volume-triggered
+// checkpoints (spec §4's "WAL ≥4MB" trigger). Preallocated zero tails never
+// count; recovery initializes it from the scanned segment chain's valid
+// prefix — with a retained chain that is the whole RetainFrom..head window,
+// which never understates the pending replay volume.
 func (w *WAL) Size() int64 { return w.bytes.Load() }
 
 // --- frame codec -------------------------------------------------------------
