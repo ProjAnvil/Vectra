@@ -189,37 +189,47 @@ func TestCypherConcurrentViewTail(t *testing.T) {
 		t.Skip("measurement run")
 	}
 	g := cypherLayeredGraph(t, 2000, 512)
-	q := `MATCH (a {key:'0'})-[:CALLS]->(b) RETURN b.key`
-	if _, err := g.Cypher(q); err != nil {
-		t.Fatal(err)
+	queries := []string{
+		`MATCH (a {key:'0'})-[:CALLS]->(b) RETURN b.key`,
+		// Var-length: thousands of expansions per query — the regime
+		// where per-node allocation churn turned into allocator
+		// contention on the BFS row path (f50d0d0 evidence).
+		`MATCH (a {key:'0'})-[:CALLS*1..3]->(b) RETURN b.key`,
+	}
+	for _, q := range queries {
+		if _, err := g.Cypher(q); err != nil {
+			t.Fatal(err)
+		}
 	}
 	const workers = 16
 	per := 300
-	var wg sync.WaitGroup
-	lat := make([][]time.Duration, workers)
-	start := time.Now()
-	for w := 0; w < workers; w++ {
-		lat[w] = make([]time.Duration, 0, per)
-		wg.Add(1)
-		go func(w int) {
-			defer wg.Done()
-			for i := 0; i < per; i++ {
-				s := time.Now()
-				if _, err := g.Cypher(q); err != nil {
-					t.Error(err)
-					return
+	for qi, q := range queries {
+		var wg sync.WaitGroup
+		lat := make([][]time.Duration, workers)
+		start := time.Now()
+		for w := 0; w < workers; w++ {
+			lat[w] = make([]time.Duration, 0, per)
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				for i := 0; i < per; i++ {
+					s := time.Now()
+					if _, err := g.Cypher(q); err != nil {
+						t.Error(err)
+						return
+					}
+					lat[w] = append(lat[w], time.Since(s))
 				}
-				lat[w] = append(lat[w], time.Since(s))
-			}
-		}(w)
+			}(w)
+		}
+		wg.Wait()
+		all := make([]time.Duration, 0, workers*per)
+		for _, l := range lat {
+			all = append(all, l...)
+		}
+		sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
+		t.Logf("cypher view-path q=%d w=%d n=%d wall=%s p50=%s p99=%s max=%s",
+			qi+1, workers, len(all), time.Since(start).Round(time.Millisecond),
+			all[len(all)/2], all[len(all)*99/100], all[len(all)-1])
 	}
-	wg.Wait()
-	all := make([]time.Duration, 0, workers*per)
-	for _, l := range lat {
-		all = append(all, l...)
-	}
-	sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
-	t.Logf("cypher view-path w=%d n=%d wall=%s p50=%s p99=%s max=%s",
-		workers, len(all), time.Since(start).Round(time.Millisecond),
-		all[len(all)/2], all[len(all)*99/100], all[len(all)-1])
 }

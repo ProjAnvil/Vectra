@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-10-22
+
+### Performance
+
+- Cypher view-path expansion is allocation-free: the last gap from the
+  row-path zero-alloc work (2026-10-19) — the cypher `directions` zip —
+  now reuses per-executor scratch via the same rowSink pattern (1-hop
+  MATCH at fan 32: 545 → 244 allocs/query, -55%; the expansion accessor
+  itself holds a steady-state zero-allocation pin). Two semantics-neutral
+  companions landed with it: pseudo-property predicate comparison without
+  boxing, and a pairwise fast path for row deduplication under 64 rows.
+  Concurrent-cypher tail and M-w16 mixed numbers:
+  docs/benchmarks/2026-10-22-cypher-zero-alloc.md.
+
 ## [0.11.0] - 2026-10-21
 
 Vector Phase 2: vectors ride a binary WAL/store channel, the HNSW
