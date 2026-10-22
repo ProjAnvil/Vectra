@@ -2,6 +2,7 @@ package cypher
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 
@@ -116,28 +117,70 @@ func runStatement(ex *executor, ast *Query) (*Result, error) {
 }
 
 // row is one binding tuple plus the pattern's frontier position (the node
-// the next edge segment expands from).
+// the next edge segment expands from). Binding maps are copy-on-write:
+// clone() shares them and both sides are flagged, and a map is copied
+// exactly once, lazily, by the ownNodes/ownEdges helpers below. Hard
+// constraint: a row's maps are mutated ONLY through those helpers, and
+// never after the row has been stored into a row set or cloned from —
+// every mutation site (extendNode, expand's edge binding, runPath's
+// cartesian anchor) writes only freshly cloned rows.
 type row struct {
 	pos   uint32
 	nodes map[string]uint32 // node var -> node ID
 	edges map[string]uint32 // edge var -> edge ID
+	// shared flags: the corresponding map is aliased by another row (set on
+	// BOTH sides by clone). Zero value false = exclusively owned, which is
+	// the state of every freshly constructed row.
+	nodesShared bool
+	edgesShared bool
 }
 
-func (r row) clone() row {
-	nr := row{pos: r.pos}
+// clone returns a row sharing r's binding maps copy-on-write. The eager
+// deep copy cost 2 map allocs per row on every expand/branch (fan-32
+// 1-hop queries paid it 33x per query); sharing removes that, and the
+// own* helpers restore isolation exactly where a write actually happens.
+// Both the source and the child are marked shared so a later write on
+// either side copies first — siblings and parent never observe each
+// other's bindings.
+func (r *row) clone() row {
 	if r.nodes != nil {
-		nr.nodes = make(map[string]uint32, len(r.nodes)+1)
-		for k, v := range r.nodes {
-			nr.nodes[k] = v
-		}
+		r.nodesShared = true
 	}
 	if r.edges != nil {
-		nr.edges = make(map[string]uint32, len(r.edges)+1)
-		for k, v := range r.edges {
-			nr.edges[k] = v
-		}
+		r.edgesShared = true
 	}
-	return nr
+	return row{
+		pos:         r.pos,
+		nodes:       r.nodes,
+		edges:       r.edges,
+		nodesShared: r.nodes != nil,
+		edgesShared: r.edges != nil,
+	}
+}
+
+// ownNodes makes r's node map safe to mutate: a shared map is copied once
+// (this row keeps the private copy; every other holder keeps the original,
+// unmodified), a nil map is created fresh. Allocation-free when the row
+// already owns a non-nil map.
+func (r *row) ownNodes() {
+	if r.nodesShared {
+		m := make(map[string]uint32, len(r.nodes)+1)
+		maps.Copy(m, r.nodes)
+		r.nodes, r.nodesShared = m, false
+	} else if r.nodes == nil {
+		r.nodes = make(map[string]uint32, 1)
+	}
+}
+
+// ownEdges is ownNodes for the edge map.
+func (r *row) ownEdges() {
+	if r.edgesShared {
+		m := make(map[string]uint32, len(r.edges)+1)
+		maps.Copy(m, r.edges)
+		r.edges, r.edgesShared = m, false
+	} else if r.edges == nil {
+		r.edges = make(map[string]uint32, 1)
+	}
 }
 
 // dedupKey identifies a row: named bindings plus the frontier position, so
@@ -374,9 +417,7 @@ func (ex *executor) runPath(pat *PathPattern, base []row) ([]row, error) {
 				r := b.clone()
 				r.pos = id
 				if first.Var != "" {
-					if r.nodes == nil {
-						r.nodes = map[string]uint32{}
-					}
+					r.ownNodes() // COW: siblings share b's map until first write
 					r.nodes[first.Var] = id
 				}
 				rows = append(rows, r)
@@ -570,9 +611,7 @@ func (ex *executor) expand(rows []row, ep *EdgePattern, np *NodePattern) ([]row,
 						if prev, dup := nr.edges[ep.Var]; dup && prev != eids[i] {
 							continue // repeated edge var must agree
 						}
-						if nr.edges == nil {
-							nr.edges = map[string]uint32{}
-						}
+						nr.ownEdges() // COW: siblings share r's map until first write
 						nr.edges[ep.Var] = eids[i]
 					}
 					out = append(out, nr)
@@ -654,9 +693,7 @@ func (r row) extendNode(np *NodePattern, id uint32) (row, bool) {
 	nr := r.clone()
 	nr.pos = id
 	if np.Var != "" {
-		if nr.nodes == nil {
-			nr.nodes = map[string]uint32{}
-		}
+		nr.ownNodes() // COW: sibling extensions share r's map until first write
 		nr.nodes[np.Var] = id
 	}
 	return nr, true

@@ -79,21 +79,40 @@ func TestCypherViewPathAllocs(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	// Evidence: 545 allocs/query pre-fix (fan 32). Post-fix: 244. The
-	// expansion row path is buffer-reused (rowSink + executor scratch, the
-	// f50d0d0 pattern) and two further view-path allocators are gone (the
-	// anchor scan's per-candidate string boxing in nodePred, ~100/query;
-	// the dedup key's per-row Sprintf/Join churn, ~9/row, now pairwise).
-	// The exact remaining shape is base 53 (parse 33 + anchor/plumbing) +
-	// 6 per result row: 2 clone-map mechanics (intermediate binding maps),
-	// 1 result map + 1 boxed cell (the public Result contract:
-	// []map[string]any), ~2 map-insert mechanics. A bound of 120 would
-	// require eliminating the per-row binding-map clones or the result
-	// contract itself — both outside this hotfix; bound leaves margin over
-	// the measured post-fix floor.
+	// Evidence: 545 allocs/query pre-f50d0d0; 244 after the row-path reuse
+	// and boxing fixes; 244 after COW bindings too — the NAMED end node of
+	// this query keeps exactly one copied binding map per row (hmap+bucket
+	// = 2 allocs), now allocated at first write instead of at clone. The
+	// COW win shows in the anonymous variant below: 243 -> 177.
+	// Decomposition (measured): base 31 (parse + anchor + plumbing) +
+	// per result row: 2 for the copied binding map (named hops only),
+	// 2 for the result map + 1 boxed cell (the public Result contract:
+	// []map[string]any), plus slice-growth mechanics. A bound below ~200
+	// for the named shape would require dropping the per-row binding map
+	// or the result contract itself.
 	t.Logf("cypher 1-hop view-path allocs/query = %.1f (fan 32)", n)
-	if n > 280 {
-		t.Fatalf("allocs = %v, want <= 280 (expansion rows must be buffer-reused; per-row cost is binding/result maps)", n)
+	if n > 260 {
+		t.Fatalf("allocs = %v, want <= 260 (named hops: one copied binding map + result contract per row)", n)
+	}
+
+	// COW pin: with an ANONYMOUS end node the clone shares the parent's
+	// binding maps and no write happens, so expansion allocates zero
+	// binding maps — per-row cost drops to the result contract only
+	// (243 pre-COW: the eager clone copied the nodes map per row).
+	qAnon := `MATCH (a {key:'0'})-[:CALLS]->() RETURN a.key`
+	for i := 0; i < 3; i++ {
+		if _, err := g.Cypher(qAnon); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nAnon := testing.AllocsPerRun(100, func() {
+		if _, err := g.Cypher(qAnon); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Logf("cypher 1-hop anonymous-end allocs/query = %.1f (fan 32)", nAnon)
+	if nAnon > 200 {
+		t.Fatalf("allocs = %v, want <= 200 (anonymous hops must allocate no binding maps under copy-on-write)", nAnon)
 	}
 }
 
