@@ -34,9 +34,12 @@ const (
 
 var errMergeInjected = errors.New("vectra/writer: injected merge failure")
 
-// merger is the background merge goroutine. It only observes quit BETWEEN
-// flights: an in-flight merge always runs to its resolution, because the
-// writer's drain/Close sequence (and any stalled batch) depends on it.
+// merger is the background merge goroutine. The LANE rules differ: a layer
+// flight (resolveFlight) only observes quit BETWEEN flights - an in-flight
+// merge always runs to its resolution, because the writer's drain/Close
+// sequence (and any stalled batch) depends on it - while the vector lane
+// (drainVectors) additionally polls quit at chunk granularity, so Close is
+// never held hostage by a multi-chunk HNSW backlog (lazy convergence, D10).
 func (h *Handle) merger() {
 	defer close(h.mergerDone)
 	for {
@@ -55,15 +58,42 @@ func (h *Handle) merger() {
 // chunks and swap snapshot heads. Vector convergence is lazy - failures
 // surface as slow convergence only; the overlay plus existing segments
 // keep queries correct (spec 5.2-3).
+//
+// Quit is polled at CHUNK granularity (one Drain(1) per iteration, up to
+// chunksPerWake): Handle.Close's mergerDone join is therefore bounded by
+// at most ONE in-flight chunk pack (~2048-vector HNSW build), never a
+// whole 8-chunk pass. The abandoned backlog is correct and self-healing -
+// queries scan the overlay (spec D10), and restart backfills it through
+// vecKick. Only the LAYER lane (resolveFlight) must run to resolution;
+// the writer's drain/Close sequence depends on that flight, and it stays
+// untouched here.
 func (h *Handle) drainVectors() {
 	const chunksPerWake = 8
 	more := false
 	for _, vi := range h.g.VectorHandles() {
-		if vi.Drain(chunksPerWake) { // one bounded pass per wake; the
-			// re-signal drives continuation so the write-stall wait never
-			// queues behind a full backlog drain (spec D10)
-			more = true
+		// One bounded pass per wake (8 chunks); the re-signal drives
+		// continuation so the write-stall wait never queues behind a full
+		// backlog drain (spec D10). Per-chunk granularity is what makes
+		// the pass interruptible: a quit between passes would still leave
+		// Close waiting out up to 8 in-flight chunk builds.
+		backlog := false
+		for c := 0; c < chunksPerWake; c++ {
+			select {
+			case <-h.quit:
+				return // abandon the backlog: lazy convergence (spec D10)
+			default:
+			}
+			backlog = vi.Drain(1)
+			if !backlog {
+				break // no full chunk pending: this index is drained
+			}
 		}
+		more = more || backlog
+	}
+	select {
+	case <-h.quit:
+		return
+	default:
 	}
 	if more {
 		select {
