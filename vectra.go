@@ -1627,13 +1627,13 @@ func Open(path string, opts Options) (*Graph, error) {
 		// v0.6 behavior: snapshot-only. Existing file loads merged; a missing
 		// file starts a fresh writable graph (durability via Seal+SaveFile).
 		//
-		// No v5 migration here (spec §1.3 scopes it to WAL-mode Opens): Seal
+		// No v6 migration here (spec §1.3 scopes it to WAL-mode Opens): Seal
 		// without a WAL is merge-only — it never writes a snapshot — so an
 		// in-place migration would be a SaveFile behind the caller's back,
 		// changing ModeOff's read-only Open contract. ModeOff also never
 		// replays a WAL, which is where the silent-truncation hazard lives;
-		// Decode reads v1-v5 transparently and any caller-side SaveFile
-		// writes v5 through the same Encode path.
+		// Decode reads v1-v6 transparently and any caller-side SaveFile
+		// writes v6 through the same Encode path.
 		if _, err := os.Stat(path); err == nil {
 			return LoadFile(path)
 		} else if !errors.Is(err, fs.ErrNotExist) {
@@ -1715,11 +1715,11 @@ func Open(path string, opts Options) (*Graph, error) {
 	var g *Graph
 	// snapVer is the store version of the snapshot recovery loads below
 	// (0 = nothing was loaded: fresh library, or WAL-only recovery). Open's
-	// v5/tripwire gate at the end reads it.
+	// v6/tripwire gate at the end reads it.
 	var snapVer uint16
 	// legacySnap is the manifest-named watermark snapshot when one was loaded:
-	// the pre-migration bytes the v5 gate at the end must retain as a rollback
-	// artifact before its Seal's cleanup deletes them ("" otherwise).
+	// the pre-migration bytes the migration gate at the end must retain as a
+	// rollback artifact before its Seal's cleanup deletes them ("" otherwise).
 	var legacySnap string
 	loadSnapshot := func(p string) error {
 		f, err := os.Open(p)
@@ -1793,32 +1793,43 @@ func Open(path string, opts Options) (*Graph, error) {
 	}
 	g.wal, g.walDir, g.dbPath = w, walDir, path
 	g.vecKick() // recovery: replays left every vector in the overlay; drain bottom-up (spec 7.1)
-	// v5 migration + fresh-library tripwire (spec §1.3, rulings #4/#9), at
-	// the END of Open: no writer is attached and no reader holds the graph
-	// yet, so one Seal runs uncontended. The replayed tail may contain v2
-	// (type-4) frames that a v0.10 binary silently truncates, and fresh or
-	// WAL-only recoveries leave no snapshot head at all — folding the
-	// recovered state into a v5 watermark snapshot closes both: old readers
-	// hard-fail on the version byte instead of misreading the layout. The
-	// gate is exact (snapVer==5 ⇒ nothing), so reopening a v5 library is
-	// write-free. A failed seal fails Open — the library must not pretend to
-	// be fine while its head stays downgrade-truncatable; recovery state
-	// survives either way (pre-manifest failures keep the WAL as the source
-	// of truth, a manifest that already landed makes the next Open a clean
-	// v5 no-migration session).
-	if snapVer < store.VersionV5 {
-		// Rollback artifact: the Seal's checkpoint deletes the pre-migration
-		// watermark via cleanupSnapshots — COPY it aside first (the manifest
-		// still names the original until the seal's WriteManifest lands, so a
-		// rename would open a crash window; .bak never matches the cleanup
-		// pattern, and a failed seal keeps the .bak as the artifact). Copy
-		// errors are ignored (best effort, cleanup discipline).
-		retainLegacyArtifact(legacySnap, snapVer)
-		if err := g.Seal(); err != nil {
-			w.Close()
-			return nil, fmt.Errorf("vectra: migrating %s to snapshot v5: %w", path, err)
+		// v6 migration + fresh-library tripwire (spec §1.3, rulings #4/#9;
+		// target lifted v5 -> v6 by the 2026-10-22 retained-WAL checkpoint
+		// plan), at the END of Open: no writer is attached and no reader holds
+		// the graph yet, so one Seal runs uncontended. The replayed tail may
+		// contain v2 (type-4) frames that a v0.10 binary silently truncates,
+		// fresh or WAL-only recoveries leave no snapshot head at all, and — the
+		// v6 reason — a v0.11.1 binary ignores manifest v2's RetainFrom and
+		// would read a light-checkpointed library's base alone, silently
+		// missing the retained chain. Folding the recovered state into a v6
+		// watermark snapshot closes all three: old readers hard-fail on the
+		// version byte instead of misreading the layout. The gate is exact
+		// (snapVer==6 ⇒ nothing), so reopening a v6 library is write-free; v4
+		// AND v5 bases now migrate (v6 is a version-only bump over v5, so a
+		// v5-built library is byte-identical but for the stamp). The migration
+		// seal always takes the COMPACT tier (compactTier forces it on a
+		// non-v6 base), so the product is a real v6 snapshot, never a light
+		// rotation over a stale base. A failed seal fails Open — the library
+		// must not pretend to be fine while its head stays
+		// downgrade-truncatable; recovery state survives either way
+		// (pre-manifest failures keep the WAL as the source of truth, a
+		// manifest that already landed makes the next Open a clean v6
+		// no-migration session).
+		if snapVer < store.VersionV6 {
+			// Rollback artifact: the Seal's checkpoint deletes the pre-migration
+			// watermark via cleanupSnapshots — COPY it aside first (the manifest
+			// still names the original until the seal's WriteManifest lands, so a
+			// rename would open a crash window; .bak never matches the cleanup
+			// pattern, and a failed seal keeps the .bak as the artifact). The
+			// stamp is the ACTUAL pre-version (a v5 migration leaves
+			// <name>-v5.bak), Copy errors are ignored (best effort, cleanup
+			// discipline).
+			retainLegacyArtifact(legacySnap, snapVer)
+			if err := g.Seal(); err != nil {
+				w.Close()
+				return nil, fmt.Errorf("vectra: migrating %s to snapshot v6: %w", path, err)
+			}
 		}
-	}
 	return g, nil
 }
 

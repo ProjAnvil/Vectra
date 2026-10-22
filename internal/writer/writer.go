@@ -55,14 +55,16 @@ type Config struct {
 
 	// CheckpointBytes is spec §4's WAL volume trigger: once the log holds
 	// this many valid frame bytes since the last checkpoint, the writer's
-	// post-batch hook runs the full Seal pipeline (merge + watermark
-	// snapshot + manifest + WAL reset) on the writer goroutine. Queries
-	// stay lock-free throughout; Submits observe a checkpoint-shaped
-	// pause. Default 64 MiB (measured cadence, see withDefaults); negative
-	// disables the volume trigger (explicit Seal/Compact/Close only). A
-	// failed volume checkpoint is sticky: the
-	// error surfaces from Close and the trigger disables itself — an
-	// ailing disk must not turn every batch into a retry storm.
+	// post-batch hook runs Seal on the writer goroutine — the merge always
+	// folds, and the checkpoint is tiered (v0.11.2): a light WAL rotation +
+	// manifest rewrite under vectra.DefaultCompactBytes of retained WAL, the
+	// full v6 watermark snapshot + WAL reset at or above it (or for a
+	// lineage's first checkpoint / pre-v6 base). Queries stay lock-free
+	// throughout; Submits observe a checkpoint-shaped pause. Default 64 MiB
+	// (measured cadence, see withDefaults); negative disables the volume
+	// trigger (explicit Seal/Compact/Close only). A failed volume checkpoint
+	// is sticky: the error surfaces from Close and the trigger disables
+	// itself — an ailing disk must not turn every batch into a retry storm.
 	CheckpointBytes int64
 
 	// MergeDelay is a test injection: the merger sleeps this long between
@@ -261,12 +263,15 @@ func (h *Handle) send(r request) error {
 
 // Close ends the wrapper session: no further Submits are accepted
 // (ErrClosed), queued ones are drained and applied, the final merge +
-// checkpoint run through g.Seal on the writer goroutine, and the writer
-// claim is yielded (direct mode is legal again). The underlying graph is
-// NOT closed — queries stay legal and Graph.Close remains the caller's
-// when the WAL handle should be torn down (Seal already checkpointed, so a
-// following Graph.Close re-checkpoints cheaply). A volume-checkpoint
-// failure recorded mid-session is joined into the returned error.
+// checkpoint run through g.Seal on the writer goroutine (the merge folds
+// unconditionally; the checkpoint tier follows the retained-WAL volume —
+// light under vectra.DefaultCompactBytes), and the writer claim is yielded
+// (direct mode is legal again). The underlying graph is NOT closed —
+// queries stay legal and Graph.Close remains the caller's when the WAL
+// handle should be torn down (Seal already checkpointed, so a following
+// Graph.Close re-checkpoints cheaply — at most one more tiered rotation).
+// A volume-checkpoint failure recorded mid-session is joined into the
+// returned error.
 func (h *Handle) Close() error {
 	h.closeOnce.Do(func() {
 		h.sendMu.Lock()
@@ -304,7 +309,11 @@ func (h *Handle) run() {
 	}
 	// writeCh closed and drained: final merge + checkpoint via g.Seal
 	// (spec ruling: the checkpoint pipeline is Seal's), still on the
-	// writer goroutine so the merge may rebuild writer-private state.
+	// writer goroutine so the merge may rebuild writer-private state. The
+	// checkpoint tier follows the retained-WAL volume (v0.11.2: light
+	// rotation under vectra.DefaultCompactBytes), but Seal's forceMerge is
+	// unconditional — the mirror rebuild and dense renumbering happen in
+	// both tiers before the writer claim is yielded.
 	h.pubMu.Lock()
 	h.finalErr = h.g.Seal()
 	h.pubMu.Unlock()
@@ -413,10 +422,16 @@ func (h *Handle) mergeEdgeThreshold() int {
 
 // volumeCheckpoint implements spec §4's "WAL ≥4MB since last checkpoint"
 // trigger: at or above CheckpointBytes of valid frame bytes the writer runs
-// the full Seal pipeline (flush + merge + watermark snapshot + manifest +
-// WAL reset) on its own goroutine — a checkpoint-shaped write pause that is
-// invisible to lock-free readers. It reports whether a checkpoint ran (so
-// the caller can skip the layer triggers Seal already satisfied).
+// g.Seal on its own goroutine — a checkpoint-shaped write pause that is
+// invisible to lock-free readers. Since v0.11.2 Seal tiers its checkpoint:
+// the merge ALWAYS folds (the writer-private mirrors are rebuilt either
+// way), but the persistence side under vectra.DefaultCompactBytes of
+// retained WAL is LIGHT — WAL rotate + manifest v2 rewrite, O(1), no
+// snapshot file — and only at/above the threshold (or for a lineage's first
+// checkpoint / pre-v6 base) is it the full compact tier: v6 watermark
+// snapshot + manifest + forest + WAL reset deleting the retained chain. It
+// reports whether a checkpoint ran (so the caller can skip the layer
+// triggers Seal already satisfied).
 func (h *Handle) volumeCheckpoint() bool {
 	if h.cfg.CheckpointBytes <= 0 || h.cpOff.Load() {
 		return false

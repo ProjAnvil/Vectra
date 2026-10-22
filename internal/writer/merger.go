@@ -194,8 +194,11 @@ func (h *Handle) sealAttempt(mc *vectra.MergeCapture) (*vectra.MergeResult, erro
 // publish, synchronously (spec ruling 4 — the guarantee that a stall can
 // always be released even when the background merger keeps failing). It
 // never touches the writer-private mirrors (a rebase, not a forceMerge),
-// so ID ratchets keep their continuity; the next full merge (Close/Seal)
-// restores dense renumbering.
+// so ID ratchets keep their continuity; dense renumbering returns at the
+// next g.Seal — the volume checkpoint or the final Close Seal — whose
+// forceMerge runs in BOTH checkpoint tiers (v0.11.2 tiering splits only
+// the persistence side), so a light checkpoint never defers the mirror
+// rebuild.
 func (h *Handle) syncMerge() {
 	h.needSync.Store(false)
 	if h.cfg.GCTune {

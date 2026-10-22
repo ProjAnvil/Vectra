@@ -1,16 +1,19 @@
 package vectra_test
 
-// Migration-on-open to store v5 + fresh-library tripwire (spec
-// 2026-10-21 §1.3, rulings #4/#9). The golden v0.10.0 library under
+// Migration-on-open to store v6 + fresh-library tripwire (spec
+// 2026-10-21 §1.3, rulings #4/#9; target lifted v5 -> v6 by the 2026-10-22
+// retained-WAL checkpoint plan). The golden v0.10.0 library under
 // testdata/legacy-v4 (v4 snapshot + vector-carrying WAL tail) is the
-// migration input, consumed read-only: a WAL-mode Open folds it into a v5
-// watermark snapshot exactly once, and a brand-new library gets an empty v5
-// checkpoint from byte one so a v0.10 downgrade hard-fails at the snapshot
-// instead of silently truncating unknown frames.
+// migration input, consumed read-only: a WAL-mode Open folds it into a v6
+// watermark snapshot exactly once, and a brand-new library gets an empty v6
+// checkpoint from byte one so a v0.11.1-or-older downgrade hard-fails at the
+// snapshot instead of silently reading the base and missing the retained
+// chain.
 
 import (
 	"bytes"
 	"encoding/binary"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"testing"
@@ -78,7 +81,7 @@ func mustStat(t *testing.T, p string) os.FileInfo {
 }
 
 // TestMigrateV4LibraryOnOpen: opening the golden v4 library migrates it in
-// place — the manifest's head becomes a v5 watermark snapshot holding the
+// place — the manifest's head becomes a v6 watermark snapshot holding the
 // folded state of snapshot + WAL tail, reads stay transparent, and a reopen
 // of the migrated library answers vector queries (Review Focus #3).
 func TestMigrateV4LibraryOnOpen(t *testing.T) {
@@ -127,11 +130,13 @@ func TestMigrateV4LibraryOnOpen(t *testing.T) {
 	}
 }
 
-// TestFreshLibraryHasV5Tripwire (ruling #9): a brand-new WAL-mode library
-// carries its v5 checkpoint + manifest from byte one — before any write and
-// before Close — so a v0.10 downgrade opening it hard-fails at the snapshot
-// version byte instead of silently proceeding.
-func TestFreshLibraryHasV5Tripwire(t *testing.T) {
+// TestFreshLibraryHasV6Tripwire (ruling #9, target v6 since the 2026-10-22
+// checkpoint plan): a brand-new WAL-mode library carries its v6 checkpoint +
+// manifest from byte one — before any write and before Close — so a
+// v0.11.1-or-older downgrade opening it hard-fails at the snapshot version
+// byte instead of reading the base alone (the retained-chain silent-loss
+// hazard the v6 tripwire exists for).
+func TestFreshLibraryHasV6Tripwire(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "fresh.db")
 	g, err := vectra.Open(db, vectra.Options{WALMode: vectra.ModeAlways})
 	if err != nil {
@@ -149,7 +154,128 @@ func TestFreshLibraryHasV5Tripwire(t *testing.T) {
 	}
 }
 
-// TestMigrationIdempotent: reopening a migrated (v5-head) library triggers
+// TestMigrationGoesToV6 pins the full migration chain's target (2026-10-22
+// plan Task 5): every WAL-mode Open of a pre-v6 head migrates to a v6
+// watermark snapshot, whatever the input version — v4 through the golden
+// fixture, v5 through a crafted at-rest library (the exact bytes a v0.11.1
+// session leaves). The compacting tier is what makes v6 the mandatory
+// product: a pre-v6 base kept alive under a manifest would be the
+// downgrade silent-loss hazard, so the migration seal never goes light.
+func TestMigrationGoesToV6(t *testing.T) {
+	t.Run("golden v4 library migrates to a v6 head", func(t *testing.T) {
+		dir := t.TempDir()
+		copyTree(t, "testdata/legacy-v4", dir)
+		db := filepath.Join(dir, "v.db")
+		g, err := vectra.Open(db, vectra.Options{WALMode: vectra.ModeAlways})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ver := headSnapshot(t, db); ver != 6 {
+			t.Fatalf("v4 fixture head after Open = v%d, want 6", ver)
+		}
+		if err := g.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, ver := headSnapshot(t, db); ver != 6 {
+			t.Fatalf("v4 fixture head after Open+Close = v%d, want 6", ver)
+		}
+	})
+	t.Run("v5 base migrates to v6 and retains a v5 rollback artifact", func(t *testing.T) {
+		dir := t.TempDir()
+		db := filepath.Join(dir, "lib.db")
+		// Build a library at rest through the real pipeline (fresh Open's
+		// tripwire seal + one compacting Close), then age its head snapshot
+		// down to v5: the library a v0.11.1 session leaves behind.
+		g, err := vectra.Open(db, vectra.Options{WALMode: vectra.ModeAlways})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := g.AddNode("a", "Svc", nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := g.AddNode("b", "Svc", nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Close(); err != nil {
+			t.Fatal(err)
+		}
+		snapPath, ver := headSnapshot(t, db)
+		if ver != 6 {
+			t.Fatalf("precondition: freshly built head = v%d, want 6", ver)
+		}
+		downgradeSnapshotToV5(t, snapPath)
+		if _, ver := headSnapshot(t, db); ver != 5 {
+			t.Fatalf("precondition: downgraded head = v%d, want 5", ver)
+		}
+
+		// Open migrates: the head probes v6, and the pre-migration v5 bytes
+		// survive as the rollback artifact (retainLegacyArtifact stamps the
+		// ACTUAL pre-version — a v5 migration leaves <name>-v5.bak, not v4).
+		g2, err := vectra.Open(db, vectra.Options{WALMode: vectra.ModeAlways})
+		if err != nil {
+			t.Fatalf("Open over a v5 base must migrate in place, not fail: %v", err)
+		}
+		head2, ver := headSnapshot(t, db)
+		if ver != 6 {
+			t.Fatalf("v5 base after Open = v%d at %s, want 6", ver, head2)
+		}
+		bak := snapPath + "-v5.bak"
+		bf, err := os.Open(bak)
+		if err != nil {
+			t.Fatalf("migration left no v5 rollback artifact: %v", err)
+		}
+		bakVer, err := store.ProbeVersion(bf)
+		bf.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bakVer != 5 {
+			t.Fatalf("rollback artifact %s probes v%d, want 5", bak, bakVer)
+		}
+
+		// Migration is transparent and durable: data intact across Close and
+		// a no-second-migration reopen.
+		if n := g2.Stats().Nodes; n != 2 {
+			t.Fatalf("nodes after v5->v6 migration = %d, want 2", n)
+		}
+		if err := g2.Close(); err != nil {
+			t.Fatal(err)
+		}
+		g3, err := vectra.Open(db, vectra.Options{WALMode: vectra.ModeAlways})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := g3.Stats().Nodes; n != 2 {
+			t.Fatalf("nodes after reopen = %d, want 2", n)
+		}
+		if _, ver := headSnapshot(t, db); ver != 6 {
+			t.Fatalf("reopen after migration = v%d, want a stable 6", ver)
+		}
+		if err := g3.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// downgradeSnapshotToV5 rewrites a v6 snapshot file in place as the v5 file
+// a v0.11.1 binary would have written: v6 is a version-only bump (identical
+// layout), so patching the header version back to 5 and re-sealing the CRC
+// trailer yields genuine v5 bytes — the same technique as the store suite's
+// resealAsV5.
+func downgradeSnapshotToV5(t *testing.T, path string) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint16(raw[4:6], 5)
+	binary.LittleEndian.PutUint32(raw[len(raw)-4:], crc32.ChecksumIEEE(raw[:len(raw)-4]))
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestMigrationIdempotent: reopening a migrated (v6-head) library triggers
 // no second seal. The observable is the checkpoint artifacts themselves: a
 // seal rewrites both the head snapshot (SaveFile) and the manifest
 // (WriteManifest) via temp+rename, so unchanged mtime+size across a reopen
@@ -196,11 +322,11 @@ func TestMigrationIdempotent(t *testing.T) {
 
 // TestMigratedLibRejectedByV4Decode pins the downgrade tripwire's mechanism:
 // Decode dispatches on the header version and hard-fails on anything it does
-// not know BEFORE interpreting the layout. The migration product is v5; an
+// not know BEFORE interpreting the layout. The migration product is v6; an
 // old binary is one that knows only older versions — the honest in-process
-// proxy for "old reader" is THIS binary facing a hypothetical v6 header,
-// which exercises the identical dispatch branch a v0.10 binary takes on the
-// v5 product.
+// proxy for "old reader" is THIS binary facing a hypothetical v7 header,
+// which exercises the identical dispatch branch a v0.11.1 binary takes on
+// the v6 product.
 func TestMigratedLibRejectedByV4Decode(t *testing.T) {
 	dir := t.TempDir()
 	copyTree(t, "testdata/legacy-v4", dir)
@@ -212,7 +338,7 @@ func TestMigratedLibRejectedByV4Decode(t *testing.T) {
 	defer g.Close()
 
 	// The migration product is the head Open left on disk — before any
-	// Close, whose own checkpoint would write v5 regardless.
+	// Close, whose own checkpoint would write v6 regardless.
 	snapPath, ver := headSnapshot(t, db)
 	if ver != 6 { // v6 tripwire (2026-10-22 plan Task 1): migration products stamp 6
 		t.Fatalf("migrated head version = %d, want 6 (Open alone must produce it)", ver)
@@ -221,14 +347,14 @@ func TestMigratedLibRejectedByV4Decode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// This binary reads its own v5 product...
+	// This binary reads its own v6 product...
 	if _, err := store.Decode(bytes.NewReader(raw)); err != nil {
-		t.Fatalf("v5 migration product must decode on this binary: %v", err)
+		t.Fatalf("v6 migration product must decode on this binary: %v", err)
 	}
 	// ...and hard-fails on an unknown version byte instead of misreading it.
 	forged := append([]byte(nil), raw...)
 	// v6 is a real supported version since the 2026-10-22 Task 1 tripwire;
-	// v7 is the unknown-header proxy now.
+	// v7 is the unknown-header proxy.
 	binary.LittleEndian.PutUint16(forged[4:6], store.VersionV5+2)
 	if _, err := store.Decode(bytes.NewReader(forged)); err == nil {
 		t.Fatal("Decode must hard-fail on an unknown snapshot version (version dispatch)")

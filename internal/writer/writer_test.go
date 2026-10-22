@@ -14,12 +14,15 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/projanvil/vectra"
+	"github.com/projanvil/vectra/internal/wal"
 	"github.com/projanvil/vectra/internal/writer"
 )
 
@@ -661,10 +664,10 @@ func TestGCTuneSmoke(t *testing.T) {
 }
 
 // TestVolumeCheckpointBoundsWAL: spec §4's WAL volume trigger. With a small
-// CheckpointBytes the writer's post-batch hook runs the full Seal pipeline
-// (merge + watermark + manifest + WAL reset) on its own — no explicit
-// Compact/Close — so the manifest exists and the log drops back under the
-// threshold while the session is still live, and the data survives a reopen.
+// CheckpointBytes the writer's post-batch hook runs Seal on its own — no
+// explicit Compact/Close — so the manifest exists and the log drops back
+// under the threshold while the session is still live, and the data
+// survives a reopen.
 func TestVolumeCheckpointBoundsWAL(t *testing.T) {
 	dir := t.TempDir()
 	db := filepath.Join(dir, "db")
@@ -703,6 +706,163 @@ func TestVolumeCheckpointBoundsWAL(t *testing.T) {
 	}
 	if got := g2.NodeCount(); got != 160 {
 		t.Fatalf("reopened NodeCount = %d, want 160", got)
+	}
+}
+
+// watermarkNames lists the <base>-<lsn>.db checkpoint snapshots next to db
+// (the same name shape the root package's cleanupSnapshots matches).
+func watermarkNames(t *testing.T, db string) []string {
+	t.Helper()
+	prefix := strings.TrimSuffix(filepath.Base(db), filepath.Ext(filepath.Base(db))) + "-"
+	es, err := os.ReadDir(filepath.Dir(db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range es {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".db") {
+			continue
+		}
+		if _, err := strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".db"), 10, 64); err != nil {
+			continue
+		}
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sameNames(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestWrapperLightCheckpoints pins the wrapper's view of Seal's tiered
+// checkpoint (v0.11.2): the wrapper's volume checkpoints flow through
+// g.Seal, whose persistence side is LIGHT under vectra.DefaultCompactBytes —
+// WAL rotate + manifest v2, NO snapshot write — once the lineage's first
+// checkpoint has compacted. Concretely: across several volume checkpoints
+// past a small explicit CheckpointBytes the on-disk watermark set stays
+// frozen, the manifest carries a retained chain (RetainFrom > 0) DURING the
+// session, Close adds no snapshot either, and a reopen recovers every write
+// including those made after the last checkpoint (the retained segments are
+// the increment). The final-Seal merge contract is asserted too: layers fold
+// to zero at Close even though the checkpoint went light — the tier split is
+// persistence-side only, so the writer-private mirror rebuild still ran.
+func TestWrapperLightCheckpoints(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "w.db")
+	const threshold = 8 << 10 // 8 KiB of frames per volume checkpoint
+	g, err := vectra.Open(db, vectra.Options{WALMode: vectra.ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := writer.Attach(g, writer.Config{CheckpointBytes: threshold})
+	if err := h.DeclareVectorIndex(vectra.VectorIndexDecl{Name: "mem", Prop: "emb", Dim: 8, Metric: "cosine"}); err != nil {
+		t.Fatalf("DeclareVectorIndex: %v", err)
+	}
+	submit := func(tag string, n int) {
+		t.Helper()
+		for i := 0; i < n; i++ {
+			v := make([]float32, 8)
+			for j := range v {
+				v[j] = float32(i*8+j) / 64
+			}
+			key := fmt.Sprintf("%s-%04d", tag, i)
+			cs := vectra.Changeset{Nodes: []vectra.NodeUpsert{{
+				Key: key, Label: "m", Props: map[string]any{"emb": v},
+			}}}
+			if err := h.Submit(cs); err != nil {
+				t.Fatalf("Submit %s: %v", key, err)
+			}
+		}
+	}
+
+	// Phase A: push past the threshold until a LIGHT checkpoint has landed —
+	// observable as a manifest carrying RetainFrom > 0, which only the light
+	// tier writes. The lineage's first checkpoint compacts first (the LSN==0
+	// rule), so by then exactly one watermark exists.
+	submit("a", 200)
+	deadline := time.Now().Add(30 * time.Second)
+	var manA wal.Manifest
+	for time.Now().Before(deadline) {
+		if m, ok, err := wal.ReadManifest(db + ".wal"); err == nil && ok && m.RetainFrom > 0 {
+			manA = m
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if manA.RetainFrom == 0 {
+		t.Fatal("no light volume checkpoint fired mid-session (manifest never carried RetainFrom > 0)")
+	}
+	frozen := watermarkNames(t, db)
+	if len(frozen) != 1 {
+		t.Fatalf("after the first compact + light checkpoints: watermarks = %v, want exactly one", frozen)
+	}
+
+	// Phase B: post-checkpoint writes crossing the threshold several more
+	// times. Every further checkpoint is light: the manifest advances its
+	// Segment (rotations happened) while the watermark set never grows.
+	submit("b", 400)
+	var manB wal.Manifest
+	deadline = time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if m, ok, err := wal.ReadManifest(db + ".wal"); err == nil && ok && m.Segment > manA.Segment && m.RetainFrom > 0 {
+			manB = m
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if manB.Segment <= manA.Segment {
+		t.Fatalf("no further light checkpoints after phase A: manifest segment %d (was %d)", manB.Segment, manA.Segment)
+	}
+	if manB.Snapshot != manA.Snapshot || manB.LSN != manA.LSN {
+		t.Fatalf("light checkpoints moved the compact boundary: %+v (was %+v)", manB, manA)
+	}
+	if got := watermarkNames(t, db); !sameNames(got, frozen) {
+		t.Fatalf("light volume checkpoints wrote snapshots: %v (frozen set was %v)", got, frozen)
+	}
+
+	// Close is light too (retained chain far below DefaultCompactBytes): no
+	// new snapshot, but the final Seal's MERGE still folded everything — the
+	// writer-mirror rebuild does not depend on the compact tier.
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := watermarkNames(t, db); !sameNames(got, frozen) {
+		t.Fatalf("light Close wrote a snapshot: %v (frozen set was %v)", got, frozen)
+	}
+	if layers, _ := g.LayerPressure(); layers != 0 {
+		t.Fatalf("layers after light-Close final Seal = %d, want 0 (Seal merges in both tiers)", layers)
+	}
+
+	// Reopen over the retained chain: every write — pre-checkpoint,
+	// checkpointed, and post-checkpoint — plus the declared index recovers.
+	g2, err := vectra.Open(db, vectra.Options{WALMode: vectra.ModeAlways})
+	if err != nil {
+		t.Fatalf("reopen over the retained chain: %v", err)
+	}
+	defer g2.Close()
+	if got := g2.NodeCount(); got != 600 {
+		t.Fatalf("reopened NodeCount = %d, want 600", got)
+	}
+	if _, ok := g2.NodeByKey("b-0399"); !ok {
+		t.Fatal("post-checkpoint write lost across the retained chain")
+	}
+	decls := g2.VectorIndexes()
+	if len(decls) != 1 || decls[0].Name != "mem" || decls[0].Dim != 8 {
+		t.Fatalf("reopened vector decls = %+v, want mem/8", decls)
+	}
+	if _, err := g2.QueryVector("mem", make([]float32, 8), vectra.QueryVectorOptions{K: 3}); err != nil {
+		t.Fatalf("QueryVector after retained-chain recovery: %v", err)
 	}
 }
 
