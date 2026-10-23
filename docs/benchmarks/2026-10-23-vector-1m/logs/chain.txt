@@ -1,0 +1,249 @@
+=== stage chain ===
+Fri Oct 23 16:07:54 CST 2026
+16:07  up 7 days, 20:31, 2 users, load averages: 3.48 4.31 5.29
+--- top CPU consumers ---
+ %CPU      TIME COMM
+ 98.4   1:53.52 spotlightknowledged
+ 90.7   0:03.76 crema
+  7.4 240:01.49 ZCode Helper (Renderer)
+  4.2  24:23.64 Microsoft Edge Helper (Renderer)
+  2.0  85:00.38 launchd
+  0.9  18:01.73 Karabiner-VirtualHIDDevice-Daemon
+  0.8 113:32.61 Microsoft Edge Helper
+--- disk ---
+/dev/disk3s5   1.8Ti   1.4Ti   419Gi    78%     11M  4.4G    0%   /System/Volumes/Data
+--- quiet gate ---
+=== relaunch Fri Oct 23 16:56:13 CST 2026 — gate patience extended to 900min, conditions unchanged ===
+quiet gate passed at 00:15:09 (load=2.71 topcpu=75.3%)
+Sat Oct 24 00:15:09 CST 2026
+=== RUN   TestVector1M
+    vector_1m_test.go:684: == B1: reopen after the build's light Close (stale forest, frozen backlog) ==
+    vector_1m_test.go:685: manifest: snapshot=v-3781.db lsn=3781 segment=95 retainFrom=91 format=2
+    vector_1m_test.go:687: open 6.074s, overlay-at-open=970751
+    vector_1m_test.go:688: B1 stale-forest restart: open=6.074s overlay-at-open=970751 | v.vec 2.80GB (mtime 12:48:11)
+    vector_1m_test.go:691: [stale-forest drain] +1m0s overlay=970751 (initial 970751) window 0.0/s cumulative 0.0/s
+    vector_1m_test.go:691: [stale-forest drain] +2m0s overlay=964607 (initial 970751) window 102.0/s cumulative 51.0/s
+    vector_1m_test.go:691: [stale-forest drain] +3m1s overlay=946175 (initial 970751) window 306.0/s cumulative 136.0/s
+    vector_1m_test.go:691: [stale-forest drain] +4m1s overlay=937983 (initial 970751) window 136.0/s cumulative 136.0/s
+    vector_1m_test.go:691: [stale-forest drain] +5m1s overlay=937983 (initial 970751) window 0.0/s cumulative 108.8/s
+    vector_1m_test.go:691: [stale-forest drain] +6m1s overlay=921599 (initial 970751) window 272.0/s cumulative 136.0/s
+    vector_1m_test.go:691: [stale-forest drain] +7m2s overlay=905215 (initial 970751) window 272.0/s cumulative 155.5/s
+    vector_1m_test.go:691: [stale-forest drain] +8m2s overlay=905215 (initial 970751) window 0.0/s cumulative 136.0/s
+    vector_1m_test.go:691: [stale-forest drain] +9m2s overlay=897023 (initial 970751) window 136.0/s cumulative 136.0/s
+    vector_1m_test.go:691: [stale-forest drain] +10m2s overlay=880639 (initial 970751) window 272.0/s cumulative 149.6/s
+    vector_1m_test.go:691: [stale-forest drain] +11m2s overlay=872447 (initial 970751) window 136.0/s cumulative 148.4/s
+    vector_1m_test.go:691: [stale-forest drain] +12m3s overlay=872447 (initial 970751) window 0.0/s cumulative 136.0/s
+    vector_1m_test.go:691: [stale-forest drain] +13m3s overlay=872447 (initial 970751) window 0.0/s cumulative 125.6/s
+    vector_1m_test.go:691: [stale-forest drain] +14m3s overlay=872447 (initial 970751) window 0.0/s cumulative 116.6/s
+    vector_1m_test.go:691: [stale-forest drain] +15m3s overlay=872447 (initial 970751) window 0.0/s cumulative 108.8/s
+    vector_1m_test.go:691: [stale-forest drain] +16m4s overlay=872447 (initial 970751) window 0.0/s cumulative 102.0/s
+    vector_1m_test.go:691: [stale-forest drain] +17m4s overlay=872447 (initial 970751) window 0.0/s cumulative 96.0/s
+    vector_1m_test.go:691: [stale-forest drain] +18m4s overlay=872447 (initial 970751) window 0.0/s cumulative 90.7/s
+    vector_1m_test.go:691: [stale-forest drain] +19m4s overlay=872447 (initial 970751) window 0.0/s cumulative 85.9/s
+    vector_1m_test.go:691: [stale-forest drain] +20m4s overlay=856063 (initial 970751) window 272.1/s cumulative 95.2/s
+    vector_1m_test.go:691: [stale-forest drain] +21m5s overlay=839679 (initial 970751) window 272.1/s cumulative 103.6/s
+    vector_1m_test.go:691: [stale-forest drain] +22m5s overlay=839679 (initial 970751) window 0.0/s cumulative 98.9/s
+    vector_1m_test.go:691: [stale-forest drain] +23m5s overlay=831487 (initial 970751) window 136.0/s cumulative 100.5/s
+    vector_1m_test.go:691: [stale-forest drain] +24m5s overlay=815103 (initial 970751) window 272.0/s cumulative 107.7/s
+    vector_1m_test.go:691: [stale-forest drain] +25m6s overlay=806911 (initial 970751) window 136.0/s cumulative 108.8/s
+    vector_1m_test.go:691: [stale-forest drain] +26m6s overlay=806911 (initial 970751) window 0.0/s cumulative 104.6/s
+    vector_1m_test.go:691: [stale-forest drain] +27m6s overlay=788479 (initial 970751) window 306.1/s cumulative 112.1/s
+    vector_1m_test.go:691: [stale-forest drain] +28m6s overlay=774143 (initial 970751) window 238.0/s cumulative 116.6/s
+    vector_1m_test.go:691: [stale-forest drain] +29m6s overlay=774143 (initial 970751) window 0.0/s cumulative 112.6/s
+    vector_1m_test.go:691: [stale-forest drain] +30m7s overlay=763903 (initial 970751) window 170.0/s cumulative 114.5/s
+    vector_1m_test.go:691: [stale-forest drain] +31m7s overlay=745471 (initial 970751) window 306.0/s cumulative 120.7/s
+    vector_1m_test.go:691: [stale-forest drain] +32m7s overlay=741375 (initial 970751) window 68.0/s cumulative 119.0/s
+    vector_1m_test.go:691: [stale-forest drain] +33m7s overlay=741375 (initial 970751) window 0.0/s cumulative 115.4/s
+    vector_1m_test.go:691: [stale-forest drain] +34m8s overlay=741375 (initial 970751) window 0.0/s cumulative 112.0/s
+    vector_1m_test.go:691: [stale-forest drain] +35m8s overlay=741375 (initial 970751) window 0.0/s cumulative 108.8/s
+    vector_1m_test.go:691: [stale-forest drain] +36m8s overlay=741375 (initial 970751) window 0.0/s cumulative 105.8/s
+    vector_1m_test.go:691: [stale-forest drain] +37m8s overlay=741375 (initial 970751) window 0.0/s cumulative 102.9/s
+    vector_1m_test.go:691: [stale-forest drain] +38m8s overlay=741375 (initial 970751) window 0.0/s cumulative 100.2/s
+    vector_1m_test.go:691: [stale-forest drain] +39m9s overlay=741375 (initial 970751) window 0.0/s cumulative 97.7/s
+    vector_1m_test.go:691: [stale-forest drain] +40m9s overlay=733183 (initial 970751) window 136.0/s cumulative 98.6/s
+    vector_1m_test.go:691: [stale-forest drain] +41m9s overlay=716799 (initial 970751) window 272.0/s cumulative 102.8/s
+    vector_1m_test.go:691: [stale-forest drain] +42m9s overlay=708607 (initial 970751) window 136.0/s cumulative 103.6/s
+    vector_1m_test.go:691: [stale-forest drain] +43m10s overlay=708607 (initial 970751) window 0.0/s cumulative 101.2/s
+    vector_1m_test.go:691: [stale-forest drain] +44m10s overlay=692223 (initial 970751) window 272.1/s cumulative 105.1/s
+    vector_1m_test.go:691: [stale-forest drain] +45m10s overlay=675839 (initial 970751) window 272.1/s cumulative 108.8/s
+    vector_1m_test.go:691: [stale-forest drain] +46m10s overlay=675839 (initial 970751) window 0.0/s cumulative 106.5/s
+    vector_1m_test.go:691: [stale-forest drain] +47m10s overlay=667647 (initial 970751) window 136.0/s cumulative 107.1/s
+    vector_1m_test.go:691: [stale-forest drain] +48m11s overlay=651263 (initial 970751) window 272.1/s cumulative 110.5/s
+    vector_1m_test.go:691: [stale-forest drain] +49m11s overlay=643071 (initial 970751) window 136.0/s cumulative 111.0/s
+    vector_1m_test.go:691: [stale-forest drain] +50m11s overlay=643071 (initial 970751) window 0.0/s cumulative 108.8/s
+    vector_1m_test.go:691: [stale-forest drain] +51m11s overlay=626687 (initial 970751) window 272.1/s cumulative 112.0/s
+    vector_1m_test.go:691: [stale-forest drain] +52m12s overlay=610303 (initial 970751) window 272.1/s cumulative 115.1/s
+    vector_1m_test.go:691: [stale-forest drain] +53m12s overlay=610303 (initial 970751) window 0.0/s cumulative 112.9/s
+    vector_1m_test.go:691: [stale-forest drain] +54m12s overlay=610303 (initial 970751) window 0.0/s cumulative 110.8/s
+    vector_1m_test.go:691: [stale-forest drain] +55m12s overlay=610303 (initial 970751) window 0.0/s cumulative 108.8/s
+    vector_1m_test.go:691: [stale-forest drain] +56m12s overlay=610303 (initial 970751) window 0.0/s cumulative 106.9/s
+    vector_1m_test.go:691: [stale-forest drain] +57m13s overlay=610303 (initial 970751) window 0.0/s cumulative 105.0/s
+    vector_1m_test.go:691: [stale-forest drain] +58m13s overlay=610303 (initial 970751) window 0.0/s cumulative 103.2/s
+    vector_1m_test.go:691: [stale-forest drain] +59m13s overlay=610303 (initial 970751) window 0.0/s cumulative 101.4/s
+    vector_1m_test.go:691: [stale-forest drain] +1h0m13s overlay=610303 (initial 970751) window 0.0/s cumulative 99.8/s
+    vector_1m_test.go:691: [stale-forest drain] +1h1m14s overlay=602111 (initial 970751) window 136.0/s cumulative 100.3/s
+    vector_1m_test.go:691: [stale-forest drain] +1h2m14s overlay=583679 (initial 970751) window 306.1/s cumulative 103.7/s
+    vector_1m_test.go:691: [stale-forest drain] +1h3m14s overlay=577535 (initial 970751) window 102.0/s cumulative 103.6/s
+    vector_1m_test.go:691: [stale-forest drain] +1h4m14s overlay=577535 (initial 970751) window 0.0/s cumulative 102.0/s
+    vector_1m_test.go:691: [stale-forest drain] +1h5m15s overlay=559103 (initial 970751) window 306.0/s cumulative 105.2/s
+    vector_1m_test.go:691: [stale-forest drain] +1h6m15s overlay=544767 (initial 970751) window 238.0/s cumulative 107.2/s
+    vector_1m_test.go:691: [stale-forest drain] +1h7m15s overlay=544767 (initial 970751) window 0.0/s cumulative 105.6/s
+    vector_1m_test.go:691: [stale-forest drain] +1h8m15s overlay=534527 (initial 970751) window 170.0/s cumulative 106.5/s
+    vector_1m_test.go:691: [stale-forest drain] +1h9m15s overlay=516095 (initial 970751) window 306.1/s cumulative 109.4/s
+    vector_1m_test.go:691: [stale-forest drain] +1h10m16s overlay=511999 (initial 970751) window 68.0/s cumulative 108.8/s
+    vector_1m_test.go:691: [stale-forest drain] +1h11m16s overlay=509951 (initial 970751) window 34.0/s cumulative 107.8/s
+    vector_1m_test.go:691: [stale-forest drain] +1h12m16s overlay=491519 (initial 970751) window 306.0/s cumulative 110.5/s
+    vector_1m_test.go:691: [stale-forest drain] +1h13m16s overlay=479231 (initial 970751) window 204.1/s cumulative 111.8/s
+    vector_1m_test.go:691: [stale-forest drain] +1h14m17s overlay=479231 (initial 970751) window 0.0/s cumulative 110.3/s
+    vector_1m_test.go:691: [stale-forest drain] +1h15m17s overlay=479231 (initial 970751) window 0.0/s cumulative 108.8/s
+    vector_1m_test.go:691: [stale-forest drain] +1h16m17s overlay=479231 (initial 970751) window 0.0/s cumulative 107.4/s
+    vector_1m_test.go:691: [stale-forest drain] +1h17m17s overlay=479231 (initial 970751) window 0.0/s cumulative 106.0/s
+    vector_1m_test.go:691: [stale-forest drain] +1h18m17s overlay=479231 (initial 970751) window 0.0/s cumulative 104.6/s
+    vector_1m_test.go:691: [stale-forest drain] +1h19m18s overlay=479231 (initial 970751) window 0.0/s cumulative 103.3/s
+    vector_1m_test.go:691: [stale-forest drain] +1h20m18s overlay=479231 (initial 970751) window 0.0/s cumulative 102.0/s
+    vector_1m_test.go:691: [stale-forest drain] +1h21m18s overlay=479231 (initial 970751) window 0.0/s cumulative 100.8/s
+    vector_1m_test.go:691: [stale-forest drain] +1h22m18s overlay=479231 (initial 970751) window 0.0/s cumulative 99.5/s
+    vector_1m_test.go:691: [stale-forest drain] +1h23m19s overlay=479231 (initial 970751) window 0.0/s cumulative 98.3/s
+    vector_1m_test.go:691: [stale-forest drain] +1h24m19s overlay=479231 (initial 970751) window 0.0/s cumulative 97.2/s
+    vector_1m_test.go:691: [stale-forest drain] +1h25m19s overlay=479231 (initial 970751) window 0.0/s cumulative 96.0/s
+    vector_1m_test.go:691: [stale-forest drain] +1h26m19s overlay=479231 (initial 970751) window 0.0/s cumulative 94.9/s
+    vector_1m_test.go:691: [stale-forest drain] +1h27m19s overlay=479231 (initial 970751) window 0.0/s cumulative 93.8/s
+    vector_1m_test.go:691: [stale-forest drain] +1h28m20s overlay=479231 (initial 970751) window 0.0/s cumulative 92.7/s
+    vector_1m_test.go:691: [stale-forest drain] +1h29m20s overlay=479231 (initial 970751) window 0.0/s cumulative 91.7/s
+    vector_1m_test.go:691: [stale-forest drain] +1h30m20s overlay=479231 (initial 970751) window 0.0/s cumulative 90.7/s
+    vector_1m_test.go:691: [stale-forest drain] +1h31m20s overlay=479231 (initial 970751) window 0.0/s cumulative 89.7/s
+    vector_1m_test.go:691: [stale-forest drain] +1h32m21s overlay=479231 (initial 970751) window 0.0/s cumulative 88.7/s
+    vector_1m_test.go:691: [stale-forest drain] +1h33m21s overlay=479231 (initial 970751) window 0.0/s cumulative 87.8/s
+    vector_1m_test.go:691: [stale-forest drain] +1h34m21s overlay=479231 (initial 970751) window 0.0/s cumulative 86.8/s
+    vector_1m_test.go:691: [stale-forest drain] +1h35m21s overlay=479231 (initial 970751) window 0.0/s cumulative 85.9/s
+    vector_1m_test.go:691: [stale-forest drain] +1h36m22s overlay=479231 (initial 970751) window 0.0/s cumulative 85.0/s
+    vector_1m_test.go:691: [stale-forest drain] +1h37m22s overlay=479231 (initial 970751) window 0.0/s cumulative 84.1/s
+    vector_1m_test.go:691: [stale-forest drain] +1h38m22s overlay=479231 (initial 970751) window 0.0/s cumulative 83.3/s
+    vector_1m_test.go:691: [stale-forest drain] +1h39m22s overlay=479231 (initial 970751) window 0.0/s cumulative 82.4/s
+    vector_1m_test.go:691: [stale-forest drain] +1h40m22s overlay=479231 (initial 970751) window 0.0/s cumulative 81.6/s
+    vector_1m_test.go:691: [stale-forest drain] +1h41m23s overlay=479231 (initial 970751) window 0.0/s cumulative 80.8/s
+    vector_1m_test.go:691: [stale-forest drain] +1h42m23s overlay=479231 (initial 970751) window 0.0/s cumulative 80.0/s
+    vector_1m_test.go:691: [stale-forest drain] +1h43m23s overlay=479231 (initial 970751) window 0.0/s cumulative 79.2/s
+    vector_1m_test.go:691: [stale-forest drain] +1h44m23s overlay=479231 (initial 970751) window 0.0/s cumulative 78.5/s
+    vector_1m_test.go:691: [stale-forest drain] +1h45m24s overlay=479231 (initial 970751) window 0.0/s cumulative 77.7/s
+    vector_1m_test.go:691: [stale-forest drain] +1h46m24s overlay=479231 (initial 970751) window 0.0/s cumulative 77.0/s
+    vector_1m_test.go:691: [stale-forest drain] +1h47m24s overlay=462847 (initial 970751) window 272.0/s cumulative 78.8/s
+    vector_1m_test.go:691: [stale-forest drain] +1h48m24s overlay=446463 (initial 970751) window 272.0/s cumulative 80.6/s
+    vector_1m_test.go:691: [stale-forest drain] +1h49m24s overlay=446463 (initial 970751) window 0.0/s cumulative 79.9/s
+    vector_1m_test.go:691: [stale-forest drain] +1h50m25s overlay=438271 (initial 970751) window 136.0/s cumulative 80.4/s
+    vector_1m_test.go:691: [stale-forest drain] +1h51m25s overlay=421887 (initial 970751) window 272.1/s cumulative 82.1/s
+    vector_1m_test.go:691: [stale-forest drain] +1h52m25s overlay=413695 (initial 970751) window 136.0/s cumulative 82.6/s
+    vector_1m_test.go:691: [stale-forest drain] +1h53m25s overlay=413695 (initial 970751) window 0.0/s cumulative 81.9/s
+    vector_1m_test.go:691: [stale-forest drain] +1h54m26s overlay=397311 (initial 970751) window 272.0/s cumulative 83.5/s
+    vector_1m_test.go:691: [stale-forest drain] +1h55m26s overlay=380927 (initial 970751) window 272.1/s cumulative 85.2/s
+    vector_1m_test.go:691: [stale-forest drain] +1h56m26s overlay=380927 (initial 970751) window 0.0/s cumulative 84.4/s
+    vector_1m_test.go:691: [stale-forest drain] +1h57m26s overlay=372735 (initial 970751) window 136.0/s cumulative 84.9/s
+    vector_1m_test.go:691: [stale-forest drain] +1h58m26s overlay=356351 (initial 970751) window 272.0/s cumulative 86.5/s
+    vector_1m_test.go:691: [stale-forest drain] +1h59m27s overlay=348159 (initial 970751) window 136.0/s cumulative 86.9/s
+    vector_1m_test.go:691: [stale-forest drain] +2h0m27s overlay=348159 (initial 970751) window 0.0/s cumulative 86.1/s
+    vector_1m_test.go:691: [stale-forest drain] +2h1m27s overlay=348159 (initial 970751) window 0.0/s cumulative 85.4/s
+    vector_1m_test.go:691: [stale-forest drain] +2h2m27s overlay=348159 (initial 970751) window 0.0/s cumulative 84.7/s
+    vector_1m_test.go:691: [stale-forest drain] +2h3m28s overlay=348159 (initial 970751) window 0.0/s cumulative 84.0/s
+    vector_1m_test.go:691: [stale-forest drain] +2h4m28s overlay=348159 (initial 970751) window 0.0/s cumulative 83.4/s
+    vector_1m_test.go:691: [stale-forest drain] +2h5m28s overlay=348159 (initial 970751) window 0.0/s cumulative 82.7/s
+    vector_1m_test.go:691: [stale-forest drain] +2h6m28s overlay=348159 (initial 970751) window 0.0/s cumulative 82.0/s
+    vector_1m_test.go:691: [stale-forest drain] +2h7m28s overlay=348159 (initial 970751) window 0.0/s cumulative 81.4/s
+    vector_1m_test.go:691: [stale-forest drain] +2h8m29s overlay=331775 (initial 970751) window 272.0/s cumulative 82.9/s
+    vector_1m_test.go:691: [stale-forest drain] +2h9m29s overlay=315391 (initial 970751) window 272.0/s cumulative 84.4/s
+    vector_1m_test.go:691: [stale-forest drain] +2h10m29s overlay=315391 (initial 970751) window 0.0/s cumulative 83.7/s
+    vector_1m_test.go:691: [stale-forest drain] +2h11m29s overlay=307199 (initial 970751) window 136.0/s cumulative 84.1/s
+    vector_1m_test.go:691: [stale-forest drain] +2h12m30s overlay=290815 (initial 970751) window 272.0/s cumulative 85.5/s
+    vector_1m_test.go:691: [stale-forest drain] +2h13m30s overlay=282623 (initial 970751) window 136.0/s cumulative 85.9/s
+    vector_1m_test.go:691: [stale-forest drain] +2h14m30s overlay=282623 (initial 970751) window 0.0/s cumulative 85.3/s
+    vector_1m_test.go:691: [stale-forest drain] +2h15m30s overlay=266239 (initial 970751) window 272.0/s cumulative 86.7/s
+    vector_1m_test.go:691: [stale-forest drain] +2h16m30s overlay=249855 (initial 970751) window 272.1/s cumulative 88.0/s
+    vector_1m_test.go:691: [stale-forest drain] +2h17m31s overlay=249855 (initial 970751) window 0.0/s cumulative 87.4/s
+    vector_1m_test.go:691: [stale-forest drain] +2h18m31s overlay=241663 (initial 970751) window 136.0/s cumulative 87.7/s
+    vector_1m_test.go:691: [stale-forest drain] +2h19m31s overlay=223231 (initial 970751) window 306.0/s cumulative 89.3/s
+    vector_1m_test.go:691: [stale-forest drain] +2h20m31s overlay=217087 (initial 970751) window 102.0/s cumulative 89.4/s
+    vector_1m_test.go:691: [stale-forest drain] +2h21m32s overlay=217087 (initial 970751) window 0.0/s cumulative 88.8/s
+    vector_1m_test.go:691: [stale-forest drain] +2h22m32s overlay=217087 (initial 970751) window 0.0/s cumulative 88.1/s
+    vector_1m_test.go:691: [stale-forest drain] +2h23m32s overlay=217087 (initial 970751) window 0.0/s cumulative 87.5/s
+    vector_1m_test.go:691: [stale-forest drain] +2h24m32s overlay=217087 (initial 970751) window 0.0/s cumulative 86.9/s
+    vector_1m_test.go:691: [stale-forest drain] +2h25m33s overlay=217087 (initial 970751) window 0.0/s cumulative 86.3/s
+    vector_1m_test.go:691: [stale-forest drain] +2h26m33s overlay=217087 (initial 970751) window 0.0/s cumulative 85.7/s
+    vector_1m_test.go:691: [stale-forest drain] +2h27m33s overlay=217087 (initial 970751) window 0.0/s cumulative 85.1/s
+    vector_1m_test.go:691: [stale-forest drain] +2h28m33s overlay=212991 (initial 970751) window 68.0/s cumulative 85.0/s
+    vector_1m_test.go:691: [stale-forest drain] +2h29m33s overlay=196607 (initial 970751) window 272.0/s cumulative 86.3/s
+    vector_1m_test.go:691: [stale-forest drain] +2h30m34s overlay=184319 (initial 970751) window 204.0/s cumulative 87.1/s
+    vector_1m_test.go:691: [stale-forest drain] +2h31m34s overlay=184319 (initial 970751) window 0.0/s cumulative 86.5/s
+    vector_1m_test.go:691: [stale-forest drain] +2h32m34s overlay=169983 (initial 970751) window 238.0/s cumulative 87.5/s
+    vector_1m_test.go:691: [stale-forest drain] +2h33m34s overlay=153599 (initial 970751) window 272.0/s cumulative 88.7/s
+    vector_1m_test.go:691: [stale-forest drain] +2h34m35s overlay=151551 (initial 970751) window 34.0/s cumulative 88.3/s
+    vector_1m_test.go:691: [stale-forest drain] +2h35m35s overlay=145407 (initial 970751) window 102.0/s cumulative 88.4/s
+    vector_1m_test.go:691: [stale-forest drain] +2h36m35s overlay=129023 (initial 970751) window 272.1/s cumulative 89.6/s
+    vector_1m_test.go:691: [stale-forest drain] +2h37m35s overlay=118783 (initial 970751) window 170.0/s cumulative 90.1/s
+    vector_1m_test.go:691: [stale-forest drain] +2h38m35s overlay=118783 (initial 970751) window 0.0/s cumulative 89.5/s
+    vector_1m_test.go:691: [stale-forest drain] +2h39m36s overlay=104447 (initial 970751) window 238.0/s cumulative 90.5/s
+    vector_1m_test.go:691: [stale-forest drain] +2h40m36s overlay=86015 (initial 970751) window 306.0/s cumulative 91.8/s
+    vector_1m_test.go:691: [stale-forest drain] +2h41m36s overlay=86015 (initial 970751) window 0.0/s cumulative 91.2/s
+    vector_1m_test.go:691: [stale-forest drain] +2h42m36s overlay=86015 (initial 970751) window 0.0/s cumulative 90.7/s
+    vector_1m_test.go:691: [stale-forest drain] +2h43m37s overlay=86015 (initial 970751) window 0.0/s cumulative 90.1/s
+    vector_1m_test.go:691: [stale-forest drain] +2h44m37s overlay=86015 (initial 970751) window 0.0/s cumulative 89.6/s
+    vector_1m_test.go:691: [stale-forest drain] +2h45m37s overlay=86015 (initial 970751) window 0.0/s cumulative 89.0/s
+    vector_1m_test.go:691: [stale-forest drain] +2h46m37s overlay=86015 (initial 970751) window 0.0/s cumulative 88.5/s
+    vector_1m_test.go:691: [stale-forest drain] +2h47m37s overlay=86015 (initial 970751) window 0.0/s cumulative 88.0/s
+    vector_1m_test.go:691: [stale-forest drain] +2h48m38s overlay=86015 (initial 970751) window 0.0/s cumulative 87.4/s
+    vector_1m_test.go:691: [stale-forest drain] +2h49m38s overlay=77823 (initial 970751) window 136.0/s cumulative 87.7/s
+    vector_1m_test.go:691: [stale-forest drain] +2h50m38s overlay=61439 (initial 970751) window 272.0/s cumulative 88.8/s
+    vector_1m_test.go:691: [stale-forest drain] +2h51m38s overlay=53247 (initial 970751) window 136.0/s cumulative 89.1/s
+    vector_1m_test.go:691: [stale-forest drain] +2h52m39s overlay=53247 (initial 970751) window 0.0/s cumulative 88.6/s
+    vector_1m_test.go:691: [stale-forest drain] +2h53m39s overlay=36863 (initial 970751) window 272.0/s cumulative 89.6/s
+    vector_1m_test.go:691: [stale-forest drain] +2h54m39s overlay=20479 (initial 970751) window 272.0/s cumulative 90.7/s
+    vector_1m_test.go:691: [stale-forest drain] +2h55m39s overlay=20479 (initial 970751) window 0.0/s cumulative 90.2/s
+    vector_1m_test.go:691: [stale-forest drain] +2h56m40s overlay=12287 (initial 970751) window 136.0/s cumulative 90.4/s
+    vector_1m_test.go:691: [stale-forest drain] converged in 2h57m29.698s: overlay 970751 -> 2047 (91.0/s cumulative)
+    vector_1m_test.go:692: B1 RESULT: open=6.074s overlay-at-open=970751 ready=2h57m29.698s (worst-case restart: light Close after a burst build re-pays the frozen backlog)
+    vector_1m_test.go:703: bulk: compact seal fired after 256MiB (25.755s) - forest refreshed at the current drain state
+    vector_1m_test.go:704: B2 bulk: 2 light seals, 256MiB in 25.755s, then compact
+    vector_1m_test.go:713: manifest: snapshot=v-3916.db lsn=3916 segment=101 retainFrom=98 format=2
+    vector_1m_test.go:714: B2 close: 372ms (light over the fresh compact boundary)
+    vector_1m_test.go:725: == B3: controlled 3-segment retained chain ==
+    vector_1m_test.go:726: open 7.596s, overlay-at-open=2047
+    vector_1m_test.go:727: B3 reopen after fresh compact: open=7.596s overlay-at-open=2047 (mini forest-load data point)
+    vector_1m_test.go:729: [pre-chain drain] converged in 0s: overlay 2047 -> 2047 (0.0/s cumulative)
+    vector_1m_test.go:742: B3 chain ingest: 43520 vectors in 2.121s
+    vector_1m_test.go:743:   seal[0] light at submit 2: wal 67917116 -> 804307, stall 332ms
+    vector_1m_test.go:743:   seal[1] light at submit 86: wal 67561788 -> 804307, stall 338ms
+    vector_1m_test.go:743:   seal[2] light at submit 170: wal 67561788 -> 804307, stall 378ms
+    vector_1m_test.go:262:   light seals: n=3 stall p50=338.015708ms max=377.643625ms (submit median 6.078625ms)
+    vector_1m_test.go:257:   compact seals: none
+    vector_1m_test.go:772: B3 close: writer 1.401s tier=light
+    vector_1m_test.go:776: manifest: snapshot=v-3916.db lsn=3916 segment=108 retainFrom=98 format=2
+    vector_1m_test.go:782: copied 6.82GB /tmp/vectra-1m -> /tmp/vectra-1m-chain in 3.548s
+    vector_1m_test.go:783: == B4: retained-chain restart (base + 3-segment chain) ==
+    vector_1m_test.go:784: manifest: snapshot=v-3916.db lsn=3916 segment=108 retainFrom=98 format=2
+    vector_1m_test.go:785: open 7.201s, overlay-at-open=45567
+    vector_1m_test.go:786: [chain-replay drain] +30s overlay=33279 (initial 45567) window 408.0/s cumulative 408.0/s
+    vector_1m_test.go:786: [chain-replay drain] +1m0s overlay=31231 (initial 45567) window 68.0/s cumulative 238.0/s
+    vector_1m_test.go:786: [chain-replay drain] +1m30s overlay=31231 (initial 45567) window 0.0/s cumulative 158.7/s
+    vector_1m_test.go:786: [chain-replay drain] +2m0s overlay=29183 (initial 45567) window 68.0/s cumulative 136.0/s
+    vector_1m_test.go:786: [chain-replay drain] +2m31s overlay=14847 (initial 45567) window 476.0/s cumulative 204.0/s
+    vector_1m_test.go:786: [chain-replay drain] +3m1s overlay=6655 (initial 45567) window 272.1/s cumulative 215.4/s
+    vector_1m_test.go:786: [chain-replay drain] converged in 3m9.207s: overlay 45567 -> 511 (238.1/s cumulative)
+    vector_1m_test.go:797: B4 RESULT (mode B): open=7.201s overlay-at-open=45567 ready=3m9.207s (chain bytes re-pack; the drain dominates)
+    vector_1m_test.go:341:   /tmp/vectra-1m-chain/v-3916.db 3177.4MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-chain/v.db.wal/manifest.json 0.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-chain/v.db.wal/wal-100.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-chain/v.db.wal/wal-101.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-chain/v.db.wal/wal-102.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-chain/v.db.wal/wal-103.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-chain/v.db.wal/wal-104.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-chain/v.db.wal/wal-105.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-chain/v.db.wal/wal-106.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-chain/v.db.wal/wal-107.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-chain/v.db.wal/wal-108.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-chain/v.db.wal/wal-109.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-chain/v.db.wal/wal-98.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-chain/v.db.wal/wal-99.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-chain/v.vec 3100.4MB
+    vector_1m_test.go:799: library total 6.88GB
+--- PASS: TestVector1M (10901.25s)
+PASS
+ok  	github.com/projanvil/vectra/bench	10902.211s
+stage B exit=0

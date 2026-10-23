@@ -1,0 +1,51 @@
+=== stage compact ===
+Sat Oct 24 03:19:40 CST 2026
+ 3:19  up 8 days,  7:42, 2 users, load averages: 4.08 4.31 4.14
+--- top CPU consumers ---
+ %CPU      TIME COMM
+115.1 3331:15.94 mediaanalysisd
+ 75.4 283:12.97 sysmond
+ 25.3 286:43.29 ZCode Helper (Renderer)
+ 21.6  82:34.13 Code Helper
+ 18.1  64:03.72 Code Helper (Renderer)
+ 17.5  23:10.39 zcode-cli
+  5.3 1284:50.24 WindowServer
+--- disk ---
+/dev/disk3s5   1.8Ti   1.4Ti   409Gi    78%     12M  4.3G    0%   /System/Volumes/Data
+--- quiet gate ---
+quiet gate passed at 04:14:11 (load=2.99 topcpu=73.5%)
+Sat Oct 24 04:14:11 CST 2026
+--- run ---
+=== RUN   TestVector1M
+    vector_1m_test.go:812: == C1: drain the chain library ==
+    vector_1m_test.go:813: open 6.213s, overlay-at-open=45567
+    vector_1m_test.go:815: [pre-compact drain] +30s overlay=33279 (initial 45567) window 408.2/s cumulative 408.2/s
+    vector_1m_test.go:815: [pre-compact drain] +1m0s overlay=31231 (initial 45567) window 68.0/s cumulative 238.1/s
+    vector_1m_test.go:815: [pre-compact drain] +1m30s overlay=31231 (initial 45567) window 0.0/s cumulative 158.7/s
+    vector_1m_test.go:815: [pre-compact drain] +2m0s overlay=27135 (initial 45567) window 136.0/s cumulative 153.0/s
+    vector_1m_test.go:815: [pre-compact drain] +2m31s overlay=14847 (initial 45567) window 408.1/s cumulative 204.1/s
+    vector_1m_test.go:815: [pre-compact drain] +3m1s overlay=6655 (initial 45567) window 272.0/s cumulative 215.4/s
+    vector_1m_test.go:815: [pre-compact drain] converged in 3m8.189s: overlay 45567 -> 511 (239.4/s cumulative)
+    vector_1m_test.go:821: == C2: bulk-volume to a compact seal (fresh forest, chain reset) ==
+    vector_1m_test.go:823: bulk: compact seal fired after 128MiB (23.357s) - forest refreshed at the current drain state
+    vector_1m_test.go:824: C2 bulk: 0 light seals, 128MiB in 23.357s, then compact
+    vector_1m_test.go:840: C2 close: writer 380ms tier=light (v.vec 3235.4MB -> 3235.4MB)
+    vector_1m_test.go:842: manifest: snapshot=v-4088.db lsn=4088 segment=112 retainFrom=109 format=2
+    vector_1m_test.go:851: copied 6.76GB /tmp/vectra-1m -> /tmp/vectra-1m-cmp in 3.497s
+    vector_1m_test.go:852: == C3: compressed-state restart (pure forest load) ==
+    vector_1m_test.go:853: manifest: snapshot=v-4088.db lsn=4088 segment=112 retainFrom=109 format=2
+    vector_1m_test.go:854: open 8.728s, overlay-at-open=511
+    vector_1m_test.go:855: [forest-load drain] converged in 0s: overlay 511 -> 511 (0.0/s cumulative)
+    vector_1m_test.go:870: C3 RESULT (mode A): open=8.728s overlay-at-open=511 ready=0s | v.vec 3.16GB | bandwidth ~0.36GB/s (v.vec bytes / open wall)
+    vector_1m_test.go:341:   /tmp/vectra-1m-cmp/v-4088.db 3435.2MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-cmp/v.db.wal/manifest.json 0.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-cmp/v.db.wal/wal-109.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-cmp/v.db.wal/wal-110.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-cmp/v.db.wal/wal-111.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-cmp/v.db.wal/wal-112.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-cmp/v.db.wal/wal-113.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-cmp/v.vec 3235.4MB
+    vector_1m_test.go:873: library total 6.83GB
+--- PASS: TestVector1M (234.37s)
+PASS
+ok  	github.com/projanvil/vectra/bench	235.191s

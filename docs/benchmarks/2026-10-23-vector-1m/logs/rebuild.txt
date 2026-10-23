@@ -1,0 +1,94 @@
+=== stage rebuild ===
+Sat Oct 24 04:47:58 CST 2026
+ 4:47  up 8 days,  9:11, 2 users, load averages: 1.89 2.20 2.51
+ %CPU      TIME COMM
+ 75.2 349:53.44 sysmond
+ 15.2  98:36.83 Code Helper
+ 15.0  79:02.11 Code Helper (Renderer)
+ 14.6 288:20.97 ZCode Helper (Renderer)
+  6.3  23:29.09 zcode-cli
+  3.9 1288:56.95 WindowServer
+  2.5  12:52.69 zsh
+/dev/disk3s5   1.8Ti   1.4Ti   402Gi    79%     12M  4.2G    0%   /System/Volumes/Data
+quiet gate passed at 04:48:54 (load=2.04 topcpu=76.6%)
+Sat Oct 24 04:48:54 CST 2026
+--- run ---
+=== RUN   TestVector1M
+    vector_1m_test.go:895: copied 5.93GB /tmp/vectra-1m-asbuilt -> /tmp/vectra-1m-rb in 2.453s
+    vector_1m_test.go:899: == no-forest rebuild (v.vec deleted) ==
+    vector_1m_test.go:900: manifest: snapshot=v-3781.db lsn=3781 segment=95 retainFrom=91 format=2
+    vector_1m_test.go:901: open 5.29s, overlay-at-open=1001471
+    vector_1m_test.go:919: [rebuild window] +30s overlay=993279/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +1m0s overlay=985087/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +1m30s overlay=976895/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +2m0s overlay=970751/1001471 window 204.6/s
+    vector_1m_test.go:919: [rebuild window] +2m30s overlay=970751/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +3m0s overlay=970751/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +3m30s overlay=970751/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +4m0s overlay=962559/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +4m30s overlay=952319/1001471 window 341.0/s
+    vector_1m_test.go:919: [rebuild window] +5m0s overlay=944127/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +5m30s overlay=937983/1001471 window 204.6/s
+    vector_1m_test.go:919: [rebuild window] +6m0s overlay=937983/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +6m30s overlay=937983/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +7m0s overlay=937983/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +7m30s overlay=929791/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +8m0s overlay=921599/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +8m30s overlay=913407/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +9m1s overlay=905215/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +9m31s overlay=905215/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +10m1s overlay=905215/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +10m31s overlay=905215/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +11m1s overlay=897023/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +11m31s overlay=888831/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +12m1s overlay=880639/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +12m31s overlay=872447/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +13m1s overlay=872447/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +13m31s overlay=872447/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +14m1s overlay=872447/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +14m31s overlay=872447/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +15m1s overlay=872447/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +15m31s overlay=872447/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +16m1s overlay=872447/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +16m31s overlay=872447/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +17m1s overlay=872447/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +17m31s overlay=872447/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +18m1s overlay=872447/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +18m31s overlay=872447/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +19m1s overlay=872447/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +19m31s overlay=872447/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +20m1s overlay=872447/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +20m31s overlay=872447/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +21m1s overlay=872447/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +21m31s overlay=864255/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +22m1s overlay=856063/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +22m31s overlay=847871/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +23m1s overlay=839679/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +23m31s overlay=839679/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +24m1s overlay=839679/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +24m31s overlay=839679/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +25m1s overlay=831487/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +25m31s overlay=823295/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +26m1s overlay=815103/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +26m32s overlay=806911/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +27m2s overlay=806911/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +27m32s overlay=806911/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +28m2s overlay=806911/1001471 window 0.0/s
+    vector_1m_test.go:919: [rebuild window] +28m32s overlay=798719/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +29m2s overlay=790527/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +29m32s overlay=782335/1001471 window 272.8/s
+    vector_1m_test.go:919: [rebuild window] +30m2s overlay=774143/1001471 window 272.8/s
+    vector_1m_test.go:926: REBUILD (bounded 1800s): open=5.29s overlay-at-open=1001471 packed 227328 in 30m1.696s = 126.2/s -> projected full convergence >= 102.3 min (floor; cascade adds)
+    vector_1m_test.go:341:   /tmp/vectra-1m-rb/v-3781.db 2884.7MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-rb/v.db.wal/manifest.json 0.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-rb/v.db.wal/wal-91.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-rb/v.db.wal/wal-92.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-rb/v.db.wal/wal-93.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-rb/v.db.wal/wal-94.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-rb/v.db.wal/wal-95.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-rb/v.db.wal/wal-96.log 64.0MB
+    vector_1m_test.go:938: library total 3.19GB
+--- PASS: TestVector1M (1813.67s)
+PASS
+ok  	github.com/projanvil/vectra/bench	1814.111s
+stage D exit=0
