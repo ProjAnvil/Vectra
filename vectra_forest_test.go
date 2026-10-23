@@ -474,7 +474,7 @@ func TestForestDiscardClasses(t *testing.T) {
 		if _, err := scratch.AddNode("x", "N", map[string]any{"v": forestVec(0, 16)}); err != nil {
 			t.Fatal(err)
 		}
-		b, err := scratch.encodeVecForest(lsn)
+		b, _, err := scratch.encodeVecForest(lsn)
 		if err != nil {
 			t.Fatal(err)
 		}

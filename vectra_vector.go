@@ -105,6 +105,29 @@ type vecIndex struct {
 	mu   sync.Mutex
 	st   *vector.State
 	head atomic.Pointer[vector.Snapshot]
+	// packCount counts CommitPack successes (the tree's only
+	// overlay->segment work); forestPacks holds the count captured by the
+	// last successful forest write. A gap between them is pack work that
+	// exists only in memory - the close-time forest refresh's trigger
+	// (1M finding B1: a light Close after lane convergence dropped 3h of
+	// packs and the reopen re-paid them). Both guarded by mu; publish()
+	// deliberately does NOT bump packCount - it fires per batch.
+	packCount   uint64
+	forestPacks uint64
+}
+
+// vecForestDrift reports whether any index has pack work the on-disk forest
+// does not carry.
+func vecForestDrift(reg []*vecIndex) bool {
+	for _, vi := range reg {
+		vi.mu.Lock()
+		drift := vi.packCount != vi.forestPacks
+		vi.mu.Unlock()
+		if drift {
+			return true
+		}
+	}
+	return false
 }
 
 func (vi *vecIndex) publish() {
@@ -138,6 +161,9 @@ func (vi *vecIndex) drain(maxChunks int) bool {
 		plan.Build(metric, vi.decl.M, vi.decl.EfConstruction, vi.seed)
 		vi.mu.Lock()
 		ok := vi.st.CommitPack(plan)
+		if ok {
+			vi.packCount++ // pack work the on-disk forest may not carry yet
+		}
 		vi.mu.Unlock()
 		if !ok {
 			continue // head moved (cannot happen today; the writer never
@@ -707,16 +733,18 @@ func vecForestPutU64(w *bytes.Buffer, v uint64) {
 // the overlay until CommitPack swaps the built segment in, so every
 // interleaving is a complete ≤LSN image (overlay or segment, never both
 // missing).
-func (g *Graph) encodeVecForest(lsn uint64) ([]byte, error) {
+func (g *Graph) encodeVecForest(lsn uint64) ([]byte, []uint64, error) {
 	reg := g.vecReg()
 	blobs := make([][]byte, len(reg))
+	counts := make([]uint64, len(reg))
 	for i, vi := range reg {
 		var b bytes.Buffer
 		vi.mu.Lock()
 		err := vi.st.Encode(&b)
+		counts[i] = vi.packCount // captured under the same lock as the image
 		vi.mu.Unlock()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		blobs[i] = b.Bytes()
 	}
@@ -727,7 +755,7 @@ func (g *Graph) encodeVecForest(lsn uint64) ([]byte, error) {
 	for _, vi := range reg {
 		decl, err := json.Marshal(vi.decl.toWal())
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		vecForestPutU32(&out, uint32(len(decl)))
 		out.Write(decl)
@@ -738,7 +766,7 @@ func (g *Graph) encodeVecForest(lsn uint64) ([]byte, error) {
 		out.Write(b)
 	}
 	vecForestPutU32(&out, crc32.ChecksumIEEE(out.Bytes()))
-	return out.Bytes(), nil
+	return out.Bytes(), counts, nil
 }
 
 // writeVecForest persists the cache as part of the checkpoint batch: temp +
@@ -766,7 +794,7 @@ func (g *Graph) writeVecForest(lsn uint64) error {
 			return nil
 		}
 	}
-	b, err := g.encodeVecForest(lsn)
+	b, counts, err := g.encodeVecForest(lsn)
 	if err != nil {
 		return err
 	}
@@ -797,6 +825,17 @@ func (g *Graph) writeVecForest(lsn uint64) error {
 	if d, err := os.Open(filepath.Dir(path)); err == nil {
 		d.Sync()
 		d.Close()
+	}
+	// The image on disk now carries every pack up to counts[i]. Advance the
+	// drift marker only when no further pack committed while the bytes were
+	// being written - a mid-write CommitPack leaves the gap armed so the
+	// close refresh still fires (the written image does not contain it).
+	for i, vi := range reg {
+		vi.mu.Lock()
+		if vi.packCount == counts[i] {
+			vi.forestPacks = counts[i]
+		}
+		vi.mu.Unlock()
 	}
 	return nil
 }

@@ -131,7 +131,7 @@ func TestStaleForestReplayEquivalence(t *testing.T) {
 	if forestLSN <= man1.LSN {
 		t.Fatalf("fixture: forest LSN %d must exceed the manifest boundary %d", forestLSN, man1.LSN)
 	}
-	crafted, err := g2.encodeVecForest(forestLSN)
+	crafted, _, err := g2.encodeVecForest(forestLSN)
 	if err != nil {
 		t.Fatal(err)
 	}
