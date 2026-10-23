@@ -264,9 +264,15 @@ func (v vecView) search(q []float32, k, ef int, r *Reader) []VectorHit {
 			}
 		}
 	}
+	// Dead-empty fast path: with no tombstones every overlay entry is
+	// alive, so the hoisted bool skips a closure call + dead-map lookup
+	// per entry (the common no-deletes state; 2026-10 profile: ~52% of
+	// the full-tail query cost). Non-empty dead map keeps the per-entry
+	// check - semantics identical either way.
+	deadEmpty := len(v.dead) == 0
 	for _, ch := range v.overlay {
 		for _, e := range ch {
-			if !alive(e.vid) {
+			if !deadEmpty && !alive(e.vid) {
 				continue
 			}
 			m[e.vid] = best{key: e.key, score: Distance(v.metric, q, e.vec), seq: math.MaxUint64}
@@ -276,11 +282,55 @@ func (v vecView) search(q []float32, k, ef int, r *Reader) []VectorHit {
 	for _, b := range m {
 		all = append(all, VectorHit{Key: b.key, Score: b.score})
 	}
-	sort.Slice(all, func(i, j int) bool { return all[i].Score < all[j].Score })
-	if len(all) > k {
-		all = all[:k]
+	return selectTopK(all, k)
+}
+
+// selectTopK returns the k lowest-scored hits ascending, replacing the old
+// collect-all + sort.Slice + truncate (which sorted every candidate -
+// ~2087 at a full tail - although only k return). len(hits) <= k is a
+// plain ascending sort; otherwise a hand-rolled size-k max-heap (root =
+// worst kept) bounds selection at O(n log k) and the <=k winners get a
+// final ascending sort. Tie handling is non-contractual: the previous
+// sort.Slice was unstable, and eviction keeps the incumbent on equal
+// scores - both are valid memberships inside a tie group that k cuts.
+// Mutates hits. No container/heap: ~25 lines, zero new deps.
+func selectTopK(hits []VectorHit, k int) []VectorHit {
+	if len(hits) <= k {
+		sort.Slice(hits, func(i, j int) bool { return hits[i].Score < hits[j].Score })
+		return hits
 	}
-	return all
+	h := hits[:k]
+	for i := len(h)/2 - 1; i >= 0; i-- { // Floyd build: last parent up
+		siftDownMax(h, i)
+	}
+	for _, c := range hits[k:] {
+		if c.Score < h[0].Score { // strictly better than the worst kept
+			h[0] = c
+			siftDownMax(h, 0)
+		}
+	}
+	sort.Slice(h, func(i, j int) bool { return h[i].Score < h[j].Score })
+	return h
+}
+
+// siftDownMax restores the max-heap-by-Score invariant at subtree root i
+// (children 2i+1/2i+2); selectTopK's bounded selection step.
+func siftDownMax(h []VectorHit, i int) {
+	n := len(h)
+	for {
+		l, r, mx := 2*i+1, 2*i+2, i
+		if l < n && h[l].Score > h[mx].Score {
+			mx = l
+		}
+		if r < n && h[r].Score > h[mx].Score {
+			mx = r
+		}
+		if mx == i {
+			return
+		}
+		h[i], h[mx] = h[mx], h[i]
+		i = mx
+	}
 }
 
 // Pack builds an L0 segment from the overlay once it reached packSize
