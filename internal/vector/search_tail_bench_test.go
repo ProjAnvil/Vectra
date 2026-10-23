@@ -64,9 +64,10 @@ func benchmarkTail(b *testing.B, full bool, ef int, slot int) {
 	b.StopTimer()
 }
 
-func BenchmarkTailFull32(b *testing.B)   { benchmarkTail(b, true, 32, 0) }
-func BenchmarkTailFull64(b *testing.B)   { benchmarkTail(b, true, 64, 1) }
-func BenchmarkTailFull128(b *testing.B)  { benchmarkTail(b, true, 128, 2) }
+func BenchmarkTailFull32(b *testing.B)  { benchmarkTail(b, true, 32, 0) }
+func BenchmarkTailFull64(b *testing.B)  { benchmarkTail(b, true, 64, 1) }
+func BenchmarkTailFull128(b *testing.B) { benchmarkTail(b, true, 128, 2) }
+
 // BenchmarkTailPack transitions the shared state to the empty-tail phase
 // (placed between the Full and Empty benches by name order F < P... use
 // explicit ordering: run benches by listing this between phases).
@@ -81,4 +82,3 @@ func BenchmarkTailPack(b *testing.B) {
 func BenchmarkTailEmpty32(b *testing.B)  { benchmarkTail(b, false, 32, 3) }
 func BenchmarkTailEmpty64(b *testing.B)  { benchmarkTail(b, false, 64, 4) }
 func BenchmarkTailEmpty128(b *testing.B) { benchmarkTail(b, false, 128, 5) }
-
