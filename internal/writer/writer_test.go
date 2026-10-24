@@ -915,3 +915,67 @@ func TestVectorLaneDrains(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestVolumeCheckpointAsyncWiring (2026-10-24 fix arc): the volume trigger
+// on a fresh lineage (first checkpoint = compact tier, always) must take
+// the ASYNC path - the crossing Submit returns without waiting on the
+// snapshot+forest bytes, later Submits keep succeeding while the flight
+// runs, a later afterBatch's poll lands the manifest, and Close/reopen are
+// clean. The bytes-level non-blocking claim itself is pinned at the graph
+// level by TestAsyncCompactWriterUnblocked's parked flight.
+func TestVolumeCheckpointAsyncWiring(t *testing.T) {
+	dir := t.TempDir()
+	g, err := vectra.Open(dir+"/v.db", vectra.Options{WALMode: vectra.ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.CreateVectorIndex(vectra.VectorIndexDecl{Name: "mem", Prop: "emb", Dim: 8, Metric: "cosine"}); err != nil {
+		t.Fatal(err)
+	}
+	h := writer.Attach(g, writer.Config{CheckpointBytes: 1 << 10}) // 1KiB: the first batch crosses
+	defer g.Close()
+
+	node := func(i int) vectra.NodeUpsert {
+		return vectra.NodeUpsert{Key: fmt.Sprintf("n%06d", i), Label: "m",
+			Props: map[string]any{"pad": strings.Repeat("x", 512), "emb": []float32{1, 2, 3, 4, 5, 6, 7, 8}}}
+	}
+	if err := h.Submit(vectra.Changeset{Nodes: []vectra.NodeUpsert{node(0), node(1), node(2)}}); err != nil {
+		t.Fatal(err)
+	}
+	// The crossing submit returned; the flight may still be writing. More
+	// submits must succeed while it is in flight (suppression window).
+	for i := 3; i < 10; i++ {
+		if err := h.Submit(vectra.Changeset{Nodes: []vectra.NodeUpsert{node(i)}}); err != nil {
+			t.Fatalf("submit %d during flight window: %v", i, err)
+		}
+	}
+	// A later afterBatch poll completes the flight: the manifest appears.
+	dl := time.Now().Add(10 * time.Second)
+	for {
+		if _, ok, err := wal.ReadManifest(dir + "/v.db.wal"); err == nil && ok {
+			break
+		}
+		if time.Now().After(dl) {
+			t.Fatal("async compact never landed a manifest")
+		}
+		// keep the writer batching so afterBatch keeps polling
+		if err := h.Submit(vectra.Changeset{Nodes: []vectra.NodeUpsert{node(100)}}); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	g2, err := vectra.Open(dir+"/v.db", vectra.Options{WALMode: vectra.ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g2.Close()
+	for _, i := range []int{0, 5, 9} {
+		if _, ok := g2.NodeByKey(fmt.Sprintf("n%06d", i)); !ok {
+			t.Fatalf("node %d lost", i)
+		}
+	}
+}

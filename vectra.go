@@ -2624,6 +2624,11 @@ func (g *Graph) TryAsyncCompact() bool {
 	if err := g.flushPending(); err != nil {
 		return false // surfaced by the next synchronous checkpoint
 	}
+	// Publish the pend before pinning: flushPending emits WAL frames but
+	// does NOT cut the layer (Save's first step is flushPend). In wrapper
+	// mode the batch's g.Batch end already published; in direct mode this
+	// is what brings sub-pendMaxOps builder contents into the view.
+	g.flushPend()
 	fl := &compactFlight{lsn: g.wal.LastLSN(), view: g.view.Load(), done: make(chan struct{})}
 	g.compactFlight = fl
 	go g.runCompactFlight(fl)

@@ -12,6 +12,7 @@ package vectra
 import (
 	"math/rand"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -197,5 +198,99 @@ func TestAsyncCompactBusyCaseKeepsTailFrames(t *testing.T) {
 		if len(hits) == 0 || hits[0].Key != keyN(35) {
 			t.Fatalf("self query after busy completion: %v", hits)
 		}
+	})
+}
+
+// TestAsyncCompactCrashStates pins the three rest states the async flight
+// can be interrupted in, following the v0.11.2 crash-sweep pattern of
+// constructing the on-disk state directly (deterministic; no kill -9
+// harness). Every state must reopen with all data intact and no silent
+// loss:
+//
+//	A - mid-flight, no bytes yet: the old manifest + full chain govern.
+//	B - snapshot+forest bytes landed, completion not run (crash between
+//	    the flight's renames and the writer's manifest): old manifest +
+//	    old chain + a NEWER forest (LSN above the base) + an orphan
+//	    snapshot; the stale-forest gate accepts it, the recovery intake's
+//	    coverage gate skips frames the forest carries, the store replays
+//	    the chain.
+//	C - completion's manifest landed, covered segments NOT yet dropped:
+//	    the new base + extra covered segments, whose frames the replay
+//	    LSN gate skips.
+func TestAsyncCompactCrashStates(t *testing.T) {
+	build := func(t *testing.T) (dir string, g *Graph, pin uint64) {
+		t.Helper()
+		dir = t.TempDir()
+		g, err := Open(dir+"/v.db", Options{WALMode: ModeAlways})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := g.CreateVectorIndex(VectorIndexDecl{Name: "mem", Prop: "emb", Dim: 8, Metric: "cosine"}); err != nil {
+			t.Fatal(err)
+		}
+		asyncWriteNodes(t, g, 0, 20)
+		if err := g.flushPending(); err != nil {
+			t.Fatal(err)
+		}
+		g.flushPend() // publish the layer (flushPending emits frames only)
+		return dir, g, g.wal.LastLSN()
+	}
+	check := func(t *testing.T, dir string) {
+		t.Helper()
+		g2, err := Open(dir+"/v.db", Options{WALMode: ModeAlways})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer g2.Close()
+		for i := 0; i < 20; i++ {
+			if _, ok := g2.NodeByKey(keyN(i)); !ok {
+				t.Fatalf("node %s lost in crash state", keyN(i))
+			}
+		}
+		hits, err := g2.QueryVector("mem", asyncCompactVec(11), QueryVectorOptions{K: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(hits) == 0 || hits[0].Key != keyN(11) {
+			t.Fatalf("self query in crash state: %v", hits)
+		}
+	}
+
+	t.Run("A-midflight", func(t *testing.T) {
+		dir, g, _ := build(t)
+		_ = g // crash before any byte: nothing started, nothing to undo
+		check(t, dir)
+	})
+	t.Run("B-bytes-no-completion", func(t *testing.T) {
+		dir, g, pin := build(t)
+		// The flight's byte stage, reproduced synchronously: snapshot from
+		// the pinned view + forest at the pin LSN, NO manifest, no WAL
+		// mutation.
+		v := g.view.Load()
+		if err := g.saveViewFile(v, g.snapshotFile(pin)); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.writeVecForest(pin); err != nil {
+			t.Fatal(err)
+		}
+		check(t, dir)
+	})
+	t.Run("C-manifest-no-drop", func(t *testing.T) {
+		dir, g, pin := build(t)
+		snap := filepath.Base(g.snapshotFile(pin))
+		if err := g.saveViewFile(g.view.Load(), g.snapshotFile(pin)); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.writeVecForest(pin); err != nil {
+			t.Fatal(err)
+		}
+		survivor := g.wal.FirstUncoveredSegment(pin)
+		if err := wal.WriteManifest(dir+"/v.db.wal", wal.Manifest{
+			Snapshot: snap, LSN: pin, Segment: g.wal.Segment(), RetainFrom: survivor, Format: 2,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// The covered prefix is still on disk (crash before Drop).
+		check(t, dir)
 	})
 }

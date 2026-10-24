@@ -307,15 +307,18 @@ func (h *Handle) run() {
 		}
 		h.applyBatch(pending)
 	}
-	// writeCh closed and drained: final merge + checkpoint via g.Seal
+	// writeCh closed and drained: final merge + checkpoint via g.SealForClose
 	// (spec ruling: the checkpoint pipeline is Seal's), still on the
 	// writer goroutine so the merge may rebuild writer-private state. The
 	// checkpoint tier follows the retained-WAL volume (v0.11.2: light
 	// rotation under vectra.DefaultCompactBytes), but Seal's forceMerge is
 	// unconditional — the mirror rebuild and dense renumbering happen in
-	// both tiers before the writer claim is yielded.
+	// both tiers before the writer claim is yielded. SealForClose adds the
+	// close-shaped forest refresh: a light tier must still persist
+	// converged pack work or the reopen restores the stale forest's frozen
+	// overlay (1M finding B1, 2026-10-24 fix arc).
 	h.pubMu.Lock()
-	h.finalErr = h.g.Seal()
+	h.finalErr = h.g.SealForClose()
 	h.pubMu.Unlock()
 	h.g.YieldWriter()
 	close(h.loopDone)
@@ -421,9 +424,13 @@ func (h *Handle) mergeEdgeThreshold() int {
 }
 
 // volumeCheckpoint implements spec §4's "WAL ≥4MB since last checkpoint"
-// trigger: at or above CheckpointBytes of valid frame bytes the writer runs
-// g.Seal on its own goroutine — a checkpoint-shaped write pause that is
-// invisible to lock-free readers. Since v0.11.2 Seal tiers its checkpoint:
+// trigger: at or above CheckpointBytes of valid frame bytes the writer
+// runs a checkpoint — a write pause that is invisible to lock-free
+// readers. Since the 2026-10-24 fix arc the COMPACT tier's multi-second
+// snapshot+forest bytes run as a background flight off the submit path
+// (the 1M measurement's 11.5-26.3s stalls); the manifest and WAL
+// mutations stay on this goroutine. Since v0.11.2 the persistence side
+// tiers:
 // the merge ALWAYS folds (the writer-private mirrors are rebuilt either
 // way), but the persistence side under vectra.DefaultCompactBytes of
 // retained WAL is LIGHT — WAL rotate + manifest v2 rewrite, O(1), no
@@ -436,8 +443,39 @@ func (h *Handle) volumeCheckpoint() bool {
 	if h.cfg.CheckpointBytes <= 0 || h.cpOff.Load() {
 		return false
 	}
+	// Every batch first completes any finished flight (manifest + WAL
+	// mutations run here, on the writer): a pending completion would race
+	// the next checkpoint's own manifest.
+	if err := h.g.PollAsyncCompact(); err != nil {
+		cpErr := fmt.Errorf("vectra/writer: async compact completion: %w", err)
+		h.cpErr.Store(&cpErr)
+		h.cpOff.Store(true)
+		return false
+	}
 	if h.g.WALSize() < h.cfg.CheckpointBytes {
 		return false
+	}
+	// One flight at a time; while one runs, volume checkpoints of BOTH
+	// tiers are suppressed (a light manifest landing mid-flight would
+	// re-anchor to the old base and fight the flight's own re-anchor).
+	// Growth is bounded by flight duration x ingest rate (the 1M
+	// measurement's worst case: 26s x 5938/s ~= 480MB); the safety valve
+	// below converts runaway growth into backpressure instead.
+	if h.g.AsyncCompactActive() {
+		if h.g.WALSize() > h.cfg.CheckpointBytes*4+(1<<30) {
+			if err := h.g.WaitAsyncCompact(); err != nil {
+				cpErr := fmt.Errorf("vectra/writer: async compact backpressure: %w", err)
+				h.cpErr.Store(&cpErr)
+				h.cpOff.Store(true)
+			}
+		}
+		return false
+	}
+	// Compact tier due (or a fresh lineage's first checkpoint): hand the
+	// bytes to a background flight - the 1M stalls (11.5-26.3s inside
+	// afterBatch) lived here. Light tier stays inline: it is O(1).
+	if h.g.TryAsyncCompact() {
+		return true
 	}
 	h.pubMu.Lock()
 	err := h.g.Seal()
