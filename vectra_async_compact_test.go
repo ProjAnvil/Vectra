@@ -10,6 +10,7 @@ package vectra
 // deleted). These tests pin the two behaviors that define the feature.
 
 import (
+	"errors"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -72,9 +73,10 @@ func TestAsyncCompactWriterUnblocked(t *testing.T) {
 
 		parked := make(chan struct{})
 		release := make(chan struct{})
-		g.compactFlightHook = func() {
+		g.compactFlightHook = func() error {
 			close(parked)
 			<-release
+			return nil
 		}
 		if !g.TryAsyncCompact() {
 			t.Fatal("flight did not start (compact tier due, none active)")
@@ -147,7 +149,7 @@ func TestAsyncCompactBusyCaseKeepsTailFrames(t *testing.T) {
 		asyncWriteNodes(t, g, 0, 20)
 
 		release := make(chan struct{})
-		g.compactFlightHook = func() { <-release }
+		g.compactFlightHook = func() error { <-release; return nil }
 		if !g.TryAsyncCompact() {
 			t.Fatal("flight did not start")
 		}
@@ -292,5 +294,45 @@ func TestAsyncCompactCrashStates(t *testing.T) {
 		}
 		// The covered prefix is still on disk (crash before Drop).
 		check(t, dir)
+	})
+}
+
+// TestAsyncCompactFlightErrorSurfaces: a failed flight's error must reach
+// the writer-side poll, the library must stay openable (the old manifest
+// and chain govern - no bytes landed, no manifest mutation), and Close
+// must not retry the flight (review focus item 4).
+func TestAsyncCompactFlightErrorSurfaces(t *testing.T) {
+	withTinyCompact(t, func() {
+		dir := t.TempDir()
+		g, err := Open(dir+"/v.db", Options{WALMode: ModeAlways})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := g.CreateVectorIndex(VectorIndexDecl{Name: "mem", Prop: "emb", Dim: 8, Metric: "cosine"}); err != nil {
+			t.Fatal(err)
+		}
+		asyncWriteNodes(t, g, 0, 20)
+		boom := errors.New("injected flight failure")
+		g.compactFlightHook = func() error { return boom }
+		if !g.TryAsyncCompact() {
+			t.Fatal("flight did not start")
+		}
+		if err := g.WaitAsyncCompact(); err == nil {
+			t.Fatal("flight error did not surface")
+		}
+		if g.AsyncCompactActive() {
+			t.Fatal("failed flight left the slot occupied")
+		}
+		if err := g.Close(); err != nil {
+			t.Fatal(err)
+		}
+		g2, err := Open(dir+"/v.db", Options{WALMode: ModeAlways})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer g2.Close()
+		if _, ok := g2.NodeByKey(keyN(19)); !ok {
+			t.Fatal("node lost after a failed flight")
+		}
 	})
 }

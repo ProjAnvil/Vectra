@@ -28,6 +28,16 @@ func closeRefreshVec(i int) []float32 {
 	return v
 }
 
+func closeRefreshSubmit(h *writer.Handle, lo, hi int) {
+	cs := vectra.Changeset{Nodes: make([]vectra.NodeUpsert, hi-lo)}
+	for i := lo; i < hi; i++ {
+		cs.Nodes[i-lo] = vectra.NodeUpsert{Key: fmt.Sprintf("n%06d", i), Label: "m", Props: map[string]any{"emb": closeRefreshVec(i)}}
+	}
+	if err := h.Submit(cs); err != nil {
+		panic(err) // test-fixture helper; callers assert the behavior that matters
+	}
+}
+
 func closeRefreshWaitIdle(t *testing.T, g *vectra.Graph) {
 	t.Helper()
 	dl := time.Now().Add(30 * time.Second)
@@ -87,7 +97,7 @@ func TestWrapperClosePreservesPackWork(t *testing.T) {
 		t.Fatal(err)
 	}
 	h2 := writer.Attach(g2, writer.Config{})
-	submit(h2, 12000, 18000)
+	closeRefreshSubmit(h2, 12000, 18000)
 	closeRefreshWaitIdle(t, g2)
 	if err := h2.Close(); err != nil {
 		t.Fatal(err)
@@ -163,5 +173,72 @@ func TestCloseWithoutDriftSkipsForestWrite(t *testing.T) {
 	}
 	if !fi1.ModTime().Equal(fi2.ModTime()) || fi1.Size() != fi2.Size() {
 		t.Fatal("forest rewritten on a no-drift close")
+	}
+}
+
+// TestVectorWritesSurviveCoveredReopen is the C1 regression from the
+// branch's final review: g.replayLSN must reset after Open's replay. In
+// the B1 shape the refreshed forest covers the whole chain, so replay
+// ends at the watermark - a stale replayLSN then silently drops EVERY
+// live vector intake of the new session (props still stored, queries
+// return stale results). Session 3 here WRITES after the reopen.
+func TestVectorWritesSurviveCoveredReopen(t *testing.T) {
+	dir := t.TempDir()
+	g, err := vectra.Open(dir+"/v.db", vectra.Options{WALMode: vectra.ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.CreateVectorIndex(vectra.VectorIndexDecl{Name: "mem", Prop: "emb", Dim: 8, Metric: "cosine"}); err != nil {
+		t.Fatal(err)
+	}
+	h := writer.Attach(g, writer.Config{})
+	closeRefreshSubmit(h, 0, 12000)
+	closeRefreshWaitIdle(t, g)
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Session 2: drift + light close (the refresh writes the forest at
+	// the session's LastLSN).
+	g2, err := vectra.Open(dir+"/v.db", vectra.Options{WALMode: vectra.ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2 := writer.Attach(g2, writer.Config{})
+	closeRefreshSubmit(h2, 12000, 18000)
+	closeRefreshWaitIdle(t, g2)
+	if err := h2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := g2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Session 3: WRITE after the covered reopen. The new vectors must
+	// reach the index on the writer's own read path (no lane wait).
+	g3, err := vectra.Open(dir+"/v.db", vectra.Options{WALMode: vectra.ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h3 := writer.Attach(g3, writer.Config{})
+	closeRefreshSubmit(h3, 18000, 18010)
+	if left := g3.VectorOverlayLen("mem"); left < 10 {
+		t.Fatalf("session-3 writes never reached the overlay: %d (<10) - stale replay gate", left)
+	}
+	hits, err := g3.QueryVector("mem", closeRefreshVec(18005), vectra.QueryVectorOptions{K: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) == 0 || hits[0].Key != "n018005" {
+		t.Fatalf("session-3 vector invisible to queries: %v", hits)
+	}
+	if err := h3.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := g3.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -394,7 +394,7 @@ func (h *Handle) afterBatch() {
 		h.syncMerge()
 	}
 	if h.volumeCheckpoint() {
-		return // sealed + checkpointed: layer pressure is already reset
+		return // flight started: the fold triggers still bound the layer stack
 	}
 	if h.g.VectorOverlayPressure() {
 		select {

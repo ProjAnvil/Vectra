@@ -323,7 +323,7 @@ type Graph struct {
 	// in-production test injection point that runs inside the flight's
 	// byte-writing stage.
 	compactFlight     *compactFlight
-	compactFlightHook func()
+	compactFlightHook func() error
 	dbPath            string      // session path; checkpoints write <dbPath minus ext>-<lsn>.db next to it
 	pendOps           []pendOp    // recorded-but-unflushed ops (inside Batch, or single writes mid-record)
 	batching          bool        // inside Batch: records accumulate instead of flushing
@@ -1807,6 +1807,11 @@ func Open(path string, opts Options) (*Graph, error) {
 		w.Close()
 		return nil, err
 	}
+	// The coverage gate is replay-only: a stale replayLSN would silently
+	// drop every live vector intake of this session when the mounted
+	// forest covers the whole chain (final-review C1 - the B1 shape ends
+	// replay exactly at the watermark).
+	g.replayLSN = 0
 	g.wal, g.walDir, g.dbPath = w, walDir, path
 	g.vecKick() // recovery: replays left every vector in the overlay; drain bottom-up (spec 7.1)
 	// v6 migration + fresh-library tripwire (spec §1.3, rulings #4/#9;
@@ -2370,26 +2375,7 @@ func (g *Graph) forceMerge() error {
 // writer goroutine (debug builds return ErrNotWriter otherwise), and
 // concurrent-safe only via the writer handle or single-goroutine
 // discipline — it rebuilds writer-private state.
-func (g *Graph) Seal() error {
-	if err := g.checkWriter(); err != nil {
-		return err
-	}
-	if err := g.WaitAsyncCompact(); err != nil {
-		return err
-	}
-	if g.wal != nil {
-		if err := g.flushPending(); err != nil {
-			return err
-		}
-	}
-	if err := g.forceMerge(); err != nil {
-		return err
-	}
-	if g.wal == nil {
-		return nil
-	}
-	return g.checkpoint(g.wal.LastLSN())
-}
+func (g *Graph) Seal() error { return g.seal(false) }
 
 // SealForClose is Seal with the close-shaped checkpoint (2026-10-24 fix
 // arc, spec item 1): the light tier additionally refreshes the vector
@@ -2400,7 +2386,11 @@ func (g *Graph) Seal() error {
 // for internal/writer's session-end Seal (the RepairAfterRebase pattern);
 // the compact tier needs nothing extra, its own forest write advances the
 // drift markers.
-func (g *Graph) SealForClose() error {
+func (g *Graph) SealForClose() error { return g.seal(true) }
+
+// seal is Seal's body; closeShape routes the light tier through the
+// forest refresh (see SealForClose).
+func (g *Graph) seal(closeShape bool) error {
 	if err := g.checkWriter(); err != nil {
 		return err
 	}
@@ -2417,6 +2407,9 @@ func (g *Graph) SealForClose() error {
 	}
 	if g.wal == nil {
 		return nil
+	}
+	if !closeShape {
+		return g.checkpoint(g.wal.LastLSN())
 	}
 	compact, man, err := g.compactTier()
 	if err != nil {
@@ -2456,6 +2449,9 @@ func (g *Graph) closeForestRefresh() error {
 // builds): concurrent-safe only via the writer handle or single-goroutine
 // discipline — it rebuilds writer-private state.
 func (g *Graph) Compact() error {
+	if err := g.WaitAsyncCompact(); err != nil {
+		return err
+	}
 	if err := g.checkWriter(); err != nil {
 		return err
 	}
@@ -2642,7 +2638,10 @@ func (g *Graph) TryAsyncCompact() bool {
 func (g *Graph) runCompactFlight(fl *compactFlight) {
 	defer close(fl.done)
 	if g.compactFlightHook != nil {
-		g.compactFlightHook()
+		if err := g.compactFlightHook(); err != nil {
+			fl.err = err
+			return
+		}
 	}
 	if err := g.saveViewFile(fl.view, g.snapshotFile(fl.lsn)); err != nil {
 		fl.err = err

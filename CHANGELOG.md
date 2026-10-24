@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+1M-measurement findings fixed (measurement record:
+`docs/benchmarks/2026-10-23-vector-1m.md`; design:
+`docs/superpowers/specs/2026-10-24-1m-fixes-design.md`).
+
+### Fixed
+
+- Light Close no longer drops converged pack work. The forest cache
+  only advanced at compacts, so a wrapper session that converged its
+  vector lane and closed light left the on-disk forest at the last
+  compact's state - reopen restored its frozen overlay wholesale and
+  re-paid the pack (1M direct measure: 970,751 entries, 2h57m30s).
+  Close-shaped checkpoints (`SealForClose`, `Graph.Close`'s light
+  branch) now refresh the cache when packs drifted since its last
+  write; an idle no-drift close stays O(1) [5b90f6b].
+- Recovery no longer re-packs forest-covered frames. The WAL tail
+  replay re-intook chain frames the mounted forest already carried -
+  vid dedup kept it correct but the copies re-packed (the bench-scale
+  repro reopened with overlay=7616 despite a fresh forest). The
+  mounted image's watermark now gates the vector intake during replay
+  (store frames still apply - props are not in the forest) [5b90f6b].
+
+### Performance
+
+- Volume-triggered compaction goes async. The compact tier's
+  snapshot+forest bytes (11.5-26.3s inside the writer's afterBatch at
+  1M, 12 occurrences) now run on a background flight over the pinned
+  immutable generation; the manifest and WAL mutations complete on the
+  writer - quiescent flights Reset exactly as before, busy flights
+  (frames appended during the flight) re-anchor v2-style and drop only
+  fully-covered segments, so fsynced frames past the pin are never
+  deleted. One flight at a time; light seals are suppressed during a
+  flight (growth bounded by flight duration x ingest rate, with a
+  backpressure valve at CheckpointBytes*4+1GiB) [42eef42, 7efea7b]. The forest
+  ENCODE still serializes with submits under the vector index mutex -
+  at 1M that is an estimated few seconds per compact (vs the 11.5-26.3s
+  of byte writes it removes); measuring it is part of the deferred 1M
+  re-run.
+
+### Changed
+
+- Spec 6.3's "1M x 768 p99 < 10ms" budget line is revised to the
+  direct measurement: ef64 (the production adaptive ef) measures
+  12.16ms at 1M. The latency-first knee is ef=48 (recall@10 0.968,
+  p99 ~8-10ms); closing the 2-3x gap to hnswlib-class engines (SIMD
+  dot product, level-0 layout) is a separate optimization arc.
+
 ## [0.11.2] - 2026-10-22
 
 Checkpoint goes O(1): the retained-WAL incremental chain replaces the
