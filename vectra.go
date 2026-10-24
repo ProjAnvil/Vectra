@@ -316,10 +316,18 @@ type Graph struct {
 	// the vector intake's forest-coverage gate reads it (0 on every live
 	// write path - only Open's replay closure sets it).
 	replayLSN uint64
-	dbPath    string      // session path; checkpoints write <dbPath minus ext>-<lsn>.db next to it
-	pendOps   []pendOp    // recorded-but-unflushed ops (inside Batch, or single writes mid-record)
-	batching  bool        // inside Batch: records accumulate instead of flushing
-	closed    atomic.Bool // after Close: writes fail with ErrClosed, queries legal
+
+	// Async compact flight (2026-10-24 fix arc, spec item 2). All flight
+	// state is writer-thread only; the goroutine communicates through the
+	// flight struct's channel and error field. compactFlightHook is a nil-
+	// in-production test injection point that runs inside the flight's
+	// byte-writing stage.
+	compactFlight     *compactFlight
+	compactFlightHook func()
+	dbPath            string      // session path; checkpoints write <dbPath minus ext>-<lsn>.db next to it
+	pendOps           []pendOp    // recorded-but-unflushed ops (inside Batch, or single writes mid-record)
+	batching          bool        // inside Batch: records accumulate instead of flushing
+	closed            atomic.Bool // after Close: writes fail with ErrClosed, queries legal
 
 	// writerTok is the wrapper-mode writer discipline hook (spec §2.3 R7):
 	// 0 = direct mode (all writes legal); non-zero = the goroutine token
@@ -1970,6 +1978,9 @@ func (g *Graph) Close() error {
 		g.closed.Store(true)
 		return nil
 	}
+	if err := g.WaitAsyncCompact(); err != nil {
+		return err
+	}
 	if err := g.flushPending(); err != nil {
 		return err
 	}
@@ -2363,6 +2374,9 @@ func (g *Graph) Seal() error {
 	if err := g.checkWriter(); err != nil {
 		return err
 	}
+	if err := g.WaitAsyncCompact(); err != nil {
+		return err
+	}
 	if g.wal != nil {
 		if err := g.flushPending(); err != nil {
 			return err
@@ -2388,6 +2402,9 @@ func (g *Graph) Seal() error {
 // drift markers.
 func (g *Graph) SealForClose() error {
 	if err := g.checkWriter(); err != nil {
+		return err
+	}
+	if err := g.WaitAsyncCompact(); err != nil {
 		return err
 	}
 	if g.wal != nil {
@@ -2576,6 +2593,142 @@ func (g *Graph) compactCheckpoint(lsn uint64) error {
 	return nil
 }
 
+// compactFlight is one in-progress background write of a compact
+// checkpoint's BYTES (snapshot + forest). The writer pinned view and lsn at
+// start; the goroutine writes both files from that immutable state and
+// reports through done/err. Every manifest write and WAL mutation happens
+// in the writer-side completion (PollAsyncCompact/WaitAsyncCompact), never
+// here - Segment fields need the writer's current head and Reset/Drop must
+// serialize with appends.
+type compactFlight struct {
+	lsn  uint64
+	view *genView
+	err  error
+	done chan struct{}
+}
+
+// TryAsyncCompact starts a compact-tier flight if one is due and none is
+// active (writer thread). Returns whether a flight started; false also
+// covers "suppressed: a flight is already in flight" - the caller defers
+// its volume checkpoint to a later batch. The pinned view is the CURRENT
+// published generation after a pending flush: export walks it immutably
+// while the writer keeps cutting layers on top.
+func (g *Graph) TryAsyncCompact() bool {
+	if g.wal == nil || g.compactFlight != nil {
+		return false
+	}
+	compact, _, err := g.compactTier()
+	if err != nil || !compact {
+		return false // light tier or unreadable manifest: the synchronous path owns both
+	}
+	if err := g.flushPending(); err != nil {
+		return false // surfaced by the next synchronous checkpoint
+	}
+	fl := &compactFlight{lsn: g.wal.LastLSN(), view: g.view.Load(), done: make(chan struct{})}
+	g.compactFlight = fl
+	go g.runCompactFlight(fl)
+	return true
+}
+
+// runCompactFlight is the background stage: write the pinned view as the
+// watermark snapshot, then the forest cache at the same LSN (its encoded
+// State may be newer than the pin - the cache load gate and the recovery
+// intake's coverage gate absorb the overlap). No manifest, no WAL contact.
+func (g *Graph) runCompactFlight(fl *compactFlight) {
+	defer close(fl.done)
+	if g.compactFlightHook != nil {
+		g.compactFlightHook()
+	}
+	if err := g.saveViewFile(fl.view, g.snapshotFile(fl.lsn)); err != nil {
+		fl.err = err
+		return
+	}
+	if err := g.writeVecForest(fl.lsn); err != nil {
+		fl.err = err
+		return
+	}
+}
+
+// AsyncCompactActive reports whether a flight is in progress (writer
+// thread).
+func (g *Graph) AsyncCompactActive() bool { return g.compactFlight != nil }
+
+// PollAsyncCompact completes a finished flight on the writer thread and
+// returns its error; an in-flight one is left alone (nil). The completion
+// is the whole manifest+WAL side of the compact tier:
+//
+//   - quiescent (no frames past the pin): exactly today's compact
+//     checkpoint - manifest, Reset, cleanup;
+//   - busy (the writer appended during the flight - 1M measured ~480MB of
+//     frames per 26s flight): Reset at the pin would DELETE fsynced frames
+//     the snapshot does not cover. Instead the manifest re-anchors v2-style
+//     at the flight's snapshot (LSN=pin, RetainFrom=the first segment not
+//     fully covered) and only the covered segments are dropped - the
+//     discipline is manifest FIRST (the reconciliation invariant makes the
+//     deleted frames unreadable), deletion after.
+func (g *Graph) PollAsyncCompact() error {
+	fl := g.compactFlight
+	if fl == nil {
+		return nil
+	}
+	select {
+	case <-fl.done:
+	default:
+		return nil
+	}
+	return g.completeAsyncCompact(fl)
+}
+
+// WaitAsyncCompact blocks for the active flight (if any) and runs its
+// completion on the writer thread. Seal/Close call it first: a checkpoint
+// landing while a flight's manifest is pending would race the flight's own
+// re-anchor.
+func (g *Graph) WaitAsyncCompact() error {
+	fl := g.compactFlight
+	if fl == nil {
+		return nil
+	}
+	<-fl.done
+	return g.completeAsyncCompact(fl)
+}
+
+func (g *Graph) completeAsyncCompact(fl *compactFlight) error {
+	g.compactFlight = nil
+	if fl.err != nil {
+		return fl.err
+	}
+	snap := g.snapshotFile(fl.lsn)
+	if g.wal.LastLSN() == fl.lsn {
+		if err := wal.WriteManifest(g.walDir, wal.Manifest{
+			Snapshot: filepath.Base(snap),
+			LSN:      fl.lsn,
+			Segment:  g.wal.Segment(),
+			Format:   2,
+		}); err != nil {
+			return err
+		}
+		if err := g.wal.Reset(fl.lsn); err != nil && !errors.Is(err, wal.ErrClosed) {
+			return err
+		}
+	} else {
+		survivor := g.wal.FirstUncoveredSegment(fl.lsn)
+		if err := wal.WriteManifest(g.walDir, wal.Manifest{
+			Snapshot:   filepath.Base(snap),
+			LSN:        fl.lsn,
+			Segment:    g.wal.Segment(),
+			RetainFrom: survivor,
+			Format:     2,
+		}); err != nil {
+			return err
+		}
+		if err := g.wal.DropSegmentsBelow(survivor); err != nil {
+			return err
+		}
+	}
+	g.cleanupSnapshots(filepath.Base(snap))
+	return nil
+}
+
 // lightCheckpoint is the O(1) tier: Rotate FIRST, manifest second. A crash in
 // between leaves the old manifest plus one empty extra segment — recovery
 // chain-continues into it, parks the head, and loses nothing (the rotated
@@ -2612,7 +2765,14 @@ func (g *Graph) lightCheckpoint(man wal.Manifest) error {
 // caller's absorption window first.
 func (g *Graph) Save(w io.Writer) error {
 	g.flushPend()
-	nodes, edges, labels, indexKeys := g.unionRecords()
+	return g.saveView(w, g.view.Load())
+}
+
+// saveView serializes one (pinned) generation - Save's body without the
+// pend flush. Safe from any goroutine: the view is immutable and the
+// registry load is atomic.
+func (g *Graph) saveView(w io.Writer, v *genView) error {
+	nodes, edges, labels, indexKeys := v.unionRecords()
 	sn := make([]store.Node, len(nodes))
 	for i, n := range nodes {
 		sn[i] = store.Node{Key: n.Key, Label: n.Label, Props: n.Props}
@@ -2637,12 +2797,18 @@ func (g *Graph) Save(w io.Writer) error {
 // SaveFile saves to a path: temp file + fsync + atomic rename, avoiding
 // half-written files.
 func (g *Graph) SaveFile(path string) error {
+	return g.saveViewFile(g.view.Load(), path)
+}
+
+// saveViewFile is SaveFile over a pinned view (the async compact flight's
+// writer-side export: no pend flush, no CURRENT-view load).
+func (g *Graph) saveViewFile(v *genView, path string) error {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	if err := g.Save(f); err != nil {
+	if err := g.saveView(f, v); err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return err
