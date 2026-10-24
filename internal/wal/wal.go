@@ -218,6 +218,10 @@ type WAL struct {
 
 	baseLSN  uint64 // from manifest: frames with lsn <= this are skipped on replay
 	startSeg int    // first segment of the live chain: recovery floors here, and a light checkpoint copies it into manifest RetainFrom
+	// segBase maps each live segment number to its marker's base LSN (the
+	// LSN its first frame carries) - the coverage oracle for
+	// FirstUncoveredSegment. Writer-thread only, like every WAL field.
+	segBase map[int]uint64
 
 	// bytes counts VALID frame bytes across the lineage since the last
 	// Reset (preallocated zero tails are not frames). Atomic so Size is
@@ -340,6 +344,10 @@ func (w *WAL) createSegment(n int, salt uint32, base uint64) error {
 	if err != nil {
 		return err
 	}
+	if w.segBase == nil {
+		w.segBase = map[int]uint64{}
+	}
+	w.segBase[n] = base
 	mj, err := json.Marshal(marker{Salt: salt, Base: base})
 	if err != nil {
 		f.Close()
@@ -428,7 +436,7 @@ func Open(dir string, mode Mode) (*WAL, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	w := &WAL{dir: dir, mode: mode}
+	w := &WAL{dir: dir, mode: mode, segBase: map[int]uint64{}}
 	if man, ok, err := ReadManifest(dir); err != nil {
 		return nil, err
 	} else if ok {
@@ -481,6 +489,7 @@ func Open(dir string, mode Mode) (*WAL, error) {
 		}
 		prev = s
 		head, headSeg = &sc, s
+		w.segBase[s] = sc.base
 		chainBytes += sc.valid
 	}
 
@@ -791,6 +800,11 @@ func (w *WAL) Reset(baseLSN uint64) error {
 	w.bytes.Store(0) // the checkpoint owns everything logged so far
 	w.retained.Store(0)
 	w.startSeg = newSeg // the chain restarts at the fresh segment; everything older is deleted below
+	for s := range w.segBase {
+		if s < newSeg {
+			delete(w.segBase, s)
+		}
+	}
 	segs, err := listSegments(w.dir)
 	if err != nil {
 		return err
@@ -866,6 +880,56 @@ func (w *WAL) Size() int64 { return w.bytes.Load() }
 // walk counts them too; the overshoot is one small marker per segment, which
 // errs toward earlier compaction — the safe side).
 func (w *WAL) RetainedBytes() int64 { return w.retained.Load() }
+
+// FirstUncoveredSegment returns the first chain segment NOT fully covered
+// by a snapshot through coverLSN - the async compact's busy-case
+// completion uses it as the re-anchoring manifest's RetainFrom survivor.
+// A segment's frames run [base(s), base(s+1)-1], so it is covered exactly
+// when the NEXT segment's base is at or below coverLSN+1; the ACTIVE
+// segment always counts as uncovered (the write head lives there and its
+// frames may exceed any cover). A missing base entry keeps the segment
+// (conservative: an unknown range is never deletable).
+func (w *WAL) FirstUncoveredSegment(coverLSN uint64) int {
+	for s := w.startSeg; s < w.segment; s++ {
+		next, ok := w.segBase[s+1]
+		if !ok || next > coverLSN+1 {
+			return s
+		}
+	}
+	return w.segment
+}
+
+// DropSegmentsBelow deletes every chain segment numbered below seg. The
+// async compact's busy-case completion calls it AFTER the re-anchoring
+// manifest landed, with seg = FirstUncoveredSegment(snapshot LSN) - the
+// Reset discipline (manifest first, deletions only for frames the
+// snapshot provably covers; the manifest's segment/LSN gating is what
+// makes the deleted frames unreadable afterwards). Reset stays the
+// compacting form's deleter; this is the second, segment-granular one.
+// Writer-thread only. RetainedBytes sheds the dropped segments' valid
+// bytes and startSeg advances; the active segment is never in range.
+func (w *WAL) DropSegmentsBelow(seg int) error {
+	if seg > w.segment {
+		return fmt.Errorf("wal: DropSegmentsBelow(%d) would drop the active segment %d", seg, w.segment)
+	}
+	var dropped int64
+	for s := w.startSeg; s < seg; s++ {
+		if sc, err := scanSegmentFile(w.dir, s); err == nil {
+			dropped += sc.valid
+		}
+		if err := os.Remove(segmentPath(w.dir, s)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		delete(w.segBase, s)
+	}
+	if dropped > 0 {
+		w.retained.Add(-dropped)
+	}
+	if w.startSeg < seg {
+		w.startSeg = seg
+	}
+	return nil
+}
 
 // FirstSegment reports the first segment of the live chain: the value a light
 // checkpoint copies into manifest RetainFrom. It is maintained by recovery

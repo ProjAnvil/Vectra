@@ -335,3 +335,111 @@ func TestV2EnvelopeSelfDescribing(t *testing.T) {
 		t.Fatalf("forged frame applied %d frames, want 0", applied)
 	}
 }
+
+// TestDropSegmentsBelowCovered pins the async compact's busy-case WAL
+// primitive (2026-10-24 fix arc, spec item 2): segment-granular deletion of
+// fully-covered retained segments. A segment's frames run from its marker
+// base to the next segment's base minus one, so coverage is decidable from
+// the in-memory base map; the ACTIVE segment always counts as uncovered
+// (the write head lives there). Discipline under test: only whole segments
+// below the named survivor go, retained bytes shrink, and the surviving
+// chain reopens and replays cleanly.
+func TestDropSegmentsBelowCovered(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(dir, ModeAlways)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Three retained segments (append + Rotate each) plus frames in the
+	// active fourth segment.
+	var lsn1, lsn3, lsn4 uint64
+	for round := 0; round < 3; round++ {
+		l, err := w.Append(testCS(round + 1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch round {
+		case 0:
+			lsn1 = l
+		case 2:
+			lsn3 = l
+		}
+		if err := w.Rotate(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if lsn4, err = w.Append(testCS(4)); err != nil {
+		t.Fatal(err)
+	}
+	if lsn1 == 0 || lsn3 <= lsn1 || lsn4 <= lsn3 {
+		t.Fatalf("unexpected lsn layout: %d %d %d", lsn1, lsn3, lsn4)
+	}
+	active := w.Segment()
+	retainedBefore := w.RetainedBytes()
+
+	// Cover through lsn3: segments 0..2 are fully covered, the active
+	// segment holds lsn4 > cover and must be the first survivor.
+	if got := w.FirstUncoveredSegment(lsn3); got != active {
+		t.Fatalf("FirstUncoveredSegment(cover=lsn3)=%d, want the active segment %d", got, active)
+	}
+	// Covering even the active's frames keeps it the first survivor: the
+	// write head must never be dropped.
+	if got := w.FirstUncoveredSegment(lsn4); got != active {
+		t.Fatalf("FirstUncoveredSegment(cover=lsn4)=%d, want the active segment %d", got, active)
+	}
+
+	// The discipline under test: the re-anchoring manifest lands FIRST
+	// (LSN = the cover, naming the survivor), then the covered segments
+	// go. Without the manifest, recovery's reconciliation invariant (first
+	// replayed lsn == baseLSN+1) correctly refuses the surviving chain.
+	if err := WriteManifest(dir, Manifest{Snapshot: "v-test.db", LSN: lsn3, Segment: active, RetainFrom: active, Format: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.DropSegmentsBelow(active); err != nil {
+		t.Fatal(err)
+	}
+	segs, err := listSegments(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segs) != 1 || segs[0] != active {
+		t.Fatalf("segments after drop: %v, want only the active %d", segs, active)
+	}
+	// RetainedBytes is the next recovery's replay volume: the dropped
+	// chain is gone but the ACTIVE segment's own frames remain counted.
+	if got := w.RetainedBytes(); got <= 0 || got >= retainedBefore {
+		t.Fatalf("retained after drop: %d (before %d, want the active segment's frames only)", got, retainedBefore)
+	}
+
+	// The surviving chain stays appendable and replayable: more frames,
+	// reopen, replay must deliver exactly the post-drop frames.
+	for i := 5; i <= 6; i++ {
+		if _, err := w.Append(testCS(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	w2, err := Open(dir, ModeAlways)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	var replayed []uint64
+	if _, err := w2.Replay(func(fr Frame) error {
+		replayed = append(replayed, fr.LSN)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := []uint64{lsn4, lsn4 + 1, lsn4 + 2}
+	if len(replayed) != len(want) {
+		t.Fatalf("replayed %d frames, want %d", len(replayed), len(want))
+	}
+	for i := range want {
+		if replayed[i] != want[i] {
+			t.Fatalf("replayed[%d]=%d, want %d", i, replayed[i], want[i])
+		}
+	}
+}
