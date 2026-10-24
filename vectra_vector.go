@@ -114,6 +114,13 @@ type vecIndex struct {
 	// deliberately does NOT bump packCount - it fires per batch.
 	packCount   uint64
 	forestPacks uint64
+	// coveredLSN is the mounted forest image's watermark: during Open's
+	// WAL replay, frames at or below it are already inside the mounted
+	// State, so the vector intake skips them (the store still applies the
+	// node - props are not in the forest). vid dedup keeps re-intake
+	// CORRECT without the gate; the gate keeps it CHEAP (without it the
+	// chain replay re-packs everything the forest covers). 0 = no mount.
+	coveredLSN uint64
 }
 
 // vecForestDrift reports whether any index has pack work the on-disk forest
@@ -400,6 +407,9 @@ func (g *Graph) vecIntakeNode(key string, props map[string]any) {
 		if vi.st == nil { // read-only mount (Clone): writes never touch it
 			continue
 		}
+		if lsn := g.replayLSN; lsn != 0 && vi.coveredBy(lsn) {
+			continue // frame already inside the mounted forest's State
+		}
 		if v, ok := props[vi.decl.Prop]; ok {
 			if fv, ok := vector.NormalizeVec(v, vi.decl.Dim); ok {
 				vi.mu.Lock()
@@ -417,11 +427,22 @@ func (g *Graph) vecIntakeNode(key string, props map[string]any) {
 	}
 }
 
+// coveredBy reports whether the replay frame at lsn is already inside the
+// mounted forest State (watermark gate; see coveredLSN).
+func (vi *vecIndex) coveredBy(lsn uint64) bool {
+	vi.mu.Lock()
+	defer vi.mu.Unlock()
+	return lsn <= vi.coveredLSN
+}
+
 // vecIntakeDelete tombstones the key in every index (node delete).
 func (g *Graph) vecIntakeDelete(key string) {
 	for _, vi := range g.vecReg() {
 		if vi.st == nil { // read-only mount (Clone): writes never touch it
 			continue
+		}
+		if lsn := g.replayLSN; lsn != 0 && vi.coveredBy(lsn) {
+			continue // covered tombstone: the mounted State already has it
 		}
 		vi.mu.Lock()
 		vi.st.Delete(key)
@@ -990,6 +1011,7 @@ func (g *Graph) mountVecForest(img *vecForestImage) bool {
 	for i, vi := range reg {
 		vi.mu.Lock()
 		vi.st = states[i]
+		vi.coveredLSN = img.lsn
 		vi.head.Store(states[i].Snapshot())
 		vi.mu.Unlock()
 	}

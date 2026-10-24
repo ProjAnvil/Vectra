@@ -310,12 +310,16 @@ type Graph struct {
 	bIndex     []string              // pending index declarations (this batch)
 
 	// WAL session state (all zero for New()/Load() graphs — v0.6 behavior).
-	wal      *wal.WAL    // nil = no recording
-	walDir   string      // checkpoint manifest location
-	dbPath   string      // session path; checkpoints write <dbPath minus ext>-<lsn>.db next to it
-	pendOps  []pendOp    // recorded-but-unflushed ops (inside Batch, or single writes mid-record)
-	batching bool        // inside Batch: records accumulate instead of flushing
-	closed   atomic.Bool // after Close: writes fail with ErrClosed, queries legal
+	wal    *wal.WAL // nil = no recording
+	walDir string   // checkpoint manifest location
+	// replayLSN is the LSN of the WAL frame Open's recovery is applying:
+	// the vector intake's forest-coverage gate reads it (0 on every live
+	// write path - only Open's replay closure sets it).
+	replayLSN uint64
+	dbPath    string      // session path; checkpoints write <dbPath minus ext>-<lsn>.db next to it
+	pendOps   []pendOp    // recorded-but-unflushed ops (inside Batch, or single writes mid-record)
+	batching  bool        // inside Batch: records accumulate instead of flushing
+	closed    atomic.Bool // after Close: writes fail with ErrClosed, queries legal
 
 	// writerTok is the wrapper-mode writer discipline hook (spec §2.3 R7):
 	// 0 = direct mode (all writes legal); non-zero = the goroutine token
@@ -1777,6 +1781,7 @@ func Open(path string, opts Options) (*Graph, error) {
 	// frames rebuild their declarations through IndexProperty (a no-op
 	// record while g.wal is nil).
 	if _, err := w.Replay(func(fr wal.Frame) error {
+		g.replayLSN = fr.LSN // forest-coverage gate (see vecIntakeNode)
 		if fr.Changeset != nil {
 			return g.applyChangeset(*fr.Changeset)
 		}
@@ -1796,43 +1801,43 @@ func Open(path string, opts Options) (*Graph, error) {
 	}
 	g.wal, g.walDir, g.dbPath = w, walDir, path
 	g.vecKick() // recovery: replays left every vector in the overlay; drain bottom-up (spec 7.1)
-		// v6 migration + fresh-library tripwire (spec §1.3, rulings #4/#9;
-		// target lifted v5 -> v6 by the 2026-10-22 retained-WAL checkpoint
-		// plan), at the END of Open: no writer is attached and no reader holds
-		// the graph yet, so one Seal runs uncontended. The replayed tail may
-		// contain v2 (type-4) frames that a v0.10 binary silently truncates,
-		// fresh or WAL-only recoveries leave no snapshot head at all, and — the
-		// v6 reason — a v0.11.1 binary ignores manifest v2's RetainFrom and
-		// would read a light-checkpointed library's base alone, silently
-		// missing the retained chain. Folding the recovered state into a v6
-		// watermark snapshot closes all three: old readers hard-fail on the
-		// version byte instead of misreading the layout. The gate is exact
-		// (snapVer==6 ⇒ nothing), so reopening a v6 library is write-free; v4
-		// AND v5 bases now migrate (v6 is a version-only bump over v5, so a
-		// v5-built library is byte-identical but for the stamp). The migration
-		// seal always takes the COMPACT tier (compactTier forces it on a
-		// non-v6 base), so the product is a real v6 snapshot, never a light
-		// rotation over a stale base. A failed seal fails Open — the library
-		// must not pretend to be fine while its head stays
-		// downgrade-truncatable; recovery state survives either way
-		// (pre-manifest failures keep the WAL as the source of truth, a
-		// manifest that already landed makes the next Open a clean v6
-		// no-migration session).
-		if snapVer < store.VersionV6 {
-			// Rollback artifact: the Seal's checkpoint deletes the pre-migration
-			// watermark via cleanupSnapshots — COPY it aside first (the manifest
-			// still names the original until the seal's WriteManifest lands, so a
-			// rename would open a crash window; .bak never matches the cleanup
-			// pattern, and a failed seal keeps the .bak as the artifact). The
-			// stamp is the ACTUAL pre-version (a v5 migration leaves
-			// <name>-v5.bak), Copy errors are ignored (best effort, cleanup
-			// discipline).
-			retainLegacyArtifact(legacySnap, snapVer)
-			if err := g.Seal(); err != nil {
-				w.Close()
-				return nil, fmt.Errorf("vectra: migrating %s to snapshot v6: %w", path, err)
-			}
+	// v6 migration + fresh-library tripwire (spec §1.3, rulings #4/#9;
+	// target lifted v5 -> v6 by the 2026-10-22 retained-WAL checkpoint
+	// plan), at the END of Open: no writer is attached and no reader holds
+	// the graph yet, so one Seal runs uncontended. The replayed tail may
+	// contain v2 (type-4) frames that a v0.10 binary silently truncates,
+	// fresh or WAL-only recoveries leave no snapshot head at all, and — the
+	// v6 reason — a v0.11.1 binary ignores manifest v2's RetainFrom and
+	// would read a light-checkpointed library's base alone, silently
+	// missing the retained chain. Folding the recovered state into a v6
+	// watermark snapshot closes all three: old readers hard-fail on the
+	// version byte instead of misreading the layout. The gate is exact
+	// (snapVer==6 ⇒ nothing), so reopening a v6 library is write-free; v4
+	// AND v5 bases now migrate (v6 is a version-only bump over v5, so a
+	// v5-built library is byte-identical but for the stamp). The migration
+	// seal always takes the COMPACT tier (compactTier forces it on a
+	// non-v6 base), so the product is a real v6 snapshot, never a light
+	// rotation over a stale base. A failed seal fails Open — the library
+	// must not pretend to be fine while its head stays
+	// downgrade-truncatable; recovery state survives either way
+	// (pre-manifest failures keep the WAL as the source of truth, a
+	// manifest that already landed makes the next Open a clean v6
+	// no-migration session).
+	if snapVer < store.VersionV6 {
+		// Rollback artifact: the Seal's checkpoint deletes the pre-migration
+		// watermark via cleanupSnapshots — COPY it aside first (the manifest
+		// still names the original until the seal's WriteManifest lands, so a
+		// rename would open a crash window; .bak never matches the cleanup
+		// pattern, and a failed seal keeps the .bak as the artifact). The
+		// stamp is the ACTUAL pre-version (a v5 migration leaves
+		// <name>-v5.bak), Copy errors are ignored (best effort, cleanup
+		// discipline).
+		retainLegacyArtifact(legacySnap, snapVer)
+		if err := g.Seal(); err != nil {
+			w.Close()
+			return nil, fmt.Errorf("vectra: migrating %s to snapshot v6: %w", path, err)
 		}
+	}
 	return g, nil
 }
 
@@ -1987,6 +1992,14 @@ func (g *Graph) Close() error {
 		}
 	} else if err := g.lightCheckpoint(man); err != nil {
 		return err
+	}
+	// Close-shaped: a light tier must still persist converged pack work,
+	// or the reopen restores the stale forest's frozen overlay (1M B1).
+	// The compact tier's own forest write already advanced the markers.
+	if !compact {
+		if err := g.closeForestRefresh(); err != nil {
+			return err
+		}
 	}
 	// The manifest has landed: this checkpoint is committed. From here on a
 	// failure is surfaced but must never leave the session retryable-but-
@@ -2362,6 +2375,55 @@ func (g *Graph) Seal() error {
 		return nil
 	}
 	return g.checkpoint(g.wal.LastLSN())
+}
+
+// SealForClose is Seal with the close-shaped checkpoint (2026-10-24 fix
+// arc, spec item 1): the light tier additionally refreshes the vector
+// forest cache when packs drifted since its last write. Without it, a
+// light Close after lane convergence leaves the on-disk forest at the
+// last compact's state and the reopen restores its frozen overlay
+// wholesale - the 1M B1 finding (970,751 entries, 2h57m re-pay). Exported
+// for internal/writer's session-end Seal (the RepairAfterRebase pattern);
+// the compact tier needs nothing extra, its own forest write advances the
+// drift markers.
+func (g *Graph) SealForClose() error {
+	if err := g.checkWriter(); err != nil {
+		return err
+	}
+	if g.wal != nil {
+		if err := g.flushPending(); err != nil {
+			return err
+		}
+	}
+	if err := g.forceMerge(); err != nil {
+		return err
+	}
+	if g.wal == nil {
+		return nil
+	}
+	compact, man, err := g.compactTier()
+	if err != nil {
+		return err
+	}
+	if compact {
+		return g.compactCheckpoint(g.wal.LastLSN())
+	}
+	if err := g.lightCheckpoint(man); err != nil {
+		return err
+	}
+	return g.closeForestRefresh()
+}
+
+// closeForestRefresh persists pack work the on-disk forest does not carry
+// (vecForestDrift). The written image carries the current LSN watermark -
+// the v0.11.2 load gate accepts forests at or past the base LSN, and the
+// chain replay's re-added entries dedup by vid (State.Add reuses vids,
+// Pack keeps newest-wins).
+func (g *Graph) closeForestRefresh() error {
+	if !vecForestDrift(g.vecReg()) {
+		return nil
+	}
+	return g.writeVecForest(g.wal.LastLSN())
 }
 
 // Compact is the explicit compaction entry point (spec §6): fold every
