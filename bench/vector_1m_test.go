@@ -613,12 +613,16 @@ func oneMBuildStage(t *testing.T) {
 		t.Fatalf("graph Close: %v", err)
 	}
 	gDur := time.Since(s)
+	// Async-era classification: compact <=> the SNAPSHOT SET changed. A
+	// vecSize-only change is the close-shaped forest refresh riding a light
+	// close (the B1 fix) - logged, not a compact.
 	closeTier := "light"
-	if !oneMStrEq(pre.snapNames, postH.snapNames) || postH.vecSize != pre.vecSize {
+	if !oneMStrEq(pre.snapNames, postH.snapNames) {
 		closeTier = "compact"
 	}
-	t.Logf("close: writer %s (tier=%s), graph %s",
-		hDur.Round(time.Millisecond), closeTier, gDur.Round(time.Millisecond))
+	refreshed := postH.vecSize != pre.vecSize && closeTier == "light"
+	t.Logf("close: writer %s (tier=%s, forest-refresh=%v), graph %s",
+		hDur.Round(time.Millisecond), closeTier, refreshed, gDur.Round(time.Millisecond))
 	oneMLogManifest(t, dir)
 	oneMSizes(t, dir)
 }
@@ -665,8 +669,26 @@ func oneMBulkVolume(t *testing.T, dir string, g *vectra.Graph, h *writer.Handle,
 			lights++ // a segment rotation landed without a snapshot write: light tier
 		}
 		state = next
+		if bulkBytes > 384<<20 {
+			// Past the threshold with margin: the async compact flight is
+			// writing its bytes off the submit path, and its snapshot file
+			// only lands when the write finishes - stop pushing volume and
+			// wait it out (smoke proven: 10 bulk submits can outrace the
+			// flight and hit the guard first).
+			dl := time.Now().Add(180 * time.Second)
+			for time.Now().Before(dl) {
+				time.Sleep(200 * time.Millisecond)
+				next := oneMScanDir(dir)
+				if !oneMStrEq(state.snapNames, next.snapNames) {
+					t.Logf("bulk: compact flight's snapshot landed while waiting (%.0fMiB pushed, %s)",
+						float64(bulkBytes)/(1<<20), time.Since(start).Round(time.Millisecond))
+					return lights, bulkBytes, time.Since(start)
+				}
+			}
+			t.Fatalf("bulk: no compact 180s past the threshold - flight never landed its snapshot")
+		}
 		if bulkBytes > 640<<20 {
-			t.Fatalf("bulk: no compact after 640MiB - threshold logic changed?")
+			t.Fatalf("bulk: no compact after 640MiB of pushes - threshold logic changed?")
 		}
 	}
 }
@@ -765,11 +787,15 @@ func oneMChainStage(t *testing.T) {
 	if err := g2.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// Async-era classification: compact <=> the SNAPSHOT SET changed. A
+	// vecSize-only change is the close-shaped forest refresh riding a light
+	// close (the B1 fix) - logged, not a compact.
 	closeTier := "light"
-	if !oneMStrEq(pre.snapNames, postH.snapNames) || postH.vecSize != pre.vecSize {
+	if !oneMStrEq(pre.snapNames, postH.snapNames) {
 		closeTier = "compact"
 	}
-	t.Logf("B3 close: writer %s tier=%s", hDur.Round(time.Millisecond), closeTier)
+	t.Logf("B3 close: writer %s tier=%s (forest-refresh=%v)",
+		hDur.Round(time.Millisecond), closeTier, postH.vecSize != pre.vecSize && closeTier == "light")
 	if closeTier != "light" {
 		t.Fatalf("B3 needs a light Close (retained < 256MiB); got %s - lower VECTRA_1M_CHAIN_VECS", closeTier)
 	}
@@ -788,9 +814,12 @@ func oneMChainStage(t *testing.T) {
 	for _, p := range []int{n / 3, 2 * n / 3} {
 		restartSelfQuery(t, g3, probes, p)
 	}
-	if b4Overlay < 2048 {
-		t.Errorf("B4 chain restart opened with overlay=%d (<2048): no chain replayed - check RetainFrom", b4Overlay)
-	}
+	// Async-era semantics: overlay-at-open counts only frames PAST the
+	// mounted forest's watermark (the recovery coverage gate - the fix
+	// arc's Task 2), not the whole chain. A small overlay here means the
+	// stale-but-ahead forest covered the chain, which is the designed
+	// behavior; the drain + probes below carry the correctness check.
+	t.Logf("B4 overlay-at-open=%d (frames past the forest watermark only - recovery coverage gate)", b4Overlay)
 	if err := g3.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -834,7 +863,7 @@ func oneMCompactStage(t *testing.T) {
 		t.Fatal(err)
 	}
 	closeTier := "light"
-	if !oneMStrEq(pre.snapNames, postH.snapNames) || postH.vecSize != preVec {
+	if !oneMStrEq(pre.snapNames, postH.snapNames) {
 		closeTier = "compact"
 	}
 	t.Logf("C2 close: writer %s tier=%s (v.vec %.1fMB -> %.1fMB)",
