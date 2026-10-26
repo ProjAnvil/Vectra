@@ -77,7 +77,7 @@ func (p *parser) expectKw(word string) error {
 // clause) ... RETURN items [ORDER BY ...] [SKIP n] [LIMIT n]. RETURN is
 // terminal — anything after it is an unexpected-token error. The WITH,
 // UNWIND and OPTIONAL MATCH arms land in T4/T5/T6; until then those
-// keywords at clause position take the default unexpected-token error.
+// keywords at clause position take the "expected RETURN" error.
 func (p *parser) parseQuery() (*Query, error) {
 	if !p.kw("MATCH") {
 		return nil, p.errf("expected MATCH, got %s", describe(p.cur()))
@@ -99,12 +99,15 @@ func (p *parser) parseQuery() (*Query, error) {
 			c, err = p.parseReturnClause()
 			sawReturn = true
 		default:
-			return nil, p.errf("expected end of input, got %s", describe(p.cur()))
+			return nil, p.errf("expected RETURN, got %s", describe(p.cur()))
 		}
 		if err != nil {
 			return nil, err
 		}
 		q.Clauses = append(q.Clauses, c)
+	}
+	if !sawReturn {
+		return nil, p.errf("expected RETURN, got %s", describe(p.cur()))
 	}
 	return q, nil
 }
@@ -982,7 +985,7 @@ func (sc *scope) checkReturn(c *ReturnClause, matchCount int) error {
 			}
 			return &Error{1, 1, fmt.Sprintf("ORDER BY variable %q is not declared in the pattern", varPart)}
 		}
-		if k := sc.kinds[varPart]; k == kindEdge {
+		if vk := sc.kinds[varPart]; vk == kindEdge {
 			if ep := sc.edges[varPart]; ep != nil && (ep.MinHops != 1 || ep.MaxHops != 1) {
 				return sc.varlenErr(1, 1, varPart)
 			}
@@ -1001,7 +1004,13 @@ func (sc *scope) checkReturn(c *ReturnClause, matchCount int) error {
 func (q *Query) validate() error {
 	sc := newScope()
 	matchCount := 0
+	sawReturn := false
 	for _, c := range q.Clauses {
+		if sawReturn {
+			// Defensive: the parser never emits clauses after RETURN, but a
+			// hand-constructed Query must not silently drop them.
+			return &Error{1, 1, "RETURN must be the final clause"}
+		}
 		switch c := c.(type) {
 		case *MatchClause:
 			matchCount++
@@ -1029,7 +1038,10 @@ func (q *Query) validate() error {
 			}
 			sc.kinds[c.Alias] = kindScalar
 		case *ReturnClause:
-			return sc.checkReturn(c, matchCount)
+			if err := sc.checkReturn(c, matchCount); err != nil {
+				return err
+			}
+			sawReturn = true
 		}
 	}
 	return nil

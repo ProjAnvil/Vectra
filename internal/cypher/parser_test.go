@@ -128,6 +128,9 @@ func TestParseErrors(t *testing.T) {
 		{"MATCH (a) WHERE a.x = RETURN a", "expected"}, // 右操作数缺失
 		{"MATCH (a) WHERE = 1 RETURN a", "expected"},   // 左操作数非法
 		{"MATCH (a) RETURN a LIMIT -", "expected number"},
+		{"MATCH (a)", `expected RETURN, got end of input`}, // RETURN 缺失
+		{"MATCH (a) WHERE a.x = 1", `expected RETURN, got end of input`},
+		{"MATCH (a) LIMIT 1", `expected RETURN, got "LIMIT"`}, // 子句位置的非 RETURN 关键字
 	}
 	for _, c := range cases {
 		_, err := Parse(c.src)
@@ -206,9 +209,9 @@ func TestParseClauseCardinality(t *testing.T) {
 	// RETURN is terminal: any clause keyword after it errors
 	for _, c := range []struct{ src, want string }{
 		{"MATCH (a) RETURN a MATCH (b)", `expected end of input, got "MATCH"`},
-		{"MATCH (a) WITH a AS x RETURN x", `expected end of input, got "WITH"`},
-		{"MATCH (a) UNWIND [1] AS k RETURN k", `expected end of input, got "UNWIND"`},
-		{"MATCH (a) OPTIONAL MATCH (b) RETURN a", `expected end of input, got "OPTIONAL"`},
+		{"MATCH (a) WITH a AS x RETURN x", `expected RETURN, got "WITH"`},
+		{"MATCH (a) UNWIND [1] AS k RETURN k", `expected RETURN, got "UNWIND"`},
+		{"MATCH (a) OPTIONAL MATCH (b) RETURN a", `expected RETURN, got "OPTIONAL"`},
 	} {
 		_, err := Parse(c.src)
 		if err == nil || !strings.Contains(err.Error(), c.want) {

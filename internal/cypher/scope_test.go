@@ -274,6 +274,14 @@ func TestScopePropRefOnScalarVar(t *testing.T) {
 		returnOf(propItem("k", "foo", "")),
 	}, `variable "k" is a scalar; property access requires a node or edge`)
 
+	// the same kind check covers aggregation arguments
+	wantErr(t, []Clause{
+		matchNodes("a"),
+		&UnwindClause{Expr: &PropRef{Var: "a", Name: "x"}, Alias: "k"},
+		returnOf(&ReturnItem{Agg: AggCall{Func: "count", Arg: propItem("k", "foo", "")},
+			Name: "count(k.foo)"}),
+	}, `variable "k" is a scalar; property access requires a node or edge`)
+
 	// returning the scalar itself is fine
 	wantOK(t,
 		matchNodes("a"),
@@ -305,4 +313,14 @@ func TestScopeReturnStarDegenerateOnly(t *testing.T) {
 	wantErr(t, []Clause{matchNodes("a"),
 		&ReturnClause{Limit: -1, Skip: -1, Star: true, Items: []*ReturnItem{aggStarItem("")}}},
 		"RETURN * cannot be combined with aggregation")
+}
+
+// Defensive: the parser never emits clauses after RETURN, but a
+// hand-constructed Query must not silently drop them.
+func TestScopeReturnMustBeFinal(t *testing.T) {
+	wantErr(t, []Clause{
+		matchNodes("a"),
+		returnOf(bareItem("a", "")),
+		matchNodes("b"),
+	}, "RETURN must be the final clause")
 }
