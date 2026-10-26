@@ -3,7 +3,7 @@
 // directly (single binary, usable over stdio, no network), for MCP hosts
 // like Claude Desktop / Claude Code.
 //
-// The tool surface follows database-MCP best practices: 10 small but
+// The tool surface follows database-MCP best practices: 14 small but
 // complete tools, separated read/write annotations, and results capped
 // by default (limit, to prevent context-window blowup).
 package mcpserver
@@ -120,6 +120,15 @@ func newService(g *vectra.Graph, opts Options) *service {
 			for _, k := range loaded.IndexedPropertyKeys() {
 				svc.propKeys[k] = true // snapshot's indexes survive the next seal
 			}
+			// Full-text declarations are a separate kind with a separate
+			// accessor: reload restores them as FTS through IndexFullText —
+			// idempotent when the loaded graph already carries them — and
+			// they never join propKeys, whose seal-time auto-index stays
+			// typed-only (an FTS key auto-declared typed would be unrequested
+			// memory).
+			for _, k := range loaded.FullTextIndexedKeys() {
+				loaded.IndexFullText(k)
+			}
 		case errors.Is(err, fs.ErrNotExist):
 			// first run: no snapshot yet — start fresh, first seal creates it
 		default:
@@ -147,7 +156,9 @@ func newServer(svc *service) *mcp.Server {
 			Instructions: "Vectra in-memory graph engine (dependency graphs). Write with inject_batch — " +
 				"writes are immediately visible to every query tool (neighbors: one hop, bfs: multi-hop, " +
 				"shortest_path, reachable: impact set, cycles: dependency cycles, cypher: Cypher-subset " +
-				"pattern queries, stats, get_node, lookup_property, vector_search: approximate top-k over a vector index). Call seal periodically to merge " +
+				"pattern queries, stats, get_node, lookup_property, lookup_contains: case-insensitive substring " +
+				"lookup over index_fulltext-declared keys, vector_search: approximate top-k over a vector " +
+				"index). Call seal periodically to merge " +
 				"micro-layers and checkpoint (in WAL mode it is the durability boundary); it is " +
 				"maintenance, never a query prerequisite.",
 		},
@@ -288,6 +299,20 @@ type lookupIn struct {
 	Limit     int    `json:"limit,omitempty"`
 }
 
+type indexFullTextIn struct {
+	PropKey string `json:"propKey"`
+}
+
+type indexFullTextOut struct {
+	PropKey string `json:"propKey"`
+}
+
+type lookupContainsIn struct {
+	PropKey  string `json:"propKey"`
+	Contains string `json:"contains" jsonschema:"substring to match, case-insensitive"`
+	Limit    int    `json:"limit,omitempty"`
+}
+
 type cypherIn struct {
 	Query string `json:"query" jsonschema:"Cypher-subset statement: MATCH ... [WHERE ...] RETURN ... [ORDER BY ...] [LIMIT n]"`
 	Limit int    `json:"limit,omitempty" jsonschema:"max rows returned, default 1000"`
@@ -386,6 +411,22 @@ func registerTools(s *mcp.Server, svc *service) {
 		Name: "lookup_property", Description: "Look up nodes by property value, typed equality (string/number/bool — label-like props such as env/team/tier, numeric ids, flags). Params: propKey, propValue, limit (default 1000).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.lookupProperty)
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "index_fulltext",
+		Description: "Declare a full-text (substring) index over a string property key — the write side of the " +
+			"lookup_contains pair. Idempotent. lookup_contains answers immediately (a pending declaration " +
+			"scans); seal later builds the gram buckets. Params: propKey.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false},
+	}, svc.indexFullText)
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "lookup_contains",
+		Description: "Look up nodes whose string property contains a substring, case-INSENSITIVE (needle and " +
+			"values fold to lower case) — differs from Cypher CONTAINS, which is a case-sensitive scan. The " +
+			"key must be declared with index_fulltext first. Params: propKey, contains, limit (default 1000).",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, svc.lookupContains)
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "cypher",
@@ -534,6 +575,15 @@ var errPropNotIndexed = errors.New("property is not indexed (re-seal after it ap
 
 func notIndexed(key string) error {
 	return fmt.Errorf("%w: %q", errPropNotIndexed, key)
+}
+
+// errKeyNotFullTextIndexed is lookup_contains's raise for keys never
+// declared through index_fulltext — its remedy differs from the typed
+// raise: declaring, not re-sealing.
+var errKeyNotFullTextIndexed = errors.New("property is not full-text indexed (declare it with index_fulltext)")
+
+func notFullTextIndexed(key string) error {
+	return fmt.Errorf("%w: %q", errKeyNotFullTextIndexed, key)
 }
 
 // parseDir maps the tool's direction argument; anything but the exact "in"
@@ -730,6 +780,54 @@ func (svc *service) lookupProperty(_ context.Context, _ *mcp.CallToolRequest, in
 		nodes = ns
 	default:
 		return nil, listOut{}, fmt.Errorf("propValue must be a string, number or boolean, got %T", in.PropValue)
+	}
+	out := listOut{Total: len(nodes)}
+	for i, n := range nodes {
+		if i >= limit {
+			break
+		}
+		out.Nodes = append(out.Nodes, n.Key)
+	}
+	out.Count = len(out.Nodes)
+	return nil, out, nil
+}
+
+// indexFullText declares a full-text index — a writer-private engine op, so
+// it serializes against inject/seal through the write mutex. The declaration
+// is pending until the next merge, but lookup_contains answers it right away
+// (scan path), matching the continuous-write model every other tool follows.
+func (svc *service) indexFullText(_ context.Context, _ *mcp.CallToolRequest, in indexFullTextIn) (*mcp.CallToolResult, indexFullTextOut, error) {
+	if svc.openErr != nil {
+		return nil, indexFullTextOut{}, svc.openErr
+	}
+	if in.PropKey == "" {
+		return nil, indexFullTextOut{}, errors.New("propKey must not be empty")
+	}
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+	svc.live.IndexFullText(in.PropKey)
+	return nil, indexFullTextOut{PropKey: in.PropKey}, nil
+}
+
+// lookupContains is lookup_property's substring sibling: case-insensitive
+// contains over an index_fulltext-declared key. substr == "" is not a
+// search (the engine answers it as undeclared), so it raises here instead of
+// handing the agent a misleading not-indexed error.
+func (svc *service) lookupContains(_ context.Context, _ *mcp.CallToolRequest, in lookupContainsIn) (*mcp.CallToolResult, listOut, error) {
+	v, err := svc.view()
+	if err != nil {
+		return nil, listOut{}, err
+	}
+	if in.Contains == "" {
+		return nil, listOut{}, errors.New("contains must not be empty")
+	}
+	limit := in.Limit
+	if limit <= 0 {
+		limit = defaultLimit
+	}
+	nodes, ok := v.LookupByContains(in.PropKey, in.Contains)
+	if !ok {
+		return nil, listOut{}, notFullTextIndexed(in.PropKey)
 	}
 	out := listOut{Total: len(nodes)}
 	for i, n := range nodes {

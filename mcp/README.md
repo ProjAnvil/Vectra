@@ -8,7 +8,7 @@ Vectra ships first-class [Model Context Protocol](https://modelcontextprotocol.i
 | **Python** (FastMCP) | [`python/`](python/) | Wraps Vectra HTTP API | stdio + Streamable HTTP | Python-first MCP hosts |
 | **TypeScript** (official SDK) | [`ts/`](ts/) | Wraps Vectra HTTP API | stdio | JS/TS-first MCP hosts |
 
-**Tool surface** (13 tools in the TS/Python proxies, 12 in the embedded Go server; read/write annotated, results capped by default to protect the context window):
+**Tool surface** (13 tools in the TS/Python proxies, 14 in the embedded Go server; read/write annotated, results capped by default to protect the context window):
 
 | Tool | Kind | Description |
 |---|---|---|
@@ -22,6 +22,8 @@ Vectra ships first-class [Model Context Protocol](https://modelcontextprotocol.i
 | `reachable` | read | Blast radius from a node |
 | `cycles` | read | Dependency cycles, largest first, with per-cycle edges (src/dst/label) |
 | `lookup_property` (Go only) | read | Property-index lookup (env/team/tier…) |
+| `index_fulltext` (Go only) | write | Declare a full-text (substring) index over a string property key (`propKey`); idempotent, answers `lookup_contains` immediately |
+| `lookup_contains` (Go only) | read | Case-insensitive substring lookup over an `index_fulltext`-declared key (`propKey` + `contains`) — unlike Cypher `CONTAINS`, which is case-sensitive |
 | `cypher` | read | Cypher-subset pattern queries (`MATCH`/`WHERE`/`RETURN`/`ORDER BY`/`LIMIT`) |
 | `vector_search` | read | **Approximate** top-k ANN over a declared vector index (`query_vector` or `similar_to`); results are approximate; k default 10, max 1000 |
 | `vector_index_create` (TS/Python only) | write | Declare a vector index: `name`, `prop`, `dim`, `metric` (cosine/l2/dot), optional `m`/`efConstruction` |
@@ -56,11 +58,11 @@ Claude Desktop (`claude_desktop_config.json`):
 }
 ```
 
-v0.7 continuous-write model: every applied write is **immediately visible** to all query tools — no seal required (the sealed gate is gone). `seal` is maintenance: it folds unmerged micro-layers into the sealed base, auto-indexes the property keys seen since the last seal, and checkpoints. The graph stays writable afterwards (writes open a new generation). In `-snapshot` mode a seal also re-saves the file; the store v3 format persists index declarations, so `lookup_property` works immediately after a restart.
+v0.7 continuous-write model: every applied write is **immediately visible** to all query tools — no seal required (the sealed gate is gone). `seal` is maintenance: it folds unmerged micro-layers into the sealed base, auto-indexes the property keys seen since the last seal, and checkpoints. The graph stays writable afterwards (writes open a new generation). In `-snapshot` mode a seal also re-saves the file; the store format persists index declarations — typed and, since store v7, full-text — so `lookup_property` and `lookup_contains` work immediately after a restart.
 
 `-wal <dir>` switches to a durable session: every batch is WAL-logged (fsync per batch), `seal` writes the checkpoint (watermark snapshot + manifest + log reset), and a restart on the same directory recovers everything — checkpointed state plus the log tail. `-wal` takes precedence over `-snapshot` (a given `-snapshot` path then names the db file; omitted, it defaults to `<wal>/graph.db`).
 
-**Parameter naming convention** (spelled out because agents guess on first call): a single node is `key`; traversal endpoints are `from`/`to` (`bfs` takes a list in `from`); property lookup uses the `propKey`/`propValue` pair; shared controls are `direction` (`"out"` default | `"in"`), `label`/`labels`, `limit` (default 1000), `maxDepth` (0 = unlimited).
+**Parameter naming convention** (spelled out because agents guess on first call): a single node is `key`; traversal endpoints are `from`/`to` (`bfs` takes a list in `from`); property lookup uses the `propKey`/`propValue` pair (substring lookup: `propKey` + `contains`); shared controls are `direction` (`"out"` default | `"in"`), `label`/`labels`, `limit` (default 1000), `maxDepth` (0 = unlimited).
 
 ## Python (wraps the HTTP API)
 
@@ -101,5 +103,5 @@ claude mcp add vectra --env VECTRA_URL=http://127.0.0.1:8080 -- node /path/to/mc
 ## Design notes
 
 - The Go server embeds the engine directly (the embedded story); Python/TS servers proxy the HTTP API — they work against a single node or a whole raft cluster (writes are forwarded via leader hints automatically).
-- Tool surface follows database-MCP best practice: small (13 tools in the proxies, 12 in Go), read/write annotated, results capped (`limit`, default 1000; vector search `k`, default 10 max 1000) with `total` always reflecting the true size.
+- Tool surface follows database-MCP best practice: small (13 tools in the proxies, 14 in Go), read/write annotated, results capped (`limit`, default 1000; vector search `k`, default 10 max 1000) with `total` always reflecting the true size.
 - Protocol specs supported: whatever the underlying SDK negotiates (Go SDK v1.8 covers up to 2026-07-28).
