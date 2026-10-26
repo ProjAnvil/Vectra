@@ -24,7 +24,7 @@ Vectra ships first-class [Model Context Protocol](https://modelcontextprotocol.i
 | `lookup_property` (Go only) | read | Property-index lookup (env/team/tier…) |
 | `index_fulltext` (Go only) | write | Declare a full-text (substring) index over a string property key (`propKey`); idempotent, answers `lookup_contains` immediately |
 | `lookup_contains` (Go only) | read | Case-insensitive substring lookup over an `index_fulltext`-declared key (`propKey` + `contains`) — unlike Cypher `CONTAINS`, which is case-sensitive |
-| `cypher` | read | Cypher-subset pattern queries (`MATCH`/`WHERE`/`RETURN`/`ORDER BY`/`LIMIT`) |
+| `cypher` | read | Cypher-subset pattern queries: `[OPTIONAL] MATCH` (repeatable) / `WITH [DISTINCT]` (projection, `ORDER BY`/`SKIP`/`LIMIT`, `WHERE` after) / `UNWIND ... AS x` / `RETURN` (`ORDER BY`/`SKIP`/`LIMIT`) |
 | `vector_search` | read | **Approximate** top-k ANN over a declared vector index (`query_vector` or `similar_to`); results are approximate; k default 10, max 1000 |
 | `vector_index_create` (TS/Python only) | write | Declare a vector index: `name`, `prop`, `dim`, `metric` (cosine/l2/dot), optional `m`/`efConstruction` |
 | `vector_index_drop` (TS/Python only) | write | Drop a declared vector index by name |

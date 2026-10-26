@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-26
+
+The Cypher clause pipeline: queries are no longer one MATCH - they are a
+clause chain. WITH scopes and projects, UNWIND fans lists out, OPTIONAL
+MATCH keeps unmatched rows, MATCH repeats (cartesian disjoint variables,
+join shared ones), and RETURN/WITH trailers gain SKIP. The parser emits a
+clause-list AST validated through a scope chain and executed by a
+stage-loop row executor with copy-on-write bindings; the first four
+clauses parse and execute with zero clause-slice allocations. Release
+gate (two-worktree A/B vs `1ec9508`, back-to-back, medians of 3 x 2s,
+two rounds): every legacy shape within +5% ns/op with allocs/op
+byte-identical - 1-hop named +4.3% (244 = 244 allocs), 1-hop anonymous
++4.4% (177 = 177), var-length +3.0% (272 = 272), undirected +2.7%
+(312 = 312); worst single round +4.8%.
+
+### Added
+
+- `WITH [DISTINCT] items [ORDER BY ...] [SKIP n] [LIMIT n] [WHERE expr]`:
+  projects into a NEW scope - only projected names survive. Bare
+  variables pass their entity binding through under their own name or
+  alias; `var.prop` and aggregation items require `AS` and project
+  scalars. `DISTINCT` dedups the projected rows; the trailer
+  (ORDER BY/SKIP/LIMIT) orders and windows them; a trailing `WHERE`
+  filters AFTER the projection (references projected names only).
+- `UNWIND expr AS alias`: fans each row's list value to one row per
+  element - the expression may be a list literal, a bare variable naming
+  a list-valued scalar (typically a `collect()` alias), or `var.prop`.
+  Null/empty lists drop the row (strict stage semantics); the alias
+  binds a scalar and the current scope survives.
+- `OPTIONAL MATCH`: a row whose whole clause (every comma pattern plus
+  the clause's WHERE) matches nothing is kept unchanged, the clause's
+  pattern variables reading null through RETURN/WITH/UNWIND. Optionality
+  is all-or-nothing across the comma patterns; the merge does not dedup
+  across base rows; a leading OPTIONAL MATCH anchors from one implicit
+  empty row.
+- Repeated `MATCH` clauses: disjoint variables cartesian-product, shared
+  variables join; stages are strict - a stage whose input is zero rows
+  yields zero rows and never re-anchors. `SKIP n` also lands in the
+  RETURN trailer (after ORDER BY, before LIMIT).
+- MCP `cypher` tool description and READMEs (en/zh-CN) document the
+  clause grammar, the scope rules, and the divergences (below).
+
+### Fixed
+
+- A pattern variable first declared under `OPTIONAL MATCH` is null on
+  the rows the optional expansion missed; using it as a pattern variable
+  in a later NON-optional MATCH silently cartesian-anchored those rows
+  (Neo4j yields zero). Validation now tracks a nullable-var set: fresh
+  OPTIONAL declarations are nullable (pre-bound join variables are not),
+  a bare-variable WITH item carries nullability through (var.prop,
+  aggregations, and WHERE filters do not clear or carry it), and the
+  offending later MATCH is a positioned error suggesting the two
+  restructures - fold the pattern into the OPTIONAL MATCH or mark the
+  later MATCH optional (`IS [NOT] NULL` is not in the grammar). Caught
+  in the T6 review before release.
+
+### Performance
+
+- A/B vs `1ec9508` (two-worktree protocol, `bench/cypher_bench_test.go`
+  copied into the main worktree, quiet solo runs, 3 x 2s, two
+  back-to-back rounds each side, six-sample medians):
+
+  | Shape | main ns/op | v0.13.0 ns/op | delta | main allocs | v0.13.0 allocs |
+  |---|---|---|---|---|---|
+  | 1-hop named | 13,350 | 13,927 | +4.3% | 244 | 244 |
+  | 1-hop anonymous | 10,619 | 11,085 | +4.4% | 177 | 177 |
+  | var-length | 14,788 | 15,238 | +3.0% | 272 | 272 |
+  | undirected | 14,808 | 15,213 | +2.7% | 312 | 312 |
+
+  Verdict: PASS - all shapes within the +5% ns/op line (worst single
+  round +4.8%, 1-hop named), allocs/op identical on every shape and
+  equal to the T1 pre-refactor anchor; `TestCypherViewPathAllocs` pins
+  244/177 on the branch. B/op is +736 on every shape at the same alloc
+  count (clause-pipeline parse structs), which the identical allocs/op
+  line covers. New-shape allocation gates: WITH pass-through 422 <= 530,
+  WITH aggregate 302 <= 380, UNWIND 350 <= 440, OPTIONAL null-extension
+  400 <= 500 allocs/query; queries without an OPTIONAL MATCH keep their
+  exact pre-pipeline allocation footprint (the nullable-var map is
+  lazy).
+- Zero-alloc clause storage: the clause list is inline for the first
+  four clauses and spills to a heap slice only at the fifth - realistic
+  MATCH/WITH/UNWIND pipelines parse with zero clause-slice allocations.
+
 ## [0.12.0] - 2026-10-26
 
 Auth and full-text search: the HTTP surface gains optional bearer-token

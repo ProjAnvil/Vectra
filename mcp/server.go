@@ -27,12 +27,12 @@ import (
 // hybrid: -ldflags for the semver, source default as fallback for plain
 // `go build`/`go install`, which cannot carry flags):
 //
-//	go build -ldflags "-X github.com/projanvil/vectra/mcp.Version=v0.12.0" ./cmd/vectra-mcp
+//	go build -ldflags "-X github.com/projanvil/vectra/mcp.Version=v0.13.0" ./cmd/vectra-mcp
 //
 // The Makefile build target injects `git describe --tags --always --dirty`.
 // The source default still gets bumped at release (chore(release) commits),
 // so unbuilt checkouts and `go install` from a tag report a truthful value.
-var Version = "0.12.0"
+var Version = "0.13.0"
 
 // defaultLimit is the default cap on nodes returned by bfs/reachable
 // (results are capped; the total field still reflects the true size,
@@ -314,7 +314,7 @@ type lookupContainsIn struct {
 }
 
 type cypherIn struct {
-	Query string `json:"query" jsonschema:"Cypher-subset statement: MATCH ... [WHERE ...] RETURN ... [ORDER BY ...] [LIMIT n]"`
+	Query string `json:"query" jsonschema:"Cypher-subset statement: [OPTIONAL] MATCH ... [WITH ...] [UNWIND ... AS x] RETURN ... [ORDER BY/SKIP/LIMIT]"`
 	Limit int    `json:"limit,omitempty" jsonschema:"max rows returned, default 1000"`
 }
 
@@ -430,10 +430,12 @@ func registerTools(s *mcp.Server, svc *service) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "cypher",
-		Description: "Query the graph with a Cypher-subset statement: MATCH (a:Label {prop:value})-[e:REL*1..3]->(b) " +
-			"WHERE b.w > 3 RETURN a.key, b ORDER BY b.w DESC LIMIT 10. Node-pair semantics for *hops " +
-			"(shortest distance within the hop window); pseudo-props a.key/a.label/a.id; edge vars bind on " +
-			"fixed single hops only. Limit defaults to 1000 (total reports the true size).",
+		Description: "Query the graph with a Cypher-subset statement: [OPTIONAL] MATCH (a:Label {prop:value})-[e:REL*1..3]->(b) " +
+			"(repeatable, comma patterns too) | WITH [DISTINCT] items [ORDER BY/SKIP/LIMIT] [WHERE] | UNWIND list AS x | " +
+			"RETURN items [ORDER BY/SKIP/LIMIT]. Example: MATCH (a)-[:CALLS]->(b) WITH a, count(b) AS n ORDER BY n DESC LIMIT 5 RETURN a.key, n. " +
+			"Node-pair semantics for *hops (shortest distance within the hop window); pseudo-props a.key/a.label/a.id; edge vars bind on " +
+			"fixed single hops only; vars from OPTIONAL MATCH may read null (they cannot anchor a later non-optional MATCH). " +
+			"Limit defaults to 1000 (total reports the true size).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, svc.cypher)
 

@@ -96,9 +96,13 @@ res, _ := g.Cypher(`MATCH (b {type:'controller'})-[:CALLS*1..2]->(s)
 // res.Columns = ["b.key", "s"]; res.Rows = [{"b.key": "gw", "s": {key,label,props,...}}, ...]
 ```
 
-语法：`MATCH pattern[, pattern...] [WHERE expr] RETURN *|items [ORDER BY item [ASC|DESC]...] [LIMIT n]`；节点 `(var:Label {prop:literal})`，边 `-[var:REL|REL*n..m]->` / `<-[...]-` / `--`（无方向）；WHERE 支持 `= <> < <= > >=`、`STARTS/ENDS WITH`、`CONTAINS`、`IN [...]`、`AND/OR/NOT`、伪属性 `var.key / var.label / var.id`，以及定长单跳上的边属性谓词（`WHERE e.weight > 3`——并行边各绑定一行）。
+语法（v0.13 子句管线）：子句按任意顺序串联——`[OPTIONAL] MATCH pattern[, pattern...] [WHERE expr]`（可重复）、`WITH [DISTINCT] items [ORDER BY item [ASC|DESC]...] [SKIP n] [LIMIT n] [WHERE expr]`、`UNWIND list AS alias`——以 `RETURN *|items [ORDER BY item [ASC|DESC]...] [SKIP n] [LIMIT n]` 收尾；节点 `(var:Label {prop:literal})`，边 `-[var:REL|REL*n..m]->` / `<-[...]-` / `--`（无方向）；WHERE 支持 `= <> < <= > >=`、`STARTS/ENDS WITH`、`CONTAINS`、`IN [...]`、`AND/OR/NOT`、伪属性 `var.key / var.label / var.id`，以及定长单跳上的边属性谓词（`WHERE e.weight > 3`——并行边各绑定一行）。
 
 语义（刻意设计并已文档化）：变长边采用**节点对语义**——目标的最短距离落在跳数窗口内即匹配（`[:CALLS*1..2]` = 按最短路径 1..2 跳；环不会制造更长的匹配），中间节点不施加目标模式过滤，变长段不绑定边变量。行按具名绑定 + 终点去重；WHERE 采用 null 传播逻辑（属性缺失永不满足，`NOT` 救不回来）。锚定在模式允许时走类型化属性索引（`{type:'controller'}`），否则全扫。中间行数上限 1,000,000（超限报错并提示收窄模式或加 `LIMIT`）。
+
+子句管线与作用域：子句逐级变换同一个行集。重复 `MATCH`（v0.13 新增）对不相交变量做笛卡尔积、对共享变量做连接；阶段是严格的——输入为零行的阶段输出零行。`OPTIONAL MATCH` 在整个子句（含逗号模式与其 WHERE）无匹配时保留输入行，该子句的模式变量读作 null。`WITH` 开启新作用域：只有被投影的名字存活——裸变量按原名或别名透传其实体绑定，`var.prop` 与聚合项必须 `AS` 且产出标量——尾部可选的 `WHERE` 在投影之后过滤。`UNWIND` 保留当前作用域，并把别名声明为逐元素绑定的标量。
+
+差异与限制（刻意设计）：`UNWIND` 扇出与所有中间阶段同受 1,000,000 行预算约束；`OPTIONAL MATCH` 不跨基行去重（重复输入保持重复）；关键字可作别名（`WITH a AS match`）；首次声明于 `OPTIONAL MATCH` 的模式变量是可空变量——在后续非 OPTIONAL 的 `MATCH` 中用作模式变量会被校验期报错，并给出两种改法（把模式折进该 `OPTIONAL MATCH`，或把后续 `MATCH` 标记为 OPTIONAL；语法中没有 `IS [NOT] NULL`）；`RETURN *` 仍仅限退化单 `MATCH` 查询；`WITH *`、`range()`、`RETURN DISTINCT` 与通用表达式项暂缓（聚合 `count/sum/avg/min/max/collect`——含 count/collect 内的 `DISTINCT`——在 RETURN 与 WITH 项中可用）。
 
 其他接入面：server `POST /v1/cypher`（`{"query": "..."}` → `{columns, rows, count}`；解析错 400 `PARSE`）、三语 MCP 的 `cypher` 工具（默认 limit 1000，`total` 报真实总数）。
 
