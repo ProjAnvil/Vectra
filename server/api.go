@@ -76,6 +76,11 @@ func (n *Node) Handler() http.Handler {
 	mux.Handle("/debug/vars", expvar.Handler())
 	n.registerExpvar()
 
+	// Auth wraps the whole mux only when tokens are loaded: without
+	// AuthTokenFile the bare mux keeps today's wire behavior byte-for-byte.
+	if len(n.authDigests) > 0 {
+		return n.authMiddleware(mux)
+	}
 	return mux
 }
 

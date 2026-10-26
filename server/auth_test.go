@@ -1,8 +1,13 @@
 package server
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -173,5 +178,194 @@ func authTestConfig(t *testing.T, id, dataDir string) Config {
 		SnapshotStore: raft.NewInmemSnapshotStore(),
 		Transport:     trans,
 		RaftConfig:    testRaftConfig(id),
+	}
+}
+
+// ============================================================
+// Bearer middleware + Handler wiring (task 2)
+// ============================================================
+
+// authReq performs one HTTP request against url, presenting the
+// Authorization header verbatim when non-empty, and returns the status,
+// headers, and raw body.
+func authReq(t *testing.T, method, url, authorization string) (int, http.Header, []byte) {
+	t.Helper()
+	req, err := http.NewRequest(method, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, url, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp.StatusCode, resp.Header, body
+}
+
+// startAuthTestNode brings up one in-process node (single-node bootstrap,
+// token file optional) served over httptest on n.Handler(), then removes
+// startup nondeterminism: wait for leadership, commit one write to force
+// the first FSM publish (small graphs seal immediately), wait for Ready.
+// Without the forced publish /v1/health answers 503 "starting" and these
+// tests would race node startup instead of exercising the middleware.
+func startAuthTestNode(t *testing.T, id, dataDir, tokenFile, seedAuth string) string {
+	t.Helper()
+	cfg := authTestConfig(t, id, dataDir)
+	cfg.AuthTokenFile = tokenFile
+	n, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New(%s): %v", id, err)
+	}
+	t.Cleanup(n.Close)
+	ts := httptest.NewServer(n.Handler())
+	t.Cleanup(ts.Close)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && !n.IsLeader() {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !n.IsLeader() {
+		t.Fatalf("%s: not elected leader within deadline", id)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/batch",
+		strings.NewReader(`{"nodes":[{"key":"auth-seed","label":"Service"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if seedAuth != "" {
+		req.Header.Set("Authorization", seedAuth)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("seed batch: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("seed batch: status %d, body %s", resp.StatusCode, body)
+	}
+	select {
+	case <-n.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s: first publish did not complete", id)
+	}
+	return ts.URL
+}
+
+// TestAuthMiddleware pins the middleware's contract through Handler(): one
+// exempt route (exact GET /v1/health), everything else — including
+// /debug/vars on the same mux — behind a bearer token matched by SHA-256
+// digest, with a byte-identical 401 for every rejection (no oracle on
+// which token exists).
+func TestAuthMiddleware(t *testing.T) {
+	dir := t.TempDir()
+	tokFile := filepath.Join(dir, "tokens")
+	if err := os.WriteFile(tokFile, []byte("tok-a\ntok-b\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := startAuthTestNode(t, "auth-mw", filepath.Join(dir, "data"), tokFile, "Bearer tok-a")
+
+	t.Run("no Authorization header gets the house 401 shape", func(t *testing.T) {
+		status, hdr, body := authReq(t, http.MethodGet, base+"/v1/stats", "")
+		if status != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", status)
+		}
+		if got := hdr.Get("WWW-Authenticate"); got != `Bearer realm="vectra"` {
+			t.Fatalf("WWW-Authenticate = %q, want %q", got, `Bearer realm="vectra"`)
+		}
+		var e struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(body, &e); err != nil {
+			t.Fatalf("401 body %s: %v", body, err)
+		}
+		if e.Error.Code != "UNAUTHORIZED" || e.Error.Message != "missing or invalid bearer token" {
+			t.Fatalf("401 body = %s, want code UNAUTHORIZED, message \"missing or invalid bearer token\"", body)
+		}
+	})
+
+	t.Run("wrong token returns the byte-identical 401, no oracle", func(t *testing.T) {
+		_, _, noHeader := authReq(t, http.MethodGet, base+"/v1/stats", "")
+		status, _, wrongTok := authReq(t, http.MethodGet, base+"/v1/stats", "Bearer not-a-token")
+		if status != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", status)
+		}
+		if !bytes.Equal(noHeader, wrongTok) {
+			t.Fatalf("401 bodies differ: no-header=%s wrong-token=%s", noHeader, wrongTok)
+		}
+	})
+
+	t.Run("lowercase bearer scheme is accepted", func(t *testing.T) {
+		status, _, _ := authReq(t, http.MethodGet, base+"/v1/stats", "bearer tok-a")
+		if status != http.StatusOK {
+			t.Fatalf("status = %d, want 200", status)
+		}
+	})
+
+	t.Run("malformed credentials are rejected", func(t *testing.T) {
+		for _, auth := range []string{
+			"Bearer",             // scheme alone, no token
+			"Bearer tok-a extra", // two tokens
+			"Basic xyz",          // wrong scheme
+		} {
+			status, _, _ := authReq(t, http.MethodGet, base+"/v1/stats", auth)
+			if status != http.StatusUnauthorized {
+				t.Fatalf("Authorization %q: status = %d, want 401", auth, status)
+			}
+		}
+	})
+
+	t.Run("GET /v1/health is exempt without a token", func(t *testing.T) {
+		status, _, _ := authReq(t, http.MethodGet, base+"/v1/health", "")
+		if status != http.StatusOK {
+			t.Fatalf("status = %d, want 200", status)
+		}
+	})
+
+	t.Run("stats and debug endpoints require a token", func(t *testing.T) {
+		for _, path := range []string{"/v1/stats", "/debug/vars"} {
+			status, _, _ := authReq(t, http.MethodGet, base+path, "")
+			if status != http.StatusUnauthorized {
+				t.Fatalf("GET %s without token: status = %d, want 401", path, status)
+			}
+		}
+	})
+
+	t.Run("correct token reaches the protected endpoint", func(t *testing.T) {
+		status, _, _ := authReq(t, http.MethodGet, base+"/v1/stats", "Bearer tok-a")
+		if status != http.StatusOK {
+			t.Fatalf("status = %d, want 200", status)
+		}
+	})
+
+	t.Run("second token from the file is also accepted", func(t *testing.T) {
+		status, _, _ := authReq(t, http.MethodGet, base+"/v1/stats", "Bearer tok-b")
+		if status != http.StatusOK {
+			t.Fatalf("status = %d, want 200", status)
+		}
+	})
+}
+
+// TestHandlerPassthroughNoAuth pins the zero-churn guarantee: a node built
+// without AuthTokenFile serves /v1/stats with no Authorization header at
+// all — Handler() returns the bare mux and existing clients see nothing.
+func TestHandlerPassthroughNoAuth(t *testing.T) {
+	dir := t.TempDir()
+	base := startAuthTestNode(t, "auth-off", filepath.Join(dir, "data"), "", "")
+	status, _, _ := authReq(t, http.MethodGet, base+"/v1/stats", "")
+	if status != http.StatusOK {
+		t.Fatalf("GET /v1/stats without Authorization: status = %d, want 200", status)
 	}
 }
