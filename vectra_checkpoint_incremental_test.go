@@ -124,8 +124,8 @@ func TestFirstCheckpointCompacts(t *testing.T) {
 	if man.Format != 2 {
 		t.Fatalf("first checkpoint Format = %d, want 2", man.Format)
 	}
-	if v := snapshotVersion(t, db, man.Snapshot); v != store.VersionV6 {
-		t.Fatalf("first checkpoint base version = %d, want v6 tripwire", v)
+	if v := snapshotVersion(t, db, man.Snapshot); v != store.VersionV7 {
+		t.Fatalf("first checkpoint base version = %d, want v7 tripwire", v)
 	}
 }
 
@@ -288,8 +288,8 @@ func TestCompactionAbsorbsRetained(t *testing.T) {
 	if man2.LSN <= man1.LSN {
 		t.Fatalf("compacted manifest LSN = %d, want > %d", man2.LSN, man1.LSN)
 	}
-	if v := snapshotVersion(t, db, man2.Snapshot); v != store.VersionV6 {
-		t.Fatalf("compacted base version = %d, want v6", v)
+	if v := snapshotVersion(t, db, man2.Snapshot); v != store.VersionV7 {
+		t.Fatalf("compacted base version = %d, want v7", v)
 	}
 	// Reset deletes everything below the fresh segment: exactly one live
 	// segment remains, and the old watermark snapshots are cleaned up.
@@ -385,8 +385,8 @@ func TestZeroFirstSegmentForcesCompact(t *testing.T) {
 	if man2.Snapshot == man1.Snapshot {
 		t.Fatalf("the guard must force a fresh base, kept %q", man2.Snapshot)
 	}
-	if v := snapshotVersion(t, db, man2.Snapshot); v != store.VersionV6 {
-		t.Fatalf("fresh base version = %d, want v6", v)
+	if v := snapshotVersion(t, db, man2.Snapshot); v != store.VersionV7 {
+		t.Fatalf("fresh base version = %d, want v7", v)
 	}
 	if got := listWatermarks(t, db); len(got) != 1 || got[0] != man2.Snapshot {
 		t.Fatalf("watermarks after the guard's compact = %v, want only %q", got, man2.Snapshot)

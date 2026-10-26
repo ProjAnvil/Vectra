@@ -235,11 +235,11 @@ func TestSnapshotCRCv5Roundtrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	data := buf.Bytes()
-	// version = 6: version-only tripwire bump over the v5 layout for the
-	// retained-WAL checkpoint chain (plan 2026-10-22, Task 1) — old binaries
-	// hard-fail on the stamp instead of silently missing retained segments.
-	if data[4] != 6 || data[5] != 0 {
-		t.Errorf("version bytes = %d/%d, want 6/0", data[4], data[5])
+	// version = 7: the 2026-10-26 FTS plan bumps the stamp (and appends the
+	// ftsKey section) over the v6/v5 layout — old binaries hard-fail on the
+	// stamp instead of silently missing retained segments.
+	if data[4] != 7 || data[5] != 0 {
+		t.Errorf("version bytes = %d/%d, want 7/0", data[4], data[5])
 	}
 	g2, err := vectra.Load(bytes.NewReader(data))
 	if err != nil {

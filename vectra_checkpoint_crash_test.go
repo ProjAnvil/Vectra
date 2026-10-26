@@ -11,11 +11,11 @@ package vectra
 //     recovery never scans it, and the next compact's Reset removes it;
 //   - compact tier, new base written but the manifest NOT landed (C1), with
 //     a retained chain live (C1 was previously pinned only over an empty
-//     chain): the old manifest plus the old chain govern, the orphan v6
+//     chain): the old manifest plus the old chain govern, the orphan v7
 //     snapshot is ignored, and a later compact's cleanup deletes it;
 //   - the tripwire sweep: EVERY rest state of a chained library — settled
 //     compact, settled light (manifest v2), and the mid-session crash shape
-//     (rotate landed, manifest not) — names a store-v6 base at the disk
+//     (rotate landed, manifest not) — names a store-v7 base at the disk
 //     level, so a v0.11.1 binary hard-fails at Decode before it can ignore
 //     RetainFrom and silently read the base alone;
 //   - ModeOff: traced, not assumed. Open's ModeOff branch stats `path` and
@@ -23,10 +23,10 @@ package vectra
 //     WAL-mode library's `path` never exists (checkpoints write watermark
 //     files next to it), so ModeOff cannot see a chained library at all:
 //     it returns a fresh empty graph, having read nothing (no silent
-//     base-only load is possible). Pointing ModeOff at a v6 snapshot FILE
-//     loads it on this binary (Decode knows v6) and hard-fails on an
+//     base-only load is possible). Pointing ModeOff at a v7 snapshot FILE
+//     loads it on this binary (Decode knows v7) and hard-fails on an
 //     unknown version byte — the exact dispatch branch a v0.11.1 binary
-//     takes on the real v6 file.
+//     takes on the real v7 file.
 
 import (
 	"bytes"
@@ -44,8 +44,8 @@ import (
 func probeManifestBase(t *testing.T, db, step string) {
 	t.Helper()
 	man := readManifest(t, db)
-	if v := snapshotVersion(t, db, man.Snapshot); v != store.VersionV6 {
-		t.Fatalf("%s: manifest-named base %s probes v%d, want the v6 tripwire", step, man.Snapshot, v)
+	if v := snapshotVersion(t, db, man.Snapshot); v != store.VersionV7 {
+		t.Fatalf("%s: manifest-named base %s probes v%d, want the v7 tripwire", step, man.Snapshot, v)
 	}
 }
 
@@ -177,7 +177,7 @@ func TestCompactCrashWindowUndeletedRetainedSegment(t *testing.T) {
 }
 
 // TestCompactCrashWindowOrphanBaseOverChain pins C1 WITH a retained chain
-// live: the compact tier writes the new v6 base first and the manifest
+// live: the compact tier writes the new v7 base first and the manifest
 // second, so a crash in between leaves an orphan watermark snapshot next to
 // an OLD manifest whose retained chain still holds every frame above the old
 // boundary. Recovery must load the old base and replay the old chain (the
@@ -225,14 +225,14 @@ func TestCompactCrashWindowOrphanBaseOverChain(t *testing.T) {
 		t.Fatalf("fixture: manifest = %+v, want a live retained chain", manLive)
 	}
 
-	// Crash after SaveFile, before WriteManifest: the orphan v6 watermark is
+	// Crash after SaveFile, before WriteManifest: the orphan v7 watermark is
 	// on disk, the manifest still names the old base, and Reset never ran.
 	orphan := g2.snapshotFile(g2.wal.LastLSN())
 	if err := g2.SaveFile(orphan); err != nil {
 		t.Fatal(err)
 	}
-	if v := snapshotVersion(t, db, filepath.Base(orphan)); v != store.VersionV6 {
-		t.Fatalf("orphan watermark probes v%d, want v6", v)
+	if v := snapshotVersion(t, db, filepath.Base(orphan)); v != store.VersionV7 {
+		t.Fatalf("orphan watermark probes v%d, want v7", v)
 	}
 	manCrash := readManifest(t, db)
 	if manCrash != manLive {
@@ -292,15 +292,15 @@ func TestCompactCrashWindowOrphanBaseOverChain(t *testing.T) {
 	}
 }
 
-// TestChainLibraryAlwaysV6Backed is the silent-loss sweep (review focus #1):
+// TestChainLibraryAlwaysV7Backed is the silent-loss sweep (review focus #1):
 // whatever rest state a chained library sits in — settled compact (v1-shaped
 // manifest), settled light (manifest v2 with RetainFrom, the state a v0.11.1
 // binary would misread by ignoring the new field), or the mid-session crash
-// shape (rotate landed, manifest not) — the manifest on disk names a store-v6
+// shape (rotate landed, manifest not) — the manifest on disk names a store-v7
 // base. That byte is what an old binary dispatches on FIRST, so the only
 // paths are hard-fail (this test's forged-version proxy) or a full correct
 // read; "old binary silently reads the base alone" does not exist.
-func TestChainLibraryAlwaysV6Backed(t *testing.T) {
+func TestChainLibraryAlwaysV7Backed(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "graph.db")
 
 	g, err := Open(db, Options{WALMode: ModeAlways})
@@ -337,7 +337,7 @@ func TestChainLibraryAlwaysV6Backed(t *testing.T) {
 	// Mid-session crash shape: the rotate landed, the manifest did not. The
 	// manifest bytes stay at the light checkpoint while a segment beyond its
 	// Segment exists on disk — the exposure window an old binary reopening
-	// mid-session faces. Its named base still probes v6.
+	// mid-session faces. Its named base still probes v7.
 	segsLive := listSegments(t, db+".wal")
 	if _, err := g2.AddNode("c", "Svc", nil); err != nil {
 		t.Fatal(err)
@@ -353,8 +353,8 @@ func TestChainLibraryAlwaysV6Backed(t *testing.T) {
 	}
 	probeManifestBase(t, db, "mid-session crash")
 
-	// The dispatch branch an old binary takes on the v6 header, exercised
-	// honestly in-process: this binary decodes its own v6 base, and hard-
+	// The dispatch branch an old binary takes on the v7 header, exercised
+	// honestly in-process: this binary decodes its own v7 base, and hard-
 	// fails on the same bytes with an unknown version byte.
 	man := readManifest(t, db)
 	snapPath := filepath.Join(filepath.Dir(db), man.Snapshot)
@@ -363,10 +363,10 @@ func TestChainLibraryAlwaysV6Backed(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := store.Decode(bytes.NewReader(raw)); err != nil {
-		t.Fatalf("this binary must decode its own v6 base: %v", err)
+		t.Fatalf("this binary must decode its own v7 base: %v", err)
 	}
 	forged := append([]byte(nil), raw...)
-	binary.LittleEndian.PutUint16(forged[4:6], store.VersionV6+1)
+	binary.LittleEndian.PutUint16(forged[4:6], store.VersionV7+1)
 	if _, err := store.Decode(bytes.NewReader(forged)); err == nil {
 		t.Fatal("Decode must hard-fail on an unknown snapshot version (old-binary dispatch proxy)")
 	}
@@ -393,11 +393,11 @@ func TestChainLibraryAlwaysV6Backed(t *testing.T) {
 //     increment was skipped; the library is simply invisible to the v0.6
 //     snapshot-only contract (and the ModeOff open writes nothing, so the
 //     library is untouched);
-//   - ModeOff Open of a v6 snapshot FILE loads it on this binary (Decode
-//     accepts v1-v6) — the file, not the library: only the compact
+//   - ModeOff Open of a v7 snapshot FILE loads it on this binary (Decode
+//     accepts v1-v7) — the file, not the library: only the compact
 //     boundary's content is visible, the retained chain is not;
 //   - the same file with an unknown version byte (the dispatch a v0.11.1
-//     binary takes on the real v6 file) hard-fails.
+//     binary takes on the real v7 file) hard-fails.
 //
 // There is no ModeOff path that silently reads a chained library's base
 // alone: either nothing is read, or the version byte gates the read.
@@ -465,16 +465,16 @@ func TestModeOffOpenOfChainedLibrary(t *testing.T) {
 		t.Fatalf("ModeOff open must not touch the WAL dir: %v (was %v)", chainAfter, chainBefore)
 	}
 
-	// ModeOff on the manifest-named v6 base FILE: this binary loads it (the
+	// ModeOff on the manifest-named v7 base FILE: this binary loads it (the
 	// compact boundary's content only — the chain is invisible to a file
 	// load, by LoadFile semantics), an old binary hard-fails at the byte.
 	snap := filepath.Join(dir, man.Snapshot)
-	if v := snapshotVersion(t, db, man.Snapshot); v != store.VersionV6 {
-		t.Fatalf("chained base probes v%d, want v6", v)
+	if v := snapshotVersion(t, db, man.Snapshot); v != store.VersionV7 {
+		t.Fatalf("chained base probes v%d, want v7", v)
 	}
 	mof, err := Open(snap, Options{WALMode: ModeOff})
 	if err != nil {
-		t.Fatalf("this binary must ModeOff-load its own v6 snapshot: %v", err)
+		t.Fatalf("this binary must ModeOff-load its own v7 snapshot: %v", err)
 	}
 	if n := mof.NodeCount(); n != 2 {
 		t.Fatalf("ModeOff file load = %d nodes, want the compact boundary's 2 (the chain is not part of the file)", n)
@@ -487,13 +487,13 @@ func TestModeOffOpenOfChainedLibrary(t *testing.T) {
 	}
 
 	// Old-binary dispatch proxy on the same surface: the identical branch a
-	// v0.11.1 binary takes on the real v6 file hard-fails through ModeOff.
+	// v0.11.1 binary takes on the real v7 file hard-fails through ModeOff.
 	raw, err := os.ReadFile(snap)
 	if err != nil {
 		t.Fatal(err)
 	}
 	forged := append([]byte(nil), raw...)
-	binary.LittleEndian.PutUint16(forged[4:6], store.VersionV6+1)
+	binary.LittleEndian.PutUint16(forged[4:6], store.VersionV7+1)
 	forgedPath := filepath.Join(dir, "forged.db")
 	if err := os.WriteFile(forgedPath, forged, 0o644); err != nil {
 		t.Fatal(err)

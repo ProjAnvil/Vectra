@@ -1,14 +1,14 @@
 package vectra_test
 
-// Migration-on-open to store v6 + fresh-library tripwire (spec
+// Migration-on-open to store v7 + fresh-library tripwire (spec
 // 2026-10-21 §1.3, rulings #4/#9; target lifted v5 -> v6 by the 2026-10-22
-// retained-WAL checkpoint plan). The golden v0.10.0 library under
-// testdata/legacy-v4 (v4 snapshot + vector-carrying WAL tail) is the
-// migration input, consumed read-only: a WAL-mode Open folds it into a v6
-// watermark snapshot exactly once, and a brand-new library gets an empty v6
-// checkpoint from byte one so a v0.11.1-or-older downgrade hard-fails at the
-// snapshot instead of silently reading the base and missing the retained
-// chain.
+// retained-WAL checkpoint plan, v6 -> v7 by the 2026-10-26 FTS plan). The
+// golden v0.10.0 library under testdata/legacy-v4 (v4 snapshot +
+// vector-carrying WAL tail) is the migration input, consumed read-only: a
+// WAL-mode Open folds it into a v7 watermark snapshot exactly once, and a
+// brand-new library gets an empty v7 checkpoint from byte one so a
+// v0.12.0-or-older downgrade hard-fails at the snapshot instead of
+// silently reading the base and missing the retained chain.
 
 import (
 	"bytes"
@@ -81,7 +81,7 @@ func mustStat(t *testing.T, p string) os.FileInfo {
 }
 
 // TestMigrateV4LibraryOnOpen: opening the golden v4 library migrates it in
-// place — the manifest's head becomes a v6 watermark snapshot holding the
+// place — the manifest's head becomes a v7 watermark snapshot holding the
 // folded state of snapshot + WAL tail, reads stay transparent, and a reopen
 // of the migrated library answers vector queries (Review Focus #3).
 func TestMigrateV4LibraryOnOpen(t *testing.T) {
@@ -93,8 +93,8 @@ func TestMigrateV4LibraryOnOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ver := headSnapshot(t, db); ver != 6 { // v6 tripwire (2026-10-22 plan Task 1)
-		t.Fatalf("head snapshot version after Open = %d, want 6", ver)
+	if _, ver := headSnapshot(t, db); ver != 7 { // v7 tripwire (2026-10-26 FTS plan Task 6)
+		t.Fatalf("head snapshot version after Open = %d, want 7", ver)
 	}
 	// Migration is transparent to reads: the sealed snapshot rows (keys
 	// n00..n23 + plain) and the replayed tail (n24..n31) all answer.
@@ -130,39 +130,40 @@ func TestMigrateV4LibraryOnOpen(t *testing.T) {
 	}
 }
 
-// TestFreshLibraryHasV6Tripwire (ruling #9, target v6 since the 2026-10-22
-// checkpoint plan): a brand-new WAL-mode library carries its v6 checkpoint +
+// TestFreshLibraryHasV7Tripwire (ruling #9, target v7 since the 2026-10-26
+// FTS plan): a brand-new WAL-mode library carries its v7 checkpoint +
 // manifest from byte one — before any write and before Close — so a
-// v0.11.1-or-older downgrade opening it hard-fails at the snapshot version
+// v0.12.0-or-older downgrade opening it hard-fails at the snapshot version
 // byte instead of reading the base alone (the retained-chain silent-loss
-// hazard the v6 tripwire exists for).
-func TestFreshLibraryHasV6Tripwire(t *testing.T) {
+// hazard the tripwire exists for).
+func TestFreshLibraryHasV7Tripwire(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "fresh.db")
 	g, err := vectra.Open(db, vectra.Options{WALMode: vectra.ModeAlways})
 	if err != nil {
 		t.Fatal(err)
 	}
 	p, ver := headSnapshot(t, db)
-	if ver != 6 { // v6 tripwire (2026-10-22 plan Task 1): fresh seals stamp 6
-		t.Fatalf("fresh head %s version = %d, want 6 (tripwire must exist before Close)", p, ver)
+	if ver != 7 { // v7 tripwire (2026-10-26 plan Task 6): fresh seals stamp 7
+		t.Fatalf("fresh head %s version = %d, want 7 (tripwire must exist before Close)", p, ver)
 	}
 	if err := g.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, ver := headSnapshot(t, db); ver != 6 {
-		t.Fatalf("post-Close head version = %d, want 6", ver)
+	if _, ver := headSnapshot(t, db); ver != 7 {
+		t.Fatalf("post-Close head version = %d, want 7", ver)
 	}
 }
 
-// TestMigrationGoesToV6 pins the full migration chain's target (2026-10-22
-// plan Task 5): every WAL-mode Open of a pre-v6 head migrates to a v6
-// watermark snapshot, whatever the input version — v4 through the golden
-// fixture, v5 through a crafted at-rest library (the exact bytes a v0.11.1
-// session leaves). The compacting tier is what makes v6 the mandatory
-// product: a pre-v6 base kept alive under a manifest would be the
-// downgrade silent-loss hazard, so the migration seal never goes light.
-func TestMigrationGoesToV6(t *testing.T) {
-	t.Run("golden v4 library migrates to a v6 head", func(t *testing.T) {
+// TestMigrationGoesToV7 pins the full migration chain's target (2026-10-22
+// plan Task 5, lifted to v7 by the 2026-10-26 FTS plan): every WAL-mode
+// Open of a pre-v7 head migrates to a v7 watermark snapshot, whatever the
+// input version — v4 through the golden fixture, v5 through a crafted
+// at-rest library (the exact bytes a v0.11.1 session leaves). The
+// compacting tier is what makes v7 the mandatory product: a pre-v7 base
+// kept alive under a manifest would be the downgrade silent-loss hazard,
+// so the migration seal never goes light.
+func TestMigrationGoesToV7(t *testing.T) {
+	t.Run("golden v4 library migrates to a v7 head", func(t *testing.T) {
 		dir := t.TempDir()
 		copyTree(t, "testdata/legacy-v4", dir)
 		db := filepath.Join(dir, "v.db")
@@ -170,17 +171,17 @@ func TestMigrationGoesToV6(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, ver := headSnapshot(t, db); ver != 6 {
-			t.Fatalf("v4 fixture head after Open = v%d, want 6", ver)
+		if _, ver := headSnapshot(t, db); ver != 7 {
+			t.Fatalf("v4 fixture head after Open = v%d, want 7", ver)
 		}
 		if err := g.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if _, ver := headSnapshot(t, db); ver != 6 {
-			t.Fatalf("v4 fixture head after Open+Close = v%d, want 6", ver)
+		if _, ver := headSnapshot(t, db); ver != 7 {
+			t.Fatalf("v4 fixture head after Open+Close = v%d, want 7", ver)
 		}
 	})
-	t.Run("v5 base migrates to v6 and retains a v5 rollback artifact", func(t *testing.T) {
+	t.Run("v5 base migrates to v7 and retains a v5 rollback artifact", func(t *testing.T) {
 		dir := t.TempDir()
 		db := filepath.Join(dir, "lib.db")
 		// Build a library at rest through the real pipeline (fresh Open's
@@ -200,15 +201,15 @@ func TestMigrationGoesToV6(t *testing.T) {
 			t.Fatal(err)
 		}
 		snapPath, ver := headSnapshot(t, db)
-		if ver != 6 {
-			t.Fatalf("precondition: freshly built head = v%d, want 6", ver)
+		if ver != 7 {
+			t.Fatalf("precondition: freshly built head = v%d, want 7", ver)
 		}
 		downgradeSnapshotToV5(t, snapPath)
 		if _, ver := headSnapshot(t, db); ver != 5 {
 			t.Fatalf("precondition: downgraded head = v%d, want 5", ver)
 		}
 
-		// Open migrates: the head probes v6, and the pre-migration v5 bytes
+		// Open migrates: the head probes v7, and the pre-migration v5 bytes
 		// survive as the rollback artifact (retainLegacyArtifact stamps the
 		// ACTUAL pre-version — a v5 migration leaves <name>-v5.bak, not v4).
 		g2, err := vectra.Open(db, vectra.Options{WALMode: vectra.ModeAlways})
@@ -216,8 +217,8 @@ func TestMigrationGoesToV6(t *testing.T) {
 			t.Fatalf("Open over a v5 base must migrate in place, not fail: %v", err)
 		}
 		head2, ver := headSnapshot(t, db)
-		if ver != 6 {
-			t.Fatalf("v5 base after Open = v%d at %s, want 6", ver, head2)
+		if ver != 7 {
+			t.Fatalf("v5 base after Open = v%d at %s, want 7", ver, head2)
 		}
 		bak := snapPath + "-v5.bak"
 		bf, err := os.Open(bak)
@@ -236,7 +237,7 @@ func TestMigrationGoesToV6(t *testing.T) {
 		// Migration is transparent and durable: data intact across Close and
 		// a no-second-migration reopen.
 		if n := g2.Stats().Nodes; n != 2 {
-			t.Fatalf("nodes after v5->v6 migration = %d, want 2", n)
+			t.Fatalf("nodes after v5->v7 migration = %d, want 2", n)
 		}
 		if err := g2.Close(); err != nil {
 			t.Fatal(err)
@@ -248,8 +249,8 @@ func TestMigrationGoesToV6(t *testing.T) {
 		if n := g3.Stats().Nodes; n != 2 {
 			t.Fatalf("nodes after reopen = %d, want 2", n)
 		}
-		if _, ver := headSnapshot(t, db); ver != 6 {
-			t.Fatalf("reopen after migration = v%d, want a stable 6", ver)
+		if _, ver := headSnapshot(t, db); ver != 7 {
+			t.Fatalf("reopen after migration = v%d, want a stable 7", ver)
 		}
 		if err := g3.Close(); err != nil {
 			t.Fatal(err)
@@ -257,25 +258,32 @@ func TestMigrationGoesToV6(t *testing.T) {
 	})
 }
 
-// downgradeSnapshotToV5 rewrites a v6 snapshot file in place as the v5 file
-// a v0.11.1 binary would have written: v6 is a version-only bump (identical
-// layout), so patching the header version back to 5 and re-sealing the CRC
-// trailer yields genuine v5 bytes — the same technique as the store suite's
-// resealAsV5.
+// downgradeSnapshotToV5 rewrites the current-version head snapshot in place
+// as the v5 file a v0.11.1 binary would have written: v7's only layout delta
+// is the ftsKey section appended after the float32 section, so the section
+// bytes must come OFF before re-stamping the header and re-sealing the CRC
+// trailer — version-byte patching alone would leave them as trailing
+// garbage. This head carries no FTS declarations, so the section is the bare
+// u32(0) count sitting right before the CRC; the zero is asserted so a
+// future SaveFile that persists real keys fails here loudly instead of
+// corrupting the fixture.
 func downgradeSnapshotToV5(t *testing.T, path string) {
 	t.Helper()
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if fts := binary.LittleEndian.Uint32(raw[len(raw)-8 : len(raw)-4]); fts != 0 {
+		t.Fatalf("fixture head carries a non-empty ftsKey section (count %d); the downgrade must strip it", fts)
+	}
+	raw = raw[:len(raw)-8] // drop ftsKey section (u32 count) + CRC trailer
 	binary.LittleEndian.PutUint16(raw[4:6], 5)
-	binary.LittleEndian.PutUint32(raw[len(raw)-4:], crc32.ChecksumIEEE(raw[:len(raw)-4]))
-	if err := os.WriteFile(path, raw, 0o644); err != nil {
+	if err := os.WriteFile(path, binary.LittleEndian.AppendUint32(raw, crc32.ChecksumIEEE(raw)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
 
-// TestMigrationIdempotent: reopening a migrated (v6-head) library triggers
+// TestMigrationIdempotent: reopening a migrated (v7-head) library triggers
 // no second seal. The observable is the checkpoint artifacts themselves: a
 // seal rewrites both the head snapshot (SaveFile) and the manifest
 // (WriteManifest) via temp+rename, so unchanged mtime+size across a reopen
@@ -290,8 +298,8 @@ func TestMigrationIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Precondition: the first Open itself migrated the head (no Close yet).
-	if _, ver := headSnapshot(t, db); ver != 6 { // v6 tripwire (2026-10-22 plan Task 1)
-		t.Fatalf("head version after first Open = %d, want 6", ver)
+	if _, ver := headSnapshot(t, db); ver != 7 { // v7 tripwire (2026-10-26 FTS plan Task 6)
+		t.Fatalf("head version after first Open = %d, want 7", ver)
 	}
 	if err := g.Close(); err != nil {
 		t.Fatal(err)
@@ -322,11 +330,11 @@ func TestMigrationIdempotent(t *testing.T) {
 
 // TestMigratedLibRejectedByV4Decode pins the downgrade tripwire's mechanism:
 // Decode dispatches on the header version and hard-fails on anything it does
-// not know BEFORE interpreting the layout. The migration product is v6; an
+// not know BEFORE interpreting the layout. The migration product is v7; an
 // old binary is one that knows only older versions — the honest in-process
-// proxy for "old reader" is THIS binary facing a hypothetical v7 header,
-// which exercises the identical dispatch branch a v0.11.1 binary takes on
-// the v6 product.
+// proxy for "old reader" is THIS binary facing a hypothetical v8 header,
+// which exercises the identical dispatch branch a v0.12.0 binary takes on
+// the v7 product.
 func TestMigratedLibRejectedByV4Decode(t *testing.T) {
 	dir := t.TempDir()
 	copyTree(t, "testdata/legacy-v4", dir)
@@ -338,24 +346,24 @@ func TestMigratedLibRejectedByV4Decode(t *testing.T) {
 	defer g.Close()
 
 	// The migration product is the head Open left on disk — before any
-	// Close, whose own checkpoint would write v6 regardless.
+	// Close, whose own checkpoint would write v7 regardless.
 	snapPath, ver := headSnapshot(t, db)
-	if ver != 6 { // v6 tripwire (2026-10-22 plan Task 1): migration products stamp 6
-		t.Fatalf("migrated head version = %d, want 6 (Open alone must produce it)", ver)
+	if ver != 7 { // v7 tripwire (2026-10-26 FTS plan Task 6): migration products stamp 7
+		t.Fatalf("migrated head version = %d, want 7 (Open alone must produce it)", ver)
 	}
 	raw, err := os.ReadFile(snapPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// This binary reads its own v6 product...
+	// This binary reads its own v7 product...
 	if _, err := store.Decode(bytes.NewReader(raw)); err != nil {
-		t.Fatalf("v6 migration product must decode on this binary: %v", err)
+		t.Fatalf("v7 migration product must decode on this binary: %v", err)
 	}
 	// ...and hard-fails on an unknown version byte instead of misreading it.
 	forged := append([]byte(nil), raw...)
-	// v6 is a real supported version since the 2026-10-22 Task 1 tripwire;
-	// v7 is the unknown-header proxy.
-	binary.LittleEndian.PutUint16(forged[4:6], store.VersionV5+2)
+	// v7 is a real supported version since the 2026-10-26 FTS plan;
+	// v8 is the unknown-header proxy.
+	binary.LittleEndian.PutUint16(forged[4:6], store.VersionV7+1)
 	if _, err := store.Decode(bytes.NewReader(forged)); err == nil {
 		t.Fatal("Decode must hard-fail on an unknown snapshot version (version dispatch)")
 	}
@@ -378,8 +386,8 @@ func TestMigrationRetainsV4Artifact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ver := headSnapshot(t, db); ver != 6 { // v6 tripwire (2026-10-22 plan Task 1)
-		t.Fatalf("head snapshot version after Open = %d, want 6", ver)
+	if _, ver := headSnapshot(t, db); ver != 7 { // v7 tripwire (2026-10-26 FTS plan Task 6)
+		t.Fatalf("head snapshot version after Open = %d, want 7", ver)
 	}
 	// The pre-migration watermark (fixture manifest names v-2.db) survives as
 	// a rollback artifact whose bytes still probe v4, while the successful
@@ -454,8 +462,8 @@ func TestMigrationCrashBeforeSealRecovers(t *testing.T) {
 	if n := g.Stats().Nodes; n != 33 {
 		t.Fatalf("nodes after crash-recovery migration = %d, want 33", n)
 	}
-	if _, ver := headSnapshot(t, db); ver != 6 { // v6 tripwire (2026-10-22 plan Task 1)
-		t.Fatalf("head version after crash-recovery migration = %d, want 6", ver)
+	if _, ver := headSnapshot(t, db); ver != 7 { // v7 tripwire (2026-10-26 FTS plan Task 6)
+		t.Fatalf("head version after crash-recovery migration = %d, want 7", ver)
 	}
 	if _, err := os.Stat(bak); err != nil {
 		t.Fatalf("rollback artifact must survive the retried migration: %v", err)

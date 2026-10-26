@@ -6,7 +6,7 @@ package vectra
 // boundary survives every light checkpoint that follows, and the segment
 // chain replays onto it — frames at or below the forest LSN re-applying
 // idempotently, frames above it applying as fresh increments. The chained
-// library's base snapshot stays a v6 tripwire (old binaries hard-fail).
+// library's base snapshot stays a v7 tripwire (old binaries hard-fail).
 
 import (
 	"bytes"
@@ -323,7 +323,7 @@ func TestOldBinaryTripwireOnChain(t *testing.T) {
 		t.Fatalf("fixture: manifest = %+v, want a retained chain", man)
 	}
 
-	// The chained base probes v6 — the downgrade hard-fail an old binary
+	// The chained base probes v7 — the downgrade hard-fail an old binary
 	// hits BEFORE it could silently ignore RetainFrom and read the base
 	// alone (the silent-loss class this plan exists to close).
 	snapPath := filepath.Join(filepath.Dir(db), man.Snapshot)
@@ -336,22 +336,22 @@ func TestOldBinaryTripwireOnChain(t *testing.T) {
 	if perr != nil {
 		t.Fatalf("probe %s: %v", snapPath, perr)
 	}
-	if ver != store.VersionV6 {
-		t.Fatalf("chained base %s version = %d, want %d", snapPath, ver, store.VersionV6)
+	if ver != store.VersionV7 {
+		t.Fatalf("chained base %s version = %d, want %d", snapPath, ver, store.VersionV7)
 	}
 	raw, err := os.ReadFile(snapPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// This binary reads its own v6 product...
+	// This binary reads its own v7 product...
 	if _, err := store.Decode(bytes.NewReader(raw)); err != nil {
-		t.Fatalf("v6 chained base must decode on this binary: %v", err)
+		t.Fatalf("v7 chained base must decode on this binary: %v", err)
 	}
 	// ...and hard-fails on an unknown version byte instead of misreading
-	// it — the identical dispatch branch a v0.11.0/1 binary takes on the
-	// v6 header.
+	// it — the identical dispatch branch a v0.11.x binary takes on the
+	// v7 header.
 	forged := append([]byte(nil), raw...)
-	binary.LittleEndian.PutUint16(forged[4:6], store.VersionV6+1)
+	binary.LittleEndian.PutUint16(forged[4:6], store.VersionV7+1)
 	if _, err := store.Decode(bytes.NewReader(forged)); err == nil {
 		t.Fatal("Decode must hard-fail on an unknown snapshot version (old-binary dispatch proxy)")
 	}

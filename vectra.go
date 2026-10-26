@@ -2540,13 +2540,15 @@ func (g *Graph) compactTier() (compact bool, man wal.Manifest, err error) {
 	return false, man, nil
 }
 
-// snapshotIsV6 reports whether the manifest-named base snapshot is a store-v6
-// file — the hard downgrade tripwire. A light checkpoint keeps the base, so
-// it is legal only over v6: an older base under a manifest v2 is silently
-// lossy for pre-0.11.2 binaries (they ignore RetainFrom and open the base
-// alone), so v1-v5 bases force the compacting tier, which rewrites the base
-// as v6. Any probe failure also forces compaction — the compact tier rewrites
-// the base and self-heals.
+// snapshotIsV6 reports whether the manifest-named base snapshot is a
+// store-v6-OR-NEWER file — the hard downgrade tripwire floor. A light
+// checkpoint keeps the base, so it is legal only over v6+: an older base
+// under a manifest v2 is silently lossy for pre-0.11.2 binaries (they
+// ignore RetainFrom and open the base alone), so v1-v5 bases force the
+// compacting tier, which rewrites the base as the current version. v7
+// bases (and any future bump) carry the same retained-WAL safety, hence
+// the >=. Any probe failure also forces compaction — the compact tier
+// rewrites the base and self-heals.
 func (g *Graph) snapshotIsV6(man wal.Manifest) bool {
 	f, err := os.Open(filepath.Join(filepath.Dir(g.dbPath), man.Snapshot))
 	if err != nil {
@@ -2554,7 +2556,7 @@ func (g *Graph) snapshotIsV6(man wal.Manifest) bool {
 	}
 	defer f.Close()
 	v, err := store.ProbeVersion(f)
-	return err == nil && v == store.VersionV6
+	return err == nil && v >= store.VersionV6
 }
 
 // compactCheckpoint is the full-snapshot tier: SaveFile (v6) → manifest →

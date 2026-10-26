@@ -1,11 +1,12 @@
 // Package store implements Vectra's single-file binary snapshot. Under the
 // small-graph all-in-memory assumption the disk only serves crash recovery:
 // whole-graph rewrite, rebuild CSR/SCC on load, no incremental WAL.
-// Layout (v5, still current under the v6 stamp; little-endian):
-// "VCTR" | u16 version(6) | u32 node count | u32 edge count |
+// Layout (v7, little-endian):
+// "VCTR" | u16 version(7) | u32 node count | u32 edge count |
 // u32 vector-decl count | decl JSON string* | node{ key string, label string, props JSON }* |
 // edge{ srcKey, dstKey, label, props }* | u32 indexKey count | key string* |
-// u32 float count | float32 LE* | u32 CRC32(IEEE, covering all preceding bytes).
+// u32 float count | float32 LE* | u32 ftsKey count | key string* |
+// u32 CRC32(IEEE, covering all preceding bytes).
 // string = u32 length + bytes; props = u32 JSON length + JSON (0 = nil).
 // The vector declarations precede the nodes (spec 2026-10-21 §1.4, ruling
 // #2) so the decoder knows the declared-prop set while resolving per-node
@@ -16,14 +17,18 @@
 // props are never hoisted. The indexKey section persists the property-index
 // declarations so a reloaded graph can rebuild them at Seal time (without
 // it, Load-based services such as vectra-mcp -snapshot lose every lookup
-// index). v4 (vector decls trailing, vectors in the JSON channel), v3, v2
+// index). v7 appends the ftsKey section after the float32 section: the FTS
+// property declarations (engine bigram gram buckets, 2026-10-26 plan) ride
+// the same positional count+strings shape so a reloaded graph rebuilds them
+// at Seal time too. v6 (v7 minus the ftsKey section — a version-only bump
+// over v5), v4 (vector decls trailing, vectors in the JSON channel), v3, v2
 // (no indexKey section) and v1 (additionally no CRC trailer) remain
-// readable; dispatched by header version. Pre-v6 readers hard-fail on the
-// version byte instead of misreading the layout. v6 is a VERSION-ONLY bump
-// over v5 (byte layout identical): the retained-WAL checkpoint chain keeps
-// the base snapshot on disk while WAL segments carry the increments, and a
-// v0.11.1 binary would silently load only that base — the v6 stamp makes it
-// hard-fail on the version byte instead of losing the retained segments.
+// readable; dispatched by header version. Pre-v7 readers hard-fail on the
+// version byte instead of misreading the layout. v6 was the retained-WAL
+// checkpoint tripwire: its base snapshot stayed on disk while WAL segments
+// carried the increments, and a v0.11.1 binary would silently load only
+// that base — the v6 stamp made it hard-fail instead of losing the retained
+// segments; v7 extends the same line to v0.12.0-era binaries.
 package store
 
 import (
@@ -41,7 +46,8 @@ import (
 
 const (
 	magic         = "VCTR"
-	versionV6     = 6 // version-only bump over v5: retained-WAL checkpoint tripwire (see package doc)
+	versionV7     = 7 // adds the ftsKey section (FTS property declarations) after the float32 section
+	versionV6     = 6 // version-only bump over v5 (retained-WAL checkpoint tripwire; v7 appends the FTS section)
 	versionV5     = 5 // declarations-first layout + shared binary float32 section
 	versionV4     = 4 // adds the vector index declaration section (trailing)
 	versionV3     = 3
@@ -62,8 +68,16 @@ const VersionV5 = versionV5
 // light checkpoint keeps the base snapshot alive under a manifest v2, so the
 // base's version byte is the ONLY hard downgrade gate — vectra's checkpoint
 // tiering probes it to decide whether a light checkpoint is expressible at
-// all (pre-v6 bases must recompact).
+// all (pre-v6 bases must recompact). It is the FLOOR of that eligibility
+// check, not the exact version: v7-and-newer bases qualify equally.
 const VersionV6 = versionV6
+
+// VersionV7 exports the current store version (2026-10-26 FTS plan): v7
+// appends the ftsKey section so FTS property declarations survive
+// checkpoint/reload, and re-arms the downgrade tripwire one version forward
+// — a v0.12.0 binary facing a hypothetical v8 hard-fails on the version
+// byte instead of misreading the layout.
+const VersionV7 = versionV7
 
 // Node / Edge use string keys rather than internal NodeIDs: the snapshot is
 // decoupled from ID assignment order and rebuilt on load. props serialize to
@@ -98,14 +112,17 @@ type VectorIndexDecl struct {
 // Data is the full decoded content of a snapshot: nodes, edges, and the
 // property-index declarations to re-register before Seal. IndexKeys is nil
 // for v1/v2 files (they never persisted any); VectorDecls is nil for
-// pre-v4 files. In v5 files declared vector props come back as []float32
-// (restored from the binary section); in v4-and-older files they arrive via
-// JSON as []any.
+// pre-v4 files; FTSKeys is nil for pre-v7 files (the ftsKey section does
+// not exist there — callers must treat nil as "no FTS declarations
+// persisted" and re-declare as needed). In v5+ files declared vector
+// props come back as []float32 (restored from the binary section); in
+// v4-and-older files they arrive via JSON as []any.
 type Data struct {
 	Nodes       []Node
 	Edges       []Edge
 	IndexKeys   []string
 	VectorDecls []VectorIndexDecl
+	FTSKeys     []string
 }
 
 // crcWriter aggregates the CRC of the written byte stream (appended as a
@@ -170,13 +187,12 @@ func writeProps(w io.Writer, props map[string]any) error {
 	return err
 }
 
-// Encode writes the whole graph to w stamped v6 (byte-identical to the v5
-// layout — the version-only retained-WAL tripwire, see package doc): the
-// vector-declaration section precedes the nodes (ruling #2) and declared
-// vector props hoist out of the JSON channel into one shared trailing
-// float32 section (ruling #1); the CRC trailer covers everything. Pre-v6
-// readers hard-fail on the version byte instead of misreading the layout
-// (same downgrade line as v4 -> v5).
+// Encode writes the whole graph to w stamped v7: the v6/v5 layout (vector
+// declarations preceding the nodes, ruling #2; declared vector props hoisted
+// out of the JSON channel into one shared trailing float32 section, ruling
+// #1) plus the ftsKey section appended after the floats, and a CRC trailer
+// covering everything. Pre-v7 readers hard-fail on the version byte instead
+// of misreading the layout (same downgrade line as v5 -> v6).
 func Encode(w io.Writer, d Data) error {
 	cw := &crcWriter{bw: bufio.NewWriter(w)}
 	var head [4]byte
@@ -184,7 +200,7 @@ func Encode(w io.Writer, d Data) error {
 	if _, err := cw.Write(head[:]); err != nil {
 		return err
 	}
-	if err := binary.Write(cw, binary.LittleEndian, uint16(versionV6)); err != nil {
+	if err := binary.Write(cw, binary.LittleEndian, uint16(versionV7)); err != nil {
 		return err
 	}
 	if err := putU32(cw, uint32(len(d.Nodes))); err != nil {
@@ -273,6 +289,17 @@ func Encode(w io.Writer, d Data) error {
 	}
 	for _, f := range sec {
 		if err := putF32(cw, f); err != nil {
+			return err
+		}
+	}
+	// v7 ftsKey section: u32 count + strings, same positional shape as the
+	// indexKey section, appended after the floats so a reloaded graph can
+	// rebuild its FTS gram buckets at Seal time.
+	if err := putU32(cw, uint32(len(d.FTSKeys))); err != nil {
+		return err
+	}
+	for _, k := range d.FTSKeys {
+		if err := writeString(cw, k); err != nil {
 			return err
 		}
 	}
@@ -419,7 +446,7 @@ func Decode(r io.Reader) (Data, error) {
 	ver := binary.LittleEndian.Uint16(raw[4:6])
 	body := raw
 	switch ver {
-	case versionV6, versionV5, versionV4, versionV3, versionV2:
+	case versionV7, versionV6, versionV5, versionV4, versionV3, versionV2:
 		body = raw[:len(raw)-4]
 		want := binary.LittleEndian.Uint32(raw[len(raw)-4:])
 		if got := crc32.ChecksumIEEE(body); got != want {
@@ -530,8 +557,29 @@ func Decode(r io.Reader) (Data, error) {
 			return Data{}, err
 		}
 	}
+	// v7 ftsKey section, mirroring the indexKey gate above: u32 count +
+	// strings, read only when the version carries the section (v6-and-older
+	// files end at the float section / v4 decl tail).
+	var ftsKeys []string
+	if ver >= versionV7 {
+		nf, err := rd.u32()
+		if err != nil {
+			return Data{}, err
+		}
+		if int64(nf)*4 > int64(len(rd.b)-rd.i) { // same forged-count guard, 4 bytes per key minimum
+			return Data{}, errTruncated
+		}
+		if nf > 0 {
+			ftsKeys = make([]string, nf)
+			for i := range ftsKeys {
+				if ftsKeys[i], err = rd.str(); err != nil {
+					return Data{}, err
+				}
+			}
+		}
+	}
 	if rd.i != len(rd.b) {
 		return Data{}, errors.New("store: trailing garbage")
 	}
-	return Data{Nodes: nodes, Edges: edges, IndexKeys: indexKeys, VectorDecls: vecDecls}, nil
+	return Data{Nodes: nodes, Edges: edges, IndexKeys: indexKeys, VectorDecls: vecDecls, FTSKeys: ftsKeys}, nil
 }
