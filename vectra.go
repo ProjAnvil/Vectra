@@ -3127,16 +3127,17 @@ func (g *Graph) ftsDeclared(key string) bool {
 	return slices.Contains(g.bFTS, key)
 }
 
-// IndexedPropertyKeys returns the property-index declarations of BOTH kinds
-// — typed and full-text (FTS plan) — as one deduplicated set: the merged
-// base's effective keys plus pending declarations from unmerged layers
-// (sorted; nil when none). A key indexed both ways appears once. It answers
-// from the published generation only — a declaration made inside a running
-// Batch becomes visible at its boundary like every other batch write — which
-// keeps it lock-free. The entry materializes the caller's absorption window
-// first (a declaration absorbed mid-window is included). Consumers that
-// persist or hand over a graph (snapshot services, clone-and-extend flows)
-// use it to preserve index configuration.
+// IndexedPropertyKeys returns the typed property-index declarations: the
+// merged base's effective keys plus pending declarations from unmerged layers
+// (sorted; nil when none). It answers from the published generation only —
+// a declaration made inside a running Batch becomes visible at its boundary
+// like every other batch write — which keeps it lock-free. The entry
+// materializes the caller's absorption window first (a declaration absorbed
+// mid-window is included). Consumers that persist or hand over a graph
+// (snapshot services, clone-and-extend flows) use it to preserve index
+// configuration. Full-text declarations are a separate kind with a separate
+// accessor (FullTextIndexedKeys): enumerating them here would make snapshot
+// consumers auto-declare typed indexes over FTS keys (unrequested memory).
 func (g *Graph) IndexedPropertyKeys() []string {
 	g.flushPend()
 	v := g.view.Load()
@@ -3151,13 +3152,37 @@ func (g *Graph) IndexedPropertyKeys() []string {
 	for _, k := range v.base.IndexedKeys() {
 		add(k)
 	}
-	for _, k := range v.base.FTSKeys() {
-		add(k)
-	}
 	for _, l := range v.layers {
 		for _, k := range l.IndexKeys() {
 			add(k)
 		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// FullTextIndexedKeys is IndexedPropertyKeys's full-text sibling: the FTS
+// declarations — the merged base's FTS keys plus pending declarations from
+// unmerged layers (sorted; nil when none) — answering from the published
+// generation only, lock-free, with the caller's absorption window
+// materialized first, exactly like IndexedPropertyKeys. A snapshot consumer
+// that wants to preserve full-text configuration re-declares these keys
+// through IndexFullText.
+func (g *Graph) FullTextIndexedKeys() []string {
+	g.flushPend()
+	v := g.view.Load()
+	seen := make(map[string]bool)
+	var out []string
+	add := func(k string) {
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	for _, k := range v.base.FTSKeys() {
+		add(k)
+	}
+	for _, l := range v.layers {
 		for _, k := range l.FTSKeys() {
 			add(k)
 		}
@@ -3217,6 +3242,7 @@ func (g *Graph) Clone() *Graph {
 func (g *Graph) LookupByProperty(key, value string) ([]Node, bool) {
 	return g.lookupNodes(key,
 		func(v *genView) ([]uint32, bool) { return v.base.LookupIndex(key, value) },
+		typedPendingIn(key),
 		func(props map[string]any) bool {
 			s, ok := props[key].(string)
 			return ok && s == value
@@ -3229,6 +3255,7 @@ func (g *Graph) LookupByProperty(key, value string) ([]Node, bool) {
 func (g *Graph) LookupByNumber(key string, v float64) ([]Node, bool) {
 	return g.lookupNodes(key,
 		func(gv *genView) ([]uint32, bool) { return gv.base.LookupNumber(key, v) },
+		typedPendingIn(key),
 		func(props map[string]any) bool {
 			f, ok := toFloat64(props[key])
 			return ok && f == v
@@ -3241,6 +3268,7 @@ func (g *Graph) LookupByNumber(key string, v float64) ([]Node, bool) {
 func (g *Graph) LookupByNumberRange(key string, min, max *float64) ([]Node, bool) {
 	return g.lookupNodes(key,
 		func(gv *genView) ([]uint32, bool) { return gv.base.LookupNumberRange(key, min, max) },
+		typedPendingIn(key),
 		func(props map[string]any) bool {
 			f, ok := toFloat64(props[key])
 			if !ok {
@@ -3260,39 +3288,119 @@ func (g *Graph) LookupByNumberRange(key string, min, max *float64) ([]Node, bool
 func (g *Graph) LookupByBool(key string, v bool) ([]Node, bool) {
 	return g.lookupNodes(key,
 		func(gv *genView) ([]uint32, bool) { return gv.base.LookupBool(key, v) },
+		typedPendingIn(key),
 		func(props map[string]any) bool {
 			b, ok := props[key].(bool)
 			return ok && b == v
 		})
 }
 
+// LookupByContains finds nodes whose string property key CONTAINS substr,
+// case-insensitively (needle and value both fold to lower case). It is the
+// read side of the full-text plan (IndexFullText): declared keys answer
+// from the sealed gram buckets, pending declarations from unmerged layers
+// answer via full scan (R14), and every candidate still passes a mandatory
+// verify Contains — the bigram prefilter is deliberately a superset filter
+// (gram collisions like value "xxabyy bc zz" vs needle "abc" are dropped by
+// the verify pass, never returned as hits). Declaration is probed FIRST —
+// base FTS keys ∪ unmerged layers' FTS keys — so an undeclared key answers
+// (nil, false) regardless of needle length: the 1-rune scan path carries no
+// index verdict of its own. A needle shorter than two runes yields no grams
+// and takes the full-scan path (correct, documented slower). substr == ""
+// is not a search: (nil, false). Declared keys return ok=true even with
+// zero hits. Hits are sorted by NodeID ascending.
+func (g *Graph) LookupByContains(key, substr string) ([]Node, bool) {
+	if substr == "" {
+		return nil, false
+	}
+	needle := strings.ToLower(substr)
+	grams := engine.Bigrams(substr)
+	g.flushPend()
+	v := g.view.Load()
+	// The declaration probe runs before any path choice: with grams the
+	// base LookupFTS ok carries the verdict, but a 1-rune needle scans and
+	// would otherwise answer an undeclared key — so the probe is explicit
+	// for every needle length (LookupByProperty's effective/pending split,
+	// mirrored over the FTS kind).
+	pendingIn := ftsPendingIn(key)
+	if !slices.Contains(v.base.FTSKeys(), key) {
+		pending := false
+		for _, l := range v.layers {
+			if pendingIn(l) {
+				pending = true
+				break
+			}
+		}
+		if !pending {
+			return nil, false
+		}
+	}
+	// No grams (1-rune needle) ⇒ no bucket to intersect: nil forces the
+	// full-scan branch inside lookupNodesOf.
+	var baseIndex func(*genView) ([]uint32, bool)
+	if len(grams) > 0 {
+		baseIndex = func(v *genView) ([]uint32, bool) { return v.base.LookupFTS(key, grams) }
+	}
+	return lookupNodesOf(v, key, baseIndex, pendingIn, func(props map[string]any) bool {
+		s, ok := props[key].(string)
+		return ok && strings.Contains(strings.ToLower(s), needle)
+	})
+}
+
+// typedPendingIn is the pending-declaration probe of the typed index kind:
+// whether key was IndexProperty-declared in an unmerged layer (the R14
+// line-scan answer window before the merge makes it effective).
+func typedPendingIn(key string) func(*delta.Layer) bool {
+	return func(l *delta.Layer) bool { return slices.Contains(l.IndexKeys(), key) }
+}
+
+// ftsPendingIn is typedPendingIn's full-text sibling: an IndexFullText
+// declaration in an unmerged layer keeps the FTS lookup answerable via scan
+// until the merge seals the gram buckets. The kinds probe independently —
+// a typed declaration never answers an FTS lookup, and vice versa.
+func ftsPendingIn(key string) func(*delta.Layer) bool {
+	return func(l *delta.Layer) bool { return slices.Contains(l.FTSKeys(), key) }
+}
+
 // lookupNodes is the shared three-source lookup: base hits (from the index
 // when effective, or a full base scan for pending keys) overridden by layer
 // records and carved by layer tombstones, then filtered by match over the
-// winner's props. The entry materializes the caller's absorption window
-// (every LookupBy* passes through here).
-func (g *Graph) lookupNodes(key string, baseIndex func(*genView) ([]uint32, bool), match func(map[string]any) bool) ([]Node, bool) {
+// winner's props. pendingIn carries the caller's declaration kind so the
+// pending scan branch answers exactly that kind's declarations. The entry
+// materializes the caller's absorption window (every LookupBy* passes
+// through here).
+func (g *Graph) lookupNodes(key string, baseIndex func(*genView) ([]uint32, bool), pendingIn func(*delta.Layer) bool, match func(map[string]any) bool) ([]Node, bool) {
 	g.flushPend()
-	return lookupNodesOf(g.view.Load(), key, baseIndex, match)
+	return lookupNodesOf(g.view.Load(), key, baseIndex, pendingIn, match)
 }
 
 // lookupNodesOf is lookupNodes pinned to one generation (the Cypher
 // execution source in view.go answers anchors against exactly the
-// generation its rows came from).
-func lookupNodesOf(v *genView, key string, baseIndex func(*genView) ([]uint32, bool), match func(map[string]any) bool) ([]Node, bool) {
-	ids, effective := baseIndex(v)
-	// Pending detection is kind-aware (FTS plan): a key declared in an
-	// unmerged layer — typed OR full-text — keeps the lookup answerable via
-	// scan (R14). This is the shared gate every LookupBy* rides, including
-	// the FTS query path.
+// generation its rows came from). baseIndex nil means "no index to ask"
+// (the FTS 1-rune scan path): the whole base becomes the candidate set —
+// the pending scan branch, generalized — and the caller's own pre-probe
+// (LookupByContains probes the declaration before choosing paths) owns the
+// declared/undeclared verdict, so the kind gate below must not reject it.
+func lookupNodesOf(v *genView, key string, baseIndex func(*genView) ([]uint32, bool), pendingIn func(*delta.Layer) bool, match func(map[string]any) bool) ([]Node, bool) {
+	var ids []uint32
+	effective, scan := false, false
+	if baseIndex == nil {
+		scan = true
+	} else {
+		ids, effective = baseIndex(v)
+	}
+	// Pending detection is kind-aware: each lookup family probes its own
+	// declaration kind in the unmerged layers, so a key declared either way
+	// stays answerable via scan (R14) — but only for the family that owns
+	// the kind.
 	pending := false
 	for _, l := range v.layers {
-		if slices.Contains(l.IndexKeys(), key) || slices.Contains(l.FTSKeys(), key) {
+		if pendingIn(l) {
 			pending = true
 			break
 		}
 	}
-	if !effective && !pending {
+	if !effective && !pending && !scan {
 		return nil, false
 	}
 	type hit struct {

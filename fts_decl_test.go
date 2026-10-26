@@ -93,9 +93,13 @@ func TestIndexFullTextCoexistsWithTyped(t *testing.T) {
 	if keys := v.base.FTSKeys(); !slices.Equal(keys, []string{"k"}) {
 		t.Fatalf("base FTSKeys = %v, want [k]", keys)
 	}
-	// the public enumeration reports the key once, carrying both kinds
+	// the public enumerations are kind-split (IndexedPropertyKeys typed-only,
+	// FullTextIndexedKeys FTS-only): the coexisting key appears once in each
 	if keys := g.IndexedPropertyKeys(); !slices.Equal(keys, []string{"k"}) {
 		t.Fatalf("IndexedPropertyKeys = %v, want [k] once", keys)
+	}
+	if keys := g.FullTextIndexedKeys(); !slices.Equal(keys, []string{"k"}) {
+		t.Fatalf("FullTextIndexedKeys = %v, want [k] once", keys)
 	}
 }
 

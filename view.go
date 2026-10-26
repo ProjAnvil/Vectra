@@ -260,6 +260,7 @@ func (s cypherSource) RowsInto(u uint32, dir int, buf []csr.AdjRow) []csr.AdjRow
 func (s cypherSource) LookupIndex(key, value string) ([]uint32, bool) {
 	ns, ok := lookupNodesOf(s.gv, key,
 		func(v *genView) ([]uint32, bool) { return v.base.LookupIndex(key, value) },
+		typedPendingIn(key),
 		func(props map[string]any) bool {
 			sv, ok := props[key].(string)
 			return ok && sv == value
@@ -270,6 +271,7 @@ func (s cypherSource) LookupIndex(key, value string) ([]uint32, bool) {
 func (s cypherSource) LookupNumber(key string, value float64) ([]uint32, bool) {
 	ns, ok := lookupNodesOf(s.gv, key,
 		func(v *genView) ([]uint32, bool) { return v.base.LookupNumber(key, value) },
+		typedPendingIn(key),
 		func(props map[string]any) bool {
 			f, ok := toFloat64(props[key])
 			return ok && f == value
@@ -280,6 +282,7 @@ func (s cypherSource) LookupNumber(key string, value float64) ([]uint32, bool) {
 func (s cypherSource) LookupBool(key string, value bool) ([]uint32, bool) {
 	ns, ok := lookupNodesOf(s.gv, key,
 		func(v *genView) ([]uint32, bool) { return v.base.LookupBool(key, value) },
+		typedPendingIn(key),
 		func(props map[string]any) bool {
 			b, ok := props[key].(bool)
 			return ok && b == value

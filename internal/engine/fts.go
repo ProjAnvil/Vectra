@@ -40,6 +40,12 @@ func bigrams(s string) []string {
 	return grams
 }
 
+// Bigrams is the needle-side entry of bigrams: the root query path
+// (LookupByContains) must split search needles with the exact function the
+// Seal-time indexer tokenized values with, so index side and query side can
+// never disagree.
+func Bigrams(s string) []string { return bigrams(s) }
+
 // LookupFTS intersects the posting lists of grams under an FTS-declared
 // property key, smallest list first; ok=false when the key was not declared
 // at Seal time. A gram with an empty posting yields an empty result. The
