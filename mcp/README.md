@@ -81,6 +81,8 @@ uv run vectra-mcp-python                    # stdio, VECTRA_URL=http://127.0.0.1
 uv run vectra-mcp-python --http :9000       # Streamable HTTP
 ```
 
+When the service runs with `-auth-token-file`, also set `VECTRA_TOKEN` — the proxy sends it as the bearer token on every request (omit it when auth is off).
+
 Claude Code:
 
 ```bash
@@ -93,6 +95,8 @@ claude mcp add vectra -- env VECTRA_URL=http://127.0.0.1:8080 uv run --directory
 cd mcp/ts && npm install && npm run build
 VECTRA_URL=http://127.0.0.1:8080 node dist/index.js
 ```
+
+`VECTRA_TOKEN` is the auth counterpart (bearer token on every request when the service runs `-auth-token-file`; omit when auth is off).
 
 Claude Code:
 

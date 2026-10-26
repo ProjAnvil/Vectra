@@ -94,6 +94,19 @@ fallback. The MCP server exposes it as `vector_search` (query_vector or
 similar_to, k ≤ 1000). Gate 2b numbers:
 [docs/benchmarks/2026-10-20-vector-phase1-gate2b.md](docs/benchmarks/2026-10-20-vector-phase1-gate2b.md).
 
+## Full-text property search (v0.12)
+
+Typed indexes answer equality and range; a full-text declaration answers **substring** lookups over a string prop — mixed CJK/Latin included:
+
+```go
+g.IndexFullText("desc")                                    // declare (pending until the next Seal/merge)
+hits, ok := g.LookupByContains("desc", "payment gateway") // case-insensitive substring, NodeID ascending
+```
+
+Semantics: `LookupByContains` is **case-insensitive** (value and needle both fold to lower case) and works rune-pair-wise — at `Seal` time each declared key's values are tokenized into adjacent two-rune **bigrams** ("图数据库" → 图数 数据 据库; a value of m runes posts m-1 deduped grams), and a lookup intersects the needle's gram posting lists, then re-verifies every candidate with a real `Contains` — the bigram index is a prefilter only, so gram collisions never surface as false hits. Declarations follow the `IndexProperty` contract: pending until the next merge (pending keys answer via full scan until then), idempotent, WAL-logged, and persisted in store v7 snapshots; a key may be typed-indexed **and** full-text-indexed. Undeclared keys and empty needles answer `(nil, false)`; needles shorter than two runes take the documented full-scan path. Cross-reference: Cypher's `CONTAINS` is unchanged — a case-sensitive scan with no relation to these buckets.
+
+**Cost (opt-in).** Buckets exist only for declared keys, and every Seal/merge/clone rebuilds them. Budget ~24-30 B per (gram, id) posting: 1M nodes × 100-character values ≈ 3-5 GB. The release gate (`BenchmarkSealFTS100K`: 100K nodes / 1M edges, one key, ~32-rune mixed CJK/Latin values) measures the with-FTS clone+seal cycle at 1.69x the no-FTS line (+162 MB/op, 0.34 s/op). MCP exposes it as `index_fulltext` / `lookup_contains` (Go server).
+
 ## Cypher-subset queries
 
 Sealed graphs answer openCypher/GQL-style pattern queries — the DSL compiles onto the same CSR traversal primitives (`bfs` / `neighbors` / `lookup_property` are the physical operators):
@@ -128,6 +141,8 @@ cd server && go build -o vectra-server ./cmd/vectra-server
 ```
 
 Semantics: writes are linearizable (raft commit) — upserts plus logical-key deletes (node deletes cascade incident edges); reads are bounded-stale (≤ SealInterval, immediate for small graphs). Edge identity in batch and transaction writes is the `(srcKey, dstKey, label)` triple — upserts collapse parallels and the last write wins on props; set `"allowParallel": true` on an edge item to append a true parallel edge instead. Anti-split-brain: nodes with `Join` set never bootstrap. The 3-node in-process chaos suite (leader failover, log replay catch-up, zero query failures during republish) runs under `-race` in CI.
+
+**Bearer-token auth (v0.12, optional).** `-auth-token-file <file>` enables static bearer auth: the file holds one token per line — multiple lines are all accepted, which is the rotation story (append the new token to every node, roll restarts, then remove the old one). Blank lines and CRLF endings are tolerated; a line with internal whitespace, an unreadable file, or an empty file aborts startup — auth never degrades into a silently open database. Every route then requires `Authorization: Bearer <token>` (SHA-256 digests, constant-time comparison) except exactly `GET /v1/health`, which stays open for the load-balancer probe. A joining node's `-join` requests carry its own token — one trust domain, every node shares the same token file. **Boundary:** HTTP auth protects HTTP only; the raft channel between nodes stays plaintext and unauthenticated, so bind `-raft` to a private interface and keep cluster traffic off untrusted networks (and terminate TLS in front of the HTTP port if tokens must not cross it in the clear — the server has no built-in TLS).
 
 ## Transactions
 

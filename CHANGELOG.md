@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-26
+
+Auth and full-text search: the HTTP surface gains optional bearer-token
+auth, and the engine gains opt-in full-text (substring) property indexes -
+case-insensitive bigram buckets built at Seal time, persisted through WAL
+frames and store v7. Release gate (`BenchmarkSealFTS100K`, 100K nodes/1M
+edges, one key, ~32-rune mixed CJK/Latin values): the with-FTS clone+seal
+cycle at 1.685x the without-FTS line, +162 MB/op, 0.339 s/op absolute
+(lines: <=2x, <=250 MB, <=1.5 s).
+
+### Added
+
+- HTTP bearer-token auth (`-auth-token-file`): tokens load once at
+  startup, one per line, multiple lines all accepted (rotation = append
+  the new token to every node, roll restarts, remove the old); blank
+  lines and CRLF tolerated, internal whitespace / unreadable / empty
+  file aborts startup (fail-fast - auth never degrades into a silently
+  open database). Every route requires `Authorization: Bearer <token>`
+  (SHA-256 digests, constant-time compare, no early exit) except exactly
+  `GET /v1/health`, the load-balancer probe. Join requests carry the
+  joining node's token - one trust domain, every node shares the token
+  file. The raft channel stays plaintext: HTTP auth never protects
+  inter-node raft TCP; bind `-raft` to a private interface.
+- Full-text property search: `Graph.IndexFullText(key)` declares a
+  string property key for substring lookup, `Graph.LookupByContains(key,
+  substr)` answers case-insensitively from seal-built bigram gram
+  buckets (a value of m runes posts m-1 deduped two-rune grams - mixed
+  CJK/Latin works naturally; every hit re-verifies with a real Contains,
+  so the prefilter never returns false positives). The declaration
+  contract mirrors IndexProperty (pending until the next merge, pending
+  keys answer via scan; idempotent; WAL-logged) and persists in store v7
+  snapshots; a key may be both typed- and full-text-indexed. Undeclared
+  keys and empty needles answer (nil, false); Cypher `CONTAINS` is
+  unchanged (case-sensitive scan). Memory: ~24-30 B per (gram, id) - 1M
+  nodes x 100-char values lands around 3-5 GB; strictly opt-in.
+- MCP: `index_fulltext` / `lookup_contains` tools (Go server, 14 tools)
+  and `VECTRA_TOKEN` env in the Python/TS proxies (sent as the bearer
+  token when the server runs auth).
+- `BenchmarkSealFTS100K` (bench/clone_test.go): the FTS seal release
+  gate - identical 100K-node datasets with and without one FTS
+  declaration; the delta isolates the seal-time gram-bucket build.
+
+### Changed
+
+- Store snapshots stamp **v7** (the FTSKey section appended after the
+  float32 section; a v6 file is v7 minus that section). Pre-v7 readers -
+  every v0.11.x binary - hard-fail on the version byte: libraries
+  checkpointed by v0.12.0 cannot be downgraded past v0.11.x (same
+  discipline as v5/v6). v6-and-older files load unchanged; legacy v1-v5
+  bases keep migrating in place on first open (`.bak` rollback artifact
+  retained), and a v6 base upgrades to v7 at its next compact - light
+  checkpoints over a v6 base stay legal (tier-gate fix below).
+
+### Fixed
+
+- The light-checkpoint legality probe compared the base's store version
+  exactly (`== v6`), so a v7 base would have been misjudged as needing
+  the full-snapshot compact tier; the probe now accepts v6-or-newer
+  (`>=`), keeping light checkpoints O(1) across store-version bumps
+  [d49d11e].
+
+### Performance
+
+- The FTS seal build is allocation-lean: interned gram strings, flat
+  extraction with presized postings, counting-sort ordering - the seal
+  gate moved from 5.12x / +653 MB (first round, failed) to 1.685x /
+  +162 MB / 0.339 s (pass) [8c415ec].
+
 ## [0.11.4] - 2026-10-26
 
 The 1M arc: direct measurement, three structural fixes, and the retest

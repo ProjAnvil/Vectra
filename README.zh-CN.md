@@ -72,6 +72,19 @@ v0.7 溶解了密封快照门。每次写入（或 `Batch`）把变更物化为�
 
 **⚠️ 升级到 0.5.0。** 存储快照改以 v3 格式写入。不兼容是单向的：v1/v2 旧文件仍可读，但 0.5 之前的二进制读不了 v3 文件——跨版本交换 `.vg` 快照的嵌入式与 MCP 用户需要两端都在 0.5+。raft 集群新旧混布策略不变（本就不支持）。
 
+## 全文属性检索（v0.12）
+
+类型化索引回答等值与范围；全文声明回答字符串属性上的**子串**查找——中英混排同样适用：
+
+```go
+g.IndexFullText("desc")                            // 声明（挂起至下次 Seal/merge）
+hits, ok := g.LookupByContains("desc", "支付网关")  // 大小写不敏感子串，按 NodeID 升序
+```
+
+语义：`LookupByContains` **大小写不敏感**（值与检索词都折叠为小写），按相邻**二元组（bigram）**工作——Seal 时把声明 key 的各值切分为相邻两 rune 的 gram（"图数据库" → 图数 数据 据库；m 个 rune 的值去重后产出 m-1 个 gram），查询时交集检索词的 gram 倒排表，再对每个候选做真实的 `Contains` 复核——bigram 索引只是预过滤，gram 碰撞不会变成假命中。声明契约与 `IndexProperty` 一致：挂起至下次 merge（此前挂起 key 走全扫回答）、幂等、记 WAL、随 store v7 快照持久化；同一 key 可以**同时**被类型化索引与全文索引。未声明的 key 与空检索词返回 `(nil, false)`；短于两个 rune 的检索词走已文档化的全扫路径。交叉引用：Cypher 的 `CONTAINS` 不变——大小写敏感的全表扫描，与本索引无关。
+
+**成本（按需开启）。** 只有声明的 key 才建桶，且每次 Seal/merge/clone 都重建。预算口径 ~24-30 B 每 (gram, id)：100 万节点 × 100 字符值 ≈ 3-5 GB。发布门（`BenchmarkSealFTS100K`：10 万点 / 100 万边、单 key、~32 rune 中英混排值）实测带 FTS 的 clone+seal 周期为无 FTS 线的 1.69 倍（+162 MB/op，0.34 s/op）。MCP 侧暴露为 `index_fulltext` / `lookup_contains`（Go 服务端）。
+
 ## Cypher 子集查询
 
 Seal 后的图可回答 openCypher/GQL 风格的模式查询——DSL 直接编译到现有 CSR 遍历原语上（`bfs` / `neighbors` / `lookup_property` 就是它的物理算子）：
@@ -106,6 +119,8 @@ cd server && go build -o vectra-server ./cmd/vectra-server
 ```
 
 一致性语义：写线性一致（raft 提交即返回）——upsert 加逻辑键删除（删点级联删边）；读有界过期（≤ SealInterval，小图即时）。批量与事务写入中边的身份是 `(srcKey, dstKey, label)` 三元组——upsert 折叠平行边、props 后写覆盖；边条目设 `"allowParallel": true` 则改为追加真正的平行边。防脑裂：设了 `Join` 的节点绝不引导。三节点进程内混沌测试（leader 宕机切换、日志回放追平、重发布期间查询零失败）在 `-race` 下进 CI。
+
+**Bearer 令牌认证（v0.12，可选）。** `-auth-token-file <文件>` 启用静态 bearer 认证：文件每行一个令牌——多行全部接受，这也是轮换方式（先把新令牌追加到所有节点，滚动重启，再删旧令牌）。空行与 CRLF 被容忍；行内含空白、文件不可读或为空都会中止启动——认证绝不静默退化成敞开的数据库。此后除 `GET /v1/health`（留给负载均衡探活）外，所有路由都要求 `Authorization: Bearer <令牌>`（SHA-256 摘要、常数时间比较）。加入节点的 `-join` 请求自带令牌——单一信任域，所有节点共享同一份令牌文件。**边界：**HTTP 认证只保护 HTTP；节点间 raft 信道仍是明文无认证，请把 `-raft` 绑到私有网卡，别让集群流量经过不受信网络（若令牌不能明文过网，需在 HTTP 端口前终结 TLS——服务端不内置 TLS）。
 
 ## 事务
 
