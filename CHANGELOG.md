@@ -7,7 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-1M-measurement findings fixed (measurement record:
+## [0.11.4] - 2026-10-26
+
+The 1M arc: direct measurement, three structural fixes, and the retest
+that verifies them at scale. Ingest accept 3.6x, compact-tier stalls
+-98%, and the worst-case restart (2h57m30s) eliminated. Measurement
+records: `docs/benchmarks/2026-10-23-vector-1m.md`,
+`docs/benchmarks/2026-10-25-1m-fixes-retest.md`; design:
+`docs/superpowers/specs/2026-10-24-1m-fixes-design.md`.
 `docs/benchmarks/2026-10-23-vector-1m.md`; design:
 `docs/superpowers/specs/2026-10-24-1m-fixes-design.md`).
 
