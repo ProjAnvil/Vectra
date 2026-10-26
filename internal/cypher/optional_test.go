@@ -317,6 +317,17 @@ func TestOptionalNoDedupMerge(t *testing.T) {
 	}
 }
 
+// TestOptionalEmptyBaseStrict: an empty (non-nil) base — a previous stage
+// that matched zero rows — stays empty through the optional stage: strict
+// stage semantics, no re-anchoring from scratch (contrast the nil base of
+// the leading form in TestOptionalCartesianNull).
+func TestOptionalEmptyBaseStrict(t *testing.T) {
+	res := optRun(t, `MATCH (a:Void) OPTIONAL MATCH (b:Ghost) RETURN count(*) AS c`)
+	if len(res.Rows) != 1 || res.Rows[0]["c"] != float64(0) {
+		t.Fatalf("empty base must stay empty: %+v", res.Rows)
+	}
+}
+
 // TestOptionalMaxRows: the per-base expansion is capped by the standard
 // per-pattern check, and the MERGED output cumulatively — the cartesian
 // shape never exceeds maxRows inside one base row but does across them.
@@ -364,6 +375,89 @@ func TestOptionalKeptRowPosNormalized(t *testing.T) {
 	}
 	if len(out) != 1 || out[0].pos != 0 || out[0].nodes != nil {
 		t.Fatalf("implicit first row: %+v", out)
+	}
+}
+
+// ---- nullability guard ----
+
+// TestOptionalNullableGuard: a pattern variable first declared under
+// OPTIONAL MATCH is null on the rows the expansion missed; a later
+// NON-optional MATCH cannot use it as a pattern variable (its expansion
+// would silently cartesian-anchor the null rows where Neo4j yields zero),
+// so validate rejects the shape with a positioned error naming the two
+// supported restructures. Nullable vars stay legal under another OPTIONAL
+// MATCH and through bare-variable WITH projections; var.prop/aggregation
+// items and WITH WHERE filters do not carry (or clear) nullability.
+func TestOptionalNullableGuard(t *testing.T) {
+	// the bad shape, positioned: the error points at the f token on line 2
+	_, err := Run(optSnap(t), "MATCH (p) OPTIONAL MATCH (p)-[:KNOWS]->(f)\nMATCH (f)-[:X]->(y) RETURN y")
+	if err == nil {
+		t.Fatal("nullable anchor: expected error, got nil")
+	}
+	e, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("error type: %T", err)
+	}
+	if !strings.Contains(e.Msg, `variable "f" may be null from OPTIONAL MATCH`) ||
+		!strings.Contains(e.Msg, "fold the pattern into the OPTIONAL MATCH") {
+		t.Fatalf("message: %q", e.Msg)
+	}
+	if e.Line != 2 || e.Col != 8 {
+		t.Fatalf("position: %d:%d, want 2:8 (the f token)", e.Line, e.Col)
+	}
+
+	// anchor position and join-var position both fire
+	optErr(t, `MATCH (p) OPTIONAL MATCH (p)-[:KNOWS]->(f) MATCH (f)-[:X]->(y) RETURN y`,
+		`variable "f" may be null from OPTIONAL MATCH`)
+	optErr(t, `MATCH (p) OPTIONAL MATCH (p)-[:KNOWS]->(f) MATCH (y)-[:X]->(f) RETURN y`,
+		`variable "f" may be null from OPTIONAL MATCH`)
+
+	// nullable edge vars are guarded too
+	optErr(t, `MATCH (p) OPTIONAL MATCH (p)-[r:KNOWS]->(f) MATCH (y)-[r:X]->(z) RETURN y`,
+		`variable "r" may be null from OPTIONAL MATCH`)
+
+	// nullable-in-optional is fine (and stays nullable): the two
+	// restructures the error suggests both parse
+	if _, err := Parse(`MATCH (p) OPTIONAL MATCH (p)-[:KNOWS]->(f) OPTIONAL MATCH (f)-[:X]->(y) RETURN y`); err != nil {
+		t.Fatalf("nullable under another OPTIONAL: %v", err)
+	}
+	if _, err := Parse(`MATCH (p) OPTIONAL MATCH (p)-[:KNOWS]->(f), (f)-[:X]->(y) RETURN p, y`); err != nil {
+		t.Fatalf("comma fold: %v", err)
+	}
+
+	// bare-variable WITH items carry nullability, own name and alias
+	optErr(t, `MATCH (p) OPTIONAL MATCH (p)-[:KNOWS]->(f) WITH p, f MATCH (f)-[:X]->(y) RETURN y`,
+		`variable "f" may be null from OPTIONAL MATCH`)
+	optErr(t, `MATCH (p) OPTIONAL MATCH (p)-[:KNOWS]->(f) WITH f AS g MATCH (g)-[:X]->(y) RETURN y`,
+		`variable "g" may be null from OPTIONAL MATCH`)
+
+	// a WITH WHERE filter cannot prove non-nullness: nullable stays
+	// nullable (the filter may keep rows the predicate cannot see)
+	optErr(t, `MATCH (p) OPTIONAL MATCH (p)-[:KNOWS]->(f) WITH p, f WHERE f.name <> 'x' MATCH (f)-[:X]->(y) RETURN y`,
+		`variable "f" may be null from OPTIONAL MATCH`)
+
+	// nullability rides ONLY bare-variable items: a var.prop projection is
+	// a scalar, so the scalar rule fires instead of the guard
+	optErr(t, `MATCH (p) OPTIONAL MATCH (p)-[:KNOWS]->(f) WITH f.name AS k MATCH (k) RETURN k`,
+		`variable "k" is a scalar; pattern variables must be nodes or edges`)
+
+	// a nullable var dropped by WITH is out of scope for references; a
+	// later MATCH (f) is a FRESH declaration (a cartesian pattern), not a
+	// reference — and carries no stale nullability
+	optErr(t, `MATCH (p) OPTIONAL MATCH (p)-[:KNOWS]->(f) WITH p RETURN f`,
+		`variable "f" is not defined in this scope`)
+	if _, err := Parse(`MATCH (p) OPTIONAL MATCH (p)-[:KNOWS]->(f) WITH p MATCH (f) RETURN f`); err != nil {
+		t.Fatalf("fresh re-declaration after WITH drop: %v", err)
+	}
+
+	// plain join vars are untouched: reuse across plain MATCHes stays legal
+	if _, err := Parse(`MATCH (a) MATCH (a)-[:X]->(b) RETURN b`); err != nil {
+		t.Fatalf("plain join: %v", err)
+	}
+	// a var first bound by a PLAIN match and re-declared under OPTIONAL
+	// keeps its binding on kept rows — still usable in later plain MATCHes
+	if _, err := Parse(`MATCH (a) OPTIONAL MATCH (a)-[:KNOWS]->(b) MATCH (a)-[:X]->(c) RETURN c`); err != nil {
+		t.Fatalf("pre-bound join var under OPTIONAL: %v", err)
 	}
 }
 

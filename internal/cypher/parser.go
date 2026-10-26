@@ -414,7 +414,8 @@ func (p *parser) parseBracketEdge() (*EdgePattern, error) {
 	}
 	ep := &EdgePattern{MinHops: 1, MaxHops: 1, Dir: DirBoth}
 	if p.at(TIdent) && !p.kw("TRUE") && !p.kw("FALSE") && !p.kw("NULL") {
-		ep.Var = p.next().Text
+		v := p.next()
+		ep.Var, ep.Line, ep.Col = v.Text, v.Line, v.Col
 	}
 	if p.at(TColon) {
 		p.next()
@@ -481,7 +482,8 @@ func (p *parser) parseNodePattern() (*NodePattern, error) {
 	}
 	np := &NodePattern{}
 	if p.at(TIdent) && !p.kw("TRUE") && !p.kw("FALSE") && !p.kw("NULL") {
-		np.Var = p.next().Text
+		v := p.next()
+		np.Var, np.Line, np.Col = v.Text, v.Line, v.Col
 	}
 	if p.at(TColon) {
 		p.next()
@@ -863,13 +865,29 @@ const (
 )
 
 // scope is the parse-time variable scope: the visible names, what each may
-// bind, and whether a WITH/UNWIND clause has been seen. sawReset selects
-// the undefined-variable error family: pure-MATCH queries keep the
-// historical "not declared in the pattern" wording byte-identical, while
-// post-WITH/UNWIND references use the scope-chain wording.
+// bind, whether a WITH/UNWIND clause has been seen, and which visible
+// node/edge variables are nullable (first declared under an OPTIONAL
+// MATCH). sawReset selects the undefined-variable error family: pure-MATCH
+// queries keep the historical "not declared in the pattern" wording
+// byte-identical, while post-WITH/UNWIND references use the scope-chain
+// wording.
+//
+// Nullability tracks the OPTIONAL-MATCH null extension: a pattern variable
+// declared by an optional clause is unbound (null) on rows the optional
+// expansion missed, and a LATER non-optional MATCH cannot anchor on it —
+// its expansion would silently cartesian-anchor the null rows (Neo4j
+// yields zero rows there instead). declarePattern enforces this with a
+// positioned error naming the two supported restructures. Nullability
+// propagates through a WITH item only when the item is the bare variable
+// (under its own name or alias); var.prop/aggregation items produce
+// scalars, which the scalar rules already fence out of patterns. A WITH
+// WHERE filter cannot prove non-nullness (null fails every predicate, but
+// the validator cannot reason about which rows survive it), so filtering
+// does NOT clear nullability.
 type scope struct {
 	kinds    map[string]varKind
 	edges    map[string]*EdgePattern // edge vars -> declaring pattern (variable-length check)
+	nullable map[string]bool         // first declared under OPTIONAL MATCH (see above); nil until one appears
 	sawReset bool                    // a WITH or UNWIND clause has been seen
 }
 
@@ -953,10 +971,27 @@ func (sc *scope) checkItemVar(v string, propAccess bool) error {
 
 // declarePattern adds one MATCH clause's pattern variables. Reusing a
 // node/edge name is a join (allowed); rebinding a scalar (WITH/UNWIND
-// projection) is an error.
+// projection) is an error. Variables first declared by an OPTIONAL clause
+// are marked nullable; a nullable variable appearing in a later
+// non-optional MATCH — as an anchor or a join — is the nullability-guard
+// error (null rows would silently cartesian; Neo4j yields zero rows).
 func (sc *scope) declarePattern(m *MatchClause) error {
 	scalarErr := func(v string) *Error {
 		return &Error{1, 1, fmt.Sprintf("variable %q is a scalar; pattern variables must be nodes or edges", v)}
+	}
+	nullableErr := func(line, col int, v string) *Error {
+		if line == 0 { // hand-built pattern without positions
+			line, col = 1, 1
+		}
+		return &Error{line, col, fmt.Sprintf("variable %q may be null from OPTIONAL MATCH; a later MATCH cannot use it as a pattern variable (IS NOT NULL is not supported - fold the pattern into the OPTIONAL MATCH or mark the later MATCH OPTIONAL)", v)}
+	}
+	// nullable vars stay legal as join vars under another OPTIONAL clause
+	// (they stay nullable); only a non-optional MATCH is fenced out.
+	guard := func(line, col int, v string) error {
+		if !m.Optional && sc.nullable[v] {
+			return nullableErr(line, col, v)
+		}
+		return nil
 	}
 	for _, pat := range m.Patterns {
 		for _, n := range pat.Nodes {
@@ -966,7 +1001,17 @@ func (sc *scope) declarePattern(m *MatchClause) error {
 			if sc.kinds[n.Var] == kindScalar {
 				return scalarErr(n.Var)
 			}
+			if err := guard(n.Line, n.Col, n.Var); err != nil {
+				return err
+			}
+			// only a FRESH declaration under OPTIONAL is nullable: a var
+			// already bound by an earlier clause keeps that binding on the
+			// kept-unchanged rows (the expansion anchored on it).
+			_, bound := sc.kinds[n.Var]
 			sc.kinds[n.Var] = kindNode
+			if m.Optional && !bound {
+				sc.markNullable(n.Var)
+			}
 		}
 		for _, e := range pat.Edges {
 			if e.Var == "" {
@@ -975,11 +1020,28 @@ func (sc *scope) declarePattern(m *MatchClause) error {
 			if sc.kinds[e.Var] == kindScalar {
 				return scalarErr(e.Var)
 			}
+			if err := guard(e.Line, e.Col, e.Var); err != nil {
+				return err
+			}
+			_, bound := sc.kinds[e.Var]
 			sc.kinds[e.Var] = kindEdge
 			sc.edges[e.Var] = e
+			if m.Optional && !bound {
+				sc.markNullable(e.Var)
+			}
 		}
 	}
 	return nil
+}
+
+// markNullable records a fresh OPTIONAL-MATCH pattern variable; the map is
+// allocated lazily so OPTIONAL-free queries keep their exact allocation
+// footprint.
+func (sc *scope) markNullable(v string) {
+	if sc.nullable == nil {
+		sc.nullable = map[string]bool{}
+	}
+	sc.nullable[v] = true
 }
 
 // applyWith validates one WITH clause and applies its projection: item
@@ -987,12 +1049,20 @@ func (sc *scope) declarePattern(m *MatchClause) error {
 // REPLACED by the projected names (bare variables keep their kind under
 // their own name — or alias; expressions and aggregations project
 // scalars). The trailer (ORDER BY, WHERE) references projected names only.
+// Nullability rides the bare-variable items only: a bare nullable variable
+// stays nullable under its own name or alias; var.prop/aggregation items
+// and a WITH WHERE filter cannot prove non-nullness, but only the bare
+// items keep the variable usable as a pattern var at all, so they are the
+// only ones that need to carry the flag (a filtered nullable var stays
+// nullable — the filter may keep null-value rows the predicate cannot
+// see).
 func (sc *scope) applyWith(c *WithClause) error {
 	sc.sawReset = true
 	if len(c.Items) == 0 {
 		return &Error{1, 1, "WITH requires at least one item"}
 	}
 	next := make(map[string]varKind, len(c.Items))
+	var nextNullable map[string]bool // lazily: only when a nullable var survives
 	for _, it := range c.Items {
 		if it.Agg.Func != "" {
 			if !it.Agg.Star {
@@ -1016,14 +1086,22 @@ func (sc *scope) applyWith(c *WithClause) error {
 			next[it.Alias] = kindScalar
 			continue
 		}
-		// bare variable: passes its binding kind under its own name or alias
+		// bare variable: passes its binding kind (and nullability) under
+		// its own name or alias
 		name := it.Var
 		if it.Alias != "" {
 			name = it.Alias
 		}
 		next[name] = sc.kinds[it.Var]
+		if sc.nullable[it.Var] {
+			if nextNullable == nil {
+				nextNullable = map[string]bool{}
+			}
+			nextNullable[name] = true
+		}
 	}
 	sc.kinds = next
+	sc.nullable = nextNullable
 	for _, k := range c.OrderBy {
 		if _, ok := next[k.Name]; ok {
 			continue
@@ -1137,8 +1215,9 @@ func (sc *scope) checkReturn(c *ReturnClause, matchCount int) error {
 // referenced variables are declared (error family by scope state),
 // scalars are never property-accessed nor rebound by patterns,
 // variable-length edge variables are never referenced, ORDER BY names
-// appear among the visible/projected names, and RETURN * is limited to
-// the degenerate single-MATCH query.
+// appear among the visible/projected names, RETURN * is limited to the
+// degenerate single-MATCH query, and a nullable (OPTIONAL-MATCH-declared)
+// variable never anchors a later non-optional MATCH.
 func (q *Query) validate() error {
 	sc := newScope()
 	matchCount := 0
@@ -1175,6 +1254,7 @@ func (q *Query) validate() error {
 				}
 			}
 			sc.kinds[c.Alias] = kindScalar
+			delete(sc.nullable, c.Alias) // the scalar rebind shadows any old pattern var
 		case *ReturnClause:
 			if err := sc.checkReturn(c, matchCount); err != nil {
 				return err

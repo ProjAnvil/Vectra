@@ -71,6 +71,10 @@ type NodePattern struct {
 	Var   string         // "" = anonymous
 	Label string         // "" = any
 	Props map[string]any // literal equality conditions; nil when absent
+	// Line, Col locate the Var token for validate-time errors that point
+	// at a named pattern variable (the nullability guard). Hand-built
+	// patterns leave them zero; the error path normalizes 0 to 1.
+	Line, Col int
 }
 
 // EdgePattern directions.
@@ -89,6 +93,9 @@ type EdgePattern struct {
 	MinHops int
 	MaxHops int
 	Dir     int
+	// Line, Col locate the Var token (the nullability guard); 0 on
+	// hand-built patterns and on the var-less "--"/"<--" forms.
+	Line, Col int
 }
 
 type ReturnClause struct {
