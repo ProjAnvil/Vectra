@@ -229,3 +229,33 @@ func TestParseClauseCardinality(t *testing.T) {
 		t.Fatalf("alias name: %q", got)
 	}
 }
+
+// TestParseClauseStorageInline pins the zero-alloc clause storage: a
+// parsed query of up to four clauses carries its clause list in the Query
+// struct's inline array (no heap slice at all — the T1 bench table's
+// allocs/op include zero clause-slice allocations), and the fifth clause
+// spills to a heap slice naturally. The backing identity is the contract:
+// append over clauses[:0] with cap 4 cannot allocate below the spill.
+func TestParseClauseStorageInline(t *testing.T) {
+	two, err := Parse(`MATCH (a)-[:CALLS]->(b) RETURN b.key`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(two.Clauses) != 2 || &two.Clauses[0] != &two.clauses[0] {
+		t.Fatalf("2-clause query must live in the inline clause storage: %d clauses", len(two.Clauses))
+	}
+	four, err := Parse(`MATCH (a) MATCH (b) MATCH (c) RETURN a.key`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(four.Clauses) != 4 || &four.Clauses[0] != &four.clauses[0] {
+		t.Fatalf("4-clause query must live in the inline clause storage: %d clauses", len(four.Clauses))
+	}
+	five, err := Parse(`MATCH (a) MATCH (b) MATCH (c) MATCH (d) RETURN a.key`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(five.Clauses) != 5 || &five.Clauses[0] == &five.clauses[0] {
+		t.Fatalf("5-clause query must spill off the inline storage: %d clauses", len(five.Clauses))
+	}
+}

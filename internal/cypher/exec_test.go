@@ -532,3 +532,35 @@ func TestExecStageWhereAcrossStages(t *testing.T) {
 		t.Fatalf("inter-stage WHERE:\n got  %v\n want %v", got, want)
 	}
 }
+
+// TestExecStrictEmptyStage pins the controller ruling for the stage
+// pipeline: a MATCH stage whose input is zero rows yields zero rows (the
+// cartesian product with the empty set is empty) — stages NEVER re-anchor.
+// The comma form inside ONE MATCH clause keeps its legacy re-anchoring of
+// an empty first pattern (runPath channels within-clause emptiness as
+// nil, which anchors); only the clause stages are strict.
+func TestExecStrictEmptyStage(t *testing.T) {
+	if res := run(t, `MATCH (a {nosuch:1}) MATCH (b) RETURN b.key`); len(res.Rows) != 0 {
+		t.Fatalf("empty first stage must not re-anchor: %d rows %+v", len(res.Rows), res.Rows)
+	}
+	// Emptiness propagates through later stages (non-nil empty row set
+	// flows stage to stage).
+	if res := run(t, `MATCH (a:Service) MATCH (x {nosuch:1}) MATCH (b) RETURN b.key`); len(res.Rows) != 0 {
+		t.Fatalf("empty middle stage must propagate: %d rows", len(res.Rows))
+	}
+	// Join shape with an empty stage: still zero rows.
+	if res := run(t, `MATCH (a {nosuch:1}) MATCH (b)-[:USES]->(c) RETURN c.key`); len(res.Rows) != 0 {
+		t.Fatalf("empty stage into join must stay empty: %d rows", len(res.Rows))
+	}
+	// Aggregation over a strict-empty pipeline still yields its single
+	// zero row (count=0), like any zero-row MATCH.
+	res := run(t, `MATCH (a {nosuch:1}) MATCH (b) RETURN count(*) AS c`)
+	if len(res.Rows) != 1 || res.Rows[0]["c"] != float64(0) {
+		t.Fatalf("count over strict-empty pipeline: %+v", res.Rows)
+	}
+	// Comma-form legacy: an empty first PATTERN re-anchors within one
+	// MATCH clause (documented legacy; stages are the strict form).
+	if res := run(t, `MATCH (a {nosuch:1}), (b) RETURN b.key`); len(res.Rows) != 4 {
+		t.Fatalf("comma-form legacy re-anchoring: %d rows, want 4", len(res.Rows))
+	}
+}

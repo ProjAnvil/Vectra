@@ -378,10 +378,20 @@ func (ex *executor) labelMask(labels []string) []bool {
 
 // matchRows executes every comma-separated path pattern in sequence,
 // joining on shared variables (cartesian product when none are shared).
-// base seeds the first pattern's rows: the executor's stage loop passes
-// the previous clause's rows (repeated MATCH / MATCH-after-WITH); the
-// first stage of a statement passes nil and anchors from scratch.
+//
+// base distinguishes the pipeline's first stage from an intermediate one
+// (the controller ruling for T4): nil anchors the first pattern from
+// scratch; a NON-nil slice — including an empty one — is a previous
+// clause's row set, and the cartesian product with the empty set is
+// empty: a stage whose input is zero rows yields zero rows and never
+// re-anchors. (The comma form inside one MATCH keeps its legacy
+// re-anchoring of an empty earlier pattern: within-clause emptiness
+// channels through runPath as nil.) On success the returned slice is
+// never nil, so emptiness propagates strictly through later stages.
 func (ex *executor) matchRows(m *MatchClause, base []row) ([]row, error) {
+	if base != nil && len(base) == 0 {
+		return base, nil // strict empty stage: cartesian with the empty set stays empty
+	}
 	rows := base
 	for _, pat := range m.Patterns {
 		var err error
@@ -393,6 +403,9 @@ func (ex *executor) matchRows(m *MatchClause, base []row) ([]row, error) {
 		if len(rows) > maxRows {
 			return nil, &Error{1, 1, fmt.Sprintf("result too large: more than %d intermediate rows; narrow the pattern or add LIMIT", maxRows)}
 		}
+	}
+	if rows == nil {
+		rows = []row{} // zero matches: empty-but-non-nil, later stages stay strict
 	}
 	return rows, nil
 }
@@ -477,12 +490,18 @@ func valsEq(a, b any) bool {
 	return string(encodeVal(nil, a)) == string(encodeVal(nil, b))
 }
 
-// runPath evaluates one path pattern against the incoming rows (empty for
-// the first pattern: the path's first node is the anchor).
+// runPath evaluates one path pattern against the incoming rows. base nil
+// means "no rows exist yet" — the first stage (or a within-clause pattern
+// after one that matched nothing, the comma form's legacy re-anchoring):
+// the path's first node anchors from scratch. A non-nil base joins on
+// shared variables or cartesian-products over the anchor candidates; an
+// empty non-nil base yields zero rows (stages are strict — usually
+// matchRows's short-circuit catches that first, this keeps the contract
+// at the consumption site).
 func (ex *executor) runPath(pat *PathPattern, base []row) ([]row, error) {
 	first := pat.Nodes[0]
 	var rows []row
-	if len(base) == 0 {
+	if base == nil {
 		for _, id := range ex.anchorCandidates(first) {
 			r := row{pos: id}
 			if first.Var != "" {

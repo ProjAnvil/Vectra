@@ -82,7 +82,7 @@ func (p *parser) parseQuery() (*Query, error) {
 	if !p.kw("MATCH") {
 		return nil, p.errf("expected MATCH, got %s", describe(p.cur()))
 	}
-	q := &Query{}
+	q := newQuery()
 	sawReturn := false
 	for !p.at(TEOF) {
 		if sawReturn {

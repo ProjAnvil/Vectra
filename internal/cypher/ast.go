@@ -5,8 +5,25 @@ package cypher
 // a cartesian product, shared variables join — matching Neo4j); WITH and
 // UNWIND clauses are scope-validated here, and their parser arms land in
 // T4/T5. Positions live on the expression nodes for error reports.
+//
+// Clauses is backed by the inline clauses array for the first four
+// clauses: every realistic MATCH/WITH/UNWIND pipeline parses with ZERO
+// clause-slice allocations (the executor's alloc budget includes none),
+// and the fifth clause spills to a heap slice through append's natural
+// growth. Parse seeds the slice via newQuery; hand-built Queries assign
+// Clauses directly and ignore the array. Do not copy a Query by value
+// while it is being parsed (the slice would alias the original's array).
 type Query struct {
+	clauses [4]Clause
 	Clauses []Clause
+}
+
+// newQuery returns a Query whose Clauses slice is backed by the inline
+// array: appends 1..4 allocate nothing.
+func newQuery() *Query {
+	q := &Query{}
+	q.Clauses = q.clauses[:0]
+	return q
 }
 
 // Clause is the clause sum type; the marker-method idiom follows Expr.
