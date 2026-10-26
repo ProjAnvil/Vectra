@@ -19,9 +19,20 @@ import (
 	"github.com/projanvil/vectra"
 )
 
-func httpPost(url string, body []byte, timeout time.Duration) (*http.Response, error) {
+// httpPost posts body as JSON. The Authorization header is attached only
+// when bearer is non-empty, so auth-off deployments keep today's wire
+// behavior byte-for-byte.
+func httpPost(url string, body []byte, timeout time.Duration, bearer string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
 	client := &http.Client{Timeout: timeout}
-	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}

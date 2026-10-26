@@ -255,7 +255,9 @@ func (n *Node) Join(seedHTTP string) error {
 		"httpAddr": announceAddr(n.cfg.HTTPAddr),
 	}
 	data, _ := json.Marshal(body)
-	resp, err := httpPost(seedHTTP+"/v1/join", data, 15*time.Second)
+	// Single trust domain: the join credential rides the same bearer auth
+	// as every other route (empty authToken = auth off, no header attached).
+	resp, err := httpPost(seedHTTP+"/v1/join", data, 15*time.Second, n.authToken)
 	if err != nil {
 		return err
 	}
