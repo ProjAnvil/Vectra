@@ -14,7 +14,8 @@ package delta
 //   - tombstone sets are the full union — over-approximation is safe, a
 //     tombstone on a key the base lacks kills nothing, and each layer's own
 //     live records already won over its own tombstones at build time;
-//   - labels and index declarations: first-seen union.
+//   - labels and index declarations (typed and full-text alike): first-seen
+//     union.
 //
 // ID discipline is per side: a node-only layer legally carries a nil edgeIDs
 // slice (and vice versa), so each side keeps its IDs unless one of the layers
@@ -65,6 +66,8 @@ func FoldLayers(layers []*Layer) *Layer {
 	var labels []string
 	indexSeen := make(map[string]bool)
 	var indexKeys []string
+	ftsSeen := make(map[string]bool)
+	var ftsKeys []string
 
 	for _, l := range layers {
 		for k := range l.nodeTomb {
@@ -114,6 +117,12 @@ func FoldLayers(layers []*Layer) *Layer {
 				indexKeys = append(indexKeys, ik)
 			}
 		}
+		for _, fk := range l.ftsKeys {
+			if !ftsSeen[fk] {
+				ftsSeen[fk] = true
+				ftsKeys = append(ftsKeys, fk)
+			}
+		}
 	}
 
 	hasNodeIDs, hasEdgeIDs := true, true
@@ -133,6 +142,7 @@ func FoldLayers(layers []*Layer) *Layer {
 		edgeTomb:  edgeTomb,
 		labels:    labels,
 		indexKeys: indexKeys,
+		ftsKeys:   ftsKeys,
 	}
 	f.nodes = make([]NodeRec, 0, len(nodeOrder))
 	f.nodeIdx = make(map[string]int, len(nodeOrder))

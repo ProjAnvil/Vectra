@@ -371,7 +371,7 @@ func (g *Graph) backfillVectorIndex(vi *vecIndex) {
 	if g.vecSkipBackfill {
 		return
 	}
-	nodes, _, _, _ := g.unionRecords()
+	nodes, _, _, _, _ := g.unionRecords()
 	for _, n := range nodes {
 		if v, ok := n.Props[vi.decl.Prop]; ok {
 			if fv, ok := vector.NormalizeVec(v, vi.decl.Dim); ok {

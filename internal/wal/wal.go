@@ -115,6 +115,12 @@ type IndexDecl struct {
 	// means "drop all" - a DropVectorIndex-only flush must survive the
 	// wire (Phase 1 audit: the guard-replay pair used to eat it).
 	VectorIndexes []VectorIndexDecl `json:"vectorIndexes"`
+	// FullTextKeys carries full-text index declarations (2026-10-26 FTS
+	// plan) in the same frame shape as the typed keys. Unlike
+	// VectorIndexes there is no drop-all op for this kind, so null ≡
+	// empty: both mean "this frame declares none". Old payloads decode it
+	// as nil (forward compatible) the same way as VectorIndexes.
+	FullTextKeys []string `json:"fullTextKeys"`
 }
 
 // VectorIndexDecl is the wire form of a vector index declaration
@@ -666,6 +672,9 @@ type Frame struct {
 	// VectorIndexes rides frameIndexDecl payloads (spec §3.3): empty on
 	// pre-Phase-1 frames.
 	VectorIndexes []VectorIndexDecl
+	// FullTextKeys rides frameIndexDecl payloads too (2026-10-26 FTS
+	// plan): empty on pre-FTS frames (null ≡ empty — no drop-all op).
+	FullTextKeys []string
 }
 
 // Replay applies every frame above the manifest's base LSN to fn, in LSN
@@ -745,6 +754,7 @@ func (w *WAL) replayLSN(fn func(lsn uint64, fr Frame) error) (uint64, error) {
 				}
 				fr.IndexKeys = d.Keys
 				fr.VectorIndexes = d.VectorIndexes
+				fr.FullTextKeys = d.FullTextKeys
 			} else if typ == frameChangesetV2 {
 				// A CRC-intact frame whose envelope still fails to decode
 				// (bad magic, torn hint section, forged out-of-range $vec

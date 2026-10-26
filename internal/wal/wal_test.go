@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -535,5 +536,64 @@ func TestVectorIndexDeclRoundtrip(t *testing.T) {
 	want := decls[1]
 	if gotVec[0][1] != want {
 		t.Fatalf("decl mismatch: %+v want %+v", gotVec[0][1], want)
+	}
+}
+
+// TestIndexDeclFullTextKeysRoundtrip: FTS declarations ride IndexDecl frames
+// alongside the typed keys (2026-10-26 FTS plan) and surface on
+// Frame.FullTextKeys; old frames without the field replay with it empty
+// (null ≡ empty — there is no drop-all op for this kind).
+func TestIndexDeclFullTextKeysRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(dir, ModeAlways)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.AppendIndex(IndexDecl{
+		Keys:         []string{"team"},
+		FullTextKeys: []string{"desc", "title"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.AppendIndex(IndexDecl{Keys: []string{"old"}}); err != nil {
+		t.Fatal(err) // pre-FTS shape: FullTextKeys absent on the wire
+	}
+	if _, err := w.Append(testCS(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w2, err := Open(dir, ModeAlways)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	var declFrames, csFrames int
+	var gotKeys, gotFTS [][]string
+	if _, err := w2.Replay(func(fr Frame) error {
+		if fr.Changeset != nil {
+			csFrames++
+			return nil
+		}
+		declFrames++
+		gotKeys = append(gotKeys, fr.IndexKeys)
+		gotFTS = append(gotFTS, fr.FullTextKeys)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if declFrames != 2 || csFrames != 1 {
+		t.Fatalf("replayed decl=%d cs=%d frames, want 2 decl + 1 cs", declFrames, csFrames)
+	}
+	if !slices.Equal(gotKeys[0], []string{"team"}) || !slices.Equal(gotKeys[1], []string{"old"}) {
+		t.Fatalf("IndexKeys replay wrong: %v", gotKeys)
+	}
+	if !slices.Equal(gotFTS[0], []string{"desc", "title"}) {
+		t.Fatalf("FullTextKeys = %v, want [desc title]", gotFTS[0])
+	}
+	if len(gotFTS[1]) != 0 {
+		t.Fatalf("old-shape frame replayed FullTextKeys = %v, want empty", gotFTS[1])
 	}
 }

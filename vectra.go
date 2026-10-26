@@ -308,6 +308,7 @@ type Graph struct {
 	bLiveNodes map[string]bool       // keys live in the builder or published-and-lifted
 	bKilled    map[delta.EdgeKey]int // per key: published parallels already tombstoned in this window (>0 also forces fresh IDs on revive)
 	bIndex     []string              // pending index declarations (this batch)
+	bFTS       []string              // pending full-text index declarations (this batch, 2026-10-26 FTS plan)
 
 	// WAL session state (all zero for New()/Load() graphs — v0.6 behavior).
 	wal    *wal.WAL // nil = no recording
@@ -574,6 +575,7 @@ const (
 	opNodeDelete
 	opIndex
 	opVecIndex // declaration-class like opIndex: rides IndexDecl frames
+	opFTS      // full-text declaration-class: rides IndexDecl frames too (FTS plan)
 )
 
 // pendOp is one recorded write, kept in original order until flush.
@@ -583,7 +585,7 @@ type pendOp struct {
 	edge     EdgeUpsert
 	edel     EdgeDelete
 	ndel     string
-	idx      string                // opIndex: declared property key
+	idx      string                // opIndex/opFTS: declared property key
 	vecDecls []wal.VectorIndexDecl // opVecIndex: full declaration list
 }
 
@@ -854,6 +856,7 @@ func (g *Graph) ensureBuilder() {
 	}
 	g.bEdgeIDs = nil
 	g.bIndex = nil
+	g.bFTS = nil
 	if !g.batching {
 		g.pend.Store(&pendWindow{owner: goroutineToken()})
 	}
@@ -1013,14 +1016,15 @@ func (g *Graph) olderIncidentEdges(key string) []delta.EdgeKey {
 // publishLayer materializes the active builder into a micro-layer, appends
 // it to the generation stack, publishes the new genView, and reconciles the
 // writer mirrors. An entirely empty layer (no records, tombstones or pending
-// index declarations) is dropped — it must not flip Sealed() or grow the
-// stack. The layers slice is extended by plain append: safe under the single
-// writer because older generations only ever read their own shorter prefix
-// (append either writes past the old len or reallocates). Full close: the
-// builder, the absorption window and the endpoint registry all reset — the
-// registry reset must happen even when the builder is already closed (a
-// window cut by an earlier read), or IDs from before a renumbering merge
-// would survive it (cutLayer restores the registry after this reset).
+// index declarations of either kind) is dropped — it must not flip Sealed()
+// or grow the stack. The layers slice is extended by plain append: safe
+// under the single writer because older generations only ever read their
+// own shorter prefix (append either writes past the old len or reallocates).
+// Full close: the builder, the absorption window and the endpoint registry
+// all reset — the registry reset must happen even when the builder is
+// already closed (a window cut by an earlier read), or IDs from before a
+// renumbering merge would survive it (cutLayer restores the registry after
+// this reset).
 func (g *Graph) publishLayer() {
 	g.pend.Store(nil)
 	b := g.builder
@@ -1034,9 +1038,9 @@ func (g *Graph) publishLayer() {
 	// registry afterwards for continued bursts
 	g.builder = nil
 	g.bNodeIDs, g.bEdgeIDs = nil, nil
-	g.bLiveNodes, g.bKilled, g.bIndex = nil, nil, nil
+	g.bLiveNodes, g.bKilled, g.bIndex, g.bFTS = nil, nil, nil, nil
 	if l != nil && l.NodeCount() == 0 && l.EdgeCount() == 0 &&
-		len(l.NodeTombstones()) == 0 && len(l.EdgeTombstones()) == 0 && len(l.IndexKeys()) == 0 {
+		len(l.NodeTombstones()) == 0 && len(l.EdgeTombstones()) == 0 && len(l.IndexKeys()) == 0 && len(l.FTSKeys()) == 0 {
 		l = nil // an entirely empty layer is dropped: it must not flip Sealed() or grow the stack
 	}
 	if l == nil && g.pendingFold.Load() == nil {
@@ -1425,6 +1429,16 @@ func (g *Graph) recordIndexDecl(key string) error {
 	return g.maybeFlush()
 }
 
+// recordFTSDecl is recordIndexDecl for the full-text kind (FTS plan): an
+// opFTS pendOp coalesced into the same IndexDecl frame run at flush.
+func (g *Graph) recordFTSDecl(key string) error {
+	if g.wal == nil {
+		return nil
+	}
+	g.pendOps = append(g.pendOps, pendOp{kind: opFTS, idx: key})
+	return g.maybeFlush()
+}
+
 // maybeFlush flushes unless a Batch boundary is holding the buffer.
 func (g *Graph) maybeFlush() error {
 	if g.batching {
@@ -1434,9 +1448,10 @@ func (g *Graph) maybeFlush() error {
 }
 
 // flushPending emits the buffered ops as one frame per kind-ordered run;
-// consecutive index declarations coalesce into one IndexDecl frame at their
-// position in the op order. On error the unflushed ops stay buffered so a
-// retry (e.g. a retried Close) does not silently drop them.
+// consecutive index declarations (typed, vector and full-text alike)
+// coalesce into one IndexDecl frame at their position in the op order. On
+// error the unflushed ops stay buffered so a retry (e.g. a retried Close)
+// does not silently drop them.
 func (g *Graph) flushPending() error {
 	if g.wal == nil {
 		g.pendOps = nil
@@ -1444,19 +1459,23 @@ func (g *Graph) flushPending() error {
 	}
 	i := 0
 	for i < len(g.pendOps) {
-		if g.pendOps[i].kind == opIndex || g.pendOps[i].kind == opVecIndex {
+		if g.pendOps[i].kind == opIndex || g.pendOps[i].kind == opVecIndex || g.pendOps[i].kind == opFTS {
 			j := i
 			keys := make([]string, 0, 4)
+			var ftsKeys []string
 			var vecs []wal.VectorIndexDecl
-			for j < len(g.pendOps) && (g.pendOps[j].kind == opIndex || g.pendOps[j].kind == opVecIndex) {
-				if g.pendOps[j].kind == opIndex {
+			for j < len(g.pendOps) && (g.pendOps[j].kind == opIndex || g.pendOps[j].kind == opVecIndex || g.pendOps[j].kind == opFTS) {
+				switch g.pendOps[j].kind {
+				case opIndex:
 					keys = append(keys, g.pendOps[j].idx)
-				} else {
+				case opFTS:
+					ftsKeys = append(ftsKeys, g.pendOps[j].idx)
+				default:
 					vecs = g.pendOps[j].vecDecls
 				}
 				j++
 			}
-			if _, err := g.wal.AppendIndex(IndexDecl{Keys: keys, VectorIndexes: vecs}); err != nil {
+			if _, err := g.wal.AppendIndex(IndexDecl{Keys: keys, VectorIndexes: vecs, FullTextKeys: ftsKeys}); err != nil {
 				g.pendOps = append([]pendOp(nil), g.pendOps[i:]...)
 				return err
 			}
@@ -1464,7 +1483,7 @@ func (g *Graph) flushPending() error {
 			continue
 		}
 		j := i + 1
-		for j < len(g.pendOps) && g.pendOps[j].kind != opIndex && g.pendOps[j].kind != opVecIndex &&
+		for j < len(g.pendOps) && g.pendOps[j].kind != opIndex && g.pendOps[j].kind != opVecIndex && g.pendOps[j].kind != opFTS &&
 			g.pendOps[j].kind >= g.pendOps[j-1].kind {
 			j++
 		}
@@ -1579,7 +1598,7 @@ func (g *Graph) Batch(fn func(*Graph)) error {
 			// in pendOps for the next flush, T2 discipline).
 			g.builder = nil
 			g.bNodeIDs, g.bEdgeIDs = nil, nil
-			g.bLiveNodes, g.bKilled, g.bIndex = nil, nil, nil
+			g.bLiveNodes, g.bKilled, g.bIndex, g.bFTS = nil, nil, nil, nil
 		}
 	}()
 	fn(g)
@@ -1786,8 +1805,8 @@ func Open(path string, opts Options) (*Graph, error) {
 	}
 	// Replay with recording detached (g.wal still nil): replaying must not
 	// amplify frames. Torn tails stop at the last complete frame. IndexDecl
-	// frames rebuild their declarations through IndexProperty (a no-op
-	// record while g.wal is nil).
+	// frames rebuild their declarations through IndexProperty/IndexFullText
+	// (a no-op record while g.wal is nil).
 	if _, err := w.Replay(func(fr wal.Frame) error {
 		g.replayLSN = fr.LSN // forest-coverage gate (see vecIntakeNode)
 		if fr.Changeset != nil {
@@ -1795,6 +1814,9 @@ func Open(path string, opts Options) (*Graph, error) {
 		}
 		for _, k := range fr.IndexKeys {
 			g.IndexProperty(k)
+		}
+		for _, k := range fr.FullTextKeys {
+			g.IndexFullText(k)
 		}
 		if fr.VectorIndexes != nil {
 			// nil = keys-only frame (pre-Phase-1 or IndexProperty); a
@@ -2167,7 +2189,7 @@ func (g *Graph) Stats() Stats {
 // unionRecords computes the logical view of the CURRENT generation (see the
 // genView method for the folding rules). Used by forceMerge, Save,
 // ExportSnapshot and Clone (merge-on-demand without publishing).
-func (g *Graph) unionRecords() ([]engine.NodeRec, []engine.EdgeRec, []string, []string) {
+func (g *Graph) unionRecords() ([]engine.NodeRec, []engine.EdgeRec, []string, []string, []string) {
 	return g.view.Load().unionRecords()
 }
 
@@ -2175,14 +2197,15 @@ func (g *Graph) unionRecords() ([]engine.NodeRec, []engine.EdgeRec, []string, []
 // records: the base with all layer tombstones applied, overlaid by layer
 // records oldest→newest (node override by key, edge append), labels merged
 // (base dictionary first — base LabelIDs stay valid), and pending index
-// declarations harvested. Deterministic order: base records first, then
-// layer records in (layer, index) order.
+// declarations harvested — typed and full-text kinds alike (the FTS plan:
+// both ride base ∪ layers into the merge). Deterministic order: base
+// records first, then layer records in (layer, index) order.
 //
 // Purity: the function reads only the pinned generation (base + layers),
 // never writer-private state — that is what lets the background merger
 // (internal/writer) run it against a captured prefix while the writer
 // keeps publishing newer layers (spec §2.3 two-writer publish protocol).
-func (v *genView) unionRecords() ([]engine.NodeRec, []engine.EdgeRec, []string, []string) {
+func (v *genView) unionRecords() ([]engine.NodeRec, []engine.EdgeRec, []string, []string, []string) {
 	labels := make([]string, 0, v.base.LabelCount())
 	labID := make(map[string]uint32, v.base.LabelCount())
 	intern := func(name string) uint32 {
@@ -2277,7 +2300,7 @@ func (v *genView) unionRecords() ([]engine.NodeRec, []engine.EdgeRec, []string, 
 		}
 	}
 
-	// pending index declarations harvested into the merge
+	// pending index declarations harvested into the merge — both kinds
 	keySet := map[string]bool{}
 	for _, k := range v.base.IndexedKeys() {
 		keySet[k] = true
@@ -2288,7 +2311,17 @@ func (v *genView) unionRecords() ([]engine.NodeRec, []engine.EdgeRec, []string, 
 		}
 	}
 	indexKeys := slices.Sorted(maps.Keys(keySet))
-	return nodes, edges, labels, indexKeys
+	ftsSet := map[string]bool{}
+	for _, k := range v.base.FTSKeys() {
+		ftsSet[k] = true
+	}
+	for _, l := range v.layers {
+		for _, k := range l.FTSKeys() {
+			ftsSet[k] = true
+		}
+	}
+	ftsKeys := slices.Sorted(maps.Keys(ftsSet))
+	return nodes, edges, labels, indexKeys, ftsKeys
 }
 
 // baseEdgeKeyFrom derives the logical key of a raw base edge record.
@@ -2324,8 +2357,8 @@ func (g *Graph) forceMerge() error {
 	if len(v.layers) == 0 && !g.rebaseHappened.Load() {
 		return nil
 	}
-	nodes, edges, labels, indexKeys := g.unionRecords()
-	snap, err := engine.Seal(nodes, edges, labels, indexKeys, nil)
+	nodes, edges, labels, indexKeys, ftsKeys := g.unionRecords()
+	snap, err := engine.Seal(nodes, edges, labels, indexKeys, ftsKeys)
 	if err != nil {
 		return err
 	}
@@ -2766,9 +2799,9 @@ func (g *Graph) lightCheckpoint(man wal.Manifest) error {
 // Save writes the whole graph to w: unconditionally exports the current
 // logical view (base ∪ layers, tombstones applied — merge-on-demand into a
 // temporary record set, nothing published). Property-index declarations —
-// effective and pending — are persisted too (store v3), so Load restores
-// both the graph and its lookup indexes. The entry materializes the
-// caller's absorption window first.
+// effective and pending, typed and full-text alike — are persisted too
+// (store v3/v7), so Load restores both the graph and its lookup indexes.
+// The entry materializes the caller's absorption window first.
 func (g *Graph) Save(w io.Writer) error {
 	g.flushPend()
 	return g.saveView(w, g.view.Load())
@@ -2778,7 +2811,7 @@ func (g *Graph) Save(w io.Writer) error {
 // pend flush. Safe from any goroutine: the view is immutable and the
 // registry load is atomic.
 func (g *Graph) saveView(w io.Writer, v *genView) error {
-	nodes, edges, labels, indexKeys := v.unionRecords()
+	nodes, edges, labels, indexKeys, ftsKeys := v.unionRecords()
 	sn := make([]store.Node, len(nodes))
 	for i, n := range nodes {
 		sn[i] = store.Node{Key: n.Key, Label: n.Label, Props: n.Props}
@@ -2797,7 +2830,7 @@ func (g *Graph) saveView(w io.Writer, v *genView) error {
 	for _, vi := range reg {
 		decls = append(decls, vecDeclToStore(vi.decl))
 	}
-	return store.Encode(w, store.Data{Nodes: sn, Edges: se, IndexKeys: indexKeys, VectorDecls: decls})
+	return store.Encode(w, store.Data{Nodes: sn, Edges: se, IndexKeys: indexKeys, VectorDecls: decls, FTSKeys: ftsKeys})
 }
 
 // SaveFile saves to a path: temp file + fsync + atomic rename, avoiding
@@ -2906,7 +2939,7 @@ func loadGraphForest(r io.Reader, img *vecForestImage) (*Graph, error) {
 			Src: s, Dst: d, LabelID: intern(e.Label), Props: e.Props,
 		})
 	}
-	g, err := graphFromEngine(nodes, edges, labels, data.IndexKeys)
+	g, err := graphFromEngine(nodes, edges, labels, data.IndexKeys, data.FTSKeys)
 	if err != nil {
 		return nil, err
 	}
@@ -2943,8 +2976,9 @@ func loadGraphForest(r io.Reader, img *vecForestImage) (*Graph, error) {
 
 // graphFromEngine builds a Graph whose initial generation is the merged base
 // of the given records (writer mirrors and ratchets seeded from the base).
-func graphFromEngine(nodes []engine.NodeRec, edges []engine.EdgeRec, labels []string, indexKeys []string) (*Graph, error) {
-	snap, err := engine.Seal(nodes, edges, labels, indexKeys, nil)
+// ftsKeys seeds the base's FTS gram buckets (the FTS plan's load path).
+func graphFromEngine(nodes []engine.NodeRec, edges []engine.EdgeRec, labels []string, indexKeys []string, ftsKeys []string) (*Graph, error) {
+	snap, err := engine.Seal(nodes, edges, labels, indexKeys, ftsKeys)
 	if err != nil {
 		return nil, err
 	}
@@ -3027,6 +3061,38 @@ func (g *Graph) IndexProperty(key string) *Graph {
 	return g
 }
 
+// IndexFullText registers a string property key for full-text (substring)
+// lookup (2026-10-26 FTS plan). Same declaration contract as IndexProperty:
+// pending until the next merge — Seal builds the base's FTS gram buckets —
+// idempotent over the base FTS keys ∪ unmerged layers ∪ the open batch, WAL
+// log-first as IndexDecl frames, and dropped after Close.
+//
+// Coexistence: a key may be BOTH typed-indexed and FTS-indexed. The kinds
+// never reject each other (the MCP layer auto-declares typed indexes over
+// every property key it saw during injection, so cross-kind rejection would
+// silently drop the FTS half on agent graphs).
+//
+// An empty key is a lenient no-op (house style): never recorded, never
+// declared. The query side (LookupByContains) ships with the FTS read path.
+func (g *Graph) IndexFullText(key string) *Graph {
+	if g.closed.Load() {
+		return g
+	}
+	g.assertWriter()
+	if key == "" {
+		return g
+	}
+	if g.ftsDeclared(key) {
+		return g
+	}
+	_ = g.recordFTSDecl(key)
+	g.ensureBuilder()
+	g.builder.IndexFullText(key)
+	g.bFTS = append(g.bFTS, key)
+	g.finishOp(0) // absorbed like any other unbatched write (cap-checked)
+	return g
+}
+
 // indexDeclared reports whether key is already an effective (base) or
 // pending (layer/batch) index declaration.
 func (g *Graph) indexDeclared(key string) bool {
@@ -3044,15 +3110,33 @@ func (g *Graph) indexDeclared(key string) bool {
 	return slices.Contains(g.bIndex, key)
 }
 
-// IndexedPropertyKeys returns the property-index declarations: the merged
+// ftsDeclared is indexDeclared's kind-aware sibling (FTS plan): it probes
+// only the full-text declarations — base FTS keys, unmerged layers and the
+// open batch — so a typed declaration of the same key never suppresses an
+// FTS declare (and vice versa).
+func (g *Graph) ftsDeclared(key string) bool {
+	v := g.view.Load()
+	if slices.Contains(v.base.FTSKeys(), key) {
+		return true
+	}
+	for _, l := range v.layers {
+		if slices.Contains(l.FTSKeys(), key) {
+			return true
+		}
+	}
+	return slices.Contains(g.bFTS, key)
+}
+
+// IndexedPropertyKeys returns the property-index declarations of BOTH kinds
+// — typed and full-text (FTS plan) — as one deduplicated set: the merged
 // base's effective keys plus pending declarations from unmerged layers
-// (sorted; nil when none). It answers from the published generation only —
-// a declaration made inside a running Batch becomes visible at its boundary
-// like every other batch write — which keeps it lock-free. The entry
-// materializes the caller's absorption window first (a declaration absorbed
-// mid-window is included). Consumers that persist or hand over a graph
-// (snapshot services, clone-and-extend flows) use it to preserve index
-// configuration.
+// (sorted; nil when none). A key indexed both ways appears once. It answers
+// from the published generation only — a declaration made inside a running
+// Batch becomes visible at its boundary like every other batch write — which
+// keeps it lock-free. The entry materializes the caller's absorption window
+// first (a declaration absorbed mid-window is included). Consumers that
+// persist or hand over a graph (snapshot services, clone-and-extend flows)
+// use it to preserve index configuration.
 func (g *Graph) IndexedPropertyKeys() []string {
 	g.flushPend()
 	v := g.view.Load()
@@ -3067,8 +3151,14 @@ func (g *Graph) IndexedPropertyKeys() []string {
 	for _, k := range v.base.IndexedKeys() {
 		add(k)
 	}
+	for _, k := range v.base.FTSKeys() {
+		add(k)
+	}
 	for _, l := range v.layers {
 		for _, k := range l.IndexKeys() {
+			add(k)
+		}
+		for _, k := range l.FTSKeys() {
 			add(k)
 		}
 	}
@@ -3089,8 +3179,8 @@ func (g *Graph) IndexedPropertyKeys() []string {
 // absorption window first.
 func (g *Graph) Clone() *Graph {
 	g.flushPend()
-	nodes, edges, labels, indexKeys := g.unionRecords()
-	c, err := graphFromEngine(nodes, edges, labels, indexKeys)
+	nodes, edges, labels, indexKeys, ftsKeys := g.unionRecords()
+	c, err := graphFromEngine(nodes, edges, labels, indexKeys, ftsKeys)
 	if err != nil { // engine.Seal of valid records cannot fail; fail loud over corrupt state
 		panic(fmt.Errorf("vectra: clone merge: %w", err))
 	}
@@ -3191,9 +3281,13 @@ func (g *Graph) lookupNodes(key string, baseIndex func(*genView) ([]uint32, bool
 // generation its rows came from).
 func lookupNodesOf(v *genView, key string, baseIndex func(*genView) ([]uint32, bool), match func(map[string]any) bool) ([]Node, bool) {
 	ids, effective := baseIndex(v)
+	// Pending detection is kind-aware (FTS plan): a key declared in an
+	// unmerged layer — typed OR full-text — keeps the lookup answerable via
+	// scan (R14). This is the shared gate every LookupBy* rides, including
+	// the FTS query path.
 	pending := false
 	for _, l := range v.layers {
-		if slices.Contains(l.IndexKeys(), key) {
+		if slices.Contains(l.IndexKeys(), key) || slices.Contains(l.FTSKeys(), key) {
 			pending = true
 			break
 		}

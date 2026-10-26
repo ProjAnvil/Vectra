@@ -76,7 +76,7 @@ var (
 // and everything reachable from it are never mutated again: all read methods
 // are safe for unsynchronized concurrent use from any number of goroutines.
 //
-// Returned slices and maps — Nodes, Edges, Labels, IndexKeys,
+// Returned slices and maps — Nodes, Edges, Labels, IndexKeys, FTSKeys,
 // NodeTombstones, EdgeTombstones and the Props maps inside records — are
 // internal references and must be treated as read-only (same sharing
 // contract as a sealed vectra graph). Tombstones shadow the BASE only; live
@@ -95,6 +95,7 @@ type Layer struct {
 	edgeTomb  map[EdgeKey]bool // base edge keys to shadow
 	labels    []string         // labels introduced this layer, dedup, stable
 	indexKeys []string         // pending index declarations
+	ftsKeys   []string         // pending full-text index declarations (2026-10-26 FTS plan)
 
 	nodeIDs   map[string]uint32 // key -> writer-assigned ID (BuildWithIDs only)
 	nodeIDIdx map[uint32]int    // writer-assigned ID -> index into nodes
@@ -140,6 +141,11 @@ func (l *Layer) Labels() []string { return l.labels }
 // IndexKeys returns the pending property-index declarations, harvested by
 // the merger at the next merge (spec §3.3, R14).
 func (l *Layer) IndexKeys() []string { return l.indexKeys }
+
+// FTSKeys returns the pending full-text index declarations (2026-10-26 FTS
+// plan), harvested by the merger at the next merge like IndexKeys. A key may
+// appear here and in IndexKeys — the kinds coexist, never reject.
+func (l *Layer) FTSKeys() []string { return l.ftsKeys }
 
 // NodeCount returns the number of live node records.
 func (l *Layer) NodeCount() int { return len(l.nodes) }
@@ -221,6 +227,7 @@ type Builder struct {
 	labels    []string // first-seen order, deduped (nodes and edges)
 	labelSeen map[string]bool
 	indexKeys []string // pending index declarations
+	ftsKeys   []string // pending full-text index declarations (2026-10-26 FTS plan)
 
 	nodeTomb map[string]bool // base node keys to shadow
 	edgeTomb map[EdgeKey]bool
@@ -520,6 +527,22 @@ func (b *Builder) IndexProperty(key string) {
 	b.indexKeys = append(b.indexKeys, key)
 }
 
+// IndexFullText declares a property key to full-text index at the next merge
+// (2026-10-26 FTS plan): same carriage contract as IndexProperty —
+// idempotent, harvested by the merger, a no-op after Build. A key may be
+// declared both ways; the kinds coexist independently.
+func (b *Builder) IndexFullText(key string) {
+	if b.built {
+		return
+	}
+	for _, k := range b.ftsKeys {
+		if k == key {
+			return
+		}
+	}
+	b.ftsKeys = append(b.ftsKeys, key)
+}
+
 // Build freezes the batch into an immutable Layer (the write side's
 // counterpart of vectra.compact): dead slots drop out, nodes keep
 // first-write order, edges keep append order, indexes are rebuilt densely
@@ -558,6 +581,7 @@ func (b *Builder) BuildWithIDs(nodeIDs map[string]uint32, edgeIDs []uint32) *Lay
 		edgeTomb:  b.edgeTomb,
 		labels:    b.labels,
 		indexKeys: b.indexKeys,
+		ftsKeys:   b.ftsKeys,
 	}
 	l.nodes = make([]NodeRec, 0, len(b.nodes)-b.deadN)
 	for _, ns := range b.nodes {
