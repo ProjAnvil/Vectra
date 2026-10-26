@@ -3,8 +3,8 @@ package cypher
 // Query is one parsed statement: a sequence of clauses ending in RETURN.
 // The v0.13 clause pipeline: MATCH may repeat (disjoint variables produce
 // a cartesian product, shared variables join — matching Neo4j); WITH and
-// UNWIND clauses are scope-validated here, and their parser arms land in
-// T4/T5. Positions live on the expression nodes for error reports.
+// UNWIND clauses are scope-validated here and parsed by their own arms.
+// Positions live on the expression nodes for error reports.
 //
 // Clauses is backed by the inline clauses array for the first four
 // clauses: every realistic MATCH/WITH/UNWIND pipeline parses with ZERO
@@ -49,8 +49,9 @@ type WithClause struct {
 }
 
 // UnwindClause is the UNWIND clause: it declares its (mandatory) alias as
-// a scalar bound to each element of the unwound expression. Data type and
-// scope validation from T2; parser arm and execution land in T5.
+// a scalar bound to each element of the unwound expression — a list
+// literal, a bare variable naming a list-valued scalar (typically a
+// collect() alias), or var.prop.
 type UnwindClause struct {
 	Expr  Expr
 	Alias string // mandatory: UNWIND expr AS alias

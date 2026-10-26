@@ -404,6 +404,40 @@ func TestWithBareVarRefRules(t *testing.T) {
 	withErr(t, `MATCH (a) WHERE missingvar RETURN a`, `variable "missingvar" is not declared in the pattern`)
 }
 
+// TestWithWhereAfterTrailerASC is the ASC-side discriminator T4's
+// DESC-side pin could not tell apart: with w = gw:5, order:3, pay:7 in scan
+// order, ASC+LIMIT 2 keeps [order(3), gw(5)] and the WHERE w > 4 then drops
+// order — only gw survives. Filtering BEFORE the trailer would keep
+// [gw(5), pay(7)] and return both, so the test pins trailer-then-filter.
+func TestWithWhereAfterTrailerASC(t *testing.T) {
+	res := run(t, `MATCH (a:Service) WITH a, a.w AS w ORDER BY w ASC LIMIT 2 WHERE w > 4 RETURN a.key`)
+	if k := keysOf(res, "a.key"); !slices.Equal(k, []string{"gw"}) {
+		t.Fatalf("ASC trailer-then-filter: %v", k)
+	}
+}
+
+// TestWithChainedAggEmpty: an all-filtered first WITH stage feeds a second,
+// aggregating WITH — the empty-input one-row rule carries through the chain
+// (count(*) over zero rows is the single zero row).
+func TestWithChainedAggEmpty(t *testing.T) {
+	res := run(t, `MATCH (a:Service) WITH a.env AS e WHERE e = 'x' WITH count(*) AS c RETURN c`)
+	if len(res.Rows) != 1 || res.Rows[0]["c"] != float64(0) {
+		t.Fatalf("chained WITH over empty stage: %+v", res.Rows)
+	}
+}
+
+// TestWithOrderByScalarKindCheck: ORDER BY scalar.prop in WITH is rejected
+// (the projected name is a scalar; property access requires an entity)
+// instead of silently sorting all-null keys. The entity form stays legal.
+func TestWithOrderByScalarKindCheck(t *testing.T) {
+	withErr(t, `MATCH (a:Service) WITH a.w AS w ORDER BY w.x RETURN w`, `variable "w" is a scalar; property access requires a node or edge`)
+	withErr(t, `MATCH (a:Service) WITH count(*) AS c ORDER BY c.x RETURN c`, `variable "c" is a scalar; property access requires a node or edge`)
+	// entity pass-through keeps ORDER BY var.prop
+	if res := run(t, `MATCH (a:Service) WITH a ORDER BY a.w ASC RETURN a.key`); len(res.Rows) != 3 {
+		t.Fatalf("entity ORDER BY must stay legal: %d rows", len(res.Rows))
+	}
+}
+
 // ---- strict empty stages through WITH ----
 
 // TestWithStrictEmpty: a WITH stage over zero rows yields zero rows and

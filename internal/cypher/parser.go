@@ -75,10 +75,10 @@ func (p *parser) expectKw(word string) error {
 // parseQuery parses a keyword-dispatched clause sequence. The grammar in
 // this task: MATCH (repeatable, comma-separated patterns + WHERE per
 // clause) ... [WITH [DISTINCT] items [ORDER BY ...] [SKIP n] [LIMIT n]
-// [WHERE expr]] ... RETURN items [ORDER BY ...] [SKIP n] [LIMIT n]. RETURN
-// is terminal — anything after it is an unexpected-token error. The UNWIND
-// and OPTIONAL MATCH arms land in T5/T6; until then those keywords at
-// clause position take the "expected RETURN" error.
+// [WHERE expr]] ... [UNWIND expr AS ident] ... RETURN items [ORDER BY ...]
+// [SKIP n] [LIMIT n]. RETURN is terminal — anything after it is an
+// unexpected-token error. The OPTIONAL MATCH arm lands in T6; until then
+// the keyword at clause position takes the "expected RETURN" error.
 func (p *parser) parseQuery() (*Query, error) {
 	if !p.kw("MATCH") {
 		return nil, p.errf("expected MATCH, got %s", describe(p.cur()))
@@ -98,6 +98,8 @@ func (p *parser) parseQuery() (*Query, error) {
 			c, err = p.parseMatchClause()
 		case p.kw("WITH"):
 			c, err = p.parseWithClause()
+		case p.kw("UNWIND"):
+			c, err = p.parseUnwindClause()
 		case p.kw("RETURN"):
 			c, err = p.parseReturnClause()
 			sawReturn = true
@@ -221,6 +223,48 @@ func (p *parser) parseWithClause() (*WithClause, error) {
 		w.Where = e
 	}
 	return w, nil
+}
+
+// parseUnwindClause parses "UNWIND expr AS alias". expr is a list literal
+// (the UNWIND-only operand spelling — parseListLit reused verbatim, so the
+// empty literal stays out of the grammar exactly as on IN's right side), a
+// bare variable (a scalar holding a list, typically a collect() alias), or
+// var.prop (a list-valued property). The alias is mandatory. The UNWIND
+// keyword is still unconsumed.
+func (p *parser) parseUnwindClause() (*UnwindClause, error) {
+	p.next() // UNWIND
+	var expr Expr
+	t := p.cur()
+	switch {
+	case p.at(TBracketL):
+		e, err := p.parseListLit()
+		if err != nil {
+			return nil, err
+		}
+		expr = e
+	case t.Kind == TIdent:
+		p.next()
+		if p.at(TDot) {
+			p.next()
+			prop, err := p.expect(TIdent, "property name")
+			if err != nil {
+				return nil, err
+			}
+			expr = &PropRef{Var: t.Text, Name: prop.Text, Line: t.Line, Col: t.Col}
+		} else {
+			expr = &VarRef{Var: t.Text, Line: t.Line, Col: t.Col}
+		}
+	default:
+		return nil, p.errf("expected variable, property reference or list literal, got %s", describe(t))
+	}
+	if err := p.expectKw("AS"); err != nil {
+		return nil, err
+	}
+	a, err := p.expect(TIdent, "alias name")
+	if err != nil {
+		return nil, err
+	}
+	return &UnwindClause{Expr: expr, Alias: a.Text}, nil
 }
 
 // parseOrderSkipLimit parses the shared ORDER BY / SKIP / LIMIT trailer
@@ -965,12 +1009,18 @@ func (sc *scope) applyWith(c *WithClause) error {
 		if _, ok := next[k.Name]; ok {
 			continue
 		}
-		varPart := k.Name
+		varPart, propAccess := k.Name, false
 		if i := strings.Index(varPart, "."); i >= 0 {
-			varPart = varPart[:i]
+			varPart, propAccess = varPart[:i], true
 		}
-		if _, ok := next[varPart]; !ok {
+		kind, ok := next[varPart]
+		if !ok {
 			return &Error{1, 1, fmt.Sprintf("ORDER BY variable %q is not defined in this scope (WITH starts a new scope; only projected variables survive)", varPart)}
+		}
+		// A projected scalar carries no properties: without this branch
+		// ORDER BY scalar.prop silently sorts all-null keys (T4 review).
+		if propAccess && kind == kindScalar {
+			return &Error{1, 1, fmt.Sprintf("variable %q is a scalar; property access requires a node or edge", varPart)}
 		}
 	}
 	if c.Where != nil {

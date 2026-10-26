@@ -172,6 +172,38 @@ func TestCypherWithAllocs(t *testing.T) {
 	}
 }
 
+// TestCypherUnwindAllocs pins the UNWIND-stage allocation shape on the
+// same layered fixture: the killer idiom — the 33 named-hop expansion rows
+// collapse via collect() into ONE aggregate row, then UNWIND fans the
+// 33-element list back out to 33 stage rows before the result contract.
+// Measured 350 = 208 (the no-UNWIND twin: expansion input + keyless
+// collect + single-row result) + ~4 per UNWIND output row (the copied
+// vals map pair under copy-on-write, the result map, one boxed cell) plus
+// slice-growth mechanics. NEW baseline for v0.13.0 T5 — it does not
+// interact with the four pre-refactor characterization shapes above.
+// Fenced with ~25% headroom per the house style for new baselines.
+func TestCypherUnwindAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("alloc counts differ under -race")
+	}
+	g := cypherLayeredGraph(t, 50, 32)
+	q := `MATCH (a {key:'0'})-[:CALLS]->(b) WITH collect(b.key) AS ks UNWIND ks AS k RETURN k`
+	for i := 0; i < 3; i++ {
+		if _, err := g.Cypher(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n := testing.AllocsPerRun(100, func() {
+		if _, err := g.Cypher(q); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Logf("cypher UNWIND fan-32 allocs/query = %.1f", n)
+	if n > 440 {
+		t.Fatalf("UNWIND fan-32 allocs = %v, want <= 440", n)
+	}
+}
+
 // TestCypherViewPathEquivalence guards the scratch reuse: the SAME query
 // must return identical results across runs, and match the graph's ground
 // truth. The degree-mixing shape matters — node 0 expands 33 out-rows and

@@ -185,9 +185,10 @@ func TestParseSkip(t *testing.T) {
 
 // TestParseClauseCardinality pins the grammar cardinality: MATCH may
 // repeat (cartesian/join semantics per the T3 stage loop), RETURN is
-// terminal, and UNWIND/OPTIONAL are not clause keywords yet — their arms
-// land in T5/T6, which own these two pins' replacement. (WITH gained its
-// real arm in T4; its scope pins moved to with_test.go's parse-path tests.)
+// terminal, and OPTIONAL is not a clause keyword yet — its arm lands in
+// T6, which owns this pin's replacement. (WITH gained its real arm in T4
+// and UNWIND in T5; their scope pins live in with_test.go and
+// unwind_test.go's parse-path tests.)
 func TestParseClauseCardinality(t *testing.T) {
 	// repeated MATCH parses and validates (T2 executes only the first)
 	q, err := Parse(`MATCH (a) MATCH (b) RETURN a`)
@@ -210,7 +211,7 @@ func TestParseClauseCardinality(t *testing.T) {
 	// RETURN is terminal: any clause keyword after it errors
 	for _, c := range []struct{ src, want string }{
 		{"MATCH (a) RETURN a MATCH (b)", `expected end of input, got "MATCH"`},
-		{"MATCH (a) UNWIND [1] AS k RETURN k", `expected RETURN, got "UNWIND"`},
+		{"MATCH (a) UNWIND [1] AS k RETURN k MATCH (b)", `expected end of input, got "MATCH"`},
 		{"MATCH (a) OPTIONAL MATCH (b) RETURN a", `expected RETURN, got "OPTIONAL"`},
 	} {
 		_, err := Parse(c.src)

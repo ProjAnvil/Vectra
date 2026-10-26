@@ -105,12 +105,12 @@ func RunView(src Source, q string) (*Result, error) {
 // and joins shared ones; unlike comma-separated patterns within one MATCH,
 // stages are STRICT: a stage whose input is empty yields zero rows and
 // never re-anchors), WHERE filters the stage's output, WITH projects its
-// items into a fresh scope (only projected names survive), and RETURN
-// terminates the pipeline.
-// A plain type switch, no closures and no runtime scope. UNWIND adds its
-// arm in T5. starMatch remembers the MATCH clause RETURN * expands
-// (validation restricts * to the single-MATCH degenerate shape, where it
-// is the only one).
+// items into a fresh scope (only projected names survive), UNWIND fans each
+// row's list value out to one row per element, and RETURN terminates the
+// pipeline.
+// A plain type switch, no closures and no runtime scope. starMatch
+// remembers the MATCH clause RETURN * expands (validation restricts * to
+// the single-MATCH degenerate shape, where it is the only one).
 func runStatement(ex *executor, ast *Query) (*Result, error) {
 	var rows []row
 	var starMatch *MatchClause
@@ -129,6 +129,12 @@ func runStatement(ex *executor, ast *Query) (*Result, error) {
 		case *WithClause:
 			var err error
 			rows, err = ex.withStage(c, rows)
+			if err != nil {
+				return nil, err
+			}
+		case *UnwindClause:
+			var err error
+			rows, err = ex.unwindStage(c, rows)
 			if err != nil {
 				return nil, err
 			}
@@ -154,6 +160,48 @@ func (ex *executor) filterRows(where Expr, rows []row) []row {
 	return filtered
 }
 
+// unwindStage executes one UNWIND clause: per input row the expression is
+// evaluated — null (absent property, null binding, or the null outcome)
+// drops the row, an empty list drops it, and a non-list non-null value is
+// a positioned type error. Each list element then yields one output row:
+// a copy-on-write clone of the input row with the alias bound to the
+// element. Output rows normalize pos to 0 (stage-constructed rows carry
+// no frontier), and the output is capped by maxRows with the standard
+// result-too-large error.
+// Elements bind as SCALARS into vals — exactly one flattening level: an
+// element that is itself a list binds as a list value, and an entity
+// element binds as its NodeVal/EdgeVal value (RETURN renders it through
+// the vals arm of itemValue). The returned slice is never nil: zero input
+// rows (or all-null sources) yield zero output rows — strict stage
+// semantics.
+func (ex *executor) unwindStage(c *UnwindClause, rows []row) ([]row, error) {
+	out := make([]row, 0, len(rows))
+	for _, r := range rows {
+		var list []any
+		if lit, isLit := c.Expr.(*ListLit); isLit {
+			list = lit.Vals // eval's ListLit arm is the IN-only null outcome; the elements are the value
+		} else if v, ok := ex.eval(c.Expr, r); ok && v != nil {
+			l, isList := v.([]any)
+			if !isList {
+				line, col := c.Expr.pos()
+				return nil, &Error{line, col, fmt.Sprintf("UNWIND requires a list, got %T", v)}
+			}
+			list = l
+		} // null outcome or nil value: list stays nil, the row drops
+		for _, el := range list {
+			nr := r.clone()
+			nr.pos = 0
+			nr.ownVals() // COW: siblings share the input's vals map until this write
+			nr.vals[c.Alias] = el
+			out = append(out, nr)
+			if len(out) > maxRows {
+				return nil, &Error{1, 1, fmt.Sprintf("result too large: more than %d intermediate rows; narrow the pattern or add LIMIT", maxRows)}
+			}
+		}
+	}
+	return out, nil
+}
+
 // row is one binding tuple plus the pattern's frontier position (the node
 // the next edge segment expands from). Binding maps are copy-on-write:
 // clone() shares them and both sides are flagged, and a map is copied
@@ -164,8 +212,8 @@ func (ex *executor) filterRows(where Expr, rows []row) []row {
 // cartesian anchor) writes only freshly cloned rows.
 //
 // pos is authoritative only on rows produced by runPath/expand (pattern
-// execution); stage-constructed rows (WITH today; UNWIND/OPTIONAL merges
-// in T5/T6) normalize pos to 0 so DISTINCT/dedup consumers never see a
+// execution); stage-constructed rows (WITH and UNWIND today; OPTIONAL
+// merges in T6) normalize pos to 0 so DISTINCT/dedup consumers never see a
 // stale frontier.
 type row struct {
 	pos   uint32
