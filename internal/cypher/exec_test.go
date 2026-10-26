@@ -298,6 +298,43 @@ func TestExecProjectionOrderLimit(t *testing.T) {
 	}
 }
 
+// TestExecProjectionSkip pins the SKIP trailer on both projection paths:
+// sort → skip → limit; skip ≥ len → empty; each bound independently
+// optional.
+func TestExecProjectionSkip(t *testing.T) {
+	// non-aggregating: w DESC over pay(7), gw(5), order(3)
+	res := run(t, `MATCH (a:Service) RETURN a.key ORDER BY a.w DESC SKIP 1 LIMIT 2`)
+	if k := keysOf(res, "a.key"); len(k) != 2 || k[0] != "gw" || k[1] != "order" {
+		t.Fatalf("skip+limit: %v", k)
+	}
+	res = run(t, `MATCH (a:Service) RETURN a.key ORDER BY a.w DESC SKIP 2`)
+	if k := keysOf(res, "a.key"); len(k) != 1 || k[0] != "order" {
+		t.Fatalf("skip only: %v", k)
+	}
+	res = run(t, `MATCH (a:Service) RETURN a.key ORDER BY a.w DESC SKIP 3`)
+	if len(res.Rows) != 0 {
+		t.Fatalf("skip >= len: %d rows, want 0", len(res.Rows))
+	}
+	res = run(t, `MATCH (a:Service) RETURN a.key ORDER BY a.w DESC SKIP 1 LIMIT 10`)
+	if k := keysOf(res, "a.key"); len(k) != 2 || k[0] != "gw" {
+		t.Fatalf("limit beyond end after skip: %v", k)
+	}
+	// aggregating: env groups prod(2), dev(1) by count DESC
+	res = run(t, `MATCH (a:Service) RETURN a.env, count(*) AS c ORDER BY c DESC SKIP 1 LIMIT 1`)
+	if len(res.Rows) != 1 || res.Rows[0]["a.env"] != "dev" {
+		t.Fatalf("agg skip+limit: %+v", res.Rows)
+	}
+	res = run(t, `MATCH (a:Service) RETURN a.env, count(*) AS c ORDER BY c DESC SKIP 5`)
+	if len(res.Rows) != 0 {
+		t.Fatalf("agg skip >= len: %d rows, want 0", len(res.Rows))
+	}
+	// SKIP without ORDER BY keeps the natural row order
+	res = run(t, `MATCH (a:Service) RETURN a.key SKIP 2`)
+	if k := keysOf(res, "a.key"); len(k) != 1 {
+		t.Fatalf("no-order skip: %v", k)
+	}
+}
+
 func TestExecRowCap(t *testing.T) {
 	old := maxRows
 	maxRows = 3

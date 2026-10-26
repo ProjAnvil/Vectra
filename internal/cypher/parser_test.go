@@ -5,15 +5,23 @@ import (
 	"testing"
 )
 
+// Assertions read the clause list directly (q.Clauses[i] type assertions),
+// never through the temporary accessors — the accessors die with the T3
+// stage loop and these tests must survive that.
+
 func TestParseCoreStatement(t *testing.T) {
 	q, err := Parse(`MATCH (a:Bean)-[:CALLS*1..2]->(b) WHERE a.type='controller' AND b.w>=3 RETURN a.key, b ORDER BY b.w DESC LIMIT 5`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(q.Match.Patterns) != 1 {
-		t.Fatalf("patterns: %d", len(q.Match.Patterns))
+	if len(q.Clauses) != 2 {
+		t.Fatalf("clauses: %d", len(q.Clauses))
 	}
-	p := q.Match.Patterns[0]
+	m := q.Clauses[0].(*MatchClause)
+	if len(m.Patterns) != 1 {
+		t.Fatalf("patterns: %d", len(m.Patterns))
+	}
+	p := m.Patterns[0]
 	if len(p.Nodes) != 2 || p.Nodes[0].Var != "a" || p.Nodes[0].Label != "Bean" || p.Nodes[1].Var != "b" {
 		t.Fatalf("nodes: %+v", p.Nodes)
 	}
@@ -21,7 +29,7 @@ func TestParseCoreStatement(t *testing.T) {
 	if len(e.Labels) != 1 || e.Labels[0] != "CALLS" || e.MinHops != 1 || e.MaxHops != 2 || e.Dir != 0 {
 		t.Fatalf("edge: %+v", e)
 	}
-	w := q.Match.Where.(*Binary)
+	w := m.Where.(*Binary)
 	if w.Op != "AND" {
 		t.Fatalf("where root: %v", w.Op)
 	}
@@ -33,11 +41,15 @@ func TestParseCoreStatement(t *testing.T) {
 	if rhs.Op != ">=" || rhs.R.(*Lit).Val != float64(3) {
 		t.Fatalf("where rhs: %+v", rhs)
 	}
-	if len(q.Return.Items) != 2 || q.Return.Items[0].Name != "a.key" || q.Return.Items[1].Name != "b" {
-		t.Fatalf("items: %+v", q.Return.Items)
+	ret := q.Clauses[1].(*ReturnClause)
+	if len(ret.Items) != 2 || ret.Items[0].Name != "a.key" || ret.Items[1].Name != "b" {
+		t.Fatalf("items: %+v", ret.Items)
 	}
-	if len(q.Return.OrderBy) != 1 || q.Return.OrderBy[0].Name != "b.w" || !q.Return.OrderBy[0].Desc || q.Return.Limit != 5 {
-		t.Fatalf("order/limit: %+v %d", q.Return.OrderBy, q.Return.Limit)
+	if len(ret.OrderBy) != 1 || ret.OrderBy[0].Name != "b.w" || !ret.OrderBy[0].Desc || ret.Limit != 5 {
+		t.Fatalf("order/limit: %+v %d", ret.OrderBy, ret.Limit)
+	}
+	if ret.Skip != -1 {
+		t.Fatalf("skip: %d, want -1 (absent)", ret.Skip)
 	}
 }
 
@@ -65,7 +77,7 @@ func TestParseEdgeForms(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Parse(%q): %v", c.src, err)
 		}
-		e := q.Match.Patterns[0].Edges[0]
+		e := q.Clauses[0].(*MatchClause).Patterns[0].Edges[0]
 		if e.Dir != c.dir || e.MinHops != c.minH || e.MaxHops != c.maxH {
 			t.Fatalf("Parse(%q): got dir=%d hops=%d..%d, want dir=%d hops=%d..%d", c.src, e.Dir, e.MinHops, e.MaxHops, c.dir, c.minH, c.maxH)
 		}
@@ -80,18 +92,20 @@ func TestParsePropsCommaPathsAndOps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(q.Match.Patterns) != 2 {
-		t.Fatalf("patterns: %d", len(q.Match.Patterns))
+	m := q.Clauses[0].(*MatchClause)
+	if len(m.Patterns) != 2 {
+		t.Fatalf("patterns: %d", len(m.Patterns))
 	}
-	np := q.Match.Patterns[0].Nodes[0]
+	np := m.Patterns[0].Nodes[0]
 	if np.Props["type"] != "controller" || np.Props["n"] != float64(3) {
 		t.Fatalf("props: %+v", np.Props)
 	}
-	if _, ok := q.Match.Where.(*Binary); !ok {
+	if _, ok := m.Where.(*Binary); !ok {
 		t.Fatal("where should be Binary")
 	}
-	if !q.Return.Star || q.Return.Limit != 2 {
-		t.Fatalf("return: %+v", q.Return)
+	ret := q.Clauses[1].(*ReturnClause)
+	if !ret.Star || ret.Limit != 2 {
+		t.Fatalf("return: %+v", ret)
 	}
 	// 大小写不敏感关键词
 	if _, err := Parse(`match (a) where a.x = 1 return a limit 3`); err != nil {
@@ -126,5 +140,89 @@ func TestParseErrors(t *testing.T) {
 		if _, ok := err.(*Error); !ok {
 			t.Fatalf("Parse(%q): error must be *Error, got %T", c.src, err)
 		}
+	}
+}
+
+// TestParseSkip pins the SKIP trailer: after ORDER BY, before LIMIT.
+func TestParseSkip(t *testing.T) {
+	q, err := Parse(`MATCH (a) RETURN a ORDER BY a.key DESC SKIP 2 LIMIT 3`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ret := q.Clauses[1].(*ReturnClause)
+	if ret.Skip != 2 || ret.Limit != 3 {
+		t.Fatalf("skip/limit: %d/%d", ret.Skip, ret.Limit)
+	}
+	if len(ret.OrderBy) != 1 || ret.OrderBy[0].Name != "a.key" || !ret.OrderBy[0].Desc {
+		t.Fatalf("order: %+v", ret.OrderBy)
+	}
+
+	// SKIP without LIMIT, and without ORDER BY
+	q, err = Parse(`MATCH (a) RETURN a SKIP 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ret = q.Clauses[1].(*ReturnClause)
+	if ret.Skip != 1 || ret.Limit != -1 {
+		t.Fatalf("skip/limit: %d/%d", ret.Skip, ret.Limit)
+	}
+
+	// negative / non-integer SKIP
+	for _, c := range []struct{ src, want string }{
+		{"MATCH (a) RETURN a SKIP 1.5", `bad SKIP "1.5"`},
+		{"MATCH (a) RETURN a SKIP -1", "expected number"},
+		{"MATCH (a) RETURN a LIMIT 1 SKIP 2", `expected end of input`}, // SKIP must precede LIMIT
+	} {
+		_, err := Parse(c.src)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("Parse(%q): got %v, want substring %q", c.src, err, c.want)
+		}
+	}
+}
+
+// TestParseClauseCardinality pins the grammar cardinality: MATCH may
+// repeat (cartesian/join semantics arrive with the T3 stage loop), RETURN
+// is terminal, and WITH/UNWIND/OPTIONAL are not clause keywords yet —
+// their arms land in T4/T5/T6, which own these three pins' replacement.
+func TestParseClauseCardinality(t *testing.T) {
+	// repeated MATCH parses and validates (T2 executes only the first)
+	q, err := Parse(`MATCH (a) MATCH (b) RETURN a`)
+	if err != nil {
+		t.Fatalf("repeated MATCH: %v", err)
+	}
+	if len(q.Clauses) != 3 {
+		t.Fatalf("clauses: %d", len(q.Clauses))
+	}
+	if _, ok := q.Clauses[0].(*MatchClause); !ok {
+		t.Fatalf("clause 0: %T", q.Clauses[0])
+	}
+	if _, ok := q.Clauses[1].(*MatchClause); !ok {
+		t.Fatalf("clause 1: %T", q.Clauses[1])
+	}
+	if _, ok := q.Clauses[2].(*ReturnClause); !ok {
+		t.Fatalf("clause 2: %T", q.Clauses[2])
+	}
+
+	// RETURN is terminal: any clause keyword after it errors
+	for _, c := range []struct{ src, want string }{
+		{"MATCH (a) RETURN a MATCH (b)", `expected end of input, got "MATCH"`},
+		{"MATCH (a) WITH a AS x RETURN x", `expected end of input, got "WITH"`},
+		{"MATCH (a) UNWIND [1] AS k RETURN k", `expected end of input, got "UNWIND"`},
+		{"MATCH (a) OPTIONAL MATCH (b) RETURN a", `expected end of input, got "OPTIONAL"`},
+	} {
+		_, err := Parse(c.src)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("Parse(%q): got %v, want substring %q", c.src, err, c.want)
+		}
+	}
+
+	// keyword-as-alias: keywords lex as identifiers, so an alias may spell
+	// like one (divergence from Cypher noted for T7)
+	q, err = Parse(`MATCH (a) RETURN a AS match`)
+	if err != nil {
+		t.Fatalf("keyword alias: %v", err)
+	}
+	if got := q.Clauses[1].(*ReturnClause).Items[0].Name; got != "match" {
+		t.Fatalf("alias name: %q", got)
 	}
 }

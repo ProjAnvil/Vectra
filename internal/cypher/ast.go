@@ -1,15 +1,41 @@
 package cypher
 
-// Query is one parsed statement: MATCH ... [WHERE ...] RETURN ... [ORDER BY
-// ...] [LIMIT n]. Positions live on the expression nodes for error reports.
+// Query is one parsed statement: a sequence of clauses ending in RETURN.
+// The v0.13 clause pipeline: MATCH may repeat (disjoint variables produce
+// a cartesian product, shared variables join — matching Neo4j); WITH and
+// UNWIND clauses are scope-validated here, and their parser arms land in
+// T4/T5. Positions live on the expression nodes for error reports.
 type Query struct {
-	Match  *MatchClause
-	Return *ReturnClause
+	Clauses []Clause
 }
 
+// Clause is the clause sum type; the marker-method idiom follows Expr.
+type Clause interface{ isClause() }
+
+// MatchClause is one MATCH clause: comma-separated path patterns plus an
+// optional WHERE filter. (An Optional flag arrives with T6.)
 type MatchClause struct {
 	Patterns []*PathPattern
 	Where    Expr // nil when absent
+}
+
+// WithClause is the WITH clause: it projects its items into a new scope
+// (only projected names survive) with an optional ORDER BY trailer and
+// WHERE filter. The data type and scope validation are load-bearing from
+// T2 (the scope-chain validator type-switches on it); the parser arm,
+// SKIP/LIMIT/DISTINCT trailer fields and execution land in T4.
+type WithClause struct {
+	Items   []*ReturnItem
+	OrderBy []OrderKey
+	Where   Expr // nil when absent
+}
+
+// UnwindClause is the UNWIND clause: it declares its (mandatory) alias as
+// a scalar bound to each element of the unwound expression. Data type and
+// scope validation from T2; parser arm and execution land in T5.
+type UnwindClause struct {
+	Expr  Expr
+	Alias string // mandatory: UNWIND expr AS alias
 }
 
 // PathPattern is one comma-separated path of the MATCH clause:
@@ -48,6 +74,7 @@ type ReturnClause struct {
 	Items   []*ReturnItem
 	OrderBy []OrderKey
 	Limit   int // <0 = none
+	Skip    int // <0 = none (SKIP n, after ORDER BY, before LIMIT)
 }
 
 type ReturnItem struct {
@@ -110,3 +137,32 @@ func (e *Not) pos() (int, int)     { return e.Line, e.Col }
 func (e *PropRef) pos() (int, int) { return e.Line, e.Col }
 func (e *Lit) pos() (int, int)     { return e.Line, e.Col }
 func (e *ListLit) pos() (int, int) { return e.Line, e.Col }
+
+func (*MatchClause) isClause()  {}
+func (*WithClause) isClause()   {}
+func (*UnwindClause) isClause() {}
+func (*ReturnClause) isClause() {}
+
+// firstMatch returns the first MATCH clause. Temporary accessor for the
+// executor: until the T3 stage loop lands, only the first MATCH executes
+// (repeated MATCH parses and validates, but its cartesian/join semantics
+// arrive with the stage loop). Deleted in T3.
+func (q *Query) firstMatch() *MatchClause {
+	for _, c := range q.Clauses {
+		if m, ok := c.(*MatchClause); ok {
+			return m
+		}
+	}
+	return nil
+}
+
+// finalReturn returns the final RETURN clause (every query Parse accepts
+// ends in one). Temporary accessor, deleted with the T3 stage loop.
+func (q *Query) finalReturn() *ReturnClause {
+	for i := len(q.Clauses) - 1; i >= 0; i-- {
+		if r, ok := q.Clauses[i].(*ReturnClause); ok {
+			return r
+		}
+	}
+	return nil
+}

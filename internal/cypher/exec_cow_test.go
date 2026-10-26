@@ -214,7 +214,7 @@ func TestRowCOWAllocShape(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		pat := ast.Match.Patterns[0]
+		pat := ast.firstMatch().Patterns[0]
 		ex := &executor{src: src}
 		ex.expand(one, pat.Edges[0], pat.Nodes[1]) // warm executor scratch
 		return testing.AllocsPerRun(100, func() {

@@ -15,14 +15,15 @@ import (
 // lower it.
 var maxGroups = 1_000_000
 
-// project applies RETURN / ORDER BY / LIMIT to the WHERE-filtered rows.
-// ORDER BY keys evaluate var[.prop] on the binding itself, so they may
+// project applies RETURN / ORDER BY / SKIP / LIMIT to the WHERE-filtered
+// rows. ORDER BY keys evaluate var[.prop] on the binding itself, so they may
 // reference properties not present in RETURN (Cypher-compatible); a key
 // that names a projected column (aliases included) uses that value.
 func (ex *executor) project(q *Query, rows []row) (*Result, error) {
-	items := q.Return.Items
-	if q.Return.Star {
-		items = starItems(q.Match)
+	ret := q.finalReturn()
+	items := ret.Items
+	if ret.Star {
+		items = starItems(q.firstMatch())
 	}
 	for _, it := range items {
 		if it.Agg.Func != "" {
@@ -45,8 +46,8 @@ func (ex *executor) project(q *Query, rows []row) (*Result, error) {
 		}
 		projRows[i] = m
 	}
-	if len(q.Return.OrderBy) > 0 {
-		keys := q.Return.OrderBy
+	if len(ret.OrderBy) > 0 {
+		keys := ret.OrderBy
 		sortVals := make([][]any, len(rows))
 		for i, r := range rows {
 			vals := make([]any, len(keys))
@@ -61,17 +62,17 @@ func (ex *executor) project(q *Query, rows []row) (*Result, error) {
 		}
 		projRows = sortRows(projRows, keys, sortVals)
 	}
-	if q.Return.Limit >= 0 && len(projRows) > q.Return.Limit {
-		projRows = projRows[:q.Return.Limit]
-	}
+	projRows = applySkipLimit(projRows, ret.Skip, ret.Limit)
 	res.Rows = projRows
 	return res, nil
 }
 
 // projectAgg is the aggregation path: every non-aggregating RETURN item is a
 // grouping key, aggregations accumulate per group in one pass over rows, and
-// ORDER BY / LIMIT apply afterwards (LIMIT never short-circuits the pass).
+// ORDER BY / SKIP / LIMIT apply afterwards (LIMIT never short-circuits the
+// pass).
 func (ex *executor) projectAgg(q *Query, items []*ReturnItem, rows []row) (*Result, error) {
+	ret := q.finalReturn()
 	res := &Result{Columns: make([]string, len(items))}
 	for i, it := range items {
 		res.Columns[i] = it.Name
@@ -135,8 +136,8 @@ func (ex *executor) projectAgg(q *Query, items []*ReturnItem, rows []row) (*Resu
 		}
 		projRows[gi] = m
 	}
-	if len(q.Return.OrderBy) > 0 {
-		keys := q.Return.OrderBy
+	if len(ret.OrderBy) > 0 {
+		keys := ret.OrderBy
 		sortVals := make([][]any, len(projRows))
 		for i, m := range projRows {
 			vals := make([]any, len(keys))
@@ -147,11 +148,24 @@ func (ex *executor) projectAgg(q *Query, items []*ReturnItem, rows []row) (*Resu
 		}
 		projRows = sortRows(projRows, keys, sortVals)
 	}
-	if q.Return.Limit >= 0 && len(projRows) > q.Return.Limit {
-		projRows = projRows[:q.Return.Limit]
-	}
+	projRows = applySkipLimit(projRows, ret.Skip, ret.Limit)
 	res.Rows = projRows
 	return res, nil
+}
+
+// applySkipLimit slices the sorted rows by SKIP then LIMIT (either < 0 =
+// absent): rows[skip : skip+limit] with both bounds clamped — SKIP past the
+// end yields the empty slice.
+func applySkipLimit(rows []map[string]any, skip, limit int) []map[string]any {
+	lo := 0
+	if skip > 0 {
+		lo = min(skip, len(rows))
+	}
+	hi := len(rows)
+	if limit >= 0 && hi-lo > limit {
+		hi = lo + limit
+	}
+	return rows[lo:hi]
 }
 
 // accState is one aggregation group: the key values and one accumulator per

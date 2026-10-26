@@ -100,14 +100,19 @@ func RunView(src Source, q string) (*Result, error) {
 }
 
 func runStatement(ex *executor, ast *Query) (*Result, error) {
-	rows, err := ex.matchRows(ast.Match)
+	// T2 limitation: only the FIRST MATCH clause executes. Repeated MATCH
+	// parses and validates (disjoint variables = cartesian, shared =
+	// join), and those execution semantics arrive with the T3 stage loop;
+	// until then firstMatch() supplies the single stage.
+	m := ast.firstMatch()
+	rows, err := ex.matchRows(m)
 	if err != nil {
 		return nil, err
 	}
-	if ast.Match.Where != nil {
+	if m.Where != nil {
 		filtered := make([]row, 0, len(rows))
 		for _, r := range rows {
-			if v, ok := ex.eval(ast.Match.Where, r); ok && v == true {
+			if v, ok := ex.eval(m.Where, r); ok && v == true {
 				filtered = append(filtered, r)
 			}
 		}

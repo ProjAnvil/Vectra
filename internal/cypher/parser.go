@@ -72,23 +72,60 @@ func (p *parser) expectKw(word string) error {
 	return nil
 }
 
+// parseQuery parses a keyword-dispatched clause sequence. The grammar in
+// this task: MATCH (repeatable, comma-separated patterns + WHERE per
+// clause) ... RETURN items [ORDER BY ...] [SKIP n] [LIMIT n]. RETURN is
+// terminal — anything after it is an unexpected-token error. The WITH,
+// UNWIND and OPTIONAL MATCH arms land in T4/T5/T6; until then those
+// keywords at clause position take the default unexpected-token error.
 func (p *parser) parseQuery() (*Query, error) {
-	if err := p.expectKw("MATCH"); err != nil {
-		return nil, err
+	if !p.kw("MATCH") {
+		return nil, p.errf("expected MATCH, got %s", describe(p.cur()))
 	}
-	q := &Query{Match: &MatchClause{}, Return: &ReturnClause{Limit: -1}}
+	q := &Query{}
+	sawReturn := false
+	for !p.at(TEOF) {
+		if sawReturn {
+			return nil, p.errf("expected end of input, got %s", describe(p.cur()))
+		}
+		var (
+			c   Clause
+			err error
+		)
+		switch {
+		case p.kw("MATCH"):
+			c, err = p.parseMatchClause()
+		case p.kw("RETURN"):
+			c, err = p.parseReturnClause()
+			sawReturn = true
+		default:
+			return nil, p.errf("expected end of input, got %s", describe(p.cur()))
+		}
+		if err != nil {
+			return nil, err
+		}
+		q.Clauses = append(q.Clauses, c)
+	}
+	return q, nil
+}
+
+// parseMatchClause parses "MATCH pattern[, pattern...][WHERE expr]". The
+// MATCH keyword is still unconsumed (the clause loop verified it).
+func (p *parser) parseMatchClause() (*MatchClause, error) {
+	p.next() // MATCH
+	m := &MatchClause{}
 	pat, err := p.parsePath()
 	if err != nil {
 		return nil, err
 	}
-	q.Match.Patterns = append(q.Match.Patterns, pat)
+	m.Patterns = append(m.Patterns, pat)
 	for p.at(TComma) {
 		p.next()
 		pat, err := p.parsePath()
 		if err != nil {
 			return nil, err
 		}
-		q.Match.Patterns = append(q.Match.Patterns, pat)
+		m.Patterns = append(m.Patterns, pat)
 	}
 	if p.kw("WHERE") {
 		p.next()
@@ -96,14 +133,20 @@ func (p *parser) parseQuery() (*Query, error) {
 		if err != nil {
 			return nil, err
 		}
-		q.Match.Where = e
+		m.Where = e
 	}
-	if err := p.expectKw("RETURN"); err != nil {
-		return nil, err
-	}
+	return m, nil
+}
+
+// parseReturnClause parses the RETURN clause through its trailer:
+// items (or *), ORDER BY, SKIP, LIMIT — in that order. The RETURN keyword
+// is still unconsumed.
+func (p *parser) parseReturnClause() (*ReturnClause, error) {
+	p.next() // RETURN
+	r := &ReturnClause{Limit: -1, Skip: -1}
 	if p.at(TStar) {
 		p.next()
-		q.Return.Star = true
+		r.Star = true
 		// Items may follow ("*, count(*)") so validate() can report the
 		// combination precisely instead of a generic syntax error.
 		for p.at(TComma) {
@@ -112,21 +155,21 @@ func (p *parser) parseQuery() (*Query, error) {
 			if err != nil {
 				return nil, err
 			}
-			q.Return.Items = append(q.Return.Items, item)
+			r.Items = append(r.Items, item)
 		}
 	} else {
 		item, err := p.parseReturnItem()
 		if err != nil {
 			return nil, err
 		}
-		q.Return.Items = append(q.Return.Items, item)
+		r.Items = append(r.Items, item)
 		for p.at(TComma) {
 			p.next()
 			item, err := p.parseReturnItem()
 			if err != nil {
 				return nil, err
 			}
-			q.Return.Items = append(q.Return.Items, item)
+			r.Items = append(r.Items, item)
 		}
 	}
 	if p.kw("ORDER") {
@@ -138,15 +181,27 @@ func (p *parser) parseQuery() (*Query, error) {
 		if err != nil {
 			return nil, err
 		}
-		q.Return.OrderBy = append(q.Return.OrderBy, key)
+		r.OrderBy = append(r.OrderBy, key)
 		for p.at(TComma) {
 			p.next()
 			key, err := p.parseOrderKey()
 			if err != nil {
 				return nil, err
 			}
-			q.Return.OrderBy = append(q.Return.OrderBy, key)
+			r.OrderBy = append(r.OrderBy, key)
 		}
+	}
+	if p.kw("SKIP") {
+		p.next()
+		t, err := p.expect(TNumber, "number")
+		if err != nil {
+			return nil, err
+		}
+		n, convErr := strconv.Atoi(t.Text)
+		if convErr != nil || n < 0 {
+			return nil, &Error{Line: t.Line, Col: t.Col, Msg: fmt.Sprintf("bad SKIP %q", t.Text)}
+		}
+		r.Skip = n
 	}
 	if p.kw("LIMIT") {
 		p.next()
@@ -158,12 +213,9 @@ func (p *parser) parseQuery() (*Query, error) {
 		if convErr != nil || n < 0 {
 			return nil, &Error{Line: t.Line, Col: t.Col, Msg: fmt.Sprintf("bad LIMIT %q", t.Text)}
 		}
-		q.Return.Limit = n
+		r.Limit = n
 	}
-	if !p.at(TEOF) {
-		return nil, p.errf("expected end of input, got %s", describe(p.cur()))
-	}
-	return q, nil
+	return r, nil
 }
 
 // parsePath parses nodePat (edgePat nodePat)*. Edge forms, by first token:
@@ -681,70 +733,214 @@ func (p *parser) parseListLit() (Expr, error) {
 	return lit, nil
 }
 
-// ---- static validation ----
+// ---- static validation (scope chain) ----
 
-// validate enforces: referenced variables are declared; variable-length
-// edge variables are never referenced; ORDER BY names appear in RETURN
-// items; RETURN * has at least one named variable.
-func (q *Query) validate() error {
-	nodeVars := map[string]bool{}
-	edgeVars := map[string]*EdgePattern{}
-	for _, pat := range q.Match.Patterns {
-		for _, n := range pat.Nodes {
-			if n.Var != "" {
-				nodeVars[n.Var] = true
-			}
-		}
-		for _, e := range pat.Edges {
-			if e.Var != "" {
-				edgeVars[e.Var] = e
-			}
-		}
+// varKind is what a scope variable may bind.
+type varKind int
+
+const (
+	kindNode varKind = iota
+	kindEdge
+	kindScalar
+)
+
+// scope is the parse-time variable scope: the visible names, what each may
+// bind, and whether a WITH/UNWIND clause has been seen. sawReset selects
+// the undefined-variable error family: pure-MATCH queries keep the
+// historical "not declared in the pattern" wording byte-identical, while
+// post-WITH/UNWIND references use the scope-chain wording.
+type scope struct {
+	kinds    map[string]varKind
+	edges    map[string]*EdgePattern // edge vars -> declaring pattern (variable-length check)
+	sawReset bool                    // a WITH or UNWIND clause has been seen
+}
+
+func newScope() *scope {
+	return &scope{kinds: map[string]varKind{}, edges: map[string]*EdgePattern{}}
+}
+
+// undefinedErr is the not-declared error in the family selected by the
+// scope state.
+func (sc *scope) undefinedErr(line, col int, v string) *Error {
+	if sc.sawReset {
+		return &Error{line, col, fmt.Sprintf("variable %q is not defined in this scope (WITH starts a new scope; only projected variables survive)", v)}
 	}
-	declared := func(v string) bool { return nodeVars[v] || edgeVars[v] != nil }
+	return &Error{line, col, fmt.Sprintf("variable %q is not declared in the pattern", v)}
+}
 
-	var checkPropRef func(Expr) error
-	checkPropRef = func(e Expr) error {
-		switch x := e.(type) {
-		case *PropRef:
-			if !declared(x.Var) {
-				return &Error{x.Line, x.Col, fmt.Sprintf("variable %q is not declared in the pattern", x.Var)}
+// varlenErr reports v when it names a variable-length edge binding.
+func (sc *scope) varlenErr(line, col int, v string) *Error {
+	return &Error{line, col, fmt.Sprintf("edge variable %q is on a variable-length edge and cannot be referenced (node-pair semantics)", v)}
+}
+
+// checkExpr reference-checks a WHERE-expression tree: every PropRef var is
+// declared, not a scalar, and not a variable-length edge binding.
+func (sc *scope) checkExpr(e Expr) error {
+	switch x := e.(type) {
+	case *PropRef:
+		k, ok := sc.kinds[x.Var]
+		if !ok {
+			return sc.undefinedErr(x.Line, x.Col, x.Var)
+		}
+		if k == kindScalar {
+			return &Error{x.Line, x.Col, fmt.Sprintf("variable %q is a scalar; property access requires a node or edge", x.Var)}
+		}
+		if k == kindEdge {
+			if ep := sc.edges[x.Var]; ep != nil && (ep.MinHops != 1 || ep.MaxHops != 1) {
+				return sc.varlenErr(x.Line, x.Col, x.Var)
 			}
-			if ep := edgeVars[x.Var]; ep != nil && (ep.MinHops != 1 || ep.MaxHops != 1) {
-				return &Error{x.Line, x.Col, fmt.Sprintf("edge variable %q is on a variable-length edge and cannot be referenced (node-pair semantics)", x.Var)}
-			}
-			return nil
-		case *Binary:
-			if err := checkPropRef(x.L); err != nil {
-				return err
-			}
-			return checkPropRef(x.R)
-		case *Not:
-			return checkPropRef(x.X)
 		}
 		return nil
-	}
-	if q.Match.Where != nil {
-		if err := checkPropRef(q.Match.Where); err != nil {
+	case *Binary:
+		if err := sc.checkExpr(x.L); err != nil {
 			return err
 		}
+		return sc.checkExpr(x.R)
+	case *Not:
+		return sc.checkExpr(x.X)
 	}
+	return nil
+}
 
-	items := q.Return.Items
+// checkItemVar validates one var[.prop] reference inside a RETURN or WITH
+// item ({1,1} positions, matching the historical RETURN-item errors).
+// propAccess=false marks a bare variable reference (RETURN k of a scalar
+// is legal; k.prop is not).
+func (sc *scope) checkItemVar(v string, propAccess bool) error {
+	k, ok := sc.kinds[v]
+	if !ok {
+		return sc.undefinedErr(1, 1, v)
+	}
+	if k == kindScalar && propAccess {
+		return &Error{1, 1, fmt.Sprintf("variable %q is a scalar; property access requires a node or edge", v)}
+	}
+	if k == kindEdge {
+		if ep := sc.edges[v]; ep != nil && (ep.MinHops != 1 || ep.MaxHops != 1) {
+			return sc.varlenErr(1, 1, v)
+		}
+	}
+	return nil
+}
+
+// declarePattern adds one MATCH clause's pattern variables. Reusing a
+// node/edge name is a join (allowed); rebinding a scalar (WITH/UNWIND
+// projection) is an error.
+func (sc *scope) declarePattern(m *MatchClause) error {
+	scalarErr := func(v string) *Error {
+		return &Error{1, 1, fmt.Sprintf("variable %q is a scalar; pattern variables must be nodes or edges", v)}
+	}
+	for _, pat := range m.Patterns {
+		for _, n := range pat.Nodes {
+			if n.Var == "" {
+				continue
+			}
+			if sc.kinds[n.Var] == kindScalar {
+				return scalarErr(n.Var)
+			}
+			sc.kinds[n.Var] = kindNode
+		}
+		for _, e := range pat.Edges {
+			if e.Var == "" {
+				continue
+			}
+			if sc.kinds[e.Var] == kindScalar {
+				return scalarErr(e.Var)
+			}
+			sc.kinds[e.Var] = kindEdge
+			sc.edges[e.Var] = e
+		}
+	}
+	return nil
+}
+
+// applyWith validates one WITH clause and applies its projection: item
+// references are checked against the incoming scope, then the scope is
+// REPLACED by the projected names (bare variables keep their kind under
+// their own name — or alias; expressions and aggregations project
+// scalars). The trailer (ORDER BY, WHERE) references projected names only.
+func (sc *scope) applyWith(c *WithClause) error {
+	sc.sawReset = true
+	if len(c.Items) == 0 {
+		return &Error{1, 1, "WITH requires at least one item"}
+	}
+	next := make(map[string]varKind, len(c.Items))
+	for _, it := range c.Items {
+		if it.Agg.Func != "" {
+			if !it.Agg.Star {
+				if err := sc.checkItemVar(it.Agg.Arg.Var, it.Agg.Arg.Prop != ""); err != nil {
+					return err
+				}
+			}
+			if it.Alias == "" {
+				return &Error{1, 1, "expression in WITH must be aliased (use AS)"}
+			}
+			next[it.Alias] = kindScalar
+			continue
+		}
+		if err := sc.checkItemVar(it.Var, it.Prop != ""); err != nil {
+			return err
+		}
+		if it.Prop != "" { // var.prop is an expression: it requires AS
+			if it.Alias == "" {
+				return &Error{1, 1, "expression in WITH must be aliased (use AS)"}
+			}
+			next[it.Alias] = kindScalar
+			continue
+		}
+		// bare variable: passes its binding kind under its own name or alias
+		name := it.Var
+		if it.Alias != "" {
+			name = it.Alias
+		}
+		next[name] = sc.kinds[it.Var]
+	}
+	sc.kinds = next
+	for _, k := range c.OrderBy {
+		if _, ok := next[k.Name]; ok {
+			continue
+		}
+		varPart := k.Name
+		if i := strings.Index(varPart, "."); i >= 0 {
+			varPart = varPart[:i]
+		}
+		if _, ok := next[varPart]; !ok {
+			return &Error{1, 1, fmt.Sprintf("ORDER BY variable %q is not defined in this scope (WITH starts a new scope; only projected variables survive)", varPart)}
+		}
+	}
+	if c.Where != nil {
+		return sc.checkExpr(c.Where)
+	}
+	return nil
+}
+
+// checkReturn validates the final RETURN clause: item references, ORDER BY
+// coverage, and the RETURN * restrictions (valid only for the degenerate
+// single-MATCH-no-WITH/UNWIND query).
+func (sc *scope) checkReturn(c *ReturnClause, matchCount int) error {
+	items := c.Items
 	aggQuery := false
 	for _, it := range items {
 		if it.Agg.Func != "" {
 			aggQuery = true
 		}
 	}
-	if q.Return.Star {
+	if c.Star {
+		if matchCount > 1 || sc.sawReset {
+			return &Error{1, 1, "RETURN * is not supported after WITH/UNWIND or multiple MATCH clauses"}
+		}
 		if aggQuery {
 			return &Error{1, 1, "RETURN * cannot be combined with aggregation"}
 		}
 		if len(items) > 0 {
 			return &Error{1, 1, "RETURN * cannot be combined with other RETURN items"}
 		}
-		if len(nodeVars)+len(edgeVars) == 0 {
+		named := 0
+		for _, k := range sc.kinds {
+			if k != kindScalar {
+				named++
+			}
+		}
+		if named == 0 {
 			return &Error{1, 1, "RETURN * with no named variables in the pattern"}
 		}
 		return nil // RETURN * + ORDER BY is supported: keys evaluate on the bindings (see project)
@@ -755,20 +951,19 @@ func (q *Query) validate() error {
 	names := map[string]bool{}
 	for _, it := range items {
 		v := it.Var // aggregations declare no variable of their own
+		propAccess := it.Prop != ""
 		if it.Agg.Func != "" && !it.Agg.Star {
 			v = it.Agg.Arg.Var
+			propAccess = it.Agg.Arg.Prop != ""
 		}
 		if v != "" {
-			if !declared(v) {
-				return &Error{1, 1, fmt.Sprintf("variable %q is not declared in the pattern", v)}
-			}
-			if ep := edgeVars[v]; ep != nil && (ep.MinHops != 1 || ep.MaxHops != 1) {
-				return &Error{1, 1, fmt.Sprintf("edge variable %q is on a variable-length edge and cannot be referenced (node-pair semantics)", v)}
+			if err := sc.checkItemVar(v, propAccess); err != nil {
+				return err
 			}
 		}
 		names[it.Name] = true
 	}
-	for _, k := range q.Return.OrderBy {
+	for _, k := range c.OrderBy {
 		if aggQuery {
 			// After aggregation only projected columns exist: the key must
 			// match a RETURN item name (aliases included).
@@ -781,11 +976,60 @@ func (q *Query) validate() error {
 		if i := strings.Index(varPart, "."); i >= 0 {
 			varPart = varPart[:i]
 		}
-		if !declared(varPart) && !names[k.Name] {
+		if _, declared := sc.kinds[varPart]; !declared && !names[k.Name] {
+			if sc.sawReset {
+				return &Error{1, 1, fmt.Sprintf("ORDER BY variable %q is not defined in this scope (WITH starts a new scope; only projected variables survive)", varPart)}
+			}
 			return &Error{1, 1, fmt.Sprintf("ORDER BY variable %q is not declared in the pattern", varPart)}
 		}
-		if ep := edgeVars[varPart]; ep != nil && (ep.MinHops != 1 || ep.MaxHops != 1) {
-			return &Error{1, 1, fmt.Sprintf("edge variable %q is on a variable-length edge and cannot be referenced (node-pair semantics)", varPart)}
+		if k := sc.kinds[varPart]; k == kindEdge {
+			if ep := sc.edges[varPart]; ep != nil && (ep.MinHops != 1 || ep.MaxHops != 1) {
+				return sc.varlenErr(1, 1, varPart)
+			}
+		}
+	}
+	return nil
+}
+
+// validate walks the clause chain building the variable scope per clause
+// and reference-checking each clause against the scope it appears in:
+// referenced variables are declared (error family by scope state),
+// scalars are never property-accessed nor rebound by patterns,
+// variable-length edge variables are never referenced, ORDER BY names
+// appear among the visible/projected names, and RETURN * is limited to
+// the degenerate single-MATCH query.
+func (q *Query) validate() error {
+	sc := newScope()
+	matchCount := 0
+	for _, c := range q.Clauses {
+		switch c := c.(type) {
+		case *MatchClause:
+			matchCount++
+			if err := sc.declarePattern(c); err != nil {
+				return err
+			}
+			if c.Where != nil {
+				if err := sc.checkExpr(c.Where); err != nil {
+					return err
+				}
+			}
+		case *WithClause:
+			if err := sc.applyWith(c); err != nil {
+				return err
+			}
+		case *UnwindClause:
+			sc.sawReset = true // the clause is being processed: scope-chain family applies
+			if c.Alias == "" {
+				return &Error{1, 1, "UNWIND expression must be aliased (use AS)"}
+			}
+			if c.Expr != nil {
+				if err := sc.checkExpr(c.Expr); err != nil {
+					return err
+				}
+			}
+			sc.kinds[c.Alias] = kindScalar
+		case *ReturnClause:
+			return sc.checkReturn(c, matchCount)
 		}
 	}
 	return nil
