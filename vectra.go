@@ -612,7 +612,7 @@ func New() *Graph {
 		autoSealEdges:     defaultAutoSealEdges,
 		foldWake:          make(chan struct{}, 1),
 	}
-	snap, err := engine.Seal(nil, nil, nil, nil)
+	snap, err := engine.Seal(nil, nil, nil, nil, nil)
 	if err != nil {
 		panic(fmt.Errorf("vectra: sealing an empty base: %w", err))
 	}
@@ -2325,7 +2325,7 @@ func (g *Graph) forceMerge() error {
 		return nil
 	}
 	nodes, edges, labels, indexKeys := g.unionRecords()
-	snap, err := engine.Seal(nodes, edges, labels, indexKeys)
+	snap, err := engine.Seal(nodes, edges, labels, indexKeys, nil)
 	if err != nil {
 		return err
 	}
@@ -2942,7 +2942,7 @@ func loadGraphForest(r io.Reader, img *vecForestImage) (*Graph, error) {
 // graphFromEngine builds a Graph whose initial generation is the merged base
 // of the given records (writer mirrors and ratchets seeded from the base).
 func graphFromEngine(nodes []engine.NodeRec, edges []engine.EdgeRec, labels []string, indexKeys []string) (*Graph, error) {
-	snap, err := engine.Seal(nodes, edges, labels, indexKeys)
+	snap, err := engine.Seal(nodes, edges, labels, indexKeys, nil)
 	if err != nil {
 		return nil, err
 	}

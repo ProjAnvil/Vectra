@@ -11,7 +11,7 @@ func sealIdx(t *testing.T, keys []string, props []map[string]any) *Snapshot {
 	for i, p := range props {
 		nodes[i] = NodeRec{Key: string(rune('a' + i)), Label: "L", Props: p}
 	}
-	s, err := Seal(nodes, nil, []string{"L"}, keys) // []string{"L"} = 边 label 注册表（LabelID 的查询对象）
+	s, err := Seal(nodes, nil, []string{"L"}, keys, nil) // []string{"L"} = 边 label 注册表（LabelID 的查询对象）
 	if err != nil {
 		t.Fatal(err)
 	}

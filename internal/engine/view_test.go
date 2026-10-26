@@ -37,6 +37,7 @@ func testView(t *testing.T) *View {
 		},
 		[]string{"knows"},
 		nil,
+		nil,
 	)
 	if err != nil {
 		t.Fatal(err)

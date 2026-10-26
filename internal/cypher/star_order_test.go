@@ -14,7 +14,7 @@ func TestStarWithOrderBySupported(t *testing.T) {
 		{Key: "a", Label: "N", Props: map[string]any{"k": "a"}},
 		{Key: "b", Label: "N", Props: map[string]any{"k": "b"}},
 	}
-	snap, err := engine.Seal(nodes, nil, nil, nil)
+	snap, err := engine.Seal(nodes, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -116,13 +116,15 @@ type Snapshot struct {
 	sccNodes   []uint32      // members grouped by component (ascending within group)
 	selfLoop   []bool
 
-	indexes map[string]*propIndex // property key -> typed index (built at Seal time)
+	indexes map[string]*propIndex  // property key -> typed index (built at Seal time)
+	fts     map[string][]gramEntry // property key -> gram posting list, sorted by (gram, id) (built at Seal time)
 }
 
 // Seal builds an immutable snapshot from raw records: forward/reverse CSR,
 // Tarjan SCC, forward/reverse condensation DAG, component member tables,
-// self-loop flags, and typed property indexes.
-func Seal(nodes []NodeRec, edges []EdgeRec, labels []string, indexKeys []string) (*Snapshot, error) {
+// self-loop flags, typed property indexes, and FTS gram buckets (only the
+// case string values of ftsKeys are tokenized).
+func Seal(nodes []NodeRec, edges []EdgeRec, labels []string, indexKeys []string, ftsKeys []string) (*Snapshot, error) {
 	s := &Snapshot{nodes: nodes, edges: edges, labels: labels}
 	n := uint32(len(nodes))
 	e := len(edges)
@@ -216,6 +218,33 @@ func Seal(nodes []NodeRec, edges []EdgeRec, labels []string, indexKeys []string)
 				return cmp.Compare(a.id, b.id)
 			})
 			s.indexes[key] = pi
+		}
+	}
+
+	// FTS gram buckets: for every declared key, each node's string value is
+	// tokenized into bigrams; postings land in one flat slice per key,
+	// sorted jointly by gram and node ID (the shape LookupFTS binary
+	// searches). Non-string values contribute nothing, and a declared key
+	// with no gram-bearing values still gets its (empty) bucket so the
+	// declared/undeclared distinction survives.
+	if len(ftsKeys) > 0 {
+		s.fts = make(map[string][]gramEntry, len(ftsKeys))
+		for _, key := range ftsKeys {
+			var postings []gramEntry
+			for id, nr := range nodes {
+				if v, ok := nr.Props[key].(string); ok {
+					for _, g := range bigrams(v) {
+						postings = append(postings, gramEntry{gram: g, id: uint32(id)})
+					}
+				}
+			}
+			slices.SortFunc(postings, func(a, b gramEntry) int {
+				if a.gram != b.gram {
+					return cmp.Compare(a.gram, b.gram)
+				}
+				return cmp.Compare(a.id, b.id)
+			})
+			s.fts[key] = postings
 		}
 	}
 	return s, nil
@@ -367,6 +396,15 @@ func (s *Snapshot) IndexedKeys() []string {
 		return nil
 	}
 	return slices.Sorted(maps.Keys(s.indexes))
+}
+
+// FTSKeys returns the property keys FTS gram buckets were built for at Seal
+// time, ascending (nil when none).
+func (s *Snapshot) FTSKeys() []string {
+	if len(s.fts) == 0 {
+		return nil
+	}
+	return slices.Sorted(maps.Keys(s.fts))
 }
 
 // ExportNodes / ExportEdges return the raw record slices (shared references,
