@@ -102,13 +102,15 @@ func RunView(src Source, q string) (*Result, error) {
 // runStatement is the clause-pipeline stage loop: each clause transforms
 // the row set in place — MATCH stages seed the next pattern round from the
 // accumulated rows (repeated MATCH cartesian-products disjoint variables
-// and joins shared ones, exactly like comma-separated patterns within one
-// MATCH), WHERE filters the stage's output, and RETURN terminates the
-// pipeline.
-// A plain type switch, no closures and no runtime scope: WITH/UNWIND add
-// their arms in T4/T5. starMatch remembers the MATCH clause RETURN *
-// expands (validation restricts * to the single-MATCH degenerate shape,
-// where it is the only one).
+// and joins shared ones; unlike comma-separated patterns within one MATCH,
+// stages are STRICT: a stage whose input is empty yields zero rows and
+// never re-anchors), WHERE filters the stage's output, WITH projects its
+// items into a fresh scope (only projected names survive), and RETURN
+// terminates the pipeline.
+// A plain type switch, no closures and no runtime scope. UNWIND adds its
+// arm in T5. starMatch remembers the MATCH clause RETURN * expands
+// (validation restricts * to the single-MATCH degenerate shape, where it
+// is the only one).
 func runStatement(ex *executor, ast *Query) (*Result, error) {
 	var rows []row
 	var starMatch *MatchClause
@@ -124,6 +126,12 @@ func runStatement(ex *executor, ast *Query) (*Result, error) {
 				rows = ex.filterRows(c.Where, rows)
 			}
 			starMatch = c
+		case *WithClause:
+			var err error
+			rows, err = ex.withStage(c, rows)
+			if err != nil {
+				return nil, err
+			}
 		case *ReturnClause:
 			return ex.project(c, starMatch, rows)
 		}
@@ -134,9 +142,8 @@ func runStatement(ex *executor, ast *Query) (*Result, error) {
 }
 
 // filterRows keeps the rows whose WHERE expression evaluates to true (null
-// outcomes never satisfy it and are not rescued by NOT). Extracted from
-// runStatement's original inline filter; MATCH's WHERE uses it today and
-// WITH's WHERE-after-projection joins it in T4.
+// outcomes never satisfy it and are not rescued by NOT). MATCH's WHERE and
+// WITH's WHERE-after-projection share it.
 func (ex *executor) filterRows(where Expr, rows []row) []row {
 	filtered := make([]row, 0, len(rows))
 	for _, r := range rows {
@@ -157,9 +164,9 @@ func (ex *executor) filterRows(where Expr, rows []row) []row {
 // cartesian anchor) writes only freshly cloned rows.
 //
 // pos is authoritative only on rows produced by runPath/expand (pattern
-// execution); stage-constructed rows (WITH/UNWIND/OPTIONAL merges, T4+)
-// normalize pos to 0 so DISTINCT/dedup consumers never see a stale
-// frontier.
+// execution); stage-constructed rows (WITH today; UNWIND/OPTIONAL merges
+// in T5/T6) normalize pos to 0 so DISTINCT/dedup consumers never see a
+// stale frontier.
 type row struct {
 	pos   uint32
 	nodes map[string]uint32 // node var -> node ID
@@ -241,6 +248,26 @@ func (r *row) ownVals() {
 		r.vals, r.valsShared = m, false
 	} else if r.vals == nil {
 		r.vals = make(map[string]any, 1)
+	}
+}
+
+// bindItem binds one projected value into a freshly constructed stage row:
+// node and edge values re-seed the binding maps by ID (entity pass-through
+// keeps identity for later MATCH joins and RETURN projection), everything
+// else is a scalar bound into vals under the projected name. r must be a
+// fresh row whose maps are exclusively owned by construction — the own*
+// helpers' lazy creation is the fast path, never a copy.
+func (r *row) bindItem(name string, v any) {
+	switch x := v.(type) {
+	case NodeVal:
+		r.ownNodes()
+		r.nodes[name] = x.ID
+	case EdgeVal:
+		r.ownEdges()
+		r.edges[name] = x.ID
+	default:
+		r.ownVals()
+		r.vals[name] = v
 	}
 }
 

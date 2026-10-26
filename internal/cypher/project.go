@@ -48,36 +48,28 @@ func (ex *executor) project(ret *ReturnClause, m *MatchClause, rows []row) (*Res
 		projRows[i] = m
 	}
 	if len(ret.OrderBy) > 0 {
-		keys := ret.OrderBy
-		sortVals := make([][]any, len(rows))
-		for i, r := range rows {
-			vals := make([]any, len(keys))
-			for j, k := range keys {
+		projRows = applyTrailer(projRows, ret.OrderBy, ret.Skip, ret.Limit,
+			func(i int, m map[string]any, k OrderKey) any {
 				if inCols[k.Name] {
-					vals[j] = projRows[i][k.Name] // projected column (alias) value
-				} else {
-					vals[j] = ex.orderValue(k.Name, r)
+					return m[k.Name] // projected column (alias) value
 				}
-			}
-			sortVals[i] = vals
-		}
-		projRows = sortRows(projRows, keys, sortVals)
+				return ex.orderValue(k.Name, rows[i]) // binding-derived
+			})
+	} else {
+		projRows = applyTrailer(projRows, nil, ret.Skip, ret.Limit, nil)
 	}
-	projRows = applySkipLimit(projRows, ret.Skip, ret.Limit)
 	res.Rows = projRows
 	return res, nil
 }
 
-// projectAgg is the aggregation path: every non-aggregating RETURN item is a
-// grouping key, aggregations accumulate per group in one pass over rows, and
-// ORDER BY / SKIP / LIMIT apply afterwards (LIMIT never short-circuits the
-// pass).
-func (ex *executor) projectAgg(ret *ReturnClause, items []*ReturnItem, rows []row) (*Result, error) {
-	res := &Result{Columns: make([]string, len(items))}
-	for i, it := range items {
-		res.Columns[i] = it.Name
-	}
-	var keyIdx, aggIdx []int
+// aggregate is the grouping core shared by RETURN aggregation and
+// aggregating WITH stages: every non-aggregating item is a grouping key,
+// aggregations accumulate per group in one pass over rows (LIMIT never
+// short-circuits the pass — the caller applies its trailer afterwards).
+// The order slice is first-seen group order; with no grouping keys and no
+// input rows it holds the single empty-group state (count=0, sum=0,
+// avg/min/max=null, collect=[]) so both consumers emit one zero row.
+func (ex *executor) aggregate(items []*ReturnItem, rows []row) (keyIdx, aggIdx []int, order []*accState, err error) {
 	for i, it := range items {
 		if it.Agg.Func == "" {
 			keyIdx = append(keyIdx, i)
@@ -85,9 +77,7 @@ func (ex *executor) projectAgg(ret *ReturnClause, items []*ReturnItem, rows []ro
 			aggIdx = append(aggIdx, i)
 		}
 	}
-
 	groups := make(map[string]*accState)
-	var order []*accState // first-seen group order
 	for _, r := range rows {
 		var kb []byte
 		keys := make([]any, len(keyIdx))
@@ -100,7 +90,7 @@ func (ex *executor) projectAgg(ret *ReturnClause, items []*ReturnItem, rows []ro
 		st := groups[ks]
 		if st == nil {
 			if len(groups) >= maxGroups {
-				return nil, &Error{1, 1, fmt.Sprintf("too many groups: aggregation exceeded %d groups; add grouping keys or filters", maxGroups)}
+				return nil, nil, nil, &Error{1, 1, fmt.Sprintf("too many groups: aggregation exceeded %d groups; add grouping keys or filters", maxGroups)}
 			}
 			st = &accState{keys: keys, aggs: make([]*aggAcc, len(aggIdx))}
 			groups[ks] = st
@@ -111,12 +101,11 @@ func (ex *executor) projectAgg(ret *ReturnClause, items []*ReturnItem, rows []ro
 				st.aggs[j] = &aggAcc{}
 			}
 			if err := ex.accum(items[i], st.aggs[j], r); err != nil {
-				return nil, err
+				return nil, nil, nil, err
 			}
 		}
 	}
-	// No grouping keys and no input rows: still exactly one output row
-	// (count=0, sum=0, avg/min/max=null, collect=[]).
+	// No grouping keys and no input rows: still exactly one output row.
 	if len(keyIdx) == 0 && len(order) == 0 {
 		st := &accState{aggs: make([]*aggAcc, len(aggIdx))}
 		for j := range st.aggs {
@@ -124,7 +113,21 @@ func (ex *executor) projectAgg(ret *ReturnClause, items []*ReturnItem, rows []ro
 		}
 		order = append(order, st)
 	}
+	return keyIdx, aggIdx, order, nil
+}
 
+// projectAgg is the aggregation path of the terminal RETURN: groups come
+// from the shared aggregate core, one result map per group, then the
+// ORDER BY / SKIP / LIMIT trailer.
+func (ex *executor) projectAgg(ret *ReturnClause, items []*ReturnItem, rows []row) (*Result, error) {
+	res := &Result{Columns: make([]string, len(items))}
+	for i, it := range items {
+		res.Columns[i] = it.Name
+	}
+	keyIdx, aggIdx, order, err := ex.aggregate(items, rows)
+	if err != nil {
+		return nil, err
+	}
 	projRows := make([]map[string]any, len(order))
 	for gi, st := range order {
 		m := make(map[string]any, len(items))
@@ -136,27 +139,126 @@ func (ex *executor) projectAgg(ret *ReturnClause, items []*ReturnItem, rows []ro
 		}
 		projRows[gi] = m
 	}
-	if len(ret.OrderBy) > 0 {
-		keys := ret.OrderBy
-		sortVals := make([][]any, len(projRows))
-		for i, m := range projRows {
-			vals := make([]any, len(keys))
-			for j, k := range keys {
-				vals[j] = m[k.Name] // post-aggregation rows only have projected columns
-			}
-			sortVals[i] = vals
-		}
-		projRows = sortRows(projRows, keys, sortVals)
-	}
-	projRows = applySkipLimit(projRows, ret.Skip, ret.Limit)
+	projRows = applyTrailer(projRows, ret.OrderBy, ret.Skip, ret.Limit,
+		func(_ int, m map[string]any, k OrderKey) any { return m[k.Name] }) // post-aggregation rows only have projected columns
 	res.Rows = projRows
 	return res, nil
 }
 
-// applySkipLimit slices the sorted rows by SKIP then LIMIT (either < 0 =
-// absent): rows[skip : skip+limit] with both bounds clamped — SKIP past the
-// end yields the empty slice.
-func applySkipLimit(rows []map[string]any, skip, limit int) []map[string]any {
+// withStage executes one WITH clause: the items project the incoming rows
+// into fresh scope-carrying rows (entity items re-seed the node/edge
+// bindings by ID, scalar items bind vals — only projected names survive),
+// then DISTINCT dedups the projected rows, the ORDER BY/SKIP/LIMIT trailer
+// applies, and the optional WHERE filters what remains. Aggregating items
+// divert to the grouping path (group keys = non-agg items). The returned
+// slice is never nil: zero input rows project to zero output rows — strict
+// stage semantics, never a re-anchor.
+func (ex *executor) withStage(c *WithClause, rows []row) ([]row, error) {
+	var out []row
+	agg := false
+	for _, it := range c.Items {
+		if it.Agg.Func != "" {
+			agg = true
+			break
+		}
+	}
+	if agg {
+		var err error
+		out, err = ex.withAggRows(c.Items, rows)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		out = ex.withProjectRows(c.Items, rows)
+	}
+	if c.Distinct {
+		out = dedupRows(out)
+	}
+	out = applyTrailer(out, c.OrderBy, c.Skip, c.Limit,
+		func(_ int, r row, k OrderKey) any { return ex.orderValue(k.Name, r) })
+	if c.Where != nil {
+		out = ex.filterRows(c.Where, out)
+	}
+	return out, nil
+}
+
+// withProjectRows is the non-aggregating WITH path: exactly one fresh
+// output row per input row (preallocated from len(input)), each item
+// evaluated on the input row and bound into the output. Input row order is
+// preserved; pos is 0 by construction (stage-constructed row).
+func (ex *executor) withProjectRows(items []*ReturnItem, rows []row) []row {
+	out := make([]row, 0, len(rows))
+	for _, r := range rows {
+		var nr row
+		for _, it := range items {
+			nr.bindItem(it.Name, ex.itemValue(it, r))
+		}
+		out = append(out, nr)
+	}
+	return out
+}
+
+// withAggRows is the aggregating WITH path: the shared aggregate core
+// builds the groups (entity keys re-seed the output bindings, scalar keys
+// bind vals, aggregation results land in vals under their aliases), one
+// output row per group in first-seen order — pos 0 by construction.
+func (ex *executor) withAggRows(items []*ReturnItem, rows []row) ([]row, error) {
+	keyIdx, aggIdx, order, err := ex.aggregate(items, rows)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]row, 0, len(order))
+	for _, st := range order {
+		var nr row
+		for j, i := range keyIdx {
+			nr.bindItem(items[i].Name, st.keys[j])
+		}
+		for j, i := range aggIdx {
+			nr.bindItem(items[i].Name, st.aggs[j].result(items[i].Agg))
+		}
+		out = append(out, nr)
+	}
+	return out, nil
+}
+
+// applyTrailer is the single ORDER BY / SKIP / LIMIT tail shared by RETURN
+// projection and WITH stages: rows are stable-sorted by the keys (val
+// returns row i's value for key k — projected columns, aliases, or
+// binding-derived values), then sliced skip-first and limit-second.
+// Generic over the row type: []map[string]any for terminal projection,
+// []row for WITH stages. keys empty skips the sort (val may be nil then).
+func applyTrailer[T any](rows []T, keys []OrderKey, skip, limit int, val func(i int, r T, k OrderKey) any) []T {
+	if len(keys) > 0 {
+		sortVals := make([][]any, len(rows))
+		for i, r := range rows {
+			vals := make([]any, len(keys))
+			for j, k := range keys {
+				vals[j] = val(i, r, k)
+			}
+			sortVals[i] = vals
+		}
+		idx := make([]int, len(rows))
+		for i := range idx {
+			idx[i] = i
+		}
+		slices.SortStableFunc(idx, func(a, b int) int {
+			for j, k := range keys {
+				c := cmpVals(sortVals[a][j], sortVals[b][j])
+				if k.Desc {
+					c = -c
+				}
+				if c != 0 {
+					return c
+				}
+			}
+			return 0
+		})
+		sorted := make([]T, len(rows))
+		for i, ix := range idx {
+			sorted[i] = rows[ix]
+		}
+		rows = sorted
+	}
 	lo := 0
 	if skip > 0 {
 		lo = min(skip, len(rows))
@@ -306,32 +408,6 @@ func encodeVal(b []byte, v any) []byte {
 	return append(b, s...)
 }
 
-// sortRows stable-sorts projected rows by precomputed ORDER BY key values
-// (sortVals[i][j] belongs to projRows[i] and key j).
-func sortRows(projRows []map[string]any, keys []OrderKey, sortVals [][]any) []map[string]any {
-	idx := make([]int, len(projRows))
-	for i := range idx {
-		idx[i] = i
-	}
-	slices.SortStableFunc(idx, func(a, b int) int {
-		for j, k := range keys {
-			c := cmpVals(sortVals[a][j], sortVals[b][j])
-			if k.Desc {
-				c = -c
-			}
-			if c != 0 {
-				return c
-			}
-		}
-		return 0
-	})
-	sorted := make([]map[string]any, len(projRows))
-	for i, ix := range idx {
-		sorted[i] = projRows[ix]
-	}
-	return sorted
-}
-
 // starItems expands RETURN * to every named variable in declaration order
 // (node, edge, node, edge ... per path).
 func starItems(m *MatchClause) []*ReturnItem {
@@ -436,6 +512,13 @@ func (ex *executor) eval(e Expr, r row) (any, bool) {
 		return x.Val, true
 	case *PropRef:
 		return ex.scalarOf(r, x.Var, x.Name)
+	case *VarRef:
+		// bare scalar reference (WITH/UNWIND alias): the binding itself;
+		// absent or null takes the null outcome (three-valued logic)
+		if v, ok := r.vals[x.Var]; ok && v != nil {
+			return v, true
+		}
+		return nil, false
 	case *Not:
 		v, ok := ex.eval(x.X, r)
 		if !ok {

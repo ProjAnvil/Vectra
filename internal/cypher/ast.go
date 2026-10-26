@@ -37,14 +37,15 @@ type MatchClause struct {
 }
 
 // WithClause is the WITH clause: it projects its items into a new scope
-// (only projected names survive) with an optional ORDER BY trailer and
-// WHERE filter. The data type and scope validation are load-bearing from
-// T2 (the scope-chain validator type-switches on it); the parser arm,
-// SKIP/LIMIT/DISTINCT trailer fields and execution land in T4.
+// (only projected names survive) with an optional DISTINCT dedup, an ORDER
+// BY/SKIP/LIMIT trailer, and a WHERE filter over the projected rows.
 type WithClause struct {
-	Items   []*ReturnItem
-	OrderBy []OrderKey
-	Where   Expr // nil when absent
+	Items    []*ReturnItem
+	OrderBy  []OrderKey
+	Skip     int  // <0 = none (after ORDER BY, before LIMIT)
+	Limit    int  // <0 = none
+	Distinct bool // WITH DISTINCT: dedup the projected rows
+	Where    Expr // nil when absent; filters AFTER the trailer
 }
 
 // UnwindClause is the UNWIND clause: it declares its (mandatory) alias as
@@ -139,6 +140,15 @@ type PropRef struct {
 	Line, Col int
 }
 
+// VarRef is a bare variable reference used as a WHERE operand (the
+// WHERE-after-WITH extension): it names a scalar binding (a WITH/UNWIND
+// projection) whose value is the operand itself. Node and edge variables
+// are rejected at validation — only scalars may be referenced bare.
+type VarRef struct {
+	Var       string
+	Line, Col int
+}
+
 type Lit struct {
 	Val       any
 	Line, Col int
@@ -152,6 +162,7 @@ type ListLit struct {
 func (e *Binary) pos() (int, int)  { return e.Line, e.Col }
 func (e *Not) pos() (int, int)     { return e.Line, e.Col }
 func (e *PropRef) pos() (int, int) { return e.Line, e.Col }
+func (e *VarRef) pos() (int, int)  { return e.Line, e.Col }
 func (e *Lit) pos() (int, int)     { return e.Line, e.Col }
 func (e *ListLit) pos() (int, int) { return e.Line, e.Col }
 

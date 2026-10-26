@@ -74,10 +74,11 @@ func (p *parser) expectKw(word string) error {
 
 // parseQuery parses a keyword-dispatched clause sequence. The grammar in
 // this task: MATCH (repeatable, comma-separated patterns + WHERE per
-// clause) ... RETURN items [ORDER BY ...] [SKIP n] [LIMIT n]. RETURN is
-// terminal — anything after it is an unexpected-token error. The WITH,
-// UNWIND and OPTIONAL MATCH arms land in T4/T5/T6; until then those
-// keywords at clause position take the "expected RETURN" error.
+// clause) ... [WITH [DISTINCT] items [ORDER BY ...] [SKIP n] [LIMIT n]
+// [WHERE expr]] ... RETURN items [ORDER BY ...] [SKIP n] [LIMIT n]. RETURN
+// is terminal — anything after it is an unexpected-token error. The UNWIND
+// and OPTIONAL MATCH arms land in T5/T6; until then those keywords at
+// clause position take the "expected RETURN" error.
 func (p *parser) parseQuery() (*Query, error) {
 	if !p.kw("MATCH") {
 		return nil, p.errf("expected MATCH, got %s", describe(p.cur()))
@@ -95,6 +96,8 @@ func (p *parser) parseQuery() (*Query, error) {
 		switch {
 		case p.kw("MATCH"):
 			c, err = p.parseMatchClause()
+		case p.kw("WITH"):
+			c, err = p.parseWithClause()
 		case p.kw("RETURN"):
 			c, err = p.parseReturnClause()
 			sawReturn = true
@@ -175,50 +178,98 @@ func (p *parser) parseReturnClause() (*ReturnClause, error) {
 			r.Items = append(r.Items, item)
 		}
 	}
-	if p.kw("ORDER") {
+	if err := p.parseOrderSkipLimit(&r.OrderBy, &r.Skip, &r.Limit); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// parseWithClause parses "WITH [DISTINCT] item[, item...][ORDER BY ...]
+// [SKIP n][LIMIT n][WHERE expr]" — the same item grammar as RETURN (bare
+// vars, var.prop, aggregation calls, AS aliases; validation requires
+// aliases for expressions) and the same trailer, plus the trailing WHERE
+// over the projected scope. The WITH keyword is still unconsumed.
+func (p *parser) parseWithClause() (*WithClause, error) {
+	p.next() // WITH
+	w := &WithClause{Skip: -1, Limit: -1}
+	if p.kw("DISTINCT") {
 		p.next()
-		if err := p.expectKw("BY"); err != nil {
-			return nil, err
-		}
-		key, err := p.parseOrderKey()
+		w.Distinct = true
+	}
+	item, err := p.parseReturnItem()
+	if err != nil {
+		return nil, err
+	}
+	w.Items = append(w.Items, item)
+	for p.at(TComma) {
+		p.next()
+		item, err := p.parseReturnItem()
 		if err != nil {
 			return nil, err
 		}
-		r.OrderBy = append(r.OrderBy, key)
+		w.Items = append(w.Items, item)
+	}
+	if err := p.parseOrderSkipLimit(&w.OrderBy, &w.Skip, &w.Limit); err != nil {
+		return nil, err
+	}
+	if p.kw("WHERE") {
+		p.next()
+		e, err := p.parseOr()
+		if err != nil {
+			return nil, err
+		}
+		w.Where = e
+	}
+	return w, nil
+}
+
+// parseOrderSkipLimit parses the shared ORDER BY / SKIP / LIMIT trailer
+// (in that order) into the caller's clause fields; each part is optional.
+func (p *parser) parseOrderSkipLimit(orderBy *[]OrderKey, skip, limit *int) error {
+	if p.kw("ORDER") {
+		p.next()
+		if err := p.expectKw("BY"); err != nil {
+			return err
+		}
+		key, err := p.parseOrderKey()
+		if err != nil {
+			return err
+		}
+		*orderBy = append(*orderBy, key)
 		for p.at(TComma) {
 			p.next()
 			key, err := p.parseOrderKey()
 			if err != nil {
-				return nil, err
+				return err
 			}
-			r.OrderBy = append(r.OrderBy, key)
+			*orderBy = append(*orderBy, key)
 		}
 	}
 	if p.kw("SKIP") {
 		p.next()
 		t, err := p.expect(TNumber, "number")
 		if err != nil {
-			return nil, err
+			return err
 		}
 		n, convErr := strconv.Atoi(t.Text)
 		if convErr != nil || n < 0 {
-			return nil, &Error{Line: t.Line, Col: t.Col, Msg: fmt.Sprintf("bad SKIP %q", t.Text)}
+			return &Error{Line: t.Line, Col: t.Col, Msg: fmt.Sprintf("bad SKIP %q", t.Text)}
 		}
-		r.Skip = n
+		*skip = n
 	}
 	if p.kw("LIMIT") {
 		p.next()
 		t, err := p.expect(TNumber, "number")
 		if err != nil {
-			return nil, err
+			return err
 		}
 		n, convErr := strconv.Atoi(t.Text)
 		if convErr != nil || n < 0 {
-			return nil, &Error{Line: t.Line, Col: t.Col, Msg: fmt.Sprintf("bad LIMIT %q", t.Text)}
+			return &Error{Line: t.Line, Col: t.Col, Msg: fmt.Sprintf("bad LIMIT %q", t.Text)}
 		}
-		r.Limit = n
+		*limit = n
 	}
-	return r, nil
+	return nil
 }
 
 // parsePath parses nodePat (edgePat nodePat)*. Edge forms, by first token:
@@ -698,18 +749,19 @@ func (p *parser) parseOperand() (Expr, error) {
 			return nil, err
 		}
 		return &Lit{Val: v, Line: t.Line, Col: t.Col}, nil
-	case t.Kind == TIdent: // var.prop
+	case t.Kind == TIdent: // var.prop, or a bare scalar variable (WITH alias)
 		p.next()
-		if _, err := p.expect(TDot, "\".\""); err != nil {
-			return nil, err
+		if !p.at(TDot) {
+			return &VarRef{Var: t.Text, Line: t.Line, Col: t.Col}, nil
 		}
+		p.next()
 		prop, err := p.expect(TIdent, "property name")
 		if err != nil {
 			return nil, err
 		}
 		return &PropRef{Var: t.Text, Name: prop.Text, Line: t.Line, Col: t.Col}, nil
 	}
-	return nil, p.errf("expected property reference or literal, got %s", describe(t))
+	return nil, p.errf("expected variable, property reference or literal, got %s", describe(t))
 }
 
 func (p *parser) parseListLit() (Expr, error) {
@@ -777,7 +829,9 @@ func (sc *scope) varlenErr(line, col int, v string) *Error {
 }
 
 // checkExpr reference-checks a WHERE-expression tree: every PropRef var is
-// declared, not a scalar, and not a variable-length edge binding.
+// declared, not a scalar, and not a variable-length edge binding. A VarRef
+// (bare operand, the WHERE-after-WITH extension) must name a declared
+// scalar — bare node/edge references are kind errors.
 func (sc *scope) checkExpr(e Expr) error {
 	switch x := e.(type) {
 	case *PropRef:
@@ -792,6 +846,15 @@ func (sc *scope) checkExpr(e Expr) error {
 			if ep := sc.edges[x.Var]; ep != nil && (ep.MinHops != 1 || ep.MaxHops != 1) {
 				return sc.varlenErr(x.Line, x.Col, x.Var)
 			}
+		}
+		return nil
+	case *VarRef:
+		k, ok := sc.kinds[x.Var]
+		if !ok {
+			return sc.undefinedErr(x.Line, x.Col, x.Var)
+		}
+		if k != kindScalar {
+			return &Error{x.Line, x.Col, fmt.Sprintf("variable %q is a node or edge; a bare variable reference requires a scalar (WITH/UNWIND projection)", x.Var)}
 		}
 		return nil
 	case *Binary:

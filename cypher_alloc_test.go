@@ -116,6 +116,62 @@ func TestCypherViewPathAllocs(t *testing.T) {
 	}
 }
 
+// TestCypherWithAllocs pins the WITH-stage allocation shapes on the same
+// layered fixture: the passthrough shape (one entity re-seed map + one vals
+// map + the result contract per row) and the aggregating shape (group
+// accumulation over the 33 expansion rows, then ONE output row). These are
+// NEW baselines for v0.13.0 T4 — they do not interact with the four
+// pre-refactor characterization shapes above.
+func TestCypherWithAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("alloc counts differ under -race")
+	}
+	g := cypherLayeredGraph(t, 50, 32)
+
+	// WITH passthrough: MATCH 33 rows -> WITH a, b.key AS k -> RETURN k.
+	// Measured 422 = 244 (the no-WITH twin's whole-query budget) + ~5 per
+	// row over 33 rows (the re-seeded node binding map pair for a, the vals
+	// map pair for k, and one NodeVal interface boxing on itemValue) + ~13
+	// parse/stage overhead (WITH items + trailer fields). Fenced with ~25%
+	// headroom per the house style for new baselines.
+	qWith := `MATCH (a {key:'0'})-[:CALLS]->(b) WITH a, b.key AS k RETURN k`
+	for i := 0; i < 3; i++ {
+		if _, err := g.Cypher(qWith); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n := testing.AllocsPerRun(100, func() {
+		if _, err := g.Cypher(qWith); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Logf("cypher WITH passthrough allocs/query = %.1f (fan 32)", n)
+	if n > 530 {
+		t.Fatalf("WITH passthrough allocs = %v, want <= 530", n)
+	}
+
+	// Aggregating WITH: 33 input rows collapse into ONE group (a is the
+	// single anchor), so the output side is one row; the input side pays
+	// the named-hop binding maps plus the per-row group machinery (key
+	// slice, encodeVal buffer + its string, NodeVal boxing) — measured 302.
+	// Fenced with ~25% headroom.
+	qAgg := `MATCH (a {key:'0'})-[:CALLS]->(b) WITH a, count(*) AS c RETURN c`
+	for i := 0; i < 3; i++ {
+		if _, err := g.Cypher(qAgg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nAgg := testing.AllocsPerRun(100, func() {
+		if _, err := g.Cypher(qAgg); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Logf("cypher WITH aggregate allocs/query = %.1f (fan 32)", nAgg)
+	if nAgg > 380 {
+		t.Fatalf("WITH aggregate allocs = %v, want <= 380", nAgg)
+	}
+}
+
 // TestCypherViewPathEquivalence guards the scratch reuse: the SAME query
 // must return identical results across runs, and match the graph's ground
 // truth. The degree-mixing shape matters — node 0 expands 33 out-rows and
