@@ -14,7 +14,9 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 const BASE = (process.env.VECTRA_URL ?? "http://127.0.0.1:8080").replace(/\/$/, "");
-const TOKEN = process.env.VECTRA_TOKEN ?? "";
+// .trim(): copy-pasted tokens often carry a trailing newline, which would
+// otherwise ride into the Authorization header as a guaranteed 401.
+const TOKEN = (process.env.VECTRA_TOKEN ?? "").trim();
 
 async function api<T = unknown>(path: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(`${BASE}${path}`, {

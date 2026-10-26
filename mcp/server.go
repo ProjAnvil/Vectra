@@ -566,9 +566,6 @@ func (svc *service) getNode(_ context.Context, _ *mcp.CallToolRequest, in struct
 	return nil, nodeOut{Key: n.Key, Label: n.Label, Props: n.Props}, nil
 }
 
-// parseDir maps the tool's direction argument; anything but the exact "in"
-// or "out" (or empty) is an error — silently answering out-neighbors for a
-// typo'd value would be a wrong answer handed to the agent.
 // errPropNotIndexed is the single raise for lookup_property's not-indexed
 // misses across the three typed lookups.
 var errPropNotIndexed = errors.New("property is not indexed (re-seal after it appears in injected data)")

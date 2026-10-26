@@ -16,16 +16,19 @@ import (
 
 // loadAuthTokens reads a bearer-token file: one token per line. Blank lines
 // (including the trailing newline) and CRLF endings are tolerated; surrounding
-// ASCII space/tab/\r is trimmed. A line with internal whitespace is rejected —
-// a token split by a copy-paste artifact must not become two silently
-// different credentials. At least one token is required.
+// ASCII space/tab/\r is trimmed; a leading UTF-8 BOM is stripped (editors
+// saving UTF-8-with-BOM would otherwise graft it onto the first token and
+// silently break credential matching). A line with internal whitespace is
+// rejected — a token split by a copy-paste artifact must not become two
+// silently different credentials. At least one token is required.
 func loadAuthTokens(path string) ([]string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("auth: read token file %s: %w", path, err)
 	}
+	content := strings.TrimPrefix(string(data), "\ufeff")
 	var tokens []string
-	for i, line := range strings.Split(string(data), "\n") {
+	for i, line := range strings.Split(content, "\n") {
 		line = strings.Trim(line, " \t\r")
 		if line == "" {
 			continue

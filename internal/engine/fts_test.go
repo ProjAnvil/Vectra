@@ -7,7 +7,7 @@ import (
 
 func TestBigrams(t *testing.T) {
 	// The 8-rule pipeline: lowercase, adjacent rune pairs r[i]r[i+1], no
-	// padding, deduped, sorted deterministically; <2 runes => nil.
+	// padding, dedup keeping first occurrence (no sort); <2 runes => nil.
 	tests := []struct {
 		name string
 		in   string

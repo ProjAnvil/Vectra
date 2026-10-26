@@ -16,7 +16,9 @@ class VectraError(RuntimeError):
 class Client:
     def __init__(self, base_url: str | None = None, timeout: float = 60.0):
         self.base_url = (base_url or os.environ.get("VECTRA_URL", "http://127.0.0.1:8080")).rstrip("/")
-        token = os.environ.get("VECTRA_TOKEN", "")
+        # .strip(): copy-pasted tokens often carry a trailing newline, which
+        # would otherwise ride into the Authorization header as a guaranteed 401.
+        token = os.environ.get("VECTRA_TOKEN", "").strip()
         self._http = httpx.Client(
             base_url=self.base_url,
             timeout=timeout,

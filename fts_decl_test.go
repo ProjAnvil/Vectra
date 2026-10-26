@@ -104,9 +104,9 @@ func TestIndexFullTextCoexistsWithTyped(t *testing.T) {
 }
 
 // (d) WAL durability: a session abandoned without Close (crash simulation)
-// replays the IndexDecl frame — the declaration is active on the reopened
-// graph and survives a subsequent Seal. The batched mixed declaration (typed
-// + FTS in one boundary) must ride ONE IndexDecl frame.
+// replays the declaration frame — both halves of the batched mixed
+// declaration (typed + FTS in one boundary) are active on the reopened
+// graph and survive a subsequent Seal.
 func TestIndexFullTextWALReplay(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "graph.db")
 	g, err := Open(db, Options{WALMode: ModeInterval})

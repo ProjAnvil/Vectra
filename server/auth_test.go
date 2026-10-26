@@ -56,6 +56,14 @@ func TestLoadAuthTokens(t *testing.T) {
 			want:    []string{"tok-1", "tok-2"},
 		},
 		{
+			// UTF-8-with-BOM editors put \ufeff on line 1; without the
+			// strip it becomes part of the first token and every request
+			// 401s against a file that looks perfectly valid.
+			name:    "UTF-8 BOM on line 1 is stripped",
+			content: "\ufefftok-1\ntok-2\n",
+			want:    []string{"tok-1", "tok-2"},
+		},
+		{
 			name:    "whitespace-only file",
 			content: " \n\t \n\r\n",
 			wantErr: "contains no tokens",

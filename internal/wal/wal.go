@@ -663,8 +663,11 @@ func (w *WAL) Sync() error {
 	return w.f.Sync()
 }
 
-// Frame is one replayed frame above the checkpoint watermark: exactly one of
-// Changeset / IndexKeys is set.
+// Frame is one replayed frame above the checkpoint watermark, in exactly one
+// of two families: a changeset frame sets Changeset (written as
+// frameChangeset or frameChangesetV2), an index-declaration frame sets
+// IndexKeys (frameIndexDecl) with VectorIndexes / FullTextKeys riding the
+// same payload.
 type Frame struct {
 	LSN       uint64
 	Changeset *Changeset // frameChangeset

@@ -1844,15 +1844,15 @@ func Open(path string, opts Options) (*Graph, error) {
 	// fresh or WAL-only recoveries leave no snapshot head at all, and — the
 	// v6 reason — a v0.11.1 binary ignores manifest v2's RetainFrom and
 	// would read a light-checkpointed library's base alone, silently
-	// missing the retained chain. Folding the recovered state into a v6
-	// watermark snapshot closes all three: old readers hard-fail on the
-	// version byte instead of misreading the layout. The gate is exact
-	// (snapVer==6 ⇒ nothing), so reopening a v6 library is write-free; v4
-	// AND v5 bases now migrate (v6 is a version-only bump over v5, so a
-	// v5-built library is byte-identical but for the stamp). The migration
-	// seal always takes the COMPACT tier (compactTier forces it on a
-	// non-v6 base), so the product is a real v6 snapshot, never a light
-	// rotation over a stale base. A failed seal fails Open — the library
+	// missing the retained chain. Folding the recovered state into a
+	// current-version watermark snapshot closes all three: old readers
+	// hard-fail on the version byte instead of misreading the layout. The
+	// gate is exact (snapVer==6 ⇒ nothing), so reopening a v6 library is
+	// write-free; v4 AND v5 bases now migrate (v6 is a version-only bump
+	// over v5, so a v5-built library is byte-identical but for the stamp).
+	// The migration seal always takes the COMPACT tier (compactTier forces
+	// it on a non-v6 base), so the product is a real current-version (v7)
+	// snapshot, never a light rotation over a stale base. A failed seal fails Open — the library
 	// must not pretend to be fine while its head stays
 	// downgrade-truncatable; recovery state survives either way
 	// (pre-manifest failures keep the WAL as the source of truth, a
@@ -2471,8 +2471,9 @@ func (g *Graph) closeForestRefresh() error {
 
 // Compact is the explicit compaction entry point (spec §6): fold every
 // unmerged layer into a fresh immutable base and — when a WAL is attached —
-// run the COMPACT checkpoint tier unconditionally (v6 watermark snapshot +
-// manifest + forest + WAL reset deleting the retained chain), whatever the
+// run the COMPACT checkpoint tier unconditionally (current-version (v7)
+// watermark snapshot + manifest + forest + WAL reset deleting the retained
+// chain), whatever the
 // retained volume: the caller asked for a full checkpoint, not a rotation.
 // Spec §3.1's "deep compaction renumbering" is absorbed by the merge itself:
 // folding already rebuilds node and edge IDs densely (R1). Seal differs only
@@ -2526,7 +2527,8 @@ var compactBytes = DefaultCompactBytes
 //     BOUNDARY: the LSN watermark is the only application gate, and moving it
 //     forward without a fresh base would silently drop every frame in
 //     between. The retained segment chain IS the increment.
-//   - compact: the full v0.11.1 pipeline — v6 watermark snapshot, manifest
+//   - compact: the full v0.11.1 pipeline — current-version (v7) watermark
+//     snapshot, manifest
 //     (v1-shaped: RetainFrom cleared, Format 2), forest cache, Reset (which
 //     deletes the retained chain), old-watermark cleanup.
 //
