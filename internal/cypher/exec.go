@@ -504,7 +504,12 @@ func (ex *executor) matchRows(m *MatchClause, base []row) ([]row, error) {
 // patterns: an earlier pattern that empties STOPS the clause — the
 // within-clause re-anchoring matchRows tolerates at the pipeline head
 // would restart later patterns from scratch and strand sub-rows that lost
-// the base row's bindings. The merge appends WITHOUT cross-row dedup
+// the base row's bindings.
+// Precondition: the caller discards base after the stage — kept-unchanged
+// rows ARE their base rows appended by value (binding maps shared, shared
+// flags NOT set), so retaining or mutating base alongside the returned
+// slice would alias one row under two owners.
+// The merge appends WITHOUT cross-row dedup
 // (duplicate base rows stay duplicated; within-pattern dedupRows runs per
 // base row inside the loop) and caps the merged output at maxRows
 // cumulatively. Kept-unchanged rows normalize pos to 0 (the
