@@ -24,6 +24,7 @@ func main() {
 	raftAddr := flag.String("raft", ":9000", "raft peer address")
 	dataDir := flag.String("data", "", "data directory (required: raft.db/snapshots/meta.json)")
 	join := flag.String("join", "", "seed node HTTP address (empty = single-node bootstrap; anti-split-brain: non-empty Join never bootstraps)")
+	authTokenFile := flag.String("auth-token-file", "", "file of bearer tokens, one per line (empty = auth disabled)")
 	sealInterval := flag.Duration("seal-interval", server.DefaultSealInterval, "publish throttle interval for large graphs")
 	flag.Parse()
 
@@ -33,12 +34,13 @@ func main() {
 	}
 
 	n, err := server.New(server.Config{
-		NodeID:       *id,
-		HTTPAddr:     *httpAddr,
-		RaftAddr:     *raftAddr,
-		DataDir:      *dataDir,
-		Join:         *join,
-		SealInterval: *sealInterval,
+		NodeID:        *id,
+		HTTPAddr:      *httpAddr,
+		RaftAddr:      *raftAddr,
+		DataDir:       *dataDir,
+		Join:          *join,
+		AuthTokenFile: *authTokenFile,
+		SealInterval:  *sealInterval,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

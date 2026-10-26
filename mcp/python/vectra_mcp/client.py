@@ -16,7 +16,12 @@ class VectraError(RuntimeError):
 class Client:
     def __init__(self, base_url: str | None = None, timeout: float = 60.0):
         self.base_url = (base_url or os.environ.get("VECTRA_URL", "http://127.0.0.1:8080")).rstrip("/")
-        self._http = httpx.Client(base_url=self.base_url, timeout=timeout)
+        token = os.environ.get("VECTRA_TOKEN", "")
+        self._http = httpx.Client(
+            base_url=self.base_url,
+            timeout=timeout,
+            headers={"Authorization": f"Bearer {token}"} if token else {},
+        )
 
     def _check(self, resp: httpx.Response) -> dict[str, Any]:
         if resp.status_code >= 400:

@@ -3,6 +3,7 @@
  * Vectra MCP server (TypeScript): wraps a running Vectra HTTP service.
  *
  * Target service: set VECTRA_URL (default http://127.0.0.1:8080).
+ * Auth: set VECTRA_TOKEN to send it as a bearer token (omit when auth is off).
  * Transport: stdio (local MCP hosts, e.g. Claude Desktop / Claude Code).
  *
  * The Go binary `vectra-mcp` embeds the engine directly; this is the
@@ -13,11 +14,16 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 const BASE = (process.env.VECTRA_URL ?? "http://127.0.0.1:8080").replace(/\/$/, "");
+const TOKEN = process.env.VECTRA_TOKEN ?? "";
 
 async function api<T = unknown>(path: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(`${BASE}${path}`, {
     ...init,
-    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+    headers: {
+      "Content-Type": "application/json",
+      ...(TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}),
+      ...(init?.headers ?? {}),
+    },
   });
   const text = await resp.text();
   if (!resp.ok) {
