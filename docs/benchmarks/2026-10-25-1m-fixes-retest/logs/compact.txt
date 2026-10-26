@@ -1,0 +1,100 @@
+=== stage compact (fix branch 9e23b7c) ===
+Sun Oct 25 22:14:30 CST 2026
+22:14  up 10 days,  2:37, 3 users, load averages: 3.78 3.11 2.35
+ %CPU      TIME COMM
+ 50.3   0:52.23 ZCode Helper (Renderer)
+ 40.6   0:02.22 Microsoft Edge Helper (Renderer)
+ 40.5 1578:56.03 WindowServer
+ 13.4   0:05.72 zcode-cli
+ 12.0   0:18.34 ZCode Helper
+ 10.2  50:17.36 com.adguard.mac.adguard.network-extension
+  7.1   0:00.03 (node)
+/dev/disk3s5   1.8Ti   1.4Ti   418Gi    78%     12M  4.4G    0%   /System/Volumes/Data
+--- quiet gate ---
+quiet gate passed at 22:18:23 (load=2.85 topcpu=42.4%)
+Sun Oct 25 22:18:23 CST 2026
+--- run ---
+=== RUN   TestVector1M
+    vector_1m_test.go:841: == C1: drain the chain library ==
+    vector_1m_test.go:842: open 6.913s, overlay-at-open=61855
+    vector_1m_test.go:844: [pre-compact drain] +30s overlay=55711 (initial 61855) window 204.4/s cumulative 204.4/s
+    vector_1m_test.go:844: [pre-compact drain] +1m0s overlay=55711 (initial 61855) window 0.0/s cumulative 102.2/s
+    vector_1m_test.go:844: [pre-compact drain] +1m30s overlay=55711 (initial 61855) window 0.0/s cumulative 68.1/s
+    vector_1m_test.go:844: [pre-compact drain] +2m0s overlay=47519 (initial 61855) window 272.5/s cumulative 119.2/s
+    vector_1m_test.go:844: [pre-compact drain] +2m30s overlay=33183 (initial 61855) window 476.4/s cumulative 190.7/s
+    vector_1m_test.go:844: [pre-compact drain] +3m0s overlay=22943 (initial 61855) window 340.2/s cumulative 215.7/s
+    vector_1m_test.go:844: [pre-compact drain] +3m31s overlay=22943 (initial 61855) window 0.0/s cumulative 184.8/s
+    vector_1m_test.go:844: [pre-compact drain] +4m1s overlay=22943 (initial 61855) window 0.0/s cumulative 161.7/s
+    vector_1m_test.go:844: [pre-compact drain] +4m31s overlay=22943 (initial 61855) window 0.0/s cumulative 143.7/s
+    vector_1m_test.go:844: [pre-compact drain] +5m1s overlay=22943 (initial 61855) window 0.0/s cumulative 129.4/s
+    vector_1m_test.go:844: [pre-compact drain] +5m31s overlay=22943 (initial 61855) window 0.0/s cumulative 117.6/s
+    vector_1m_test.go:844: [pre-compact drain] +6m1s overlay=22943 (initial 61855) window 0.0/s cumulative 107.8/s
+    vector_1m_test.go:844: [pre-compact drain] +6m31s overlay=22943 (initial 61855) window 0.0/s cumulative 99.5/s
+    vector_1m_test.go:844: [pre-compact drain] +7m1s overlay=22943 (initial 61855) window 0.0/s cumulative 92.4/s
+    vector_1m_test.go:844: [pre-compact drain] +7m31s overlay=22943 (initial 61855) window 0.0/s cumulative 86.3/s
+    vector_1m_test.go:844: [pre-compact drain] +8m1s overlay=22943 (initial 61855) window 0.0/s cumulative 80.9/s
+    vector_1m_test.go:844: [pre-compact drain] +8m31s overlay=22943 (initial 61855) window 0.0/s cumulative 76.1/s
+    vector_1m_test.go:844: [pre-compact drain] +9m1s overlay=22943 (initial 61855) window 0.0/s cumulative 71.9/s
+    vector_1m_test.go:844: [pre-compact drain] +9m31s overlay=22943 (initial 61855) window 0.0/s cumulative 68.1/s
+    vector_1m_test.go:844: [pre-compact drain] +10m1s overlay=22943 (initial 61855) window 0.0/s cumulative 64.7/s
+    vector_1m_test.go:844: [pre-compact drain] +10m31s overlay=22943 (initial 61855) window 0.0/s cumulative 61.6/s
+    vector_1m_test.go:844: [pre-compact drain] +11m1s overlay=22943 (initial 61855) window 0.0/s cumulative 58.8/s
+    vector_1m_test.go:844: [pre-compact drain] +11m32s overlay=22943 (initial 61855) window 0.0/s cumulative 56.3/s
+    vector_1m_test.go:844: [pre-compact drain] +12m2s overlay=22943 (initial 61855) window 0.0/s cumulative 53.9/s
+    vector_1m_test.go:844: [pre-compact drain] +12m32s overlay=22943 (initial 61855) window 0.0/s cumulative 51.8/s
+    vector_1m_test.go:844: [pre-compact drain] +13m2s overlay=22943 (initial 61855) window 0.0/s cumulative 49.8/s
+    vector_1m_test.go:844: [pre-compact drain] +13m32s overlay=22943 (initial 61855) window 0.0/s cumulative 47.9/s
+    vector_1m_test.go:844: [pre-compact drain] +14m2s overlay=22943 (initial 61855) window 0.0/s cumulative 46.2/s
+    vector_1m_test.go:844: [pre-compact drain] +14m32s overlay=22943 (initial 61855) window 0.0/s cumulative 44.6/s
+    vector_1m_test.go:844: [pre-compact drain] +15m2s overlay=22943 (initial 61855) window 0.0/s cumulative 43.1/s
+    vector_1m_test.go:844: [pre-compact drain] +15m32s overlay=22943 (initial 61855) window 0.0/s cumulative 41.8/s
+    vector_1m_test.go:844: [pre-compact drain] +16m2s overlay=22943 (initial 61855) window 0.0/s cumulative 40.4/s
+    vector_1m_test.go:844: [pre-compact drain] +16m32s overlay=22943 (initial 61855) window 0.0/s cumulative 39.2/s
+    vector_1m_test.go:844: [pre-compact drain] +17m2s overlay=22943 (initial 61855) window 0.0/s cumulative 38.1/s
+    vector_1m_test.go:844: [pre-compact drain] +17m32s overlay=22943 (initial 61855) window 0.0/s cumulative 37.0/s
+    vector_1m_test.go:844: [pre-compact drain] +18m2s overlay=22943 (initial 61855) window 0.0/s cumulative 36.0/s
+    vector_1m_test.go:844: [pre-compact drain] +18m32s overlay=22943 (initial 61855) window 0.0/s cumulative 35.0/s
+    vector_1m_test.go:844: [pre-compact drain] +19m3s overlay=22943 (initial 61855) window 0.0/s cumulative 34.1/s
+    vector_1m_test.go:844: [pre-compact drain] +19m33s overlay=22943 (initial 61855) window 0.0/s cumulative 33.2/s
+    vector_1m_test.go:844: [pre-compact drain] +20m3s overlay=22943 (initial 61855) window 0.0/s cumulative 32.4/s
+    vector_1m_test.go:844: [pre-compact drain] +20m33s overlay=22943 (initial 61855) window 0.0/s cumulative 31.6/s
+    vector_1m_test.go:844: [pre-compact drain] +21m3s overlay=22943 (initial 61855) window 0.0/s cumulative 30.8/s
+    vector_1m_test.go:844: [pre-compact drain] +21m33s overlay=22943 (initial 61855) window 0.0/s cumulative 30.1/s
+    vector_1m_test.go:844: [pre-compact drain] +22m3s overlay=22943 (initial 61855) window 0.0/s cumulative 29.4/s
+    vector_1m_test.go:844: [pre-compact drain] +22m33s overlay=22943 (initial 61855) window 0.0/s cumulative 28.8/s
+    vector_1m_test.go:844: [pre-compact drain] +23m3s overlay=22943 (initial 61855) window 0.0/s cumulative 28.1/s
+    vector_1m_test.go:844: [pre-compact drain] +23m34s overlay=22943 (initial 61855) window 0.0/s cumulative 27.5/s
+    vector_1m_test.go:844: [pre-compact drain] +24m4s overlay=22943 (initial 61855) window 0.0/s cumulative 27.0/s
+    vector_1m_test.go:844: [pre-compact drain] +24m34s overlay=22943 (initial 61855) window 0.0/s cumulative 26.4/s
+    vector_1m_test.go:844: [pre-compact drain] +25m4s overlay=22943 (initial 61855) window 0.0/s cumulative 25.9/s
+    vector_1m_test.go:844: [pre-compact drain] +25m34s overlay=22943 (initial 61855) window 0.0/s cumulative 25.4/s
+    vector_1m_test.go:844: [pre-compact drain] +26m4s overlay=22943 (initial 61855) window 0.0/s cumulative 24.9/s
+    vector_1m_test.go:844: [pre-compact drain] +26m34s overlay=22943 (initial 61855) window 0.0/s cumulative 24.4/s
+    vector_1m_test.go:844: [pre-compact drain] +27m4s overlay=22943 (initial 61855) window 0.0/s cumulative 24.0/s
+    vector_1m_test.go:844: [pre-compact drain] +27m34s overlay=22943 (initial 61855) window 0.0/s cumulative 23.5/s
+    vector_1m_test.go:844: [pre-compact drain] +28m4s overlay=22943 (initial 61855) window 0.0/s cumulative 23.1/s
+    vector_1m_test.go:844: [pre-compact drain] +28m35s overlay=22943 (initial 61855) window 0.0/s cumulative 22.7/s
+    vector_1m_test.go:844: [pre-compact drain] +29m5s overlay=14751 (initial 61855) window 272.0/s cumulative 27.0/s
+    vector_1m_test.go:844: [pre-compact drain] converged in 29m32.306s: overlay 61855 -> 415 (34.7/s cumulative)
+    vector_1m_test.go:850: == C2: bulk-volume to a compact seal (fresh forest, chain reset) ==
+    vector_1m_test.go:852: bulk: compact flight's snapshot landed while waiting (448MiB pushed, 14.093s)
+    vector_1m_test.go:853: C2 bulk: 6 light seals, 448MiB in 14.094s, then compact
+    vector_1m_test.go:869: C2 close: writer 32.808s tier=compact (v.vec 3302.9MB -> 3311.2MB)
+    vector_1m_test.go:871: manifest: snapshot=v-4193.db lsn=4193 segment=78 retainFrom=77 format=2
+    vector_1m_test.go:880: copied 7.35GB /tmp/vectra-1m -> /tmp/vectra-1m-cmp in 3.134s
+    vector_1m_test.go:881: == C3: compressed-state restart (pure forest load) ==
+    vector_1m_test.go:882: manifest: snapshot=v-4193.db lsn=4193 segment=78 retainFrom=77 format=2
+    vector_1m_test.go:883: open 8.231s, overlay-at-open=415
+    vector_1m_test.go:884: [forest-load drain] converged in 0s: overlay 415 -> 415 (0.0/s cumulative)
+    vector_1m_test.go:899: C3 RESULT (mode A): open=8.231s overlay-at-open=415 ready=0s | v.vec 3.23GB | bandwidth ~0.39GB/s (v.vec bytes / open wall)
+    vector_1m_test.go:341:   /tmp/vectra-1m-cmp/v-4193.db 4084.2MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-cmp/v.db.wal/manifest.json 0.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-cmp/v.db.wal/wal-77.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-cmp/v.db.wal/wal-78.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-cmp/v.db.wal/wal-79.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m-cmp/v.vec 3311.2MB
+    vector_1m_test.go:902: library total 7.41GB
+--- PASS: TestVector1M (1841.28s)
+PASS
+ok  	github.com/projanvil/vectra/bench	1842.169s
+stage compact exit=0

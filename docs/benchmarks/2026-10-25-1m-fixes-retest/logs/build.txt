@@ -1,0 +1,268 @@
+=== stage build (fix branch 9e23b7c) ===
+Sun Oct 25 11:23:48 CST 2026
+11:23  up 9 days, 15:47, 3 users, load averages: 6.84 5.73 4.66
+ %CPU      TIME COMM
+ 99.1   0:10.79 crema
+ 73.6 1746:16.43 sysmond
+ 45.3 1511:06.48 WindowServer
+ 22.7 116:30.42 ZCode Helper (Renderer)
+ 20.9 270:25.56 Code Helper
+ 15.0 209:05.59 Code Helper (Renderer)
+ 13.8  21:31.66 ZCode Helper
+/dev/disk3s5   1.8Ti   1.4Ti   424Gi    77%     12M  4.4G    0%   /System/Volumes/Data
+--- quiet gate ---
+quiet gate passed at 11:47:24 (load=2.01 topcpu=77.7%)
+Sun Oct 25 11:47:24 CST 2026
+--- run ---
+=== RUN   TestVector1M
+    vector_1m_test.go:420: env: GOVERSION=go1.27.2 GOMAXPROCS=18 NumCPU=18 GOGC="" n=1001471 cpBytes=64MiB dir=/tmp/vectra-1m
+    vector_1m_test.go:425: fixture: 1001471 x 768 vectors generated in 3.865s
+    vector_1m_test.go:455: reference State build started concurrently (single-threaded HNSW, same protocol as the 100k gate)
+    vector_1m_test.go:461: ingest: 1001471 vectors accepted in 46.668s = 21459/s (submit p50=6.143125ms max=11.70378775s)
+    vector_1m_test.go:463:   seal[0] compact at submit 195: wal 156035656 -> 804307, stall 39ms
+    vector_1m_test.go:463:   seal[1] light at submit 279: wal 67561788 -> 804307, stall 22ms
+    vector_1m_test.go:463:   seal[2] light at submit 363: wal 67561788 -> 804307, stall 25ms
+    vector_1m_test.go:463:   seal[3] compact at submit 2035: wal 1344801304 -> 804307, stall 191ms
+    vector_1m_test.go:463:   seal[4] light at submit 2119: wal 67561788 -> 804307, stall 182ms
+    vector_1m_test.go:463:   seal[5] light at submit 2203: wal 67561788 -> 804307, stall 184ms
+    vector_1m_test.go:463:   seal[6] light at submit 2287: wal 67561788 -> 804307, stall 337ms
+    vector_1m_test.go:262:   light seals: n=5 stall p50=181.697125ms max=336.600625ms (submit median 6.143125ms)
+    vector_1m_test.go:262:   compact seals: n=2 stall p50=190.566542ms max=190.566542ms (submit median 6.143125ms)
+    vector_1m_test.go:465: [build drain] +1m0s overlay=972799 (initial 987135) window 237.0/s cumulative 237.0/s
+    vector_1m_test.go:465: [build drain] +2m1s overlay=970751 (initial 987135) window 34.0/s cumulative 135.7/s
+    vector_1m_test.go:465: [build drain] +3m1s overlay=970751 (initial 987135) window 0.0/s cumulative 90.6/s
+    vector_1m_test.go:465: [build drain] +4m1s overlay=954367 (initial 987135) window 272.1/s cumulative 135.9/s
+    vector_1m_test.go:465: [build drain] +5m1s overlay=940031 (initial 987135) window 238.3/s cumulative 156.3/s
+    vector_1m_test.go:465: [build drain] +6m1s overlay=937983 (initial 987135) window 34.1/s cumulative 136.0/s
+    vector_1m_test.go:465: [build drain] +7m2s overlay=937983 (initial 987135) window 0.0/s cumulative 116.6/s
+    vector_1m_test.go:465: [build drain] +8m2s overlay=933887 (initial 987135) window 68.1/s cumulative 110.6/s
+    vector_1m_test.go:465: [build drain] +9m2s overlay=921599 (initial 987135) window 204.4/s cumulative 121.0/s
+    vector_1m_test.go:465: [build drain] +10m2s overlay=913407 (initial 987135) window 136.3/s cumulative 122.5/s
+    vector_1m_test.go:465: [build drain] +11m2s overlay=905215 (initial 987135) window 136.3/s cumulative 123.8/s
+    vector_1m_test.go:465: [build drain] +12m2s overlay=905215 (initial 987135) window 0.0/s cumulative 113.5/s
+    vector_1m_test.go:465: [build drain] +13m2s overlay=899071 (initial 987135) window 102.2/s cumulative 112.6/s
+    vector_1m_test.go:465: [build drain] +14m2s overlay=886783 (initial 987135) window 204.4/s cumulative 119.1/s
+    vector_1m_test.go:465: [build drain] +15m2s overlay=872447 (initial 987135) window 238.2/s cumulative 127.1/s
+    vector_1m_test.go:465: [build drain] +16m3s overlay=872447 (initial 987135) window 0.0/s cumulative 119.1/s
+    vector_1m_test.go:465: [build drain] +17m3s overlay=872447 (initial 987135) window 0.0/s cumulative 112.1/s
+    vector_1m_test.go:465: [build drain] +18m3s overlay=872447 (initial 987135) window 0.0/s cumulative 105.9/s
+    vector_1m_test.go:465: [build drain] +19m3s overlay=872447 (initial 987135) window 0.0/s cumulative 100.3/s
+    vector_1m_test.go:465: [build drain] +20m3s overlay=872447 (initial 987135) window 0.0/s cumulative 95.3/s
+    vector_1m_test.go:465: [build drain] +21m3s overlay=872447 (initial 987135) window 0.0/s cumulative 90.8/s
+    vector_1m_test.go:465: [build drain] +22m3s overlay=872447 (initial 987135) window 0.0/s cumulative 86.7/s
+    vector_1m_test.go:465: [build drain] +23m4s overlay=872447 (initial 987135) window 0.0/s cumulative 82.9/s
+    vector_1m_test.go:465: [build drain] +24m4s overlay=872447 (initial 987135) window 0.0/s cumulative 79.4/s
+    vector_1m_test.go:465: [build drain] +25m4s overlay=872447 (initial 987135) window 0.0/s cumulative 76.3/s
+    vector_1m_test.go:465: [build drain] +26m4s overlay=864255 (initial 987135) window 136.0/s cumulative 78.6/s
+    vector_1m_test.go:465: [build drain] +27m4s overlay=847871 (initial 987135) window 272.1/s cumulative 85.7/s
+    vector_1m_test.go:465: [build drain] +28m5s overlay=839679 (initial 987135) window 136.1/s cumulative 87.5/s
+    vector_1m_test.go:465: [build drain] +29m5s overlay=839679 (initial 987135) window 0.0/s cumulative 84.5/s
+    vector_1m_test.go:465: [build drain] +30m5s overlay=831487 (initial 987135) window 136.0/s cumulative 86.2/s
+    vector_1m_test.go:465: [build drain] +31m5s overlay=815103 (initial 987135) window 272.1/s cumulative 92.2/s
+    vector_1m_test.go:465: [build drain] +32m6s overlay=806911 (initial 987135) window 136.1/s cumulative 93.6/s
+    vector_1m_test.go:465: [build drain] +33m6s overlay=806911 (initial 987135) window 0.0/s cumulative 90.8/s
+    vector_1m_test.go:465: [build drain] +34m6s overlay=798719 (initial 987135) window 136.3/s cumulative 92.1/s
+    vector_1m_test.go:465: [build drain] +35m6s overlay=782335 (initial 987135) window 272.5/s cumulative 97.3/s
+    vector_1m_test.go:465: [build drain] +36m6s overlay=774143 (initial 987135) window 136.3/s cumulative 98.3/s
+    vector_1m_test.go:465: [build drain] +37m6s overlay=774143 (initial 987135) window 0.0/s cumulative 95.7/s
+    vector_1m_test.go:465: [build drain] +38m6s overlay=765951 (initial 987135) window 136.2/s cumulative 96.7/s
+    vector_1m_test.go:465: [build drain] +39m7s overlay=749567 (initial 987135) window 272.0/s cumulative 101.2/s
+    vector_1m_test.go:465: [build drain] +40m7s overlay=741375 (initial 987135) window 136.0/s cumulative 102.1/s
+    vector_1m_test.go:465: [build drain] +41m7s overlay=741375 (initial 987135) window 0.0/s cumulative 99.6/s
+    vector_1m_test.go:465: [build drain] +42m7s overlay=741375 (initial 987135) window 0.0/s cumulative 97.2/s
+    vector_1m_test.go:465: [build drain] +43m7s overlay=741375 (initial 987135) window 0.0/s cumulative 95.0/s
+    vector_1m_test.go:465: [build drain] +44m8s overlay=741375 (initial 987135) window 0.0/s cumulative 92.8/s
+    vector_1m_test.go:465: [build drain] +45m8s overlay=741375 (initial 987135) window 0.0/s cumulative 90.8/s
+    vector_1m_test.go:465: [build drain] +46m8s overlay=741375 (initial 987135) window 0.0/s cumulative 88.8/s
+    vector_1m_test.go:465: [build drain] +47m8s overlay=741375 (initial 987135) window 0.0/s cumulative 86.9/s
+    vector_1m_test.go:465: [build drain] +48m8s overlay=741375 (initial 987135) window 0.0/s cumulative 85.1/s
+    vector_1m_test.go:465: [build drain] +49m9s overlay=741375 (initial 987135) window 0.0/s cumulative 83.3/s
+    vector_1m_test.go:465: [build drain] +50m9s overlay=733183 (initial 987135) window 136.2/s cumulative 84.4/s
+    vector_1m_test.go:465: [build drain] +51m9s overlay=716799 (initial 987135) window 272.5/s cumulative 88.1/s
+    vector_1m_test.go:465: [build drain] +52m9s overlay=708607 (initial 987135) window 136.3/s cumulative 89.0/s
+    vector_1m_test.go:465: [build drain] +53m9s overlay=708607 (initial 987135) window 0.0/s cumulative 87.3/s
+    vector_1m_test.go:465: [build drain] +54m9s overlay=700415 (initial 987135) window 136.3/s cumulative 88.2/s
+    vector_1m_test.go:465: [build drain] +55m9s overlay=684031 (initial 987135) window 272.3/s cumulative 91.6/s
+    vector_1m_test.go:465: [build drain] +56m10s overlay=675839 (initial 987135) window 136.0/s cumulative 92.4/s
+    vector_1m_test.go:465: [build drain] +57m10s overlay=675839 (initial 987135) window 0.0/s cumulative 90.8/s
+    vector_1m_test.go:465: [build drain] +58m10s overlay=665599 (initial 987135) window 170.1/s cumulative 92.1/s
+    vector_1m_test.go:465: [build drain] +59m10s overlay=651263 (initial 987135) window 238.1/s cumulative 94.6/s
+    vector_1m_test.go:465: [build drain] +1h0m11s overlay=643071 (initial 987135) window 136.0/s cumulative 95.3/s
+    vector_1m_test.go:465: [build drain] +1h1m11s overlay=643071 (initial 987135) window 0.0/s cumulative 93.7/s
+    vector_1m_test.go:465: [build drain] +1h2m11s overlay=632831 (initial 987135) window 170.0/s cumulative 95.0/s
+    vector_1m_test.go:465: [build drain] +1h3m11s overlay=618495 (initial 987135) window 238.1/s cumulative 97.2/s
+    vector_1m_test.go:465: [build drain] +1h4m11s overlay=610303 (initial 987135) window 136.0/s cumulative 97.8/s
+    vector_1m_test.go:465: [build drain] +1h5m12s overlay=610303 (initial 987135) window 0.0/s cumulative 96.3/s
+    vector_1m_test.go:465: [build drain] +1h6m12s overlay=610303 (initial 987135) window 0.0/s cumulative 94.9/s
+    vector_1m_test.go:465: [build drain] +1h7m12s overlay=610303 (initial 987135) window 0.0/s cumulative 93.5/s
+    vector_1m_test.go:465: [build drain] +1h8m12s overlay=610303 (initial 987135) window 0.0/s cumulative 92.1/s
+    vector_1m_test.go:465: [build drain] +1h9m13s overlay=610303 (initial 987135) window 0.0/s cumulative 90.7/s
+    vector_1m_test.go:465: [build drain] +1h10m13s overlay=610303 (initial 987135) window 0.0/s cumulative 89.4/s
+    vector_1m_test.go:465: [build drain] +1h11m13s overlay=610303 (initial 987135) window 0.0/s cumulative 88.2/s
+    vector_1m_test.go:465: [build drain] +1h12m13s overlay=610303 (initial 987135) window 0.0/s cumulative 87.0/s
+    vector_1m_test.go:465: [build drain] +1h13m13s overlay=610303 (initial 987135) window 0.0/s cumulative 85.8/s
+    vector_1m_test.go:465: [build drain] +1h14m14s overlay=593919 (initial 987135) window 272.1/s cumulative 88.3/s
+    vector_1m_test.go:465: [build drain] +1h15m14s overlay=581631 (initial 987135) window 204.0/s cumulative 89.8/s
+    vector_1m_test.go:465: [build drain] +1h16m14s overlay=577535 (initial 987135) window 68.0/s cumulative 89.5/s
+    vector_1m_test.go:465: [build drain] +1h17m14s overlay=577535 (initial 987135) window 0.0/s cumulative 88.4/s
+    vector_1m_test.go:465: [build drain] +1h18m15s overlay=561151 (initial 987135) window 272.1/s cumulative 90.7/s
+    vector_1m_test.go:465: [build drain] +1h19m15s overlay=544767 (initial 987135) window 272.1/s cumulative 93.0/s
+    vector_1m_test.go:465: [build drain] +1h20m15s overlay=544767 (initial 987135) window 0.0/s cumulative 91.9/s
+    vector_1m_test.go:465: [build drain] +1h21m15s overlay=544767 (initial 987135) window 0.0/s cumulative 90.7/s
+    vector_1m_test.go:465: [build drain] +1h22m15s overlay=534527 (initial 987135) window 170.3/s cumulative 91.7/s
+    vector_1m_test.go:465: [build drain] +1h23m15s overlay=520191 (initial 987135) window 238.5/s cumulative 93.5/s
+    vector_1m_test.go:465: [build drain] +1h24m15s overlay=511999 (initial 987135) window 136.3/s cumulative 94.0/s
+    vector_1m_test.go:465: [build drain] +1h25m16s overlay=511999 (initial 987135) window 0.0/s cumulative 92.9/s
+    vector_1m_test.go:465: [build drain] +1h26m16s overlay=503807 (initial 987135) window 136.0/s cumulative 93.4/s
+    vector_1m_test.go:465: [build drain] +1h27m16s overlay=487423 (initial 987135) window 272.1/s cumulative 95.4/s
+    vector_1m_test.go:465: [build drain] +1h28m16s overlay=479231 (initial 987135) window 136.0/s cumulative 95.9/s
+    vector_1m_test.go:465: [build drain] +1h29m17s overlay=479231 (initial 987135) window 0.0/s cumulative 94.8/s
+    vector_1m_test.go:465: [build drain] +1h30m17s overlay=479231 (initial 987135) window 0.0/s cumulative 93.8/s
+    vector_1m_test.go:465: [build drain] +1h31m17s overlay=479231 (initial 987135) window 0.0/s cumulative 92.7/s
+    vector_1m_test.go:465: [build drain] +1h32m17s overlay=479231 (initial 987135) window 0.0/s cumulative 91.7/s
+    vector_1m_test.go:465: [build drain] +1h33m17s overlay=479231 (initial 987135) window 0.0/s cumulative 90.7/s
+    vector_1m_test.go:465: [build drain] +1h34m18s overlay=479231 (initial 987135) window 0.0/s cumulative 89.8/s
+    vector_1m_test.go:465: [build drain] +1h35m18s overlay=479231 (initial 987135) window 0.0/s cumulative 88.8/s
+    vector_1m_test.go:465: [build drain] +1h36m18s overlay=479231 (initial 987135) window 0.0/s cumulative 87.9/s
+    vector_1m_test.go:465: [build drain] +1h37m18s overlay=479231 (initial 987135) window 0.0/s cumulative 87.0/s
+    vector_1m_test.go:465: [build drain] +1h38m18s overlay=479231 (initial 987135) window 0.0/s cumulative 86.1/s
+    vector_1m_test.go:465: [build drain] +1h39m19s overlay=479231 (initial 987135) window 0.0/s cumulative 85.2/s
+    vector_1m_test.go:465: [build drain] +1h40m19s overlay=479231 (initial 987135) window 0.0/s cumulative 84.4/s
+    vector_1m_test.go:465: [build drain] +1h41m19s overlay=479231 (initial 987135) window 0.0/s cumulative 83.5/s
+    vector_1m_test.go:465: [build drain] +1h42m19s overlay=479231 (initial 987135) window 0.0/s cumulative 82.7/s
+    vector_1m_test.go:465: [build drain] +1h43m20s overlay=479231 (initial 987135) window 0.0/s cumulative 81.9/s
+    vector_1m_test.go:465: [build drain] +1h44m20s overlay=479231 (initial 987135) window 0.0/s cumulative 81.1/s
+    vector_1m_test.go:465: [build drain] +1h45m20s overlay=479231 (initial 987135) window 0.0/s cumulative 80.4/s
+    vector_1m_test.go:465: [build drain] +1h46m20s overlay=479231 (initial 987135) window 0.0/s cumulative 79.6/s
+    vector_1m_test.go:465: [build drain] +1h47m20s overlay=479231 (initial 987135) window 0.0/s cumulative 78.9/s
+    vector_1m_test.go:465: [build drain] +1h48m21s overlay=479231 (initial 987135) window 0.0/s cumulative 78.1/s
+    vector_1m_test.go:465: [build drain] +1h49m21s overlay=479231 (initial 987135) window 0.0/s cumulative 77.4/s
+    vector_1m_test.go:465: [build drain] +1h50m21s overlay=479231 (initial 987135) window 0.0/s cumulative 76.7/s
+    vector_1m_test.go:465: [build drain] +1h51m21s overlay=479231 (initial 987135) window 0.0/s cumulative 76.0/s
+    vector_1m_test.go:465: [build drain] +1h52m21s overlay=479231 (initial 987135) window 0.0/s cumulative 75.3/s
+    vector_1m_test.go:465: [build drain] +1h53m22s overlay=479231 (initial 987135) window 0.0/s cumulative 74.7/s
+    vector_1m_test.go:465: [build drain] +1h54m22s overlay=479231 (initial 987135) window 0.0/s cumulative 74.0/s
+    vector_1m_test.go:465: [build drain] +1h55m22s overlay=479231 (initial 987135) window 0.0/s cumulative 73.4/s
+    vector_1m_test.go:465: [build drain] +1h56m22s overlay=479231 (initial 987135) window 0.0/s cumulative 72.7/s
+    vector_1m_test.go:465: [build drain] +1h57m22s overlay=479231 (initial 987135) window 0.0/s cumulative 72.1/s
+    vector_1m_test.go:465: [build drain] +1h58m23s overlay=479231 (initial 987135) window 0.0/s cumulative 71.5/s
+    vector_1m_test.go:465: [build drain] +1h59m23s overlay=479231 (initial 987135) window 0.0/s cumulative 70.9/s
+    vector_1m_test.go:465: [build drain] +2h0m23s overlay=479231 (initial 987135) window 0.0/s cumulative 70.3/s
+    vector_1m_test.go:465: [build drain] +2h1m23s overlay=479231 (initial 987135) window 0.0/s cumulative 69.7/s
+    vector_1m_test.go:465: [build drain] +2h2m23s overlay=479231 (initial 987135) window 0.0/s cumulative 69.2/s
+    vector_1m_test.go:465: [build drain] +2h3m24s overlay=479231 (initial 987135) window 0.0/s cumulative 68.6/s
+    vector_1m_test.go:465: [build drain] +2h4m24s overlay=479231 (initial 987135) window 0.0/s cumulative 68.0/s
+    vector_1m_test.go:465: [build drain] +2h5m24s overlay=479231 (initial 987135) window 0.0/s cumulative 67.5/s
+    vector_1m_test.go:465: [build drain] +2h6m24s overlay=479231 (initial 987135) window 0.0/s cumulative 67.0/s
+    vector_1m_test.go:465: [build drain] +2h7m24s overlay=479231 (initial 987135) window 0.0/s cumulative 66.4/s
+    vector_1m_test.go:465: [build drain] +2h8m25s overlay=475135 (initial 987135) window 68.0/s cumulative 66.5/s
+    vector_1m_test.go:465: [build drain] +2h9m25s overlay=462847 (initial 987135) window 204.1/s cumulative 67.5/s
+    vector_1m_test.go:465: [build drain] +2h10m25s overlay=446463 (initial 987135) window 272.1/s cumulative 69.1/s
+    vector_1m_test.go:465: [build drain] +2h11m25s overlay=446463 (initial 987135) window 0.0/s cumulative 68.6/s
+    vector_1m_test.go:465: [build drain] +2h12m26s overlay=444415 (initial 987135) window 34.0/s cumulative 68.3/s
+    vector_1m_test.go:465: [build drain] +2h13m26s overlay=430079 (initial 987135) window 238.0/s cumulative 69.6/s
+    vector_1m_test.go:465: [build drain] +2h14m26s overlay=413695 (initial 987135) window 272.1/s cumulative 71.1/s
+    vector_1m_test.go:465: [build drain] +2h15m26s overlay=413695 (initial 987135) window 0.0/s cumulative 70.6/s
+    vector_1m_test.go:465: [build drain] +2h16m26s overlay=411647 (initial 987135) window 34.0/s cumulative 70.3/s
+    vector_1m_test.go:465: [build drain] +2h17m27s overlay=397311 (initial 987135) window 238.1/s cumulative 71.5/s
+    vector_1m_test.go:465: [build drain] +2h18m27s overlay=380927 (initial 987135) window 272.1/s cumulative 73.0/s
+    vector_1m_test.go:465: [build drain] +2h19m27s overlay=380927 (initial 987135) window 0.0/s cumulative 72.5/s
+    vector_1m_test.go:465: [build drain] +2h20m27s overlay=378879 (initial 987135) window 34.0/s cumulative 72.2/s
+    vector_1m_test.go:465: [build drain] +2h21m27s overlay=364543 (initial 987135) window 238.1/s cumulative 73.4/s
+    vector_1m_test.go:465: [build drain] +2h22m28s overlay=348159 (initial 987135) window 272.1/s cumulative 74.8/s
+    vector_1m_test.go:465: [build drain] +2h23m28s overlay=348159 (initial 987135) window 0.0/s cumulative 74.2/s
+    vector_1m_test.go:465: [build drain] +2h24m28s overlay=348159 (initial 987135) window 0.0/s cumulative 73.7/s
+    vector_1m_test.go:465: [build drain] +2h25m28s overlay=348159 (initial 987135) window 0.0/s cumulative 73.2/s
+    vector_1m_test.go:465: [build drain] +2h26m29s overlay=348159 (initial 987135) window 0.0/s cumulative 72.7/s
+    vector_1m_test.go:465: [build drain] +2h27m29s overlay=348159 (initial 987135) window 0.0/s cumulative 72.2/s
+    vector_1m_test.go:465: [build drain] +2h28m29s overlay=348159 (initial 987135) window 0.0/s cumulative 71.7/s
+    vector_1m_test.go:465: [build drain] +2h29m29s overlay=348159 (initial 987135) window 0.0/s cumulative 71.2/s
+    vector_1m_test.go:465: [build drain] +2h30m29s overlay=348159 (initial 987135) window 0.0/s cumulative 70.8/s
+    vector_1m_test.go:465: [build drain] +2h31m30s overlay=348159 (initial 987135) window 0.0/s cumulative 70.3/s
+    vector_1m_test.go:465: [build drain] +2h32m30s overlay=348159 (initial 987135) window 0.0/s cumulative 69.8/s
+    vector_1m_test.go:465: [build drain] +2h33m30s overlay=335871 (initial 987135) window 204.1/s cumulative 70.7/s
+    vector_1m_test.go:465: [build drain] +2h34m30s overlay=323583 (initial 987135) window 204.0/s cumulative 71.6/s
+    vector_1m_test.go:465: [build drain] +2h35m31s overlay=315391 (initial 987135) window 136.1/s cumulative 72.0/s
+    vector_1m_test.go:465: [build drain] +2h36m31s overlay=315391 (initial 987135) window 0.0/s cumulative 71.5/s
+    vector_1m_test.go:465: [build drain] +2h37m31s overlay=307199 (initial 987135) window 136.0/s cumulative 71.9/s
+    vector_1m_test.go:465: [build drain] +2h38m31s overlay=290815 (initial 987135) window 272.0/s cumulative 73.2/s
+    vector_1m_test.go:465: [build drain] +2h39m31s overlay=282623 (initial 987135) window 136.1/s cumulative 73.6/s
+    vector_1m_test.go:465: [build drain] +2h40m32s overlay=282623 (initial 987135) window 0.0/s cumulative 73.1/s
+    vector_1m_test.go:465: [build drain] +2h41m32s overlay=274431 (initial 987135) window 136.3/s cumulative 73.5/s
+    vector_1m_test.go:465: [build drain] +2h42m32s overlay=264191 (initial 987135) window 170.4/s cumulative 74.1/s
+    vector_1m_test.go:465: [build drain] +2h43m32s overlay=249855 (initial 987135) window 238.5/s cumulative 75.1/s
+    vector_1m_test.go:465: [build drain] +2h44m32s overlay=249855 (initial 987135) window 0.0/s cumulative 74.7/s
+    vector_1m_test.go:465: [build drain] +2h45m32s overlay=247807 (initial 987135) window 34.1/s cumulative 74.4/s
+    vector_1m_test.go:465: [build drain] +2h46m32s overlay=233471 (initial 987135) window 238.5/s cumulative 75.4/s
+    vector_1m_test.go:465: [build drain] +2h47m32s overlay=217087 (initial 987135) window 272.6/s cumulative 76.6/s
+    vector_1m_test.go:465: [build drain] +2h48m32s overlay=217087 (initial 987135) window 0.0/s cumulative 76.1/s
+    vector_1m_test.go:465: [build drain] +2h49m33s overlay=217087 (initial 987135) window 0.0/s cumulative 75.7/s
+    vector_1m_test.go:465: [build drain] +2h50m33s overlay=217087 (initial 987135) window 0.0/s cumulative 75.3/s
+    vector_1m_test.go:465: [build drain] +2h51m33s overlay=217087 (initial 987135) window 0.0/s cumulative 74.8/s
+    vector_1m_test.go:465: [build drain] +2h52m33s overlay=217087 (initial 987135) window 0.0/s cumulative 74.4/s
+    vector_1m_test.go:465: [build drain] +2h53m33s overlay=217087 (initial 987135) window 0.0/s cumulative 74.0/s
+    vector_1m_test.go:465: [build drain] +2h54m33s overlay=217087 (initial 987135) window 0.0/s cumulative 73.5/s
+    vector_1m_test.go:465: [build drain] +2h55m33s overlay=217087 (initial 987135) window 0.0/s cumulative 73.1/s
+    vector_1m_test.go:465: [build drain] +2h56m33s overlay=217087 (initial 987135) window 0.0/s cumulative 72.7/s
+    vector_1m_test.go:465: [build drain] +2h57m33s overlay=217087 (initial 987135) window 0.0/s cumulative 72.3/s
+    vector_1m_test.go:465: [build drain] +2h58m34s overlay=202751 (initial 987135) window 238.5/s cumulative 73.2/s
+    vector_1m_test.go:465: [build drain] +2h59m34s overlay=192511 (initial 987135) window 170.4/s cumulative 73.8/s
+    vector_1m_test.go:465: [build drain] +3h0m34s overlay=184319 (initial 987135) window 136.3/s cumulative 74.1/s
+    vector_1m_test.go:465: [build drain] +3h1m34s overlay=184319 (initial 987135) window 0.0/s cumulative 73.7/s
+    vector_1m_test.go:465: [build drain] +3h2m34s overlay=176127 (initial 987135) window 136.3/s cumulative 74.0/s
+    vector_1m_test.go:465: [build drain] +3h3m34s overlay=159743 (initial 987135) window 272.6/s cumulative 75.1/s
+    vector_1m_test.go:465: [build drain] +3h4m34s overlay=151551 (initial 987135) window 136.3/s cumulative 75.5/s
+    vector_1m_test.go:465: [build drain] +3h5m34s overlay=151551 (initial 987135) window 0.0/s cumulative 75.0/s
+    vector_1m_test.go:465: [build drain] +3h6m34s overlay=139263 (initial 987135) window 204.4/s cumulative 75.7/s
+    vector_1m_test.go:465: [build drain] +3h7m35s overlay=126975 (initial 987135) window 204.4/s cumulative 76.4/s
+    vector_1m_test.go:465: [build drain] +3h8m35s overlay=118783 (initial 987135) window 136.3/s cumulative 76.7/s
+    vector_1m_test.go:465: [build drain] +3h9m35s overlay=118783 (initial 987135) window 0.0/s cumulative 76.3/s
+    vector_1m_test.go:465: [build drain] +3h10m35s overlay=110591 (initial 987135) window 136.3/s cumulative 76.7/s
+    vector_1m_test.go:465: [build drain] +3h11m35s overlay=102399 (initial 987135) window 136.3/s cumulative 77.0/s
+    vector_1m_test.go:465: [build drain] +3h12m35s overlay=86015 (initial 987135) window 272.6/s cumulative 78.0/s
+    vector_1m_test.go:465: [build drain] +3h13m35s overlay=86015 (initial 987135) window 0.0/s cumulative 77.6/s
+    vector_1m_test.go:465: [build drain] +3h14m35s overlay=86015 (initial 987135) window 0.0/s cumulative 77.2/s
+    vector_1m_test.go:465: [build drain] +3h15m35s overlay=86015 (initial 987135) window 0.0/s cumulative 76.8/s
+    vector_1m_test.go:465: [build drain] +3h16m36s overlay=86015 (initial 987135) window 0.0/s cumulative 76.4/s
+    vector_1m_test.go:465: [build drain] +3h17m36s overlay=86015 (initial 987135) window 0.0/s cumulative 76.0/s
+    vector_1m_test.go:465: [build drain] +3h18m36s overlay=86015 (initial 987135) window 0.0/s cumulative 75.6/s
+    vector_1m_test.go:465: [build drain] +3h19m36s overlay=86015 (initial 987135) window 0.0/s cumulative 75.2/s
+    vector_1m_test.go:465: [build drain] +3h20m36s overlay=86015 (initial 987135) window 0.0/s cumulative 74.9/s
+    vector_1m_test.go:465: [build drain] +3h21m36s overlay=86015 (initial 987135) window 0.0/s cumulative 74.5/s
+    vector_1m_test.go:465: [build drain] +3h22m36s overlay=86015 (initial 987135) window 0.0/s cumulative 74.1/s
+    vector_1m_test.go:465: [build drain] +3h23m36s overlay=86015 (initial 987135) window 0.0/s cumulative 73.8/s
+    vector_1m_test.go:465: [build drain] +3h24m36s overlay=79871 (initial 987135) window 102.2/s cumulative 73.9/s
+    vector_1m_test.go:465: [build drain] +3h25m36s overlay=69631 (initial 987135) window 170.4/s cumulative 74.4/s
+    vector_1m_test.go:465: [build drain] +3h26m37s overlay=53247 (initial 987135) window 272.5/s cumulative 75.3/s
+    vector_1m_test.go:465: [build drain] +3h27m37s overlay=53247 (initial 987135) window 0.0/s cumulative 75.0/s
+    vector_1m_test.go:465: [build drain] +3h28m37s overlay=45055 (initial 987135) window 136.3/s cumulative 75.3/s
+    vector_1m_test.go:465: [build drain] +3h29m37s overlay=28671 (initial 987135) window 272.6/s cumulative 76.2/s
+    vector_1m_test.go:465: [build drain] +3h30m37s overlay=20479 (initial 987135) window 136.3/s cumulative 76.5/s
+    vector_1m_test.go:465: [build drain] +3h31m37s overlay=20479 (initial 987135) window 0.0/s cumulative 76.1/s
+    vector_1m_test.go:465: [build drain] +3h32m37s overlay=6143 (initial 987135) window 238.5/s cumulative 76.9/s
+    vector_1m_test.go:465: [build drain] converged in 3h33m1.337s: overlay 987135 -> 2047 (77.1/s cumulative)
+    vector_1m_test.go:466: build totals: ingest=46.668s drain=3h33m1.337s (initial overlay at drain start 987135)
+    vector_1m_test.go:469: reference State built in 3h33m48.006s (concurrent with the graph lane)
+    vector_1m_test.go:473: converged: tail=2047 (full tail by construction)
+    vector_1m_test.go:526: truth: 50 x top-10 of 1001471 computed untimed in 37.14s
+    vector_1m_test.go:570: ef=32 FULL-TAIL: recall@10=0.9480 | graph p50=6.357875ms p99(max of 50)=6.942041ms | state-ref p50=6.244958ms p99=6.892ms | ratio 1.02x | spike-1M context recall 0.9440/0.9960/0.9980
+    vector_1m_test.go:570: ef=64 FULL-TAIL: recall@10=0.9900 | graph p50=10.361875ms p99(max of 50)=11.19625ms | state-ref p50=10.248458ms p99=11.345583ms | ratio 1.01x | spike-1M context recall 0.9440/0.9960/0.9980
+    vector_1m_test.go:570: ef=128 FULL-TAIL: recall@10=1.0000 | graph p50=18.688291ms p99(max of 50)=22.635792ms | state-ref p50=17.52825ms p99=19.327625ms | ratio 1.07x | spike-1M context recall 0.9440/0.9960/0.9980
+    vector_1m_test.go:591: ef=32 EMPTY-TAIL state-ref p50=6.381958ms p99(max of 50)=7.475667ms (pairing against the full-tail lines above)
+    vector_1m_test.go:591: ef=64 EMPTY-TAIL state-ref p50=10.54525ms p99(max of 50)=11.898042ms (pairing against the full-tail lines above)
+    vector_1m_test.go:591: ef=128 EMPTY-TAIL state-ref p50=18.094167ms p99(max of 50)=23.713542ms (pairing against the full-tail lines above)
+    vector_1m_test.go:597: [mem post-drain+queries (graph+reference+fixtures)] HeapAlloc=9.79GB HeapInuse=10.35GB HeapSys=27.55GB NumGC=137 PauseTotal=81.081661ms GCCPUFraction=0.0002
+    vector_1m_test.go:601: [mem graph-alone] HeapAlloc=6.61GB HeapInuse=7.64GB HeapSys=27.55GB NumGC=139 PauseTotal=81.23287ms GCCPUFraction=0.0002
+    vector_1m_test.go:604: manifest: snapshot=v-2033.db lsn=2033 segment=35 retainFrom=28 format=2
+    vector_1m_test.go:624: close: writer 32.442s (tier=compact, forest-refresh=false), graph 17ms
+    vector_1m_test.go:626: manifest: snapshot=v-3913.db lsn=3913 segment=56 retainFrom=55 format=2
+    vector_1m_test.go:341:   /tmp/vectra-1m/v-3913.db 2985.4MB
+    vector_1m_test.go:341:   /tmp/vectra-1m/v.db.wal/manifest.json 0.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m/v.db.wal/wal-55.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m/v.db.wal/wal-56.log 64.0MB
+    vector_1m_test.go:341:   /tmp/vectra-1m/v.vec 3100.4MB
+    vector_1m_test.go:627: library total 6.07GB
+--- PASS: TestVector1M (12912.58s)
+PASS
+ok  	github.com/projanvil/vectra/bench	12914.352s
+stage build exit=0

@@ -1,0 +1,42 @@
+=== stage chain (fix branch 9e23b7c) ===
+Sun Oct 25 15:40:35 CST 2026
+15:40  up 9 days, 20:03, 3 users, load averages: 4.42 4.25 5.11
+ %CPU      TIME COMM
+ 44.4 1559:23.70 WindowServer
+ 39.0   1:23.51 Electron
+ 16.0  46:46.09 WorkBuddy Helper (Renderer)
+ 13.1 132:55.43 ZCode Helper (Renderer)
+  8.0  31:04.70 ZCode Helper
+  7.1  35:27.35 Electron
+  4.6  21:45.08 WorkBuddy Helper (GPU)
+/dev/disk3s5   1.8Ti   1.4Ti   407Gi    78%     12M  4.3G    0%   /System/Volumes/Data
+--- quiet gate ---
+quiet gate passed at 21:32:40 (load=1.76 topcpu=1.9%)
+Sun Oct 25 21:32:40 CST 2026
+--- run ---
+=== RUN   TestVector1M
+    vector_1m_test.go:706: == B1: reopen after the build's light Close (stale forest, frozen backlog) ==
+    vector_1m_test.go:707: manifest: snapshot=v-3913.db lsn=3913 segment=56 retainFrom=55 format=2
+    vector_1m_test.go:709: open 5.357s, overlay-at-open=2047
+    vector_1m_test.go:710: B1 stale-forest restart: open=5.357s overlay-at-open=2047 | v.vec 3.03GB (mtime 15:22:37)
+    vector_1m_test.go:713: [stale-forest drain] converged in 0s: overlay 2047 -> 2047 (0.0/s cumulative)
+    vector_1m_test.go:714: B1 RESULT: open=5.357s overlay-at-open=2047 ready=0s (worst-case restart: light Close after a burst build re-pays the frozen backlog)
+    vector_1m_test.go:725: bulk: compact flight's snapshot landed while waiting (448MiB pushed, 15.679s)
+    vector_1m_test.go:726: B2 bulk: 6 light seals, 448MiB in 15.679s, then compact
+    vector_1m_test.go:735: manifest: snapshot=v-3917.db lsn=3917 segment=64 retainFrom=60 format=2
+    vector_1m_test.go:736: B2 close: 9.972s (light over the fresh compact boundary)
+    vector_1m_test.go:747: == B3: controlled 3-segment retained chain ==
+    vector_1m_test.go:748: open 7.518s, overlay-at-open=2047
+    vector_1m_test.go:749: B3 reopen after fresh compact: open=7.518s overlay-at-open=2047 (mini forest-load data point)
+    vector_1m_test.go:751: [pre-chain drain] converged in 0s: overlay 2047 -> 2047 (0.0/s cumulative)
+    vector_1m_test.go:764: B3 chain ingest: 68000 vectors in 2.015s
+    vector_1m_test.go:765:   seal[0] light at submit 2: wal 202142476 -> 804307, stall 272ms
+    vector_1m_test.go:262:   light seals: n=1 stall p50=272.423834ms max=272.423834ms (submit median 6.086166ms)
+    vector_1m_test.go:257:   compact seals: none
+    vector_1m_test.go:775: B3: only 1 light seals after 68000 vectors (want 3) - raise VECTRA_1M_CHAIN_VECS
+    vector_1m_test.go:797: B3 close: writer 21.482s tier=compact (forest-refresh=false)
+    vector_1m_test.go:800: B3 needs a light Close (retained < 256MiB); got compact - lower VECTRA_1M_CHAIN_VECS
+--- FAIL: TestVector1M (75.34s)
+FAIL
+FAIL	github.com/projanvil/vectra/bench	76.015s
+FAIL

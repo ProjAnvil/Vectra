@@ -41,9 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flight (growth bounded by flight duration x ingest rate, with a
   backpressure valve at CheckpointBytes*4+1GiB) [42eef42, 7efea7b]. The forest
   ENCODE still serializes with submits under the vector index mutex -
-  at 1M that is an estimated few seconds per compact (vs the 11.5-26.3s
-  of byte writes it removes); measuring it is part of the deferred 1M
-  re-run.
+  measured at 1M: submit max 11.70s during flights (vs the 11.5-26.3s
+  stall every submit used to pay; retest:
+  docs/benchmarks/2026-10-25-1m-fixes-retest.md - ingest accept
+  5,938 -> 21,459/s, compact-tier submit stall p50 11.47s -> 190ms,
+  B1 reopen ready 2h57m30s -> 0s, recall unchanged).
 
 ### Changed
 
