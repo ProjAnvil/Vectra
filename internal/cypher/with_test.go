@@ -120,6 +120,30 @@ func TestWithParse(t *testing.T) {
 	withErr(t, `MATCH (a) WITH * RETURN a`, "expected variable")
 }
 
+// TestWithDuplicateItemNames pins the within-clause uniqueness rule: a
+// duplicate item name is a last-write-wins on the projection map (the
+// earlier binding silently dropped — Neo4j also rejects it), and when the
+// two items disagree on nullability the overwrite would strand a stale
+// nullable flag on the survivor.
+func TestWithDuplicateItemNames(t *testing.T) {
+	withErr(t, `MATCH (a)-[:CALLS]->(b) WITH a AS g, b AS g RETURN g`,
+		`variable "g" is already declared in this WITH clause; item names must be unique`)
+	// bare items collide under their own name
+	withErr(t, `MATCH (a)-[:CALLS]->(b) WITH a, a RETURN a`,
+		`variable "a" is already declared in this WITH clause; item names must be unique`)
+	// a bare item colliding with an earlier alias (b is a legal incoming
+	// reference; the collision is in the projection, not the source)
+	withErr(t, `MATCH (a)-[:CALLS]->(b) WITH a AS b, b RETURN b`,
+		`variable "b" is already declared in this WITH clause; item names must be unique`)
+	// expression/aggregation aliases collide like any other item name
+	withErr(t, `MATCH (a) WITH count(*) AS k, a.key AS k RETURN k`,
+		`variable "k" is already declared in this WITH clause; item names must be unique`)
+	// distinct names in one clause stay legal (entities and scalars mixed)
+	if _, err := Parse(`MATCH (a)-[:CALLS]->(b) WITH a AS g, b, b.key AS k RETURN g, k`); err != nil {
+		t.Fatalf("distinct item names: %v", err)
+	}
+}
+
 // ---- non-aggregating projection ----
 
 // TestWithPassthrough: entity pass-through (re-seeded by ID), scalar alias

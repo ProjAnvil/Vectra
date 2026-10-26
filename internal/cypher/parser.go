@@ -874,8 +874,8 @@ const (
 //
 // Nullability tracks the OPTIONAL-MATCH null extension: a pattern variable
 // declared by an optional clause is unbound (null) on rows the optional
-// expansion missed, and a LATER non-optional MATCH cannot anchor on it —
-// its expansion would silently cartesian-anchor the null rows (Neo4j
+// expansion missed, and a LATER non-optional MATCH cannot anchor or join on
+// it — its expansion would silently cartesian-anchor the null rows (Neo4j
 // yields zero rows there instead). declarePattern enforces this with a
 // positioned error naming the two supported restructures. Nullability
 // propagates through a WITH item only when the item is the bare variable
@@ -1055,13 +1055,18 @@ func (sc *scope) markNullable(v string) {
 // items keep the variable usable as a pattern var at all, so they are the
 // only ones that need to carry the flag (a filtered nullable var stays
 // nullable — the filter may keep null-value rows the predicate cannot
-// see).
+// see). Item names must be unique within the clause: last-write-wins on
+// a duplicate would drop the earlier binding — and, when the two items
+// disagree on nullability, leave a stale flag on the survivor.
 func (sc *scope) applyWith(c *WithClause) error {
 	sc.sawReset = true
 	if len(c.Items) == 0 {
 		return &Error{1, 1, "WITH requires at least one item"}
 	}
 	next := make(map[string]varKind, len(c.Items))
+	dupErr := func(v string) *Error {
+		return &Error{1, 1, fmt.Sprintf("variable %q is already declared in this WITH clause; item names must be unique", v)}
+	}
 	var nextNullable map[string]bool // lazily: only when a nullable var survives
 	for _, it := range c.Items {
 		if it.Agg.Func != "" {
@@ -1073,6 +1078,9 @@ func (sc *scope) applyWith(c *WithClause) error {
 			if it.Alias == "" {
 				return &Error{1, 1, "expression in WITH must be aliased (use AS)"}
 			}
+			if _, dup := next[it.Alias]; dup {
+				return dupErr(it.Alias)
+			}
 			next[it.Alias] = kindScalar
 			continue
 		}
@@ -1083,6 +1091,9 @@ func (sc *scope) applyWith(c *WithClause) error {
 			if it.Alias == "" {
 				return &Error{1, 1, "expression in WITH must be aliased (use AS)"}
 			}
+			if _, dup := next[it.Alias]; dup {
+				return dupErr(it.Alias)
+			}
 			next[it.Alias] = kindScalar
 			continue
 		}
@@ -1091,6 +1102,9 @@ func (sc *scope) applyWith(c *WithClause) error {
 		name := it.Var
 		if it.Alias != "" {
 			name = it.Alias
+		}
+		if _, dup := next[name]; dup {
+			return dupErr(name)
 		}
 		next[name] = sc.kinds[it.Var]
 		if sc.nullable[it.Var] {
@@ -1216,8 +1230,10 @@ func (sc *scope) checkReturn(c *ReturnClause, matchCount int) error {
 // scalars are never property-accessed nor rebound by patterns,
 // variable-length edge variables are never referenced, ORDER BY names
 // appear among the visible/projected names, RETURN * is limited to the
-// degenerate single-MATCH query, and a nullable (OPTIONAL-MATCH-declared)
-// variable never anchors a later non-optional MATCH.
+// degenerate single-MATCH query, an UNWIND alias never shadows a
+// node/edge variable, WITH item names are unique within their clause,
+// and a nullable (OPTIONAL-MATCH-declared) variable never anchors or
+// joins in a later non-optional MATCH.
 func (q *Query) validate() error {
 	sc := newScope()
 	matchCount := 0
@@ -1247,6 +1263,13 @@ func (q *Query) validate() error {
 			sc.sawReset = true // the clause is being processed: scope-chain family applies
 			if c.Alias == "" {
 				return &Error{1, 1, "UNWIND expression must be aliased (use AS)"}
+			}
+			// The alias binds into vals at execution, but itemValue reads
+			// nodes/edges before vals: an alias shadowing a pattern variable
+			// would return the stale entity. Rebinding a SCALAR (self-rebind
+			// UNWIND ks AS ks included) is fine — vals overwrite vals.
+			if k, bound := sc.kinds[c.Alias]; bound && k != kindScalar {
+				return &Error{1, 1, fmt.Sprintf("variable %q is already declared as a node or edge; the UNWIND alias must be a fresh name", c.Alias)}
 			}
 			if c.Expr != nil {
 				if err := sc.checkExpr(c.Expr); err != nil {

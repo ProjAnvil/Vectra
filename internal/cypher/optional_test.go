@@ -412,9 +412,21 @@ func TestOptionalNullableGuard(t *testing.T) {
 	optErr(t, `MATCH (p) OPTIONAL MATCH (p)-[:KNOWS]->(f) MATCH (y)-[:X]->(f) RETURN y`,
 		`variable "f" may be null from OPTIONAL MATCH`)
 
-	// nullable edge vars are guarded too
-	optErr(t, `MATCH (p) OPTIONAL MATCH (p)-[r:KNOWS]->(f) MATCH (y)-[r:X]->(z) RETURN y`,
-		`variable "r" may be null from OPTIONAL MATCH`)
+	// nullable edge vars are guarded too — with the edge token's own
+	// position, not the node default
+	_, err = Run(optSnap(t), "MATCH (p) OPTIONAL MATCH (p)-[r:KNOWS]->(f)\nMATCH (y)-[r:X]->(z) RETURN y")
+	if err == nil {
+		t.Fatal("nullable edge join: expected error, got nil")
+	}
+	if e, ok = err.(*Error); !ok {
+		t.Fatalf("error type: %T", err)
+	}
+	if !strings.Contains(e.Msg, `variable "r" may be null from OPTIONAL MATCH`) {
+		t.Fatalf("message: %q", e.Msg)
+	}
+	if e.Line != 2 || e.Col != 12 {
+		t.Fatalf("position: %d:%d, want 2:12 (the r token)", e.Line, e.Col)
+	}
 
 	// nullable-in-optional is fine (and stays nullable): the two
 	// restructures the error suggests both parse

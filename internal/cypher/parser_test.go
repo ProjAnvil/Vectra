@@ -190,7 +190,7 @@ func TestParseSkip(t *testing.T) {
 // optional_test.go — the pre-T6 OPTIONAL row here was replaced by
 // TestOptionalParse's lone-OPTIONAL pin.)
 func TestParseClauseCardinality(t *testing.T) {
-	// repeated MATCH parses and validates (T2 executes only the first)
+	// repeated MATCH parses and validates (the T3 stage loop executes each)
 	q, err := Parse(`MATCH (a) MATCH (b) RETURN a`)
 	if err != nil {
 		t.Fatalf("repeated MATCH: %v", err)

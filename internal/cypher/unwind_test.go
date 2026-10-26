@@ -104,6 +104,41 @@ func TestUnwindParse(t *testing.T) {
 	withErr(t, `MATCH (a) UNWIND [] AS x RETURN x`, "expected literal")
 }
 
+// TestUnwindAliasShadow pins the alias-shadowing rule: UNWIND binds into
+// vals, but itemValue reads nodes/edges first, so an alias reusing a
+// node/edge name would return the stale entity — validate rejects it
+// (Neo4j also rejects the rebind). Rebinding a SCALAR is the legal case:
+// vals overwrite vals, so the self-rebind UNWIND ks AS ks is exact.
+func TestUnwindAliasShadow(t *testing.T) {
+	// node shadow — the I1 repro: without the guard, RETURN a yields the
+	// node twice instead of the list elements
+	withErr(t, `MATCH (a) UNWIND [1, 2] AS a RETURN a`,
+		`variable "a" is already declared as a node or edge; the UNWIND alias must be a fresh name`)
+	// edge shadow
+	withErr(t, `MATCH (a)-[e:CALLS]->(b) UNWIND [1] AS e RETURN e`,
+		`variable "e" is already declared as a node or edge; the UNWIND alias must be a fresh name`)
+	// OPTIONAL-declared nodes are still nodes: the shadow rule fires
+	// regardless of nullability
+	withErr(t, `MATCH (a) OPTIONAL MATCH (a)-[:KNOWS]->(b) UNWIND [1] AS b RETURN b`,
+		`variable "b" is already declared as a node or edge; the UNWIND alias must be a fresh name`)
+	// a node renamed by a bare WITH item keeps its kind under the alias,
+	// so the alias is shadow-protected too
+	withErr(t, `MATCH (a) WITH a AS x UNWIND [1] AS x RETURN x`,
+		`variable "x" is already declared as a node or edge; the UNWIND alias must be a fresh name`)
+
+	// scalar self-rebind stays legal and is exact end-to-end: each output
+	// row's ks is one list element, not the whole list
+	res := run(t, `MATCH (n) WITH collect(n.key) AS ks UNWIND ks AS ks RETURN ks`)
+	if k := keysOf(res, "ks"); !slices.Equal(k, []string{"gw", "order", "pay", "store"}) {
+		t.Fatalf("scalar self-rebind: %v", k)
+	}
+	// rebinding a scalar under a fresh name (the normal idiom) is untouched
+	res = run(t, `MATCH (n) WITH collect(n.key) AS ks UNWIND ks AS k RETURN k`)
+	if k := keysOf(res, "k"); !slices.Equal(k, []string{"gw", "order", "pay", "store"}) {
+		t.Fatalf("scalar rebind: %v", k)
+	}
+}
+
 // ---- sources ----
 
 // TestUnwindLiteral: a list literal fans each input row out to one output
