@@ -195,6 +195,136 @@ func TestRowCOWRepeatedVarCycle(t *testing.T) {
 	}
 }
 
+// TestRowValsCOWSiblingIsolation pins the third copy-on-write arm: vals is
+// shared by clone and detached by the first ownVals, with the same
+// neither-sibling-nor-parent-observes-writes contract as nodes/edges.
+func TestRowValsCOWSiblingIsolation(t *testing.T) {
+	parent := row{pos: 1, nodes: map[string]uint32{"a": 1}, vals: map[string]any{"n": float64(1)}}
+
+	c1 := parent.clone()
+	c2 := parent.clone()
+	if c1.vals["n"] != float64(1) || !c1.valsShared || !c2.valsShared {
+		t.Fatalf("clone must share and flag vals: c1=%+v c2=%+v", c1, c2)
+	}
+	c1.ownVals()
+	c1.vals["m"] = "x"
+
+	if parent.vals["m"] != nil || len(parent.vals) != 1 {
+		t.Fatalf("parent saw child vals write: %v", parent.vals)
+	}
+	if c2.vals["m"] != nil || !c2.valsShared {
+		t.Fatalf("sibling saw sibling vals write: %v", c2.vals)
+	}
+	if c1.vals["m"] != "x" || c1.valsShared {
+		t.Fatalf("child lost its own vals write: %v", c1.vals)
+	}
+
+	// Nil-vals rows start a map through ownVals exactly like nil nodes/edges.
+	fresh := row{pos: 4}
+	fresh.ownVals()
+	fresh.vals["k"] = true
+	if fresh.vals["k"] != true || fresh.valsShared {
+		t.Fatalf("ownVals must create an owned map: %+v", fresh)
+	}
+
+	// A clone of a nil-vals row carries no vals map and no shared flag:
+	// rows without scalars must be indistinguishable from the two-arm shape.
+	noScalar := row{pos: 5, nodes: map[string]uint32{"a": 5}}
+	ch := noScalar.clone()
+	if ch.vals != nil || ch.valsShared {
+		t.Fatalf("nil-vals clone must stay nil/unflagged: %+v", ch)
+	}
+	ch.ownVals()
+	ch.vals["q"] = nil
+	if noScalar.vals != nil || len(ch.vals) != 1 {
+		t.Fatalf("nil-vals ownVals broken: noScalar=%v ch=%v", noScalar.vals, ch.vals)
+	}
+}
+
+// TestRowValsCloneZeroAlloc pins the third arm's cost contract: cloning
+// allocates nothing — with or without a vals map. A nil-vals clone must
+// equal the two-map shape's zero allocations (rows without scalars pay
+// nothing for the arm's existence).
+func TestRowValsCloneZeroAlloc(t *testing.T) {
+	if raceEnabled {
+		t.Skip("alloc counts differ under -race")
+	}
+	twoMaps := row{pos: 1, nodes: map[string]uint32{"a": 1}, edges: map[string]uint32{"e": 2}}
+	if n := testing.AllocsPerRun(100, func() { twoMaps.clone() }); n != 0 {
+		t.Fatalf("nil-vals clone allocates %.0f, want 0 (two-map shape)", n)
+	}
+	withVals := twoMaps
+	withVals.vals = map[string]any{"n": float64(1)}
+	if n := testing.AllocsPerRun(100, func() { withVals.clone() }); n != 0 {
+		t.Fatalf("shared-vals clone allocates %.0f, want 0", n)
+	}
+}
+
+// TestRowValsDedupIdentity pins row identity with scalar bindings: vals
+// enter dedupKey/sameRow via encodeVal value identity ONLY when non-nil —
+// rows differing solely in vals stay distinct through dedupRows on both the
+// pairwise and the map path, structurally identical rows still collapse,
+// and nil-vals rows keep the legacy identity bit-for-bit.
+func TestRowValsDedupIdentity(t *testing.T) {
+	base := row{pos: 1, nodes: map[string]uint32{"a": 1}}
+	r1 := base.clone()
+	r1.ownVals()
+	r1.vals["n"] = float64(1)
+	r2 := base.clone()
+	r2.ownVals()
+	r2.vals["n"] = float64(2)
+	r3 := base.clone()
+	r3.ownVals()
+	r3.vals["n"] = float64(1)
+
+	if r1.dedupKey() == r2.dedupKey() {
+		t.Fatal("dedupKey must distinguish rows differing only in vals")
+	}
+	if r1.dedupKey() != r3.dedupKey() {
+		t.Fatal("dedupKey must agree on equal vals")
+	}
+	if !sameRow(r1, r3) || sameRow(r1, r2) {
+		t.Fatalf("sameRow vals identity: r1=%v r2=%v r3=%v", r1.vals, r2.vals, r3.vals)
+	}
+	// encodeVal value identity: numeric normalization across dynamic types.
+	ri := base.clone()
+	ri.ownVals()
+	ri.vals["n"] = 1 // int
+	if !sameRow(ri, r1) {
+		t.Fatal("int 1 and float64 1 are the same value under encodeVal identity")
+	}
+
+	// Pairwise path (<= dedupPairwiseMax): r3 collapses into r1, r2 survives.
+	kept := dedupRows([]row{r1, r2, r3})
+	if len(kept) != 2 || kept[0].vals["n"] != float64(1) || kept[1].vals["n"] != float64(2) {
+		t.Fatalf("pairwise dedup kept %d rows: %+v", len(kept), kept)
+	}
+
+	// Map path (> dedupPairwiseMax): 69 distinct vals + 1 exact duplicate.
+	big := make([]row, 0, dedupPairwiseMax+6)
+	for i := 0; i <= dedupPairwiseMax+5; i++ {
+		r := base.clone()
+		r.ownVals()
+		r.vals["n"] = float64(i)
+		big = append(big, r)
+	}
+	big = append(big, big[0].clone())
+	if kept := dedupRows(big); len(kept) != dedupPairwiseMax+6 {
+		t.Fatalf("map-path dedup kept %d rows, want %d", len(kept), dedupPairwiseMax+6)
+	}
+
+	// Legacy path: rows without vals keep the two-arm identity — equal
+	// bindings collapse, and the key format is unchanged by the third arm.
+	n1 := row{pos: 2, nodes: map[string]uint32{"a": 2}}
+	n2 := row{pos: 2, nodes: map[string]uint32{"a": 2}}
+	if n1.dedupKey() != n2.dedupKey() || !sameRow(n1, n2) {
+		t.Fatal("nil-vals identity must be unchanged")
+	}
+	if kept := dedupRows([]row{n1, n2}); len(kept) != 1 {
+		t.Fatalf("nil-vals dedup kept %d, want 1", len(kept))
+	}
+}
+
 // TestRowCOWAllocShape locks the allocation shape per expansion: anonymous
 // end nodes extend with zero binding-map allocations (clone shares, no
 // write), named end nodes allocate exactly one map (the copied one).
@@ -214,7 +344,16 @@ func TestRowCOWAllocShape(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		pat := ast.firstMatch().Patterns[0]
+		var pat *PathPattern
+		for _, c := range ast.Clauses {
+			if m, ok := c.(*MatchClause); ok {
+				pat = m.Patterns[0]
+				break
+			}
+		}
+		if pat == nil {
+			t.Fatalf("q=%s: no MATCH clause", q)
+		}
 		ex := &executor{src: src}
 		ex.expand(one, pat.Edges[0], pat.Nodes[1]) // warm executor scratch
 		return testing.AllocsPerRun(100, func() {

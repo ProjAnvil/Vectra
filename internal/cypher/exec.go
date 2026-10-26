@@ -99,45 +99,78 @@ func RunView(src Source, q string) (*Result, error) {
 	return runStatement(ex, ast)
 }
 
+// runStatement is the clause-pipeline stage loop: each clause transforms
+// the row set in place — MATCH stages seed the next pattern round from the
+// accumulated rows (repeated MATCH cartesian-products disjoint variables
+// and joins shared ones, exactly like comma-separated patterns within one
+// MATCH), WHERE filters the stage's output, and RETURN terminates the
+// pipeline.
+// A plain type switch, no closures and no runtime scope: WITH/UNWIND add
+// their arms in T4/T5. starMatch remembers the MATCH clause RETURN *
+// expands (validation restricts * to the single-MATCH degenerate shape,
+// where it is the only one).
 func runStatement(ex *executor, ast *Query) (*Result, error) {
-	// T2 limitation: only the FIRST MATCH clause executes. Repeated MATCH
-	// parses and validates (disjoint variables = cartesian, shared =
-	// join), and those execution semantics arrive with the T3 stage loop;
-	// until then firstMatch() supplies the single stage.
-	m := ast.firstMatch()
-	rows, err := ex.matchRows(m)
-	if err != nil {
-		return nil, err
-	}
-	if m.Where != nil {
-		filtered := make([]row, 0, len(rows))
-		for _, r := range rows {
-			if v, ok := ex.eval(m.Where, r); ok && v == true {
-				filtered = append(filtered, r)
+	var rows []row
+	var starMatch *MatchClause
+	for _, c := range ast.Clauses {
+		switch c := c.(type) {
+		case *MatchClause:
+			var err error
+			rows, err = ex.matchRows(c, rows)
+			if err != nil {
+				return nil, err
 			}
+			if c.Where != nil {
+				rows = ex.filterRows(c.Where, rows)
+			}
+			starMatch = c
+		case *ReturnClause:
+			return ex.project(c, starMatch, rows)
 		}
-		rows = filtered
 	}
-	return ex.project(ast, rows)
+	// Unreachable through Run/RunView (the parser emits RETURN as the final
+	// clause); a hand-constructed clause chain without one projects empty.
+	return &Result{}, nil
+}
+
+// filterRows keeps the rows whose WHERE expression evaluates to true (null
+// outcomes never satisfy it and are not rescued by NOT). Extracted from
+// runStatement's original inline filter; MATCH's WHERE uses it today and
+// WITH's WHERE-after-projection joins it in T4.
+func (ex *executor) filterRows(where Expr, rows []row) []row {
+	filtered := make([]row, 0, len(rows))
+	for _, r := range rows {
+		if v, ok := ex.eval(where, r); ok && v == true {
+			filtered = append(filtered, r)
+		}
+	}
+	return filtered
 }
 
 // row is one binding tuple plus the pattern's frontier position (the node
 // the next edge segment expands from). Binding maps are copy-on-write:
 // clone() shares them and both sides are flagged, and a map is copied
-// exactly once, lazily, by the ownNodes/ownEdges helpers below. Hard
-// constraint: a row's maps are mutated ONLY through those helpers, and
+// exactly once, lazily, by the ownNodes/ownEdges/ownVals helpers below.
+// Hard constraint: a row's maps are mutated ONLY through those helpers, and
 // never after the row has been stored into a row set or cloned from —
 // every mutation site (extendNode, expand's edge binding, runPath's
 // cartesian anchor) writes only freshly cloned rows.
+//
+// pos is authoritative only on rows produced by runPath/expand (pattern
+// execution); stage-constructed rows (WITH/UNWIND/OPTIONAL merges, T4+)
+// normalize pos to 0 so DISTINCT/dedup consumers never see a stale
+// frontier.
 type row struct {
 	pos   uint32
 	nodes map[string]uint32 // node var -> node ID
 	edges map[string]uint32 // edge var -> edge ID
+	vals  map[string]any    // scalar var -> value (WITH/UNWIND aliases); nil until first bound
 	// shared flags: the corresponding map is aliased by another row (set on
 	// BOTH sides by clone). Zero value false = exclusively owned, which is
 	// the state of every freshly constructed row.
 	nodesShared bool
 	edgesShared bool
+	valsShared  bool
 }
 
 // clone returns a row sharing r's binding maps copy-on-write. The eager
@@ -149,7 +182,9 @@ type row struct {
 // other's bindings. (In practice every executor call site clones from a
 // transient copy — a range-loop copy or a value-receiver pass — so the
 // parent side is protected by the never-mutate-after-clone row
-// discipline above, not by the receiver-side flagging.)
+// discipline above, not by the receiver-side flagging.) A nil vals map
+// stays nil and unflagged: rows without scalar bindings pay nothing for
+// the third arm's existence.
 func (r *row) clone() row {
 	if r.nodes != nil {
 		r.nodesShared = true
@@ -157,12 +192,17 @@ func (r *row) clone() row {
 	if r.edges != nil {
 		r.edgesShared = true
 	}
+	if r.vals != nil {
+		r.valsShared = true
+	}
 	return row{
 		pos:         r.pos,
 		nodes:       r.nodes,
 		edges:       r.edges,
+		vals:        r.vals,
 		nodesShared: r.nodes != nil,
 		edgesShared: r.edges != nil,
+		valsShared:  r.vals != nil,
 	}
 }
 
@@ -191,17 +231,37 @@ func (r *row) ownEdges() {
 	}
 }
 
+// ownVals is ownNodes for the scalar-bindings map. Rows without scalars
+// carry a nil vals map (zero cost through clone); the first binding in a
+// stage creates it here.
+func (r *row) ownVals() {
+	if r.valsShared {
+		m := make(map[string]any, len(r.vals)+1)
+		maps.Copy(m, r.vals)
+		r.vals, r.valsShared = m, false
+	} else if r.vals == nil {
+		r.vals = make(map[string]any, 1)
+	}
+}
+
 // dedupKey identifies a row: named bindings plus the frontier position, so
 // rows that differ only in anonymous end nodes stay distinct (Cypher
 // semantics) while true duplicates from parallel expansion paths collapse.
+// Scalar bindings join the key ONLY when vals != nil — a row without
+// scalars encodes to exactly the pre-vals key (the legacy path is
+// bit-identical), and encodeVal gives the vals the same value identity
+// aggregation groups use.
 func (r row) dedupKey() string {
-	parts := make([]string, 0, len(r.nodes)+len(r.edges)+1)
+	parts := make([]string, 0, len(r.nodes)+len(r.edges)+len(r.vals)+1)
 	parts = append(parts, fmt.Sprintf("p=%d", r.pos))
 	for k, v := range r.nodes {
 		parts = append(parts, fmt.Sprintf("n:%s=%d", k, v))
 	}
 	for k, v := range r.edges {
 		parts = append(parts, fmt.Sprintf("e:%s=%d", k, v))
+	}
+	for k, v := range r.vals { // no iterations on a nil map: legacy key unchanged
+		parts = append(parts, fmt.Sprintf("v:%s=%s", k, encodeVal(nil, v)))
 	}
 	slices.Sort(parts[1:]) // position first, bindings in stable order
 	return strings.Join(parts, ";")
@@ -318,8 +378,11 @@ func (ex *executor) labelMask(labels []string) []bool {
 
 // matchRows executes every comma-separated path pattern in sequence,
 // joining on shared variables (cartesian product when none are shared).
-func (ex *executor) matchRows(m *MatchClause) ([]row, error) {
-	rows := []row{}
+// base seeds the first pattern's rows: the executor's stage loop passes
+// the previous clause's rows (repeated MATCH / MATCH-after-WITH); the
+// first stage of a statement passes nil and anchors from scratch.
+func (ex *executor) matchRows(m *MatchClause, base []row) ([]row, error) {
+	rows := base
 	for _, pat := range m.Patterns {
 		var err error
 		rows, err = ex.runPath(pat, rows)
@@ -376,7 +439,9 @@ func dedupRows(rows []row) []row {
 }
 
 // sameRow is full binding-tuple equality (the pairwise form of dedupKey:
-// same position, same node bindings, same edge bindings).
+// same position, same node bindings, same edge bindings, and — when either
+// side carries scalars — same vals under encodeVal value identity). Rows
+// without scalars take the legacy comparison untouched.
 func sameRow(a, b row) bool {
 	if a.pos != b.pos || len(a.nodes) != len(b.nodes) || len(a.edges) != len(b.edges) {
 		return false
@@ -391,7 +456,25 @@ func sameRow(a, b row) bool {
 			return false
 		}
 	}
+	if a.vals != nil || b.vals != nil {
+		if len(a.vals) != len(b.vals) {
+			return false
+		}
+		for k, v := range a.vals {
+			bv, ok := b.vals[k]
+			if !ok || !valsEq(v, bv) {
+				return false
+			}
+		}
+	}
 	return true
+}
+
+// valsEq is scalar value identity: encodeVal equality, so int 1 and
+// float64 1 are the same value and node/edge scalars compare by ID — the
+// same identity dedupKey's map path and aggregation group keys use.
+func valsEq(a, b any) bool {
+	return string(encodeVal(nil, a)) == string(encodeVal(nil, b))
 }
 
 // runPath evaluates one path pattern against the incoming rows (empty for

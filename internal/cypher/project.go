@@ -15,19 +15,20 @@ import (
 // lower it.
 var maxGroups = 1_000_000
 
-// project applies RETURN / ORDER BY / SKIP / LIMIT to the WHERE-filtered
-// rows. ORDER BY keys evaluate var[.prop] on the binding itself, so they may
-// reference properties not present in RETURN (Cypher-compatible); a key
-// that names a projected column (aliases included) uses that value.
-func (ex *executor) project(q *Query, rows []row) (*Result, error) {
-	ret := q.finalReturn()
+// project applies the terminal RETURN clause's items / ORDER BY / SKIP /
+// LIMIT to the stage loop's final row set (ret is the RETURN clause
+// itself; m is the MATCH clause RETURN * expands, tracked by the stage
+// loop). ORDER BY keys evaluate var[.prop] on the binding itself, so they
+// may reference properties not present in RETURN (Cypher-compatible); a
+// key that names a projected column (aliases included) uses that value.
+func (ex *executor) project(ret *ReturnClause, m *MatchClause, rows []row) (*Result, error) {
 	items := ret.Items
 	if ret.Star {
-		items = starItems(q.firstMatch())
+		items = starItems(m)
 	}
 	for _, it := range items {
 		if it.Agg.Func != "" {
-			return ex.projectAgg(q, items, rows)
+			return ex.projectAgg(ret, items, rows)
 		}
 	}
 	res := &Result{Columns: make([]string, len(items))}
@@ -71,8 +72,7 @@ func (ex *executor) project(q *Query, rows []row) (*Result, error) {
 // grouping key, aggregations accumulate per group in one pass over rows, and
 // ORDER BY / SKIP / LIMIT apply afterwards (LIMIT never short-circuits the
 // pass).
-func (ex *executor) projectAgg(q *Query, items []*ReturnItem, rows []row) (*Result, error) {
-	ret := q.finalReturn()
+func (ex *executor) projectAgg(ret *ReturnClause, items []*ReturnItem, rows []row) (*Result, error) {
 	res := &Result{Columns: make([]string, len(items))}
 	for i, it := range items {
 		res.Columns[i] = it.Name
@@ -358,6 +358,9 @@ func (ex *executor) itemValue(it *ReturnItem, r row) any {
 		if id, ok := r.edges[it.Var]; ok {
 			return ex.edgeVal(id)
 		}
+		if v, ok := r.vals[it.Var]; ok { // scalar binding (WITH/UNWIND alias): the value itself
+			return v
+		}
 		return nil
 	}
 	v, ok := ex.scalarOf(r, it.Var, it.Prop)
@@ -386,7 +389,10 @@ func (ex *executor) orderValue(name string, r row) any {
 
 // scalarOf reads var.name: the pseudo-props key/label/id (nodes) and
 // label/id (edges), or the node/edge's own property. ok=false when the
-// variable is unbound or the property is absent (evaluates to null).
+// variable is unbound or the property is absent (evaluates to null). A
+// scalar binding (vals) carries no properties — property access on one
+// evaluates to null; scope validation rejects the spelling anyway, this
+// keeps hand-built expression trees honest.
 func (ex *executor) scalarOf(r row, v, name string) (any, bool) {
 	if id, ok := r.nodes[v]; ok {
 		rec, _ := ex.nodeInfo(id)
@@ -412,6 +418,9 @@ func (ex *executor) scalarOf(r row, v, name string) (any, bool) {
 		val, present := props[name]
 		return val, present
 	}
+	// v may still be a scalar binding (r.vals): scalars carry no properties,
+	// so var.name on one takes the same null outcome as an unbound variable
+	// (scope validation rejects the spelling in parsed queries).
 	return nil, false
 }
 

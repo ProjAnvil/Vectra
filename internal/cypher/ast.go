@@ -142,27 +142,3 @@ func (*MatchClause) isClause()  {}
 func (*WithClause) isClause()   {}
 func (*UnwindClause) isClause() {}
 func (*ReturnClause) isClause() {}
-
-// firstMatch returns the first MATCH clause. Temporary accessor for the
-// executor: until the T3 stage loop lands, only the first MATCH executes
-// (repeated MATCH parses and validates, but its cartesian/join semantics
-// arrive with the stage loop). Deleted in T3.
-func (q *Query) firstMatch() *MatchClause {
-	for _, c := range q.Clauses {
-		if m, ok := c.(*MatchClause); ok {
-			return m
-		}
-	}
-	return nil
-}
-
-// finalReturn returns the final RETURN clause (every query Parse accepts
-// ends in one). Temporary accessor, deleted with the T3 stage loop.
-func (q *Query) finalReturn() *ReturnClause {
-	for i := len(q.Clauses) - 1; i >= 0; i-- {
-		if r, ok := q.Clauses[i].(*ReturnClause); ok {
-			return r
-		}
-	}
-	return nil
-}

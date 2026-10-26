@@ -1,6 +1,9 @@
 package cypher
 
 import (
+	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -342,5 +345,190 @@ func TestExecRowCap(t *testing.T) {
 	_, err := Run(execSnap(t), `MATCH (a), (b), (c) RETURN a.key`) // 4×4×4=64 > 3
 	if err == nil || !strings.Contains(err.Error(), "too large") {
 		t.Fatalf("row cap: %v", err)
+	}
+}
+
+// renderRows 把结果按行序渲染成 "col=val" 串（保持结果顺序，供有序比较）；
+// rowSet 复制并排序，供多重集（顺序无关）比较 —— 变长展开经 map 迭代，
+// 行序按构造即不确定。
+func renderRows(res *Result) []string {
+	out := make([]string, 0, len(res.Rows))
+	for _, r := range res.Rows {
+		var sb strings.Builder
+		for _, c := range res.Columns {
+			v := r[c]
+			switch x := v.(type) {
+			case string:
+				sb.WriteString(c + "=" + x + " ")
+			case float64:
+				sb.WriteString(c + "=" + strconv.Itoa(int(x)) + " ")
+			case int:
+				sb.WriteString(c + "=" + strconv.Itoa(x) + " ")
+			case NodeVal:
+				sb.WriteString(c + "=n" + strconv.Itoa(int(x.ID)) + " ")
+			case EdgeVal:
+				sb.WriteString(c + "=e" + strconv.Itoa(int(x.ID)) + " ")
+			case nil:
+				sb.WriteString(c + "=null ")
+			default:
+				sb.WriteString(c + "=other ")
+			}
+		}
+		out = append(out, sb.String())
+	}
+	return out
+}
+
+func rowSet(rows []string) []string {
+	s := slices.Clone(rows)
+	sort.Strings(s)
+	return s
+}
+
+// TestExecStageLoopDegenerateGoldens: the stage loop over [Match, Return]
+// must produce byte-identical results to the pre-stage executor's recorded
+// goldens (expectations copied verbatim from the tests above — they ARE the
+// golden table for the degenerate clause shape). ordered=true compares row
+// order exactly (ORDER BY cases); otherwise the multiset.
+func TestExecStageLoopDegenerateGoldens(t *testing.T) {
+	tests := []struct {
+		name    string
+		q       string
+		want    []string
+		ordered bool
+	}{
+		{
+			name: "chain named b",
+			q:    `MATCH (a {type:'controller'})-[:CALLS]->(b)-[:USES]->(c) RETURN a.key, c.key`,
+			want: []string{"a.key=gw c.key=store ", "a.key=gw c.key=store "},
+		},
+		{
+			name: "chain anonymous b dedup",
+			q:    `MATCH (a {type:'controller'})-[:CALLS]->()-[:USES]->(c) RETURN a.key, c.key`,
+			want: []string{"a.key=gw c.key=store "},
+		},
+		{
+			name: "undirected",
+			q:    `MATCH (a {key:'store'})--(b) RETURN b.key`,
+			want: []string{"b.key=gw ", "b.key=order ", "b.key=pay "},
+		},
+		{
+			name: "var length 0..1",
+			q:    `MATCH (a {key:'gw'})-[*0..1]->(b) RETURN b.key`,
+			want: []string{"b.key=gw ", "b.key=order ", "b.key=pay "},
+		},
+		{
+			name:    "order desc limit",
+			q:       `MATCH (a:Service) RETURN a.key ORDER BY a.w DESC LIMIT 2`,
+			want:    []string{"a.key=pay ", "a.key=gw "},
+			ordered: true,
+		},
+		{
+			name:    "order asc full",
+			q:       `MATCH (a:Service) RETURN a.key, a.w ORDER BY a.w ASC`,
+			want:    []string{"a.key=order a.w=3 ", "a.key=gw a.w=5 ", "a.key=pay a.w=7 "},
+			ordered: true,
+		},
+		{
+			name: "where operators",
+			q:    `MATCH (a:Service) WHERE a.w > 3 RETURN a.key`,
+			want: []string{"a.key=gw ", "a.key=pay "},
+		},
+		{
+			name:    "agg skip limit",
+			q:       `MATCH (a:Service) RETURN a.env, count(*) AS c ORDER BY c DESC SKIP 1 LIMIT 1`,
+			want:    []string{"a.env=dev c=1 "},
+			ordered: true,
+		},
+		{
+			name: "star",
+			q:    `MATCH (a {key:'gw'})-[e:CALLS]->(b) RETURN *`,
+			want: []string{"a=n0 e=e0 b=n1 ", "a=n0 e=e1 b=n2 "},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := renderRows(run(t, tt.q))
+			want := tt.want
+			if !tt.ordered {
+				got, want = rowSet(got), rowSet(want)
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("q=%s\n got  %v\n want %v", tt.q, got, want)
+			}
+		})
+	}
+}
+
+// TestExecRepeatedMatchCartesian: 第二个 MATCH 与第一个无共享变量 → 跨阶段笛卡尔积，
+// 结果多重集必须与逗号分隔的单 MATCH 写法完全一致（2 行：gw × {order,pay}）。
+func TestExecRepeatedMatchCartesian(t *testing.T) {
+	q := `MATCH (a {key:'gw'}) MATCH (b {type:'service'}) RETURN a.key, b.key`
+	res := run(t, q)
+	if len(res.Rows) != 2 {
+		t.Fatalf("repeated MATCH cartesian: %d rows, want 2 (%+v)", len(res.Rows), res.Rows)
+	}
+	got := rowSet(renderRows(res))
+	comma := rowSet(renderRows(run(t, `MATCH (a {key:'gw'}), (b {type:'service'}) RETURN a.key, b.key`)))
+	if !slices.Equal(got, comma) {
+		t.Fatalf("repeated MATCH ≠ comma form:\n stage %v\n comma %v", got, comma)
+	}
+	if want := []string{"a.key=gw b.key=order ", "a.key=gw b.key=pay "}; !slices.Equal(got, want) {
+		t.Fatalf("cartesian golden:\n got  %v\n want %v", got, want)
+	}
+}
+
+// TestExecRepeatedMatchJoin: 共享变量跨阶段 join —— 语义与单 MATCH 逗号形式一致
+// （4 行），包括并行边去重后的行恒等。
+func TestExecRepeatedMatchJoin(t *testing.T) {
+	q := `MATCH (a)-[:CALLS]->(b) MATCH (b)-[:USES]->(c) RETURN a.key, b.key, c.key`
+	res := run(t, q)
+	if len(res.Rows) != 4 {
+		t.Fatalf("repeated MATCH join: %d rows, want 4 (%+v)", len(res.Rows), res.Rows)
+	}
+	got := rowSet(renderRows(res))
+	comma := rowSet(renderRows(run(t, `MATCH (a)-[:CALLS]->(b), (b)-[:USES]->(c) RETURN a.key, b.key, c.key`)))
+	if !slices.Equal(got, comma) {
+		t.Fatalf("repeated MATCH ≠ comma form:\n stage %v\n comma %v", got, comma)
+	}
+	want := []string{
+		"a.key=gw b.key=order c.key=store ",
+		"a.key=gw b.key=pay c.key=store ",
+		"a.key=order b.key=pay c.key=store ",
+		"a.key=pay b.key=order c.key=store ",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("join golden:\n got  %v\n want %v", got, want)
+	}
+}
+
+// TestExecStageWhereAcrossStages: WHERE 可引用前一阶段绑定的变量（作用域链
+// 逐句累积），过滤器在整阶段行集上执行；第一个 MATCH 的 WHERE 在第二个
+// MATCH 之前裁剪行集。
+func TestExecStageWhereAcrossStages(t *testing.T) {
+	// 服务 w：gw=5, order=3, pay=7 → b.w>a.w 的对：(gw,pay),(order,gw),(order,pay)
+	res := run(t, `MATCH (a:Service) MATCH (b:Service) WHERE b.w > a.w RETURN a.key, b.key`)
+	got := rowSet(renderRows(res))
+	want := []string{
+		"a.key=gw b.key=pay ",
+		"a.key=order b.key=gw ",
+		"a.key=order b.key=pay ",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("WHERE across stages:\n got  %v\n want %v", got, want)
+	}
+
+	// 阶段间过滤：第一个 MATCH 的 WHERE 先裁到 prod 服务 {gw,order}，
+	// 第二个 MATCH 笛卡尔展开 USES 出边 {order,pay}→store → 2×2=4 行。
+	res = run(t, `MATCH (a:Service) WHERE a.env = 'prod' MATCH (b)-[:USES]->(c) RETURN a.key, b.key, c.key`)
+	got = rowSet(renderRows(res))
+	want = []string{
+		"a.key=gw b.key=order c.key=store ",
+		"a.key=gw b.key=pay c.key=store ",
+		"a.key=order b.key=order c.key=store ",
+		"a.key=order b.key=pay c.key=store ",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("inter-stage WHERE:\n got  %v\n want %v", got, want)
 	}
 }
