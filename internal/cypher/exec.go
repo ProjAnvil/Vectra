@@ -118,12 +118,21 @@ func runStatement(ex *executor, ast *Query) (*Result, error) {
 		switch c := c.(type) {
 		case *MatchClause:
 			var err error
-			rows, err = ex.matchRows(c, rows)
-			if err != nil {
-				return nil, err
-			}
-			if c.Where != nil {
-				rows = ex.filterRows(c.Where, rows)
+			if c.Optional {
+				// WHERE rides inside the optionality (an empty filtered
+				// expansion keeps the base rows)
+				rows, err = ex.optionalRows(c, rows)
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				rows, err = ex.matchRows(c, rows)
+				if err != nil {
+					return nil, err
+				}
+				if c.Where != nil {
+					rows = ex.filterRows(c.Where, rows)
+				}
 			}
 			starMatch = c
 		case *WithClause:
@@ -212,9 +221,9 @@ func (ex *executor) unwindStage(c *UnwindClause, rows []row) ([]row, error) {
 // cartesian anchor) writes only freshly cloned rows.
 //
 // pos is authoritative only on rows produced by runPath/expand (pattern
-// execution); stage-constructed rows (WITH and UNWIND today; OPTIONAL
-// merges in T6) normalize pos to 0 so DISTINCT/dedup consumers never see a
-// stale frontier.
+// execution); stage-constructed rows (WITH, UNWIND, and OPTIONAL MATCH's
+// kept-unchanged rows) normalize pos to 0 so DISTINCT/dedup consumers
+// never see a stale frontier.
 type row struct {
 	pos   uint32
 	nodes map[string]uint32 // node var -> node ID
@@ -483,6 +492,63 @@ func (ex *executor) matchRows(m *MatchClause, base []row) ([]row, error) {
 		rows = []row{} // zero matches: empty-but-non-nil, later stages stay strict
 	}
 	return rows, nil
+}
+
+// optionalRows executes one OPTIONAL MATCH clause: for every incoming row
+// the WHOLE clause — every comma pattern plus the clause's WHERE — runs
+// over that row alone as the match base (the same runPath join/cartesian
+// machinery, one base row at a time). A row whose expansion comes back
+// empty is kept unchanged (its pattern variables stay unbound and read as
+// null through itemValue/scalarOf); a row with matches contributes every
+// sub-row. Optionality is all-or-nothing across the clause's comma
+// patterns: an earlier pattern that empties STOPS the clause — the
+// within-clause re-anchoring matchRows tolerates at the pipeline head
+// would restart later patterns from scratch and strand sub-rows that lost
+// the base row's bindings. The merge appends WITHOUT cross-row dedup
+// (duplicate base rows stay duplicated; within-pattern dedupRows runs per
+// base row inside the loop) and caps the merged output at maxRows
+// cumulatively. Kept-unchanged rows normalize pos to 0 (the
+// stage-constructed-row invariant). A nil base is the first stage: the
+// one implicit empty incoming row anchors from scratch, so even an empty
+// graph yields a single all-null row. The returned slice is never nil:
+// zero input rows yield zero output rows — strict stage semantics.
+func (ex *executor) optionalRows(m *MatchClause, base []row) ([]row, error) {
+	if base == nil {
+		base = []row{{}} // first stage: one implicit empty incoming row
+	}
+	out := make([]row, 0, len(base))
+	scratch := make([]row, 1) // the per-base-row match base, reused: runPath never retains it
+	for _, b := range base {
+		scratch[0] = b
+		sub := scratch
+		for _, pat := range m.Patterns {
+			var err error
+			sub, err = ex.runPath(pat, sub)
+			if err != nil {
+				return nil, err
+			}
+			if len(sub) == 0 {
+				break // all-or-nothing: later patterns never re-anchor
+			}
+			sub = dedupRows(sub)
+			if len(sub) > maxRows {
+				return nil, &Error{1, 1, fmt.Sprintf("result too large: more than %d intermediate rows; narrow the pattern or add LIMIT", maxRows)}
+			}
+		}
+		if m.Where != nil {
+			sub = ex.filterRows(m.Where, sub)
+		}
+		if len(sub) == 0 {
+			b.pos = 0 // kept row: stage-constructed, no frontier to carry
+			out = append(out, b)
+		} else {
+			out = append(out, sub...)
+		}
+		if len(out) > maxRows {
+			return nil, &Error{1, 1, fmt.Sprintf("result too large: more than %d intermediate rows; narrow the pattern or add LIMIT", maxRows)}
+		}
+	}
+	return out, nil
 }
 
 // dedupPairwiseMax is the batch size below which dedupRows compares rows

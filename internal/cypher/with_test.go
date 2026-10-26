@@ -429,12 +429,22 @@ func TestWithChainedAggEmpty(t *testing.T) {
 // TestWithOrderByScalarKindCheck: ORDER BY scalar.prop in WITH is rejected
 // (the projected name is a scalar; property access requires an entity)
 // instead of silently sorting all-null keys. The entity form stays legal.
+// The T6 rider mirrors the check on the RETURN path: a WITH/UNWIND-scoped
+// scalar property-accessed by RETURN's ORDER BY is rejected the same way.
 func TestWithOrderByScalarKindCheck(t *testing.T) {
 	withErr(t, `MATCH (a:Service) WITH a.w AS w ORDER BY w.x RETURN w`, `variable "w" is a scalar; property access requires a node or edge`)
 	withErr(t, `MATCH (a:Service) WITH count(*) AS c ORDER BY c.x RETURN c`, `variable "c" is a scalar; property access requires a node or edge`)
-	// entity pass-through keeps ORDER BY var.prop
+	// RETURN-path mirror (T6 rider): without it these silently sorted
+	// all-null keys
+	withErr(t, `MATCH (a:Service) WITH a.w AS w RETURN w ORDER BY w.x`, `variable "w" is a scalar; property access requires a node or edge`)
+	withErr(t, `MATCH (a:Service) WITH count(*) AS c RETURN c ORDER BY c.x`, `variable "c" is a scalar; property access requires a node or edge`)
+	withErr(t, `MATCH (a:Service) UNWIND [1, 2] AS k RETURN k ORDER BY k.x`, `variable "k" is a scalar; property access requires a node or edge`)
+	// entity forms stay legal on both paths
 	if res := run(t, `MATCH (a:Service) WITH a ORDER BY a.w ASC RETURN a.key`); len(res.Rows) != 3 {
-		t.Fatalf("entity ORDER BY must stay legal: %d rows", len(res.Rows))
+		t.Fatalf("entity WITH ORDER BY must stay legal: %d rows", len(res.Rows))
+	}
+	if res := run(t, `MATCH (a:Service) RETURN a.key ORDER BY a.w`); len(res.Rows) != 3 {
+		t.Fatalf("entity RETURN ORDER BY must stay legal: %d rows", len(res.Rows))
 	}
 }
 

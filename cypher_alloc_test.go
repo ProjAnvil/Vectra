@@ -204,6 +204,41 @@ func TestCypherUnwindAllocs(t *testing.T) {
 	}
 }
 
+// TestCypherOptionalAllocs pins the OPTIONAL-MATCH null-extension shape on
+// the same layered fixture: every one of the 33 named-hop expansion rows
+// hits an optional pattern that matches nothing (the graph has no USES
+// edges) and is kept unchanged — pattern variables read as null, and the
+// kept rows SHARE the incoming rows' copy-on-write binding maps (no
+// re-seed, no copies). Measured 398 = 244 (the no-OPTIONAL twin's
+// whole-query budget) + ~4.7 per row over 33 rows (the per-base-row
+// machinery: the join-branch clone's rows slice and the view-path
+// adjacency probe on the USES label — the classic optional-edge idiom's
+// real cost; the disjoint-label variant `OPTIONAL MATCH (c:Void)`, which
+// skips the adjacency probe, measures 292). NEW baseline for v0.13.0 T6 —
+// it does not interact with the four pre-refactor characterization shapes
+// above. Fenced with ~25% headroom per the house style for new baselines.
+func TestCypherOptionalAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("alloc counts differ under -race")
+	}
+	g := cypherLayeredGraph(t, 50, 32)
+	q := `MATCH (a {key:'0'})-[:CALLS]->(b) OPTIONAL MATCH (b)-[:USES]->(c) RETURN b.key, c.key`
+	for i := 0; i < 3; i++ {
+		if _, err := g.Cypher(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n := testing.AllocsPerRun(100, func() {
+		if _, err := g.Cypher(q); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Logf("cypher OPTIONAL null-extension allocs/query = %.1f (fan 32)", n)
+	if n > 500 {
+		t.Fatalf("OPTIONAL null-extension allocs = %v, want <= 500", n)
+	}
+}
+
 // TestCypherViewPathEquivalence guards the scratch reuse: the SAME query
 // must return identical results across runs, and match the graph's ground
 // truth. The degree-mixing shape matters — node 0 expands 33 out-rows and

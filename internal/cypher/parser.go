@@ -72,15 +72,15 @@ func (p *parser) expectKw(word string) error {
 	return nil
 }
 
-// parseQuery parses a keyword-dispatched clause sequence. The grammar in
-// this task: MATCH (repeatable, comma-separated patterns + WHERE per
+// parseQuery parses a keyword-dispatched clause sequence. The grammar:
+// [OPTIONAL] MATCH (repeatable, comma-separated patterns + WHERE per
 // clause) ... [WITH [DISTINCT] items [ORDER BY ...] [SKIP n] [LIMIT n]
 // [WHERE expr]] ... [UNWIND expr AS ident] ... RETURN items [ORDER BY ...]
-// [SKIP n] [LIMIT n]. RETURN is terminal — anything after it is an
-// unexpected-token error. The OPTIONAL MATCH arm lands in T6; until then
-// the keyword at clause position takes the "expected RETURN" error.
+// [SKIP n] [LIMIT n]. OPTIONAL prefixes MATCH (the two-keyword arm;
+// optionality covers the whole clause incl. its comma patterns). RETURN is
+// terminal — anything after it is an unexpected-token error.
 func (p *parser) parseQuery() (*Query, error) {
-	if !p.kw("MATCH") {
+	if !p.kw("MATCH") && !p.atOptionalMatch() {
 		return nil, p.errf("expected MATCH, got %s", describe(p.cur()))
 	}
 	q := newQuery()
@@ -94,7 +94,7 @@ func (p *parser) parseQuery() (*Query, error) {
 			err error
 		)
 		switch {
-		case p.kw("MATCH"):
+		case p.kw("MATCH"), p.atOptionalMatch():
 			c, err = p.parseMatchClause()
 		case p.kw("WITH"):
 			c, err = p.parseWithClause()
@@ -117,11 +117,30 @@ func (p *parser) parseQuery() (*Query, error) {
 	return q, nil
 }
 
-// parseMatchClause parses "MATCH pattern[, pattern...][WHERE expr]". The
-// MATCH keyword is still unconsumed (the clause loop verified it).
+// atOptionalMatch reports whether the cursor sits on the two-keyword
+// OPTIONAL MATCH prefix — the only OPTIONAL spelling in the grammar. A
+// lone OPTIONAL at clause position (anything but MATCH following it) is
+// NOT this arm and keeps the generic unexpected-token error. The +1 index
+// is safe: toks always ends with TEOF, and a cursor on OPTIONAL is never
+// on that final token.
+func (p *parser) atOptionalMatch() bool {
+	if !p.kw("OPTIONAL") {
+		return false
+	}
+	t := p.toks[p.pos+1]
+	return t.Kind == TIdent && strings.EqualFold(t.Text, "MATCH")
+}
+
+// parseMatchClause parses "[OPTIONAL] MATCH pattern[, pattern...]
+// [WHERE expr]". The leading keyword(s) are still unconsumed (the clause
+// loop verified them).
 func (p *parser) parseMatchClause() (*MatchClause, error) {
-	p.next() // MATCH
 	m := &MatchClause{}
+	if p.kw("OPTIONAL") {
+		p.next() // OPTIONAL
+		m.Optional = true
+	}
+	p.next() // MATCH
 	pat, err := p.parsePath()
 	if err != nil {
 		return nil, err
@@ -1088,15 +1107,21 @@ func (sc *scope) checkReturn(c *ReturnClause, matchCount int) error {
 			}
 			continue
 		}
-		varPart := k.Name
+		varPart, propAccess := k.Name, false
 		if i := strings.Index(varPart, "."); i >= 0 {
-			varPart = varPart[:i]
+			varPart, propAccess = varPart[:i], true
 		}
 		if _, declared := sc.kinds[varPart]; !declared && !names[k.Name] {
 			if sc.sawReset {
 				return &Error{1, 1, fmt.Sprintf("ORDER BY variable %q is not defined in this scope (WITH starts a new scope; only projected variables survive)", varPart)}
 			}
 			return &Error{1, 1, fmt.Sprintf("ORDER BY variable %q is not declared in the pattern", varPart)}
+		}
+		// A scalar carries no properties: without this branch ORDER BY
+		// scalar.prop silently sorts all-null keys (the T4 applyWith
+		// rider, mirrored here on the RETURN path in T6).
+		if propAccess && sc.kinds[varPart] == kindScalar {
+			return &Error{1, 1, fmt.Sprintf("variable %q is a scalar; property access requires a node or edge", varPart)}
 		}
 		if vk := sc.kinds[varPart]; vk == kindEdge {
 			if ep := sc.edges[varPart]; ep != nil && (ep.MinHops != 1 || ep.MaxHops != 1) {

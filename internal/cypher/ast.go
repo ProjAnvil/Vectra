@@ -30,10 +30,13 @@ func newQuery() *Query {
 type Clause interface{ isClause() }
 
 // MatchClause is one MATCH clause: comma-separated path patterns plus an
-// optional WHERE filter. (An Optional flag arrives with T6.)
+// optional WHERE filter. Optional marks the OPTIONAL MATCH spelling:
+// optionality covers the whole clause (every comma pattern is
+// all-or-nothing per incoming row — see optionalRows).
 type MatchClause struct {
 	Patterns []*PathPattern
 	Where    Expr // nil when absent
+	Optional bool // OPTIONAL MATCH: an empty expansion keeps the incoming rows
 }
 
 // WithClause is the WITH clause: it projects its items into a new scope
