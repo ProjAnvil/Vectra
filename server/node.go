@@ -50,6 +50,7 @@ type Config struct {
 	RaftAddr      string // raft peer address
 	DataDir       string // Persistence directory (raft.db / snapshots / meta.json)
 	Join          string // Seed node's HTTP address; empty = single-node bootstrap
+	AuthTokenFile string // Bearer tokens, one per line; empty = auth disabled
 	SealInterval  time.Duration
 	LogStore      raft.LogStore
 	StableStore   raft.StableStore
@@ -69,6 +70,10 @@ type Node struct {
 	cfg Config
 	fsm *fsm
 	r   *raft.Raft
+
+	// Static bearer auth; both empty/nil = auth disabled (today's behavior)
+	authDigests [][32]byte // SHA-256 of each valid token (constant-size compare)
+	authToken   string     // First raw token; presented when joining an authed seed
 
 	bolt  *raftboltdb.BoltStore // Held in production mode; nil in test mode
 	trans raft.Transport
@@ -94,6 +99,21 @@ func New(cfg Config) (*Node, error) {
 	if cfg.DataDir == "" {
 		return nil, errors.New("server: DataDir required")
 	}
+	// Static auth: fail fast. A typo'd or unreadable token file must abort
+	// startup, never degrade into a silently open database — so this runs
+	// before New touches the data directory.
+	var (
+		authDigests [][32]byte
+		authToken   string
+	)
+	if cfg.AuthTokenFile != "" {
+		tokens, err := loadAuthTokens(cfg.AuthTokenFile)
+		if err != nil {
+			return nil, err
+		}
+		authDigests = authDigestsFrom(tokens)
+		authToken = tokens[0]
+	}
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -107,8 +127,10 @@ func New(cfg Config) (*Node, error) {
 	}
 
 	n := &Node{
-		registry: map[string]string{cfg.RaftAddr: meta.HTTPAddr},
-		closed:   make(chan struct{}),
+		registry:    map[string]string{cfg.RaftAddr: meta.HTTPAddr},
+		closed:      make(chan struct{}),
+		authDigests: authDigests,
+		authToken:   authToken,
 	}
 
 	// Persistence and transport
