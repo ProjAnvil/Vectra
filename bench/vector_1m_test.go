@@ -344,7 +344,7 @@ func oneMSizes(t *testing.T, dir string) {
 	t.Logf("library total %.2fGB", float64(total)/(1<<30))
 }
 
-// oneMMemLog pins the gate-2a memory口径: live HeapAlloc after explicit
+// oneMMemLog pins the gate-2a memory measurement: live HeapAlloc after explicit
 // GC (two collections), HeapInuse alongside for span-level visibility.
 func oneMMemLog(t *testing.T, label string) runtime.MemStats {
 	t.Helper()
@@ -593,7 +593,7 @@ func oneMBuildStage(t *testing.T) {
 	}
 
 	// Memory: with everything resident, then graph-alone (fixtures and
-	// the reference dropped) - the gate-2a口径.
+	// the reference dropped) - the gate-2a measurement.
 	oneMMemLog(t, "post-drain+queries (graph+reference+fixtures)")
 	vecs = nil
 	truths = nil
