@@ -72,6 +72,20 @@ v0.7 溶解了密封快照门。每次写入（或 `Batch`）把变更物化为�
 
 **⚠️ 升级到 0.5.0。** 存储快照改以 v3 格式写入。不兼容是单向的：v1/v2 旧文件仍可读，但 0.5 之前的二进制读不了 v3 文件——跨版本交换 `.vg` 快照的嵌入式与 MCP 用户需要两端都在 0.5+。raft 集群新旧混布策略不变（本就不支持）。
 
+## 向量检索（v0.9, Phase 1）
+
+对节点属性声明向量索引，即可做近似 top-k 查询（嵌入式 HNSW，纯 Go 标准库、零新增依赖——完整设计见
+[docs/superpowers/specs/2026-10-19-vector-search-design.md](docs/superpowers/specs/2026-10-19-vector-search-design.md)）：
+
+```go
+g.CreateVectorIndex(vectra.VectorIndexDecl{Name: "mem", Prop: "embedding", Dim: 768, Metric: "cosine"})
+g.AddNode("thought-1", "Memory", map[string]any{"embedding": someVec}) // []float32 属性
+hits, _ := g.QueryVector("mem", queryVec, vectra.QueryVectorOptions{K: 10, Label: "Memory"})
+```
+
+已提交的向量立即可查（overlay 的精确扫描兜底）；后台打包在不阻塞写的前提下构建段森林（写者摄入从不等待建图）。结果为近似值，并列时不保证顺序。声明经 WAL 与 store v4 持久化；恢复自底向上重建，overlay 作为精确回退。MCP 服务器以 `vector_search` 工具暴露（query_vector 或 similar_to，k ≤ 1000）。门 2b 数据：
+[docs/benchmarks/2026-10-20-vector-phase1-gate2b.md](docs/benchmarks/2026-10-20-vector-phase1-gate2b.md)。
+
 ## 全文属性检索（v0.12）
 
 类型化索引回答等值与范围；全文声明回答字符串属性上的**子串**查找——中英混排同样适用：

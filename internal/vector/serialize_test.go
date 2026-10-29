@@ -26,7 +26,7 @@ func buildForestState() *State {
 		s.Pack(false)
 	}
 	s.Delete("k5000")
-	s.Delete("k7000")                    // dead bits over packed vectors
+	s.Delete("k7000")                      // dead bits over packed vectors
 	s.Add("k100", normalizeRand(rng, dim)) // update: overlay beats segment
 	for i := 0; i < 100; i++ {
 		s.Add(fmt.Sprintf("t%d", i), normalizeRand(rng, dim))

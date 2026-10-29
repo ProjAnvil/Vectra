@@ -16,7 +16,7 @@ func (s *sinkFake) Rows(u uint32, dir int) []csr.AdjRow { return s.rows[u] }
 func (s *sinkFake) RowsInto(u uint32, dir int, buf []csr.AdjRow) []csr.AdjRow {
 	return append(buf[:0], s.rows[u]...)
 }
-func (s *sinkFake) NodeCount() int                         { return s.n }
+func (s *sinkFake) NodeCount() int                              { return s.n }
 func (s *sinkFake) FastAdjacency(dir int) (csr.Adjacency, bool) { return csr.Adjacency{}, false }
 
 // TestViewRowZeroAllocSteadyState locks the row-path allocation contract:

@@ -109,7 +109,7 @@ func TestBigLayerSkipsPrebuild(t *testing.T) {
 	// one big window-cut layer via unbatched burst (absorbs to 64K-edge cuts;
 	// 9000 edges stay one layer)
 	for i := 0; i+1 < len(keys); i++ {
-		for _, k := range keys[(i+1)%len(keys):min(i+6, len(keys))] {
+		for _, k := range keys[(i+1)%len(keys) : min(i+6, len(keys))] {
 			if _, err := g.AddEdge(keys[i], k, "BULK", nil); err != nil {
 				t.Fatal(err)
 			}

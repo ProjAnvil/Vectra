@@ -54,7 +54,7 @@ func dotProduct(a, b []float32) float32 {
 		s6 += av[6] * bv[6]
 		s7 += av[7] * bv[7]
 	}
-	dot := ((s0+s4)+(s1+s5))+((s2+s6)+(s3+s7))
+	dot := ((s0 + s4) + (s1 + s5)) + ((s2 + s6) + (s3 + s7))
 	var tail float32
 	for ; i < len(a); i++ {
 		tail += a[i] * b[i]
@@ -75,7 +75,7 @@ func l2Squared(a, b []float32) float64 {
 		s2 += t2 * t2
 		s3 += t3 * t3
 	}
-	sq := (s0+s1)+(s2+s3)
+	sq := (s0 + s1) + (s2 + s3)
 	for ; i < len(a); i++ {
 		t := float64(a[i] - b[i])
 		sq += t * t

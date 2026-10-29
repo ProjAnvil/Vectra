@@ -166,8 +166,6 @@ that verifies them at scale. Ingest accept 3.6x, compact-tier stalls
 records: `docs/benchmarks/2026-10-23-vector-1m.md`,
 `docs/benchmarks/2026-10-25-1m-fixes-retest.md`; design:
 `docs/superpowers/specs/2026-10-24-1m-fixes-design.md`.
-`docs/benchmarks/2026-10-23-vector-1m.md`; design:
-`docs/superpowers/specs/2026-10-24-1m-fixes-design.md`).
 
 ### Fixed
 

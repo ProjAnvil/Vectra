@@ -1856,7 +1856,7 @@ func Open(path string, opts Options) (*Graph, error) {
 	// must not pretend to be fine while its head stays
 	// downgrade-truncatable; recovery state survives either way
 	// (pre-manifest failures keep the WAL as the source of truth, a
-	// manifest that already landed makes the next Open a clean v6
+	// manifest that already landed makes the next Open a clean
 	// no-migration session).
 	if snapVer < store.VersionV6 {
 		// Rollback artifact: the Seal's checkpoint deletes the pre-migration
@@ -1870,7 +1870,7 @@ func Open(path string, opts Options) (*Graph, error) {
 		retainLegacyArtifact(legacySnap, snapVer)
 		if err := g.Seal(); err != nil {
 			w.Close()
-			return nil, fmt.Errorf("vectra: migrating %s to snapshot v6: %w", path, err)
+			return nil, fmt.Errorf("vectra: migrating %s to current snapshot version: %w", path, err)
 		}
 	}
 	return g, nil
@@ -2568,14 +2568,14 @@ func (g *Graph) compactTier() (compact bool, man wal.Manifest, err error) {
 	if err != nil {
 		return false, man, err
 	}
-	if !ok || man.Snapshot == "" || man.LSN == 0 || !g.snapshotIsV6(man) ||
+	if !ok || man.Snapshot == "" || man.LSN == 0 || !g.snapshotAtLeastV6(man) ||
 		g.wal.RetainedBytes() >= compactBytes || g.wal.FirstSegment() == 0 {
 		return true, man, nil
 	}
 	return false, man, nil
 }
 
-// snapshotIsV6 reports whether the manifest-named base snapshot is a
+// snapshotAtLeastV6 reports whether the manifest-named base snapshot is a
 // store-v6-OR-NEWER file — the hard downgrade tripwire floor. A light
 // checkpoint keeps the base, so it is legal only over v6+: an older base
 // under a manifest v2 is silently lossy for pre-0.11.2 binaries (they
@@ -2584,7 +2584,7 @@ func (g *Graph) compactTier() (compact bool, man wal.Manifest, err error) {
 // bases (and any future bump) carry the same retained-WAL safety, hence
 // the >=. Any probe failure also forces compaction — the compact tier
 // rewrites the base and self-heals.
-func (g *Graph) snapshotIsV6(man wal.Manifest) bool {
+func (g *Graph) snapshotAtLeastV6(man wal.Manifest) bool {
 	f, err := os.Open(filepath.Join(filepath.Dir(g.dbPath), man.Snapshot))
 	if err != nil {
 		return false
