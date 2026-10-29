@@ -11,11 +11,17 @@ from vectra_graph import Client
 
 client = Client(base_url="http://127.0.0.1:8080")  # or set VECTRA_URL / VECTRA_TOKEN
 
+before = client.stats()["publishedSeq"]            # raft index before the write
 client.batch(nodes=[{"key": "gateway", "label": "Service", "props": {"env": "prod"}}])
-aw = client.await_seq(client.stats()["publishedSeq"] + 1)
+aw = client.await_seq(before + 1)                  # reached=True once the write publishes
 for row in client.cypher("MATCH (n:Service) RETURN n.key")["rows"]:
     print(row["n.key"])
 ```
+
+Take the sequence number **before** the write: awaiting `publishedSeq + 1`
+read *after* the write stalls the full server timeout on an already
+caught-up server (it returns `reached: False`, never an error — the
+awaited index simply never arrives).
 
 Optimistic transaction (read at a snapshot, commit under validation):
 

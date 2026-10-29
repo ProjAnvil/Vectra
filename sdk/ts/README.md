@@ -17,7 +17,10 @@ import { VectraClient, TxnConflictError } from "@projanvil/vectra";
 
 const vectra = new VectraClient({ baseUrl: "http://127.0.0.1:8080" });
 
-// Auto-commit write, then read-your-writes.
+// Auto-commit write, then read-your-writes. Take the sequence number
+// BEFORE the write: awaiting (post-write stats).publishedSeq + 1 stalls
+// the full server timeout on an already caught-up server (reached: false).
+const before = (await vectra.stats()).publishedSeq;
 await vectra.batch({
   nodes: [
     { key: "api", label: "Service", props: { env: "prod" } },
@@ -25,8 +28,7 @@ await vectra.batch({
   ],
   edges: [{ srcKey: "api", dstKey: "auth", label: "CALLS" }],
 });
-const s = await vectra.stats();
-await vectra.awaitSeq(s.publishedSeq + 1);
+await vectra.awaitSeq(before + 1); // reached: true once the write publishes
 
 // Traversal.
 const walk = await vectra.bfs(["api"], { maxDepth: 2 });

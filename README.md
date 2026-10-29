@@ -223,16 +223,17 @@ npm install @projanvil/vectra
 
 Both packages live in-repo under `sdk/`; publishing to PyPI/npm is pending the owner's release — until then install from a checkout (`pip install ./sdk/python` / `npm install ./sdk/ts`).
 
-Python quickstart (connect → Cypher write with summary → read back → vector search):
+Python quickstart (connect → Cypher write with summary → declare a vector index → batch-write the vector → read back → search):
 
 ```python
 from vectra_graph import Client
 
-client = Client(base_url="http://127.0.0.1:8080")          # or $VECTRA_URL / $VECTRA_TOKEN
-summary = client.cypher("CREATE (n:Doc {key:'d1', emb:[1.0,0.0,0.0]})")["summary"]
-client.await_seq(client.stats()["publishedSeq"] + 1)      # read-your-writes
+client = Client(base_url="http://127.0.0.1:8080")      # or $VECTRA_URL / $VECTRA_TOKEN
+summary = client.cypher("CREATE (n:Tag {key:'t1', title:'hello'})")["summary"]
+client.vector_create_index("docs", prop="emb", dim=3)  # declare the vector index
+client.batch(nodes=[{"key": "d1", "label": "Doc", "props": {"emb": [1.0, 0.0, 0.0]}}])
 rows = client.cypher("MATCH (n:Doc) RETURN n.key, n.emb")["rows"]
-hits = client.vector_search("docs", similar_to="d1", k=5)["hits"]  # index "docs" on emb
+hits = client.vector_search("docs", similar_to="d1", k=5)["hits"]
 ```
 
 TypeScript quickstart:
@@ -241,11 +242,14 @@ TypeScript quickstart:
 import { VectraClient } from "@projanvil/vectra";
 
 const vectra = new VectraClient({ baseUrl: "http://127.0.0.1:8080" });
-const write = await vectra.cypher("CREATE (n:Doc {key:'d1', emb:[1.0,0.0,0.0]})"); // write.summary.createdNodes === 1
-await vectra.awaitSeq((await vectra.stats()).publishedSeq + 1);      // read-your-writes
+const write = await vectra.cypher("CREATE (n:Tag {key:'t1', title:'hello'})");  // write.summary.createdNodes === 1
+await vectra.vectorCreateIndex("docs", "emb", 3);  // declare the vector index
+await vectra.batch({ nodes: [{ key: "d1", label: "Doc", props: { emb: [1.0, 0.0, 0.0] } }] });
 const rows = (await vectra.cypher("MATCH (n:Doc) RETURN n.key, n.emb")).rows;
 const hits = (await vectra.vectorSearch("docs", { similarTo: "d1", k: 5 })).hits;
 ```
+
+Note the split: the Cypher write demos the summary counters on scalar props, while the vector rides a `batch`/`txn` node prop — the Cypher subset has no list literals (CREATE maps and SET both take scalars only).
 
 ## Benchmarks (M1 Pro, power-law graphs, full reports in [docs/benchmarks](docs/benchmarks))
 

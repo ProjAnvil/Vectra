@@ -215,16 +215,17 @@ npm install @projanvil/vectra
 
 两个包均在仓库内 `sdk/` 下；PyPI/npm 发布待所有者执行——在此之前可从检出安装（`pip install ./sdk/python` / `npm install ./sdk/ts`）。
 
-Python 快速上手（连接 → 带摘要的 Cypher 写入 → 读回 → 向量检索）：
+Python 快速上手（连接 → 带摘要的 Cypher 写入 → 声明向量索引 → batch 写入向量 → 读回 → 检索）：
 
 ```python
 from vectra_graph import Client
 
-client = Client(base_url="http://127.0.0.1:8080")          # 或 $VECTRA_URL / $VECTRA_TOKEN
-summary = client.cypher("CREATE (n:Doc {key:'d1', emb:[1.0,0.0,0.0]})")["summary"]
-client.await_seq(client.stats()["publishedSeq"] + 1)      # 读己之写
+client = Client(base_url="http://127.0.0.1:8080")      # 或 $VECTRA_URL / $VECTRA_TOKEN
+summary = client.cypher("CREATE (n:Tag {key:'t1', title:'hello'})")["summary"]
+client.vector_create_index("docs", prop="emb", dim=3)  # 声明向量索引
+client.batch(nodes=[{"key": "d1", "label": "Doc", "props": {"emb": [1.0, 0.0, 0.0]}}])
 rows = client.cypher("MATCH (n:Doc) RETURN n.key, n.emb")["rows"]
-hits = client.vector_search("docs", similar_to="d1", k=5)["hits"]  # "docs" 索引声明在 emb 上
+hits = client.vector_search("docs", similar_to="d1", k=5)["hits"]
 ```
 
 TypeScript 快速上手：
@@ -233,11 +234,14 @@ TypeScript 快速上手：
 import { VectraClient } from "@projanvil/vectra";
 
 const vectra = new VectraClient({ baseUrl: "http://127.0.0.1:8080" });
-const write = await vectra.cypher("CREATE (n:Doc {key:'d1', emb:[1.0,0.0,0.0]})"); // write.summary.createdNodes === 1
-await vectra.awaitSeq((await vectra.stats()).publishedSeq + 1);      // 读己之写
+const write = await vectra.cypher("CREATE (n:Tag {key:'t1', title:'hello'})");  // write.summary.createdNodes === 1
+await vectra.vectorCreateIndex("docs", "emb", 3);  // 声明向量索引
+await vectra.batch({ nodes: [{ key: "d1", label: "Doc", props: { emb: [1.0, 0.0, 0.0] } }] });
 const rows = (await vectra.cypher("MATCH (n:Doc) RETURN n.key, n.emb")).rows;
 const hits = (await vectra.vectorSearch("docs", { similarTo: "d1", k: 5 })).hits;
 ```
+
+注意这里的分工：Cypher 写入在标量属性上演示摘要计数器，而向量经由 `batch`/`txn` 的节点属性写入——Cypher 子集没有列表字面量（CREATE 属性表和 SET 都只接受标量）。
 
 ## 基准（M1 Pro，幂律图，完整报告见 [docs/benchmarks](docs/benchmarks)）
 
