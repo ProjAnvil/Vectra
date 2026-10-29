@@ -1091,3 +1091,39 @@ func TestCypherMergeDeterminismReplicas(t *testing.T) {
 		t.Fatalf("edge = %q want since=2020 w=7 keys=2", e1)
 	}
 }
+
+// TestCypherMergeResurrectOnCreateNoPanic pins the resurrection path's
+// writtenNodes record (review F1): a MERGE that recreates a bound var
+// deleted earlier in the SAME statement must record a NON-NIL props map —
+// overlayNodeProp assigns straight into an existing record's map, so a nil
+// one panicked with "assignment to entry in nil map" the moment an ON
+// CREATE SET item touched the recreated node.
+func TestCypherMergeResurrectOnCreateNoPanic(t *testing.T) {
+	g := New()
+	if _, err := g.Cypher(`CREATE (a:P {key:'x', v:1})`); err != nil {
+		t.Fatal(err)
+	}
+	res, err := g.Cypher(`MATCH (a {key:'x'}) DETACH DELETE a MERGE (a) ON CREATE SET a.z = 1 RETURN a.key, a.z`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Summary == nil || res.Summary.DeletedNodes != 1 || res.Summary.CreatedNodes != 1 {
+		t.Fatalf("summary = %+v want DeletedNodes=1, CreatedNodes=1 (delete then resurrect)", res.Summary)
+	}
+	if res.Summary.PropertiesSet != 1 {
+		t.Errorf("PropertiesSet = %d want 1 (the ON CREATE item)", res.Summary.PropertiesSet)
+	}
+	if len(res.Rows) != 1 || res.Rows[0]["a.key"] != "x" || res.Rows[0]["a.z"] != 1.0 {
+		t.Fatalf("rows = %+v want a.key=x, a.z=1", res.Rows)
+	}
+	n, ok := g.NodeByKey("x")
+	if !ok {
+		t.Fatal("resurrected node missing through the read path")
+	}
+	if n.Props["z"] != 1.0 {
+		t.Fatalf("props = %v want z=1 (ON CREATE fired on the resurrection)", n.Props)
+	}
+	if _, has := n.Props["v"]; has {
+		t.Fatalf("props = %v want v gone (the delete killed the original props; AddNode revive does not resurrect them)", n.Props)
+	}
+}

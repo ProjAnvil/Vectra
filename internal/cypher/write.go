@@ -493,7 +493,9 @@ func (ex *executor) mergeNode(np *NodePattern, r *row, onCreate, onMatch []*SetI
 		if created {
 			ex.sum.CreatedNodes++
 		}
-		ex.writtenNodes[id] = engine.NodeRec{Key: key, Label: np.Label}
+		// Non-nil props, exactly as createNode records: overlayNodeProp
+		// assigns straight into an existing record's map.
+		ex.writtenNodes[id] = engine.NodeRec{Key: key, Label: np.Label, Props: map[string]any{}}
 		r.ownNodes()
 		r.nodes[np.Var] = id
 		return ex.applySetItems(onCreate, r)
