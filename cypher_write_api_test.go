@@ -446,7 +446,11 @@ func TestCypherSetEdgeProp(t *testing.T) {
 		if e.Props["tag"] != "go" {
 			t.Errorf("parallel %d tag = %v want go (triple-addressed)", e.ID, e.Props["tag"])
 		}
-		ws[e.Props["w"].(float64)] = true
+		w, isNum := e.Props["w"].(float64)
+		if !isNum {
+			t.Fatalf("parallel %d w = %#v want a number", e.ID, e.Props["w"])
+		}
+		ws[w] = true
 	}
 	if !ws[9.0] || !ws[2.0] {
 		t.Errorf("per-parallel w values = %v want {9, 2} preserved", ws)
@@ -454,6 +458,38 @@ func TestCypherSetEdgeProp(t *testing.T) {
 	// 2 match rows x 1 item x 2 parallels touched per call
 	if res.Summary.PropertiesSet != 4 {
 		t.Errorf("PropertiesSet = %d want 4 (2 rows x 2 edges touched)", res.Summary.PropertiesSet)
+	}
+}
+
+// TestCypherSetEdgeReturnScalars pins the edge SET read overlay: RETURN of
+// edge SCALARS after SET serves the staged props AND the pre-existing ones
+// — the fold seeds from the pre-write record of the bound parallel (never
+// from the freshly rewritten canonical ID, which resolves nowhere) and
+// accumulates per triple across items (Review F1).
+func TestCypherSetEdgeReturnScalars(t *testing.T) {
+	g := New()
+	if _, err := g.Cypher(`CREATE (a:P {key:'a'})-[:CALLS {keep:'me', w:1}]->(b:P {key:'b'})`); err != nil {
+		t.Fatal(err)
+	}
+	// shape 1: one item; the untouched prop must survive the RETURN
+	res, err := g.Cypher(`MATCH (a {key:'a'})-[r:CALLS]->(b {key:'b'}) SET r.tag = 'go' RETURN r.keep, r.tag`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := res.Rows[0]["r.keep"]; got != "me" {
+		t.Errorf("r.keep = %v want me (seed from the pre-write record)", got)
+	}
+	if got := res.Rows[0]["r.tag"]; got != "go" {
+		t.Errorf("r.tag = %v want go", got)
+	}
+	// shape 2: two items; every staged prop renders, not just the last
+	res, err = g.Cypher(`MATCH (a {key:'a'})-[r:CALLS]->(b {key:'b'}) SET r.w = 9, r.note = 'x' RETURN r.w, r.note, r.keep`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := res.Rows[0]
+	if row["r.w"] != 9.0 || row["r.note"] != "x" || row["r.keep"] != "me" {
+		t.Fatalf("row = %v want w=9, note=x, keep=me (fold accumulates across items)", row)
 	}
 }
 

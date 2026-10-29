@@ -462,6 +462,12 @@ type executor struct {
 	// entities that did not exist when it was taken.
 	writtenNodes map[uint32]engine.NodeRec
 	writtenEdges map[uint32]writtenEdge
+	// setEdgeFolds accumulates the SET clause's property folds per TRIPLE
+	// (keyed by edgeRef, not by ID: SetEdgeProps rewrites the triple with
+	// fresh EdgeIDs on every call, so any ID key goes stale between items).
+	// Each fold publishes into writtenEdges under the CURRENT canonical ID
+	// (EdgeIDByTriple); see foldEdgeProp for the seeding rule.
+	setEdgeFolds map[edgeRef]writtenEdge
 }
 
 // writtenEdge is a created edge's post-write record for edgeVal.

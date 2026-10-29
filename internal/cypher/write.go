@@ -105,6 +105,7 @@ func RunWrite(src Source, w Writer, q string) (*Result, error) {
 		edgeRefs:     make(map[uint32]edgeRef),
 		writtenNodes: make(map[uint32]engine.NodeRec),
 		writtenEdges: make(map[uint32]writtenEdge),
+		setEdgeFolds: make(map[edgeRef]writtenEdge),
 	}
 	// The CSR fast path requires BOTH directions (RunView's gating rule).
 	if adjF, okF := src.FastAdjacency(0); okF {
@@ -289,9 +290,7 @@ func (ex *executor) setStage(c *SetClause, rows []row) ([]row, error) {
 					return nil, err
 				}
 				ex.sum.PropertiesSet += n
-				if canon, okC := ex.w.EdgeIDByTriple(ref.srcKey, ref.dstKey, ref.label); okC {
-					ex.overlayEdgeProp(canon, it.Prop, val)
-				}
+				ex.foldEdgeProp(ref, id, it.Prop, val)
 			} else {
 				// An OPTIONAL MATCH miss leaves the var unbound in the kept
 				// row; Neo4j parity is the explicit null error.
@@ -315,7 +314,9 @@ func (ex *executor) setStage(c *SetClause, rows []row) ([]row, error) {
 // pending overlay serves FIRST (values staged by earlier items of this
 // row), everything else falls through to the ordinary evaluator — reads of
 // other entities resolve through the pinned pre-write source, exactly as
-// CREATE's property expressions do.
+// CREATE's property expressions do. PropRef-only by design: a nested or
+// comparison RHS falls through whole (see foldEdgeProp for the edge-var
+// consequence).
 func (ex *executor) evalPending(e Expr, r row, pending map[string]map[string]any) (any, bool) {
 	if pending != nil {
 		if p, ok := e.(*PropRef); ok {
@@ -351,24 +352,40 @@ func (ex *executor) overlayNodeProp(id uint32, prop string, val any) {
 	ex.writtenNodes[id] = rec
 }
 
-// overlayEdgeProp is overlayNodeProp's edge twin, keyed by the CANONICAL
-// post-write edge of the triple (EdgeIDByTriple — the same ID rebindRows
-// remaps RETURN bindings to): SetEdgeProps rewrites parallels with fresh
-// EdgeIDs, so the bound ID itself would be missed after the rebind.
-func (ex *executor) overlayEdgeProp(id uint32, prop string, val any) {
-	we, ok := ex.writtenEdges[id]
+// foldEdgeProp stages one edge property write into the statement's
+// triple-keyed fold (setEdgeFolds) and publishes it under the CURRENT
+// canonical ID of the triple (EdgeIDByTriple — the same ID rebindRows
+// remaps RETURN bindings to). The fold seeds from the PRE-WRITE record of
+// the bound parallel (edgeInfo(boundID): writtenEdges first — an edge this
+// statement created — then the pinned source), NEVER from the canonical ID
+// itself: SetEdgeProps rewrites the triple with fresh EdgeIDs on every
+// call, so a canonical ID resolves nowhere pre-write and moves again on
+// every later item — seeding from it would empty the fold's base and strand
+// earlier items' folds on stale IDs (Review F1).
+//
+// Known limitation (the pending overlay is PropRef-only, see evalPending):
+// the fold publishes under the canonical ID while RHS reads resolve
+// through the BOUND ID, so a nested or comparison RHS on an edge var
+// (e.g. r.w + 1 after SET r.w = 1) reads the pinned pre-write value; only
+// a direct property read sees the staged value. Node targets have no such
+// gap — their overlay publishes under the bound ID itself.
+func (ex *executor) foldEdgeProp(ref edgeRef, boundID uint32, prop string, val any) {
+	fold, ok := ex.setEdgeFolds[ref]
 	if !ok {
-		src, dst, label, props, _ := ex.edgeInfo(id)
+		src, dst, label, props, _ := ex.edgeInfo(boundID) // pre-write truth
 		p := make(map[string]any, len(props)+1)
 		maps.Copy(p, props)
-		we = writtenEdge{src: src, dst: dst, label: label, props: p}
+		fold = writtenEdge{src: src, dst: dst, label: label, props: p}
+		ex.setEdgeFolds[ref] = fold
 	}
 	if val == nil {
-		delete(we.props, prop)
+		delete(fold.props, prop)
 	} else {
-		we.props[prop] = val
+		fold.props[prop] = val
 	}
-	ex.writtenEdges[id] = we
+	if canon, okC := ex.w.EdgeIDByTriple(ref.srcKey, ref.dstKey, ref.label); okC {
+		ex.writtenEdges[canon] = fold // publish; fold.props is shared, so always current
+	}
 }
 
 // boundNodeKey resolves a bound node ID to its logical key: the refs memo
