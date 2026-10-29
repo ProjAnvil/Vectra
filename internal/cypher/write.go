@@ -25,6 +25,8 @@ type Writer interface {
 	// without an explicit key: "_c<id>" drawn from the node-ID ratchet.
 	// Deterministic: replaying the same statement sequence on identical
 	// state yields identical keys (required for raft FSM re-execution).
+	// No guard: behavior on a closed graph is undefined, matching
+	// AddNode — the consuming CreateNode call is what fails closed.
 	NewNodeKey() string
 	NodeIDByKey(key string) (uint32, bool)
 	// CreateNode applies AddNode upsert semantics; created=false when the
@@ -47,7 +49,9 @@ type Writer interface {
 	// is missing (statement error, first-error-stops).
 	CreateEdge(srcKey, dstKey, label string, props map[string]any) (id uint32, err error)
 	// SetEdgeProps writes props onto every live parallel edge of the
-	// triple; returns the number of edges touched.
+	// triple; returns the number of edges touched. The rewrite is
+	// delete-then-re-add of the whole triple: a mid-loop failure leaves
+	// it partially re-added (first-error-stops, no rollback).
 	SetEdgeProps(srcKey, dstKey, label string, props map[string]any) (int, error)
 	// EdgeIDByTriple returns the first live parallel edge (used to rebind
 	// RETURN'd edge variables after writes).
@@ -157,7 +161,11 @@ func (ex *executor) createPattern(pat *PathPattern, r *row) error {
 			if id, ok := r.nodes[np.Var]; ok { // rebind: the bound node is the identity
 				key, ok := ex.boundNodeKey(id)
 				if !ok {
-					return &Error{np.Line, np.Col, fmt.Sprintf("bound node %q does not resolve to a key", np.Var)}
+					line, col := np.Line, np.Col
+					if line == 0 { // hand-built pattern: no token positions
+						line, col = 1, 1
+					}
+					return &Error{line, col, fmt.Sprintf("bound node %q does not resolve to a key", np.Var)}
 				}
 				keys[i], ids[i] = key, id
 				continue

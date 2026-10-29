@@ -44,6 +44,10 @@ path, found, _ := g.ShortestPath("gateway", "kafka")
 // dependency-cycle discovery (nodes + intra-cycle edges with label/props)
 for _, c := range g.Cycles() { ... }
 
+// Cypher write clauses (v0.14): CREATE/MERGE/SET/DELETE + index DDL
+cw, _ := g.Cypher(`CREATE (p:Service {key:'payments'})-[:CALLS {w:2}]->(o:Service {key:'orders'})`)
+_ = cw.Summary // {CreatedNodes: 2, CreatedEdges: 1, ...} — writes carry counters
+
 // atomic single-file snapshot
 g.SaveFile("deps.vg")
 ```
@@ -120,13 +124,29 @@ res, _ := g.Cypher(`MATCH (b {type:'controller'})-[:CALLS*1..2]->(s)
 
 Grammar (v0.13 clause pipeline): clauses chain in any order — `[OPTIONAL] MATCH pattern[, pattern...] [WHERE expr]` (repeatable), `WITH [DISTINCT] items [ORDER BY item [ASC|DESC]...] [SKIP n] [LIMIT n] [WHERE expr]`, `UNWIND list AS alias` — ending in `RETURN *|items [ORDER BY item [ASC|DESC]...] [SKIP n] [LIMIT n]`; node `(var:Label {prop:literal})`, edge `-[var:REL|REL*n..m]->` / `<-[...]-` / `--` (undirected); WHERE supports `= <> < <= > >=`, `STARTS/ENDS WITH`, `CONTAINS`, `IN [...]`, `AND/OR/NOT`, the pseudo-props `var.key / var.label / var.id`, and edge props on fixed single hops (`WHERE e.weight > 3` — parallel edges each bind a row).
 
+Write clauses and DDL (v0.14): `CREATE pattern[, pattern...]`, `SET var.prop = expr, ...` (a `null` RHS deletes the property), `[DETACH] DELETE var[, var...]`, `MERGE pattern [ON CREATE SET items] [ON MATCH SET items]`, and the standalone `CREATE [FULLTEXT] INDEX ON (n.prop)`. Write-pattern prop values are **expressions** (`{key: k, weight: 2}` — the bulk-import shape), unlike read patterns' literals:
+
+```go
+g.Cypher(`CREATE (s:Service {key:'payments', env:'prod'}) RETURN s`) // keyed create (RETURN optional)
+g.Cypher(`UNWIND ['a','b','c'] AS k CREATE (n:Service {key:k})`)    // bulk: one create per unwound row
+g.Cypher(`MATCH (s {key:'payments'}) SET s.env = 'staging', s.tmp = null`)
+g.Cypher(`MATCH (s {key:'payments'}) DETACH DELETE s`)              // node + incident edges
+g.Cypher(`MERGE (s:Service {key:'payments'}) ON CREATE SET s.fresh = true ON MATCH SET s.seen = true`)
+g.Cypher(`CREATE INDEX ON (n.env)`)                                 // typed
+g.Cypher(`CREATE FULLTEXT INDEX ON (n.desc)`)                       // full-text
+```
+
+Statement shape: an optional read prefix (`MATCH` / `WITH` / `UNWIND`) feeds the write clauses per row, left to right, and an optional trailing `RETURN` projects the post-write state (a deleted binding renders null). No read clause may follow a write clause in this version. A write statement's result carries a `summary` — `createdNodes / createdEdges / deletedNodes / deletedEdges / propertiesSet / indexesCreated`.
+
 Semantics (deliberate, documented): variable-length edges follow **node-pair semantics** — a target matches when its *shortest distance* lies within the hop window (`[:CALLS*1..2]` = 1..2 hops by shortest path; cycles do not create longer matches), intermediate nodes are not filtered by the target pattern, and variable-length edges bind no edge variable. Rows dedup on named bindings + final position; WHERE uses null-propagating logic (a missing property never satisfies, and `NOT` does not rescue it). Anchoring uses the typed property indexes when the pattern allows (`{type:'controller'}`), scanning otherwise. Intermediate rows are capped at 1,000,000 (error asks for a narrower pattern or `LIMIT`).
 
 Clause pipeline and scope: clauses transform one row set stage by stage. Repeated `MATCH` (new in v0.13) cartesian-products disjoint variables and joins shared ones; stages are strict — a stage whose input is zero rows yields zero rows. `OPTIONAL MATCH` keeps an incoming row whose whole clause (comma patterns plus its WHERE) matches nothing, the clause's pattern variables reading null. `WITH` starts a new scope: only projected names survive — bare variables pass their entity binding through (own name or alias), while `var.prop` and aggregation items require `AS` and project scalars — and its optional trailing `WHERE` filters the projected rows. `UNWIND` keeps the scope and declares its alias as a scalar bound to each list element.
 
 Divergences & limits (deliberate): `UNWIND` fan-out and every intermediate stage are capped by the 1,000,000-row budget; `OPTIONAL MATCH` does not dedup across base rows (duplicate inputs stay duplicated); keywords may serve as aliases (`WITH a AS match`); a pattern variable first declared under `OPTIONAL MATCH` is nullable — using it as a pattern variable in a later non-optional `MATCH` is a validation error suggesting the restructures (fold the pattern into the `OPTIONAL MATCH`, or mark the later `MATCH` optional; `IS [NOT] NULL` is not in the grammar); `RETURN *` remains limited to the degenerate single-`MATCH` query; `WITH *`, `range()`, `RETURN DISTINCT`, and general expression items are deferred (the aggregations `count/sum/avg/min/max/collect`, including `DISTINCT` inside count/collect, work in RETURN and WITH items).
 
-Same surface elsewhere: server `POST /v1/cypher` (`{"query": "..."}` → `{columns, rows, count}`; parse errors 400 `PARSE`), MCP tool `cypher` in all three servers (default limit 1000, `total` reports the true size).
+Write identity & divergences (v0.14, deliberate): `key` in a write pattern's props is the node's logical key — extracted as identity, never stored as a property; a keyless CREATE draws a deterministic engine-generated `_c<id>` key (the `_c` prefix is reserved), and CREATE on an existing key is an `AddNode` upsert (label and props replaced wholesale). `MERGE` matches a node by key only — the pattern's other props are creation-time, so a hit never rewrites them (`ON MATCH SET` is the update path) — and an edge by its `(src, dst, label)` triple (an existing edge binds the whole pattern and suppresses endpoint creation). `SET`/`DELETE` on an edge variable addresses the WHOLE triple: a SET writes every parallel edge, a DELETE removes them all (one `DELETE r` on a two-parallel triple counts `deletedEdges: 2`), and in `DETACH DELETE a, r` a cascade that already killed r is a silent no-op for r; rebinding resolves the lowest-ID live parallel, so a RETURNed edge scalar on a multigraph may render a different parallel's untouched props. Errors are first-error-stops with applied-writes-remain (the `Batch` contract — no rollback); a plain `DELETE` of a node that still has edges fails before any write lands. `CREATE INDEX ON (n.prop)` declares an index GLOBAL per property key — label-scoped spellings are rejected — and the declaration stays pending until the next Seal/merge (idempotent; every applied statement counts one `indexesCreated`). Write statements run on the single-writer path: the calling convention of `AddNode`/`UpsertEdge` in embedded mode, one raft `Apply` per statement in server mode.
+
+Same surface elsewhere: server `POST /v1/cypher` classifies the statement — reads answer from the local published snapshot exactly as before (`{"query": "..."}` → `{columns, rows, count}`), writes replicate through raft like `/v1/batch` and return `{columns, rows, summary}` (the counter keys above, never `count`); parse errors are 400 `PARSE` either way. MCP tool `cypher` in all three servers (default limit 1000, `total` reports the true size) is annotated not-read-only for the write clauses; the Go server executes them in-process on the embedded engine and surfaces the same summary object (the Python/TS proxies pass it through).
 
 ## Server mode (optional module)
 
@@ -135,7 +155,9 @@ All embedded graph products (Kuzu, CozoDB, SQLite) ship without replication; eve
 ```
 write: client →POST /v1/batch→ leader ─raft→ majority commit → deterministic FSM replay
 publisher (each node): RLock clone → Seal outside the lock → atomic.Pointer swap
-queries: GET /v1/* and POST /v1/query|/v1/cypher → local published snapshot (lock-free, never interrupted)
+queries: GET /v1/* and POST /v1/query → local published snapshot (lock-free, never interrupted)
+cypher: POST /v1/cypher classifies — reads → local published snapshot, unchanged;
+         writes → raft (the leader's FSM re-executes the statement deterministically)
 ```
 
 ```bash
@@ -144,7 +166,7 @@ cd server && go build -o vectra-server ./cmd/vectra-server
 ./vectra-server -id n2 -data /data/n2 -join http://n1:8080              # join
 ```
 
-Semantics: writes are linearizable (raft commit) — upserts plus logical-key deletes (node deletes cascade incident edges); reads are bounded-stale (≤ SealInterval, immediate for small graphs). Edge identity in batch and transaction writes is the `(srcKey, dstKey, label)` triple — upserts collapse parallels and the last write wins on props; set `"allowParallel": true` on an edge item to append a true parallel edge instead. Anti-split-brain: nodes with `Join` set never bootstrap. The 3-node in-process chaos suite (leader failover, log replay catch-up, zero query failures during republish) runs under `-race` in CI.
+Semantics: writes are linearizable (raft commit) — upserts plus logical-key deletes (node deletes cascade incident edges); reads are bounded-stale (≤ SealInterval, immediate for small graphs). Edge identity in batch and transaction writes is the `(srcKey, dstKey, label)` triple — upserts collapse parallels and the last write wins on props; set `"allowParallel": true` on an edge item to append a true parallel edge instead. Cypher write statements join the same path: `POST /v1/cypher` classifies each statement (reads stay local and byte-for-byte unchanged), a write commits through raft exactly like a batch, and the response is `{columns, rows, summary}` with the mutation counters (`createdNodes / createdEdges / deletedNodes / deletedEdges / propertiesSet / indexesCreated` from the APPLY result) — never the read path's `count` key. Anti-split-brain: nodes with `Join` set never bootstrap. The 3-node in-process chaos suite (leader failover, log replay catch-up, zero query failures during republish) runs under `-race` in CI.
 
 **Bearer-token auth (v0.12, optional).** `-auth-token-file <file>` enables static bearer auth: the file holds one token per line — multiple lines are all accepted, which is the rotation story (append the new token to every node, roll restarts, then remove the old one). Blank lines and CRLF endings are tolerated; a line with internal whitespace, an unreadable file, or an empty file aborts startup — auth never degrades into a silently open database. Every route then requires `Authorization: Bearer <token>` (SHA-256 digests, constant-time comparison) except exactly `GET /v1/health`, which stays open for the load-balancer probe. A joining node's `-join` requests carry its own token — one trust domain, every node shares the same token file. **Boundary:** HTTP auth protects HTTP only; the raft channel between nodes stays plaintext and unauthenticated, so bind `-raft` to a private interface and keep cluster traffic off untrusted networks (and terminate TLS in front of the HTTP port if tokens must not cross it in the clear — the server has no built-in TLS).
 
@@ -161,6 +183,8 @@ conflict: 409 {committed: false, conflicts: [...], conflictTotal, hint}
 ```
 
 **Isolation.** Default is snapshot isolation (SI): write-set validation, first-committer-wins — any written key modified after the token rejects the whole batch, so blind writes participate too (stronger than badger/FDB defaults, where blind writes sneak through). `"ser": true` adds read-set validation: keys recorded in `readNodes`/`readEdges` that changed after the token also reject (phantom / write-skew protection). Edge writes bump both endpoint versions; node deletes cascade to peer adjacency — all observable through validation. A `txn` field is required (400 `VALIDATION` without it — use `/v1/batch` for auto-commit); readNodes and readEdges are capped at 100,000 keys (400 `TXN_READSET_TOO_LARGE`).
+
+**⚠️ Cypher writes are invisible to OCC validation (v0.14 known limit).** Cypher write statements do not advance the per-key transaction version tables — the write summary carries counters, not touched keys — so an OCC/SI/SER transaction cannot conflict-detect on keys written via Cypher: a `/v1/txn` batch whose read or write set overlaps Cypher-written keys validates as if those keys had not changed. Until engine-level touched-key tracking lands, do not mix interactive `/v1/txn` traffic and Cypher writes on the same keys — keep the two on disjoint key sets, or route the contested writes through `/v1/txn`'s node/edge items instead.
 
 **Read-set coverage** — what to record for `ser: true`:
 
@@ -180,7 +204,7 @@ conflict: 409 {committed: false, conflicts: [...], conflictTotal, hint}
 
 ## MCP (agents)
 
-Three first-class implementations — [Go (embedded engine)](mcp), [Python (FastMCP)](mcp/python), [TypeScript](mcp/ts) — exposing one-hop / multi-hop / shortest-path / reachability / cycles (with intra-cycle edges) / Cypher-subset pattern queries as MCP tools, plus `inject_batch` for writes (`allowParallel` supported; `lookup_property` takes string/number/bool values). In the Go server every applied write is immediately queryable — no seal round-trip; `seal` is optional maintenance (merge + checkpoint), and `-wal <dir>` runs a durable session that recovers across restarts:
+Three first-class implementations — [Go (embedded engine)](mcp), [Python (FastMCP)](mcp/python), [TypeScript](mcp/ts) — exposing one-hop / multi-hop / shortest-path / reachability / cycles (with intra-cycle edges) / Cypher-subset pattern queries as MCP tools, plus `inject_batch` for writes (`allowParallel` supported; `lookup_property` takes string/number/bool values). Since v0.14 the `cypher` tool takes write clauses too (CREATE/MERGE/SET/DELETE, CREATE INDEX): it is annotated not-read-only, the Go server executes them in-process on the embedded engine, and a write result carries the `summary` counters (`createdNodes / createdEdges / deletedNodes / deletedEdges / propertiesSet / indexesCreated`; reads keep the key absent). In the Go server every applied write is immediately queryable — no seal round-trip; `seal` is optional maintenance (merge + checkpoint), and `-wal <dir>` runs a durable session that recovers across restarts:
 
 ```bash
 claude mcp add vectra -- /path/to/vectra-mcp
@@ -212,14 +236,14 @@ changeset.go         Changeset vocabulary (WAL frames, server raft batches)
 options.go           Open options: WALMode / WALDir
 merge.go             background-merge protocol: CaptureMerge / PublishMerge / LayerPressure
 view.go              three-source row streams (base CSR + micro-layer records)
-cypher.go            facade: Cypher-subset query entry (Graph.Cypher)
+cypher.go            facade: Cypher-subset entry (Graph.Cypher — reads and writes)
 internal/csr         CSR adjacency (pointer-free uint32 arrays)
 internal/dag         Tarjan SCC, condensation, topological levels
 internal/engine      sealed snapshot + accessors + Seal pipeline
 internal/delta       immutable micro-layer builder and layer records
 internal/wal         embedded logical WAL (JSON frames, watermark checkpoints)
 internal/writer      single-writer wrapper: queue, group commit, background merger
-internal/cypher      Cypher-subset lexer, parser, AST, row executor
+internal/cypher      Cypher-subset lexer, parser, AST, row executor + write-clause executor
 internal/traverse    algorithms: layer-synced BFS, reachability, bidirectional path, cycles
 internal/store       snapshot codec (v3: indexKey section + CRC32 trailer, v1/v2 read-compatible)
 server/              separate module: raft replication + HTTP API + hot-swap publisher

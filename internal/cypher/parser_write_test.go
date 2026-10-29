@@ -284,6 +284,10 @@ func TestParseWriteErrors(t *testing.T) {
 		{"MATCH (a)-[r:X*]->(b) DELETE r", "variable-length edge", 1, 1},
 		{`MATCH (a)-[r:X]->(b) CREATE (r)-[:P]->(c)`, `variable "r" is an edge`, 1, 30},
 		{`MATCH (a) CREATE (b)-[a:X]->(c)`, `edge variable "a" is already declared`, 1, 23},
+		// scalar colliding as an edge var rides the same `bound` branch
+		// (edge pattern vars must be fresh names of any kind) — pinned
+		// explicitly so the scalar arm cannot silently change message.
+		{`UNWIND [1] AS k CREATE (a)-[k:X]->(b)`, `edge variable "k" is already declared`, 1, 29},
 		{"MERGE (a), (b)", "MERGE takes exactly one pattern", 1, 10},
 	}
 	for _, c := range cases {

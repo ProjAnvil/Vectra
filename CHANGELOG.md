@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - Unreleased
+
+The Cypher write path: the subset grows from a read pipeline into a statement
+language — CREATE / SET / DELETE / DETACH DELETE / MERGE (with ON CREATE SET /
+ON MATCH SET) and `CREATE [FULLTEXT] INDEX` DDL execute against the embedded
+engine, replicate through raft on the server, and report their mutations as
+counter summaries. Read statements keep the v0.13 pipeline byte-for-byte.
+
+### Added
+
+- Cypher write clauses. A statement is an optional read prefix (MATCH / WITH /
+  UNWIND) feeding per-row write clauses left to right, plus an optional
+  trailing RETURN over the post-write state (a deleted binding renders null);
+  no read clause may follow a write clause in this version. Write-pattern
+  prop values are expressions (`UNWIND [...] AS k CREATE (n:P {key:k})` is
+  the bulk-import shape); SET items write one property each with `null`
+  deleting the key; a plain DELETE of a node that still has edges fails
+  before any write lands; MERGE trailers run per arm.
+- Write results carry a summary: `createdNodes / createdEdges / deletedNodes /
+  deletedEdges / propertiesSet / indexesCreated` (`CypherResult.Summary`;
+  read statements leave it nil).
+- Documented write identity & divergences: `key` in a write pattern's props
+  is the node's logical key (extracted as identity, never stored as a
+  property); a keyless CREATE draws a deterministic engine-generated `_c<id>`
+  key (the `_c` prefix is reserved); CREATE on an existing key is an AddNode
+  upsert (label and props replaced). MERGE matches a node by key only (the
+  pattern's other props are creation-time) and an edge by its
+  (src, dst, label) triple — an existing edge binds the whole pattern and
+  suppresses endpoint creation. SET/DELETE on an edge variable addresses the
+  whole triple (every parallel written by a SET, all removed by a DELETE;
+  `DETACH DELETE a, r` no-ops r when a's cascade already killed it); the
+  lowest-ID parallel rebind means a RETURNed edge scalar on a multigraph may
+  render a different parallel's untouched props. Errors are
+  first-error-stops with applied-writes-remain (the Batch contract — no
+  rollback).
+- `CREATE INDEX ON (n.prop)` / `CREATE FULLTEXT INDEX ON (n.prop)`: standalone
+  DDL declaring an index GLOBAL per property key (label-scoped spellings are
+  rejected), pending until the next Seal/merge, idempotent, counting one
+  `indexesCreated` per applied statement.
+- Server: `POST /v1/cypher` classifies each statement — reads stay on the
+  local published snapshot with the exact pre-v0.14 response shape; writes
+  replicate through raft exactly like `/v1/batch` (the leader's FSM
+  re-executes the statement deterministically; follower/apply errors share
+  the batch write faces) and return `{columns, rows, summary}` — never the
+  read path's `count`. MCP: the `cypher` tool is annotated not-read-only;
+  the Go server executes writes in-process and surfaces the summary
+  counters (the Python/TS proxies pass them through).
+- **Known limitation — Cypher writes are invisible to OCC validation.**
+  Cypher write statements do not advance the server's per-key transaction
+  version tables (the write summary carries counters, not touched keys), so
+  an OCC/SI/SER `/v1/txn` batch cannot conflict-detect on keys written via
+  Cypher. Until engine-level touched-key tracking lands, do not mix
+  interactive `/v1/txn` traffic and Cypher writes on the same keys — keep
+  them on disjoint key sets or route the contested writes through `/v1/txn`'s
+  node/edge items.
+
 ## [0.13.1] - 2026-10-29
 
 ### Fixed

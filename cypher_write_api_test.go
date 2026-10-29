@@ -495,6 +495,52 @@ func TestCypherSetEdgeReturnScalars(t *testing.T) {
 	}
 }
 
+// TestCypherSetEdgeReturnParallelRebind pins the documented multigraph
+// divergence of the triple-addressed write path: EdgeIDByTriple rebinding
+// resolves the lowest-ID live parallel and the SET fold is triple-keyed
+// (seeded from the first row's bound parallel), so on a 2-parallel triple
+// every RETURNed edge scalar renders the FIRST parallel's untouched props —
+// the second row's bound parallel carried w=2, yet its r.w renders 1.
+func TestCypherSetEdgeReturnParallelRebind(t *testing.T) {
+	g := New()
+	if _, err := g.Cypher(`CREATE (a:P {key:'a'})-[:CALLS {w:1}]->(b:P {key:'b'})`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Cypher(`MATCH (a {key:'a'}), (b {key:'b'}) CREATE (a)-[:CALLS {w:2}]->(b)`); err != nil {
+		t.Fatal(err)
+	}
+	res, err := g.Cypher(`MATCH (a {key:'a'})-[r:CALLS]->(b {key:'b'}) SET r.tag = 'go' RETURN r.w, r.tag`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("rows = %d want 2 (parallel edges each bind a row)", len(res.Rows))
+	}
+	for i, row := range res.Rows {
+		if row["r.w"] != 1.0 {
+			t.Errorf("row %d r.w = %v want 1 (the lowest-ID parallel's value; the rebind never points at the second parallel)", i, row["r.w"])
+		}
+		if row["r.tag"] != "go" {
+			t.Errorf("row %d r.tag = %v want go (staged writes render on every row)", i, row["r.tag"])
+		}
+	}
+	// the stored state is exact: both parallels carry the written tag and
+	// keep their own w (the rendering divergence above never leaks here)
+	es := liveTriple(t, g, "a", "b", "CALLS")
+	ws := map[float64]bool{}
+	for _, e := range es {
+		if e.Props["tag"] != "go" {
+			t.Errorf("parallel %d tag = %v want go", e.ID, e.Props["tag"])
+		}
+		if w, ok := e.Props["w"].(float64); ok {
+			ws[w] = true
+		}
+	}
+	if !ws[1.0] || !ws[2.0] {
+		t.Errorf("per-parallel w values = %v want {1, 2} preserved", ws)
+	}
+}
+
 // TestCypherSetUnboundErrors pins the OPTIONAL MATCH miss: the target var
 // is unbound in the kept row and SET errors (Neo4j parity),
 // first-error-stops, inventing nothing.
