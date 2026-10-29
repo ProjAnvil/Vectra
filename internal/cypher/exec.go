@@ -33,10 +33,12 @@ type EdgeVal struct {
 
 // Result is the outcome of one statement: ordered columns and one map per
 // matching row. Cell values are NodeVal, EdgeVal, string, float64, bool or
-// nil.
+// nil. Summary carries the mutation counters of a WRITE statement (RunWrite
+// populates it; read statements leave it nil).
 type Result struct {
 	Columns []string
 	Rows    []map[string]any
+	Summary *WriteSummary
 }
 
 // Source is the three-source execution surface (v0.7 spec §3.2): node/edge
@@ -152,12 +154,45 @@ func runStatement(ex *executor, ast *Query) (*Result, error) {
 			if err != nil {
 				return nil, err
 			}
+		case *CreateClause:
+			// Write stages exist only on the RunWrite path (ex.w != nil);
+			// a write clause reaching Run/RunView is a routing bug, not a
+			// silent no-op.
+			if ex.w == nil {
+				return nil, &Error{1, 1, "write clause outside the write path (use RunWrite)"}
+			}
+			var err error
+			rows, err = ex.createStage(c, rows)
+			if err != nil {
+				return nil, err
+			}
+		case *SetClause, *DeleteClause, *MergeClause, *IndexClause:
+			// Parsed and validated (Task 1) but not yet executable; an
+			// explicit error beats silently skipping a mutation.
+			return nil, &Error{1, 1, "only CREATE write clauses are supported in this version"}
 		case *ReturnClause:
-			return ex.project(c, starMatch, rows)
+			if ex.w != nil {
+				// Rebind entity bindings through the writer against the
+				// post-write state before projection (see rebindRows).
+				rows = ex.rebindRows(rows)
+			}
+			res, err := ex.project(c, starMatch, rows)
+			if err != nil {
+				return nil, err
+			}
+			if ex.w != nil {
+				res.Summary = &ex.sum
+			}
+			return res, nil
 		}
 	}
 	// Unreachable through Run/RunView (the parser emits RETURN as the final
 	// clause); a hand-constructed clause chain without one projects empty.
+	// The write statement's RETURN-less form (RETURN optional when the
+	// statement writes) lands here with the summary attached.
+	if ex.w != nil {
+		return &Result{Summary: &ex.sum}, nil
+	}
 	return &Result{}, nil
 }
 
@@ -187,8 +222,13 @@ func (ex *executor) filterRows(where Expr, rows []row) []row {
 // element binds as its NodeVal/EdgeVal value (RETURN renders it through
 // the vals arm of itemValue). The returned slice is never nil: zero input
 // rows (or all-null sources) yield zero output rows — strict stage
-// semantics.
+// semantics. A nil input (the clause is the pipeline's FIRST stage — a
+// leading UNWIND, the bulk-import shape) seeds one implicit empty incoming
+// row, the same first-stage anchoring matchRows/optionalRows provide.
 func (ex *executor) unwindStage(c *UnwindClause, rows []row) ([]row, error) {
+	if rows == nil {
+		rows = []row{{}} // first stage: one implicit empty incoming row
+	}
 	out := make([]row, 0, len(rows))
 	for _, r := range rows {
 		var list []any
@@ -388,6 +428,37 @@ type executor struct {
 	rowTg   []uint32
 	rowEids []uint32
 	rowLbs  []uint32
+
+	// ---- write path (RunWrite; every field below stays zero on Run/RunView) ----
+
+	// w is the mutation surface; nil marks a pure-read executor and gates
+	// every write-stage arm in runStatement.
+	w Writer
+	// sum accumulates the statement's mutation counters; attached to the
+	// Result at the RETURN (or terminal) exit.
+	sum WriteSummary
+	// nodeRefs/edgeRefs memo the key/triple identity of every bound entity
+	// the statement has touched (captured lazily from the PINNED pre-write
+	// source — or from writtenNodes/writtenEdges for entities the statement
+	// itself created — then never re-dereferenced through pinned IDs).
+	// ID-keyed, not var-keyed: in a multi-row statement one var names a
+	// different entity per row.
+	nodeRefs map[uint32]nodeRef
+	edgeRefs map[uint32]edgeRef
+	// writtenNodes/writtenEdges hold the records this statement wrote, keyed
+	// by post-write ID. nodeInfo/edgeInfo consult them FIRST so the RETURN
+	// projection (and later CREATE patterns reading an earlier endpoint's
+	// properties) see post-write truth — the pinned source cannot resolve
+	// entities that did not exist when it was taken.
+	writtenNodes map[uint32]engine.NodeRec
+	writtenEdges map[uint32]writtenEdge
+}
+
+// writtenEdge is a created edge's post-write record for edgeVal.
+type writtenEdge struct {
+	src, dst uint32
+	label    string
+	props    map[string]any
 }
 
 // The three-source dispatch helpers: RunView's source answers, Run's
@@ -401,6 +472,11 @@ func (ex *executor) nodeCount() int {
 }
 
 func (ex *executor) nodeInfo(id uint32) (engine.NodeRec, bool) {
+	if ex.writtenNodes != nil { // write path: this statement's writes win
+		if rec, ok := ex.writtenNodes[id]; ok {
+			return rec, true
+		}
+	}
 	if ex.src != nil {
 		return ex.src.NodeInfo(id)
 	}
@@ -408,6 +484,11 @@ func (ex *executor) nodeInfo(id uint32) (engine.NodeRec, bool) {
 }
 
 func (ex *executor) edgeInfo(id uint32) (uint32, uint32, string, map[string]any, bool) {
+	if ex.writtenEdges != nil { // write path: this statement's writes win
+		if we, ok := ex.writtenEdges[id]; ok {
+			return we.src, we.dst, we.label, we.props, true
+		}
+	}
 	if ex.src != nil {
 		return ex.src.EdgeInfo(id)
 	}

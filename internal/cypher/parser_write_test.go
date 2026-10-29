@@ -336,3 +336,37 @@ func TestValidateReadAfterWriteMirrored(t *testing.T) {
 		t.Fatalf("write-after-read must validate: %v", err)
 	}
 }
+
+// TestParseWriteEdgeProps pins the write-pattern edge property map (Task 3
+// gap-fill: CREATE/MERGE edges carry expression-valued props, MATCH edges
+// keep rejecting the brace form) and its reference validation.
+func TestParseWriteEdgeProps(t *testing.T) {
+	ast, err := Parse(`CREATE (a)-[:CALLS {w:1, tag:'x'}]->(b:P {key:'b'})`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cc := ast.Clauses[0].(*CreateClause)
+	ep := cc.Patterns[0].Edges[0]
+	if len(ep.Exprs) != 2 {
+		t.Fatalf("edge Exprs = %v want two entries", ep.Exprs)
+	}
+	if w := ep.Exprs["w"].(*Lit); w.Val != 1.0 {
+		t.Errorf("w = %v want 1", w.Val)
+	}
+	if tag := ep.Exprs["tag"].(*Lit); tag.Val != "x" {
+		t.Errorf("tag = %v want x", tag.Val)
+	}
+	// props referencing declared variables parse (the bulk-import shape)
+	if _, err := Parse(`UNWIND ['a'] AS k CREATE (x:P {key:k})-[:E {src:k}]->(y:P {key:'y'})`); err != nil {
+		t.Fatalf("expression-valued edge prop: %v", err)
+	}
+	// undeclared references are positioned errors
+	if _, err := Parse(`CREATE (a)-[:E {w: missing.w}]->(b)`); err == nil {
+		t.Fatal("undeclared reference in edge props must fail validation")
+	}
+	// MATCH keeps its grammar: the brace on a read-pattern edge is a parse
+	// error exactly as before the write path existed
+	if _, err := Parse(`MATCH (a)-[:E {w:1}]->(b) RETURN a`); err == nil {
+		t.Fatal("MATCH edge property map must not parse")
+	}
+}

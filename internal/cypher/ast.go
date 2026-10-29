@@ -143,6 +143,13 @@ type EdgePattern struct {
 	MinHops int
 	MaxHops int
 	Dir     int
+	// Exprs holds WRITE-pattern edge property values as expressions
+	// (CREATE (a)-[:CALLS {w:1}]->(b)); MATCH patterns cannot carry a
+	// property map — the grammar admits the brace form on edges only in
+	// write patterns, so this stays nil everywhere the read path builds
+	// an EdgePattern. Edges have no logical key: every entry, "key"
+	// included, is an ordinary stored property.
+	Exprs map[string]Expr
 	// Line, Col locate the Var token (the nullability guard); 0 on
 	// hand-built patterns and on the var-less "--"/"<--" forms.
 	Line, Col int

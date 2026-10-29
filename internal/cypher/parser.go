@@ -618,7 +618,7 @@ func (p *parser) parsePath(write bool) (*PathPattern, error) {
 				if _, err := p.expect(TMinus, "\"-\""); err != nil {
 					return nil, err
 				}
-				inner, err := p.parseBracketEdge()
+				inner, err := p.parseBracketEdge(write)
 				if err != nil {
 					return nil, err
 				}
@@ -633,7 +633,7 @@ func (p *parser) parsePath(write bool) (*PathPattern, error) {
 			}
 		case p.at(TMinus): // -[...]-> / -[...]-
 			p.next()
-			inner, err := p.parseBracketEdge()
+			inner, err := p.parseBracketEdge(write)
 			if err != nil {
 				return nil, err
 			}
@@ -661,9 +661,12 @@ func (p *parser) parsePath(write bool) (*PathPattern, error) {
 	}
 }
 
-// parseBracketEdge parses [var][:A|B][hops] between brackets (brackets
-// themselves included); direction is set by the caller.
-func (p *parser) parseBracketEdge() (*EdgePattern, error) {
+// parseBracketEdge parses [var][:A|B][hops][{props}] between brackets
+// (brackets themselves included); direction is set by the caller. The
+// trailing property map is WRITE-pattern only: each value parses as an
+// expression into Exprs (CREATE semantics); on MATCH patterns the brace
+// remains the "expected ]" error it always was.
+func (p *parser) parseBracketEdge(write bool) (*EdgePattern, error) {
 	if _, err := p.expect(TBracketL, "\"[\""); err != nil {
 		return nil, err
 	}
@@ -714,6 +717,32 @@ func (p *parser) parseBracketEdge() (*EdgePattern, error) {
 			ep.MinHops, ep.MaxHops = 1, p.mustNum()
 		default: // bare * = 1..∞
 			ep.MinHops, ep.MaxHops = 1, -1
+		}
+	}
+	if write && p.at(TBraceL) {
+		p.next()
+		ep.Exprs = map[string]Expr{}
+		for {
+			k, err := p.expect(TIdent, "property name")
+			if err != nil {
+				return nil, err
+			}
+			if _, err := p.expect(TColon, "\":\""); err != nil {
+				return nil, err
+			}
+			e, err := p.parseOr()
+			if err != nil {
+				return nil, err
+			}
+			ep.Exprs[k.Text] = e
+			if p.at(TComma) {
+				p.next()
+				continue
+			}
+			break
+		}
+		if _, err := p.expect(TBraceR, "\"}\""); err != nil {
+			return nil, err
 		}
 	}
 	if _, err := p.expect(TBracketR, "\"]\""); err != nil {
@@ -1394,6 +1423,16 @@ func (sc *scope) checkWritePattern(pat *PathPattern, mergeNode bool) error {
 		}
 	}
 	for _, e := range pat.Edges {
+		// Edge prop expressions reference-check against the scope the
+		// pattern's nodes have already extended (sorted key order, the
+		// node-map convention): the edge's own var is deliberately NOT yet
+		// declared, so a self-referencing prop is an undefined-variable
+		// error here.
+		for _, k := range slices.Sorted(maps.Keys(e.Exprs)) {
+			if err := sc.checkExpr(e.Exprs[k]); err != nil {
+				return err
+			}
+		}
 		if e.Var == "" {
 			continue
 		}
