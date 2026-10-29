@@ -465,31 +465,40 @@ func (ex *executor) orderValue(name string, r row) any {
 
 // scalarOf reads var.name: the pseudo-props key/label/id (nodes) and
 // label/id (edges), or the node/edge's own property. ok=false when the
-// variable is unbound or the property is absent (evaluates to null). A
-// scalar binding (vals) carries no properties — property access on one
-// evaluates to null; scope validation rejects the spelling anyway, this
-// keeps hand-built expression trees honest.
+// variable is unbound, the bound record no longer resolves, or the
+// property is absent (evaluates to null); the id pseudo-prop is the one
+// exception — the binding itself carries it, no record lookup. A scalar
+// binding (vals) carries no properties — property access on one evaluates
+// to null; scope validation rejects the spelling anyway, this keeps
+// hand-built expression trees honest.
 func (ex *executor) scalarOf(r row, v, name string) (any, bool) {
 	if id, ok := r.nodes[v]; ok {
-		rec, _ := ex.nodeInfo(id)
+		if name == "id" {
+			return float64(id), true // binding-derived: no record lookup needed
+		}
+		rec, ok := ex.nodeInfo(id)
+		if !ok {
+			return nil, false // unresolvable record: a miss, not a zero-valued key/label
+		}
 		switch name {
 		case "key":
 			return rec.Key, true
 		case "label":
 			return rec.Label, true
-		case "id":
-			return float64(id), true
 		}
 		val, present := rec.Props[name]
 		return val, present
 	}
 	if id, ok := r.edges[v]; ok {
-		_, _, label, props, _ := ex.edgeInfo(id)
-		switch name {
-		case "label":
+		if name == "id" {
+			return float64(id), true // binding-derived: no record lookup needed
+		}
+		_, _, label, props, ok := ex.edgeInfo(id)
+		if !ok {
+			return nil, false // same rule: an unresolvable record is a miss
+		}
+		if name == "label" {
 			return label, true
-		case "id":
-			return float64(id), true
 		}
 		val, present := props[name]
 		return val, present

@@ -171,15 +171,17 @@ func (ex *executor) createPattern(pat *PathPattern, r *row) error {
 				continue
 			}
 			// Bare form with the var unbound in THIS row: the rebind
-			// spelling (validation allows only bare rebinds) met an
-			// OPTIONAL MATCH null. Creating a nameless fresh node instead
-			// would silently invent data — error.
+			// spelling (validation allows only bare rebinds) met a row the
+			// variable never resolved in — an OPTIONAL MATCH miss, a DELETE
+			// earlier in the statement, or a statement shape that never
+			// bound it. Creating a nameless fresh node instead would
+			// silently invent data — error.
 			if np.Label == "" && np.Exprs == nil {
 				line, col := np.Line, np.Col
 				if line == 0 {
 					line, col = 1, 1
 				}
-				return &Error{line, col, fmt.Sprintf("variable %q is not bound in this row (an OPTIONAL MATCH null); CREATE cannot rebind it", np.Var)}
+				return &Error{line, col, fmt.Sprintf("variable %q is not bound in this row (an OPTIONAL MATCH miss, an earlier DELETE in this statement, or a statement shape that never bound it); CREATE cannot rebind it", np.Var)}
 			}
 		}
 		key, id, err := ex.createNode(np, *r)
@@ -554,14 +556,15 @@ func (ex *executor) mergeEdge(pat *PathPattern, r *row, onCreate, onMatch []*Set
 				continue
 			}
 			if np.Label == "" && np.Exprs == nil {
-				// Bare form unbound in THIS row: the rebind spelling met an
-				// OPTIONAL MATCH null (the createStage rule) — merging a
+				// Bare form unbound in THIS row (the createStage rule): an
+				// OPTIONAL MATCH miss, a DELETE earlier in the statement, or
+				// a statement shape that never bound it — merging a
 				// nameless fresh node would invent identity. Error.
 				line, col := np.Line, np.Col
 				if line == 0 {
 					line, col = 1, 1
 				}
-				return &Error{line, col, fmt.Sprintf("variable %q is not bound in this row (an OPTIONAL MATCH null); MERGE cannot rebind it", np.Var)}
+				return &Error{line, col, fmt.Sprintf("variable %q is not bound in this row (an OPTIONAL MATCH miss, an earlier DELETE in this statement, or a statement shape that never bound it); MERGE cannot rebind it", np.Var)}
 			}
 		}
 		if kexpr, has := np.Exprs["key"]; has {

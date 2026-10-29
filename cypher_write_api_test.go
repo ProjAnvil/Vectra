@@ -1413,3 +1413,54 @@ func TestCypherIndexDDLPendingThenSeal(t *testing.T) {
 		t.Fatalf("carved anchor rows = %v want [a b c] (layer record + override over the indexed base)", got)
 	}
 }
+
+// TestCypherComposedWriteStages pins the composed-statement contract (final
+// review Minor #2, previously verified only by an out-of-tree probe): all
+// four write clause kinds run left to right in ONE statement — CREATE, then
+// SET, then DETACH DELETE, then MERGE — under a trailing RETURN that
+// projects the post-write state. The summary must carry each stage's exact
+// counters (the probe's {CreatedNodes:2, DeletedNodes:1, PropertiesSet:2}
+// shape, plus this chain's edge and ON MATCH contributions), and the final
+// graph state is asserted through the read path.
+func TestCypherComposedWriteStages(t *testing.T) {
+	g := New()
+	res, err := g.Cypher(`CREATE (a:P {key:'a', v:1})-[:E]->(b:P {key:'b'}) SET a.v = 2, a.w = 3 DETACH DELETE b MERGE (a) ON MATCH SET a.seen = true RETURN a.v, a.w, a.seen`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// exact counters: the CREATE stage's 2 nodes + 1 edge, the SET stage's
+	// 2 items, the DETACH DELETE's 1 node + 1 cascade-killed edge, and the
+	// MERGE hit arm's 1 ON MATCH item (a miss would have added a node).
+	want := CypherWriteSummary{CreatedNodes: 2, CreatedEdges: 1, DeletedNodes: 1, DeletedEdges: 1, PropertiesSet: 3, IndexesCreated: 0}
+	if res.Summary == nil || *res.Summary != want {
+		t.Fatalf("summary = %+v want %+v", res.Summary, want)
+	}
+	// stage ORDER pins: the RETURN reads the state every later stage left —
+	// a.v is the SET stage's 2 (not the creation-time 1) and a.seen is the
+	// MERGE hit arm's ON MATCH write (proving MERGE matched the node the
+	// CREATE stage made, after the DELETE stage ran between them).
+	if len(res.Rows) != 1 {
+		t.Fatalf("rows = %d want 1", len(res.Rows))
+	}
+	if res.Rows[0]["a.v"] != 2.0 || res.Rows[0]["a.w"] != 3.0 || res.Rows[0]["a.seen"] != true {
+		t.Fatalf("row = %v want a.v=2, a.w=3, a.seen=true (post-write state)", res.Rows[0])
+	}
+	// final graph state: only a survives, carrying exactly the written
+	// props; b and the cascade-killed edge are gone.
+	if _, ok := g.NodeByKey("b"); ok {
+		t.Fatal("b survived DETACH DELETE")
+	}
+	if n := g.NodeCount(); n != 1 {
+		t.Fatalf("node count = %d want 1 (a only; the MERGE hit created nothing)", n)
+	}
+	if n := g.EdgeCount(); n != 0 {
+		t.Fatalf("edge count = %d want 0 (the cascade killed E)", n)
+	}
+	a, ok := g.NodeByKey("a")
+	if !ok {
+		t.Fatal("a missing after the composed statement")
+	}
+	if !maps.Equal(a.Props, map[string]any{"v": 2.0, "w": 3.0, "seen": true}) {
+		t.Fatalf("a props = %v want v=2, w=3, seen=true", a.Props)
+	}
+}
