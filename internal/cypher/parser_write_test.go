@@ -281,6 +281,9 @@ func TestParseWriteErrors(t *testing.T) {
 		{"MATCH (a) CREATE INDEX ON (a.x)", "standalone statement", 1, 11},
 		{"CREATE INDEX ON (n.x) RETURN n", "standalone statement", 1, 1},
 		{"MATCH (a)-[r:X*]->(b) DELETE r", "variable-length edge", 1, 1},
+		{`MATCH (a)-[r:X]->(b) CREATE (r)-[:P]->(c)`, `variable "r" is an edge`, 1, 30},
+		{`MATCH (a) CREATE (b)-[a:X]->(c)`, `edge variable "a" is already declared`, 1, 23},
+		{"MERGE (a), (b)", "MERGE takes exactly one pattern", 1, 10},
 	}
 	for _, c := range cases {
 		_, err := Parse(c.src)
@@ -297,5 +300,39 @@ func TestParseWriteErrors(t *testing.T) {
 		if e.Line != c.line || e.Col != c.col {
 			t.Fatalf("Parse(%q): position %d:%d, want %d:%d", c.src, e.Line, e.Col, c.line, c.col)
 		}
+	}
+}
+
+// TestValidateReadAfterWriteMirrored pins the validate-side mirror of the
+// read-after-write sequencing rule: parseQuery enforces it with token
+// positions, validate() re-enforces it for hand-built Queries (same
+// message, {1,1} — hand-built clauses carry no positions).
+func TestValidateReadAfterWriteMirrored(t *testing.T) {
+	q := &Query{Clauses: []Clause{
+		&MatchClause{},
+		&CreateClause{Patterns: []*PathPattern{{}}},
+		&MatchClause{},
+	}}
+	err := q.validate()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "read clauses after a write clause are not supported in this version") {
+		t.Fatalf("got %q", err)
+	}
+	e, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("error must be *Error, got %T", err)
+	}
+	if e.Line != 1 || e.Col != 1 {
+		t.Fatalf("position %d:%d, want 1:1", e.Line, e.Col)
+	}
+	// The legal ordering (write clauses only after the read prefix) passes.
+	q = &Query{Clauses: []Clause{
+		&MatchClause{Patterns: []*PathPattern{{Nodes: []*NodePattern{{Var: "a"}}}}},
+		&CreateClause{Patterns: []*PathPattern{{}}},
+	}}
+	if err := q.validate(); err != nil {
+		t.Fatalf("write-after-read must validate: %v", err)
 	}
 }

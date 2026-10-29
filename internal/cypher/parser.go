@@ -2,6 +2,8 @@ package cypher
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -455,8 +457,9 @@ func (p *parser) parseDeleteClause() (*DeleteClause, error) {
 
 // parseMergeClause parses "MERGE pattern [ON CREATE SET items]
 // [ON MATCH SET items]" — exactly one path pattern (comma patterns are a
-// CREATE spelling), at most one trailer of each kind, in either order.
-// The MERGE keyword is still unconsumed.
+// CREATE spelling). The ON CREATE SET / ON MATCH SET trailers may appear
+// in either order and REPEAT, items appending in source order (Neo4j's
+// permissive form). The MERGE keyword is still unconsumed.
 func (p *parser) parseMergeClause() (*MergeClause, error) {
 	p.next() // MERGE
 	pat, err := p.parsePath(true)
@@ -1312,9 +1315,13 @@ func (sc *scope) markNullable(v string) {
 // its variables into the scope (write clauses EXTEND the scope; they never
 // start one — see the SET/DELETE no-scope errors). Rules: edges must be
 // outgoing and fixed single hop; an endpoint whose variable is already
-// bound must rebind BARE — no label, no props, the binding supplies the
-// node; a statically-literal "key" prop must be a string; every prop
-// expression must reference declared variables. Endpoints are processed
+// bound must rebind BARE — no label, no props, and a NODE binding (an
+// edge binding cannot be rebound as a node); edge pattern variables are
+// always fresh declarations (colliding with any binding in scope,
+// including this pattern's nodes, is an error); a statically-literal "key"
+// prop must be a string; every prop expression must reference declared
+// variables (walked in sorted key order so a multi-error pattern reports
+// the same error on every run). Endpoints are processed
 // left to right and declared as they go, so a later map may read an
 // earlier endpoint's properties (Neo4j's creation order) but not the
 // reverse. mergeNode marks the lone-node MERGE form, whose fresh node
@@ -1347,6 +1354,13 @@ func (sc *scope) checkWritePattern(pat *PathPattern, mergeNode bool) error {
 				if k == kindScalar {
 					return &Error{1, 1, fmt.Sprintf("variable %q is a scalar; pattern variables must be nodes or edges", n.Var)}
 				}
+				if k == kindEdge {
+					line, col := n.Line, n.Col
+					if line == 0 {
+						line, col = 1, 1
+					}
+					return &Error{line, col, fmt.Sprintf("variable %q is an edge; node patterns rebind node variables only", n.Var)}
+				}
 				if n.Label != "" || n.Props != nil || n.Exprs != nil {
 					line, col := n.Line, n.Col
 					if line == 0 {
@@ -1370,8 +1384,8 @@ func (sc *scope) checkWritePattern(pat *PathPattern, mergeNode bool) error {
 				return err
 			}
 		}
-		for _, e := range n.Exprs {
-			if err := sc.checkExpr(e); err != nil {
+		for _, k := range slices.Sorted(maps.Keys(n.Exprs)) {
+			if err := sc.checkExpr(n.Exprs[k]); err != nil {
 				return err
 			}
 		}
@@ -1380,10 +1394,21 @@ func (sc *scope) checkWritePattern(pat *PathPattern, mergeNode bool) error {
 		}
 	}
 	for _, e := range pat.Edges {
-		if e.Var != "" {
-			sc.kinds[e.Var] = kindEdge
-			sc.edges[e.Var] = e
+		if e.Var == "" {
+			continue
 		}
+		// Edge pattern vars are always FRESH declarations: rebinding an
+		// existing binding (node, edge, or scalar) as an edge would leave
+		// earlier references pointing at the wrong kind of entity.
+		if _, bound := sc.kinds[e.Var]; bound {
+			line, col := e.Line, e.Col
+			if line == 0 {
+				line, col = 1, 1
+			}
+			return &Error{line, col, fmt.Sprintf("edge variable %q is already declared; edge pattern variables must be fresh names", e.Var)}
+		}
+		sc.kinds[e.Var] = kindEdge
+		sc.edges[e.Var] = e
 	}
 	return nil
 }
@@ -1643,16 +1668,25 @@ func (sc *scope) checkReturn(c *ReturnClause, matchCount int) error {
 // edges must be outgoing fixed hop, and a MERGE is a single node (with a
 // mandatory "key" on fresh nodes) or a single edge pattern. CREATE INDEX
 // never reaches this walk — the parser admits it only as a standalone
-// statement. Read-after-write sequencing is a parser rule (parseQuery).
+// statement. Read-after-write sequencing is enforced twice: parseQuery
+// rejects it with token positions, and this walk mirrors it ({1,1}) so a
+// hand-built Query cannot silently drop the rule.
 func (q *Query) validate() error {
 	sc := newScope()
 	matchCount := 0
 	sawReturn := false
+	sawWrite := false
 	for _, c := range q.Clauses {
 		if sawReturn {
 			// Defensive: the parser never emits clauses after RETURN, but a
 			// hand-constructed Query must not silently drop them.
 			return &Error{1, 1, "RETURN must be the final clause"}
+		}
+		if sawWrite {
+			switch c.(type) {
+			case *MatchClause, *WithClause, *UnwindClause:
+				return &Error{1, 1, "read clauses after a write clause are not supported in this version"}
+			}
 		}
 		switch c := c.(type) {
 		case *MatchClause:
@@ -1736,6 +1770,9 @@ func (q *Query) validate() error {
 				return err
 			}
 			sawReturn = true
+		}
+		if isWriteClause(c) {
+			sawWrite = true
 		}
 	}
 	return nil
