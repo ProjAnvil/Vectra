@@ -108,10 +108,10 @@ func (w *writeGraph) NodeHasEdges(key string) bool {
 	return err == nil && len(es) > 0
 }
 
-// DeleteNodeCascade is DETACH DELETE: the node plus every incident edge.
-func (w *writeGraph) DeleteNodeCascade(key string) error {
-	_, err := w.g.DeleteNode(key)
-	return err
+// DeleteNodeCascade is DETACH DELETE: the node plus every incident edge;
+// the count is the cascade's edge kills (root DeleteNode's second return).
+func (w *writeGraph) DeleteNodeCascade(key string) (int, error) {
+	return w.g.DeleteNode(key)
 }
 
 // edgesOnTriple lists the live parallel edges of (src, dst, label) in

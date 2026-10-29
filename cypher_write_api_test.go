@@ -7,6 +7,7 @@ package vectra
 
 import (
 	"errors"
+	"fmt"
 	"maps"
 	"path/filepath"
 	"strings"
@@ -576,9 +577,11 @@ func TestCypherSetEdgeWALRoundTrip(t *testing.T) {
 }
 
 // TestCypherDeleteDetached pins DETACH DELETE: the node and every incident
-// edge die (cascade), the neighbors survive, and DeletedNodes counts ACTUAL
-// deletions — a node bound in several rows deletes once; the later rows are
-// silent no-ops (not-found: no count, no error).
+// edge die (cascade), the neighbors survive, and the summary counts BOTH
+// sides — DeletedNodes the actual node deletions (a node bound in several
+// rows deletes once; later rows are silent not-found no-ops) and
+// DeletedEdges the cascade's edge kills (the Writer's DeleteNodeCascade
+// count, not just edge-var deletions).
 func TestCypherDeleteDetached(t *testing.T) {
 	g := New()
 	if _, err := g.Cypher(`CREATE (h:P {key:'hub'}), (x:P {key:'x'}), (y:P {key:'y'})`); err != nil {
@@ -595,6 +598,9 @@ func TestCypherDeleteDetached(t *testing.T) {
 	}
 	if res.Summary == nil || res.Summary.DeletedNodes != 1 {
 		t.Fatalf("summary = %+v want DeletedNodes=1", res.Summary)
+	}
+	if res.Summary.DeletedEdges != 2 {
+		t.Fatalf("summary = %+v want DeletedEdges=2 (the cascade's kills are counted)", res.Summary)
 	}
 	if _, ok := g.NodeByKey("hub"); ok {
 		t.Fatal("hub survived DETACH DELETE")
@@ -739,6 +745,36 @@ func TestCypherDeleteUnboundErrors(t *testing.T) {
 	}
 }
 
+// TestCypherDeleteCascadeThenEdgeVar pins the edge arm's endpoint-liveness
+// gate: in a mixed DETACH DELETE, the node arm's cascade may kill an edge
+// var's triple before the edge arm runs — the dead triple is a silent no-op
+// skip (mirroring the node arm's earlier-row not-found rule), never a
+// leaked root ErrNodeNotFound. The statement succeeds with both entities
+// gone, the cascade's kill counted in DeletedEdges and the skipped arm
+// contributing nothing.
+func TestCypherDeleteCascadeThenEdgeVar(t *testing.T) {
+	g := New()
+	if _, err := g.Cypher(`CREATE (a:P {key:'x'})-[:CALLS]->(b:P {key:'y'})`); err != nil {
+		t.Fatal(err)
+	}
+	res, err := g.Cypher(`MATCH (a {key:'x'})-[r:CALLS]->(b {key:'y'}) DETACH DELETE a, r`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Summary == nil || res.Summary.DeletedNodes != 1 || res.Summary.DeletedEdges != 1 {
+		t.Fatalf("summary = %+v want DeletedNodes=1, DeletedEdges=1 (cascade kill; r's arm no-ops)", res.Summary)
+	}
+	if _, ok := g.NodeByKey("x"); ok {
+		t.Fatal("node x survived DETACH DELETE")
+	}
+	if _, ok := g.NodeByKey("y"); !ok {
+		t.Fatal("node y must survive the cascade")
+	}
+	if n := g.EdgeCount(); n != 0 {
+		t.Fatalf("edge count = %d want 0 (the cascade killed it; EdgeCount, not EdgesOf: the x key no longer resolves)", n)
+	}
+}
+
 // TestCypherWriteReadPathUnchanged pins three-source visibility around a
 // Cypher write: an existing read query over base + unmerged layer keeps its
 // exact results (minus the new row) after a Cypher CREATE appends another
@@ -795,5 +831,263 @@ func TestCypherWriteReadPathUnchanged(t *testing.T) {
 	}
 	if got := cnt.Rows[0]["count(x)"].(float64); got != 5 {
 		t.Fatalf("count(x) = %v want 5", got)
+	}
+}
+
+// TestCypherMergeNodeCreateThenMatch pins the node MERGE identity rule: the
+// same statement run twice merges by KEY — the first run creates (ON CREATE
+// SET fires, CreatedNodes=1, the pattern's props stored MINUS key), the
+// second matches (ON MATCH SET fires, CreatedNodes=0, the pattern's props
+// NOT rewritten — match-by-key, not by full prop map).
+func TestCypherMergeNodeCreateThenMatch(t *testing.T) {
+	g := New()
+	q := `MERGE (n:P {key:'m', v:1}) ON CREATE SET n.fresh = true ON MATCH SET n.seen = true RETURN n.key, n.v`
+	res, err := g.Cypher(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 1 || res.Rows[0]["n.key"] != "m" || res.Rows[0]["n.v"] != 1.0 {
+		t.Fatalf("rows = %+v want one row m/1", res.Rows)
+	}
+	if res.Summary == nil || res.Summary.CreatedNodes != 1 {
+		t.Fatalf("summary = %+v want CreatedNodes=1 on the create arm", res.Summary)
+	}
+	n, ok := g.NodeByKey("m")
+	if !ok {
+		t.Fatal("merged node missing through the read path")
+	}
+	if n.Label != "P" {
+		t.Errorf("label = %q want P", n.Label)
+	}
+	if _, has := n.Props["key"]; has {
+		t.Errorf("stored props must not contain the key: %v", n.Props)
+	}
+	if n.Props["v"] != 1.0 || n.Props["fresh"] != true {
+		t.Fatalf("props = %v want v=1 and fresh=true (ON CREATE fired)", n.Props)
+	}
+	if _, has := n.Props["seen"]; has {
+		t.Fatalf("ON MATCH fired on a create: %v", n.Props)
+	}
+
+	res, err = g.Cypher(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Summary == nil || res.Summary.CreatedNodes != 0 {
+		t.Fatalf("summary = %+v want CreatedNodes=0 on the match arm", res.Summary)
+	}
+	if res.Summary.PropertiesSet != 1 {
+		t.Errorf("PropertiesSet = %d want 1 (the ON MATCH item)", res.Summary.PropertiesSet)
+	}
+	n, _ = g.NodeByKey("m")
+	if n.Props["seen"] != true {
+		t.Fatalf("ON MATCH did not fire on the match arm: %v", n.Props)
+	}
+	if n.Props["v"] != 1.0 || n.Props["fresh"] != true {
+		t.Fatalf("match arm rewrote creation-time props: %v", n.Props)
+	}
+	if got := g.NodeCount(); got != 1 {
+		t.Fatalf("node count = %d want 1 (the second merge created nothing)", got)
+	}
+}
+
+// TestCypherMergeNodeMatchByKeyOnly pins the documented divergence: node
+// MERGE matches by key alone — an existing node whose other props differ
+// from the pattern's is matched as-is, its props untouched (creation-time
+// only; ON MATCH SET is the update path), and no node is created.
+func TestCypherMergeNodeMatchByKeyOnly(t *testing.T) {
+	g := New()
+	if _, err := g.Cypher(`CREATE (n:P {key:'x', v:'orig'})`); err != nil {
+		t.Fatal(err)
+	}
+	res, err := g.Cypher(`MERGE (n:P {key:'x', v:'other', extra:9})`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Summary == nil || res.Summary.CreatedNodes != 0 {
+		t.Fatalf("summary = %+v want CreatedNodes=0 (matched by key)", res.Summary)
+	}
+	if got := g.NodeCount(); got != 1 {
+		t.Fatalf("node count = %d want 1", got)
+	}
+	n, _ := g.NodeByKey("x")
+	if n.Props["v"] != "orig" {
+		t.Errorf("v = %v want orig (a match must not rewrite props)", n.Props["v"])
+	}
+	if _, has := n.Props["extra"]; has {
+		t.Errorf("a pattern-only prop leaked into the matched node: %v", n.Props)
+	}
+	if n.Label != "P" {
+		t.Errorf("label = %q want P", n.Label)
+	}
+}
+
+// TestCypherMergeEdgeFoldOrCreate pins the edge MERGE arms. Miss: the
+// (srcKey,dstKey,label) triple check fails, endpoints resolve per the
+// createStage rules (an existing key binds — only 'b' is created — and the
+// edge is written with UpsertEdgeTriple fold semantics, CreatedEdges=1, ON
+// CREATE SET firing on the edge var). Hit: the same merge again matches the
+// triple — no duplicate edge, no endpoint churn, the pattern's {w:2} is
+// creation-time only (w stays 1), ON MATCH SET the update path.
+func TestCypherMergeEdgeFoldOrCreate(t *testing.T) {
+	g := New()
+	// endpoint 'a' exists; 'b' does not: the miss arm must create only b.
+	if _, err := g.Cypher(`CREATE (a:P {key:'a', tag:1})`); err != nil {
+		t.Fatal(err)
+	}
+	res, err := g.Cypher(`MERGE (a:P {key:'a'})-[r:CALLS {w:1}]->(b:P {key:'b'}) ON CREATE SET r.fresh = true RETURN r.w`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 1 || res.Rows[0]["r.w"] != 1.0 {
+		t.Fatalf("rows = %+v want r.w=1", res.Rows)
+	}
+	if res.Summary == nil || res.Summary.CreatedNodes != 1 || res.Summary.CreatedEdges != 1 {
+		t.Fatalf("summary = %+v want CreatedNodes=1 (b only), CreatedEdges=1", res.Summary)
+	}
+	es := liveTriple(t, g, "a", "b", "CALLS")
+	if len(es) != 1 {
+		t.Fatalf("parallels = %d want 1", len(es))
+	}
+	if es[0].Props["w"] != 1.0 || es[0].Props["fresh"] != true {
+		t.Fatalf("edge props = %v want w=1 and fresh=true (ON CREATE fired)", es[0].Props)
+	}
+	if got := g.NodeCount(); got != 2 {
+		t.Fatalf("node count = %d want 2 (existing 'a' bound, not recreated)", got)
+	}
+	if a, _ := g.NodeByKey("a"); a.Props["tag"] != 1.0 {
+		t.Fatalf("existing endpoint 'a' was rewritten: %v", a.Props)
+	}
+
+	res, err = g.Cypher(`MERGE (a:P {key:'a'})-[r:CALLS {w:2}]->(b:P {key:'b'}) ON MATCH SET r.hits = 1 RETURN r.w`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Summary == nil || res.Summary.CreatedNodes != 0 || res.Summary.CreatedEdges != 0 {
+		t.Fatalf("summary = %+v want all create counters 0 on the match arm", res.Summary)
+	}
+	if len(res.Rows) != 1 || res.Rows[0]["r.w"] != 1.0 {
+		t.Fatalf("rows = %+v want r.w=1 (pattern props are creation-time only)", res.Rows)
+	}
+	es = liveTriple(t, g, "a", "b", "CALLS")
+	if len(es) != 1 {
+		t.Fatalf("parallels = %d want 1 (no duplicate edge on the match arm)", len(es))
+	}
+	if es[0].Props["w"] != 1.0 || es[0].Props["hits"] != 1.0 {
+		t.Fatalf("edge props = %v want w=1 (untouched) and hits=1 (ON MATCH fired)", es[0].Props)
+	}
+	if got := g.NodeCount(); got != 2 {
+		t.Fatalf("node count = %d want 2 (the match arm created no endpoints)", got)
+	}
+}
+
+// TestCypherMergeEdgeExistingSkipsEndpointCreation pins the Neo4j
+// full-pattern-match rule: when the triple already exists, endpoint
+// creation is suppressed even though the pattern spells its endpoints as
+// fresh labeled propertied node patterns — their keys name the existing
+// endpoints, so no node is created, the would-be endpoint props land
+// nowhere, and the fresh vars bind the existing entities.
+func TestCypherMergeEdgeExistingSkipsEndpointCreation(t *testing.T) {
+	g := New()
+	if _, err := g.Cypher(`CREATE (a:P {key:'a'})-[:CALLS {w:1}]->(b:P {key:'b'})`); err != nil {
+		t.Fatal(err)
+	}
+	before := g.NodeCount()
+	res, err := g.Cypher(`MERGE (a2:P {key:'a', fresh:1})-[r:CALLS]->(b2:P {key:'b', fresh:1}) RETURN a2.key, b2.key`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Summary == nil || res.Summary.CreatedNodes != 0 || res.Summary.CreatedEdges != 0 {
+		t.Fatalf("summary = %+v want all create counters 0 (the whole pattern matched)", res.Summary)
+	}
+	if got := g.NodeCount(); got != before {
+		t.Fatalf("node count = %d want %d (an existing edge suppresses endpoint creation)", got, before)
+	}
+	if len(res.Rows) != 1 || res.Rows[0]["a2.key"] != "a" || res.Rows[0]["b2.key"] != "b" {
+		t.Fatalf("rows = %+v want a2/b2 bound to the existing endpoints", res.Rows)
+	}
+	for _, k := range []string{"a", "b"} {
+		n, _ := g.NodeByKey(k)
+		if _, has := n.Props["fresh"]; has {
+			t.Errorf("endpoint %q gained a pattern-only prop: %v", k, n.Props)
+		}
+	}
+	if es := liveTriple(t, g, "a", "b", "CALLS"); len(es) != 1 || es[0].Props["w"] != 1.0 {
+		t.Fatalf("edge = %+v want the untouched existing one", es)
+	}
+}
+
+// TestCypherMergeDeterminismReplicas pins Review Focus 1's statement-level
+// determinism on the MERGE path (full-statement version): two graphs with
+// identical starting state replayed an identical MERGE-heavy statement
+// sequence produce identical summaries and identical end state — same props
+// on every key, same single edge with the same props (the key ratchet never
+// enters: every merge carries an explicit key or rides existing keys, and
+// no map-iteration order drives an observable write).
+func TestCypherMergeDeterminismReplicas(t *testing.T) {
+	run := func() (sums [][4]int, props map[string]map[string]any, edge string) {
+		g := New()
+		stmts := []string{
+			`MERGE (u:User {key:'alice', name:'Alice'}) ON CREATE SET u.hits = 1`,
+			`MERGE (u:User {key:'bob'}) ON CREATE SET u.hits = 1`,
+			`MERGE (a:User {key:'alice'})-[r:KNOWS {since:2020}]->(b:User {key:'bob'}) ON CREATE SET r.w = 7`,
+			`UNWIND ['x', 'y', 'x'] AS k MERGE (n:P {key:k, v:1}) ON CREATE SET n.f = true ON MATCH SET n.f = false`,
+			`MERGE (a:User {key:'alice'}) ON MATCH SET a.hits = 2`,
+		}
+		for _, q := range stmts {
+			res, err := g.Cypher(q)
+			if err != nil {
+				t.Fatalf("%q: %v", q, err)
+			}
+			s := res.Summary
+			if s == nil {
+				t.Fatalf("%q returned no summary", q)
+			}
+			sums = append(sums, [4]int{s.CreatedNodes, s.CreatedEdges, s.PropertiesSet, s.DeletedNodes})
+		}
+		props = make(map[string]map[string]any)
+		for _, k := range []string{"alice", "bob", "x", "y"} {
+			n, ok := g.NodeByKey(k)
+			if !ok {
+				t.Fatalf("node %q missing", k)
+			}
+			props[k] = n.Props
+		}
+		es := liveTriple(t, g, "alice", "bob", "KNOWS")
+		if len(es) != 1 {
+			t.Fatalf("KNOWS parallels = %d want exactly 1", len(es))
+		}
+		e := es[0]
+		edge = fmt.Sprintf("since=%v w=%v keys=%d", e.Props["since"], e.Props["w"], len(e.Props))
+		return sums, props, edge
+	}
+	s1, p1, e1 := run()
+	s2, p2, e2 := run()
+	for i := range s1 {
+		if s1[i] != s2[i] {
+			t.Fatalf("statement %d summary drift: %v vs %v", i, s1[i], s2[i])
+		}
+	}
+	for k, want := range p1 {
+		if !maps.Equal(want, p2[k]) {
+			t.Fatalf("node %q prop drift: %v vs %v", k, want, p2[k])
+		}
+	}
+	if e1 != e2 {
+		t.Fatalf("edge state drift: %q vs %q", e1, e2)
+	}
+	// the expected end state, both replicas: ON CREATE/ON MATCH outcomes
+	// settled per arm (x merged twice: create then match — f ends false).
+	if p1["alice"]["hits"] != 2.0 || p1["alice"]["name"] != "Alice" {
+		t.Fatalf("alice props = %v want hits=2 (final ON MATCH), name=Alice", p1["alice"])
+	}
+	if p1["bob"]["hits"] != 1.0 {
+		t.Fatalf("bob props = %v want hits=1", p1["bob"])
+	}
+	if p1["x"]["f"] != false || p1["y"]["f"] != true || p1["x"]["v"] != 1.0 {
+		t.Fatalf("unwind-merge props = x:%v y:%v want x.f=false (matched), y.f=true (created)", p1["x"], p1["y"])
+	}
+	if e1 != "since=2020 w=7 keys=2" {
+		t.Fatalf("edge = %q want since=2020 w=7 keys=2", e1)
 	}
 }

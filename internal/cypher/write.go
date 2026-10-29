@@ -34,7 +34,10 @@ type Writer interface {
 	// number of property keys written (sets + deletes).
 	SetNodeProps(key string, props map[string]any) (int, error)
 	NodeHasEdges(key string) bool
-	DeleteNodeCascade(key string) error
+	// DeleteNodeCascade removes the node and every incident edge (DETACH
+	// DELETE), returning the number of edges the cascade killed (the
+	// summary's DeletedEdges counter adds them).
+	DeleteNodeCascade(key string) (edgesDeleted int, err error)
 	// DeleteEdgeTriple deletes every parallel edge on the triple (E6
 	// divergence, pinned by test).
 	DeleteEdgeTriple(srcKey, dstKey, label string) (int, error)
@@ -248,66 +251,78 @@ func (ex *executor) createNode(np *NodePattern, r row) (string, uint32, error) {
 	return key, id, nil
 }
 
-// setStage executes one SET clause: per input row, items left to right.
-// Each item resolves its target through the row's bindings (node key via
-// boundNodeKey, edge triple via boundEdgeRef — both memoized in the refs
-// sidecars), evaluates the RHS against the row plus a per-row pending
-// overlay of the values EARLIER items staged (SET a.x = 1, a.y = a.x must
-// see the 1), and writes exactly one property: a nil value DELETES the
-// key. PropertiesSet accumulates the writer's counts (sets + deletes for
-// nodes; edges touched for the triple-addressed edge form). First error
-// stops the statement; earlier rows' writes remain. Rows pass through
-// unchanged — SET mutates properties, never bindings.
+// setStage executes one SET clause: per input row, items left to right
+// through the shared SetItem machinery (applySetItems — MERGE's ON CREATE
+// SET / ON MATCH SET trailers run the identical loop against their
+// just-bound/created vars). First error stops the statement; earlier rows'
+// writes remain. Rows pass through unchanged — SET mutates properties,
+// never bindings.
 func (ex *executor) setStage(c *SetClause, rows []row) ([]row, error) {
 	if rows == nil {
 		rows = []row{{}} // defensive: validation requires a binding clause before SET
 	}
-	for _, r := range rows {
-		var pending map[string]map[string]any // var -> prop -> staged value (this row only)
-		for _, it := range c.Items {
-			val := any(nil) // the null outcome stages a delete
-			if v, ok := ex.evalPending(it.Value, r, pending); ok {
-				val = v
-			}
-			if id, ok := r.nodes[it.Var]; ok { // nil-map lookup: safe miss
-				key, okK := ex.boundNodeKey(id)
-				if !okK {
-					return nil, &Error{1, 1, fmt.Sprintf("bound node %q does not resolve to a key", it.Var)}
-				}
-				n, err := ex.w.SetNodeProps(key, map[string]any{it.Prop: val})
-				if err != nil {
-					return nil, err
-				}
-				ex.sum.PropertiesSet += n
-				ex.overlayNodeProp(id, it.Prop, val)
-			} else if id, ok := r.edges[it.Var]; ok {
-				ref, okR := ex.boundEdgeRef(id)
-				if !okR {
-					return nil, &Error{1, 1, fmt.Sprintf("bound edge %q does not resolve to a triple", it.Var)}
-				}
-				n, err := ex.w.SetEdgeProps(ref.srcKey, ref.dstKey, ref.label, map[string]any{it.Prop: val})
-				if err != nil {
-					return nil, err
-				}
-				ex.sum.PropertiesSet += n
-				ex.foldEdgeProp(ref, id, it.Prop, val)
-			} else {
-				// An OPTIONAL MATCH miss leaves the var unbound in the kept
-				// row; Neo4j parity is the explicit null error.
-				return nil, &Error{1, 1, fmt.Sprintf("SET requires a bound node or edge variable; %s is null", it.Var)}
-			}
-			if pending == nil {
-				pending = make(map[string]map[string]any)
-			}
-			props, ok := pending[it.Var]
-			if !ok {
-				props = make(map[string]any)
-				pending[it.Var] = props
-			}
-			props[it.Prop] = val
+	for i := range rows {
+		if err := ex.applySetItems(c.Items, &rows[i]); err != nil {
+			return nil, err
 		}
 	}
 	return rows, nil
+}
+
+// applySetItems applies one ordered SetItem list to the row's bound
+// entities: each item resolves its target through the row's bindings (node
+// key via boundNodeKey, edge triple via boundEdgeRef — both memoized in
+// the refs sidecars), evaluates the RHS against the row plus a per-list
+// pending overlay of the values EARLIER items staged (SET a.x = 1, a.y =
+// a.x must see the 1), and writes exactly one property: a nil value
+// DELETES the key. PropertiesSet accumulates the writer's counts (sets +
+// deletes for nodes; edges touched for the triple-addressed edge form).
+// First error stops the list — and with it the statement.
+func (ex *executor) applySetItems(items []*SetItem, r *row) error {
+	var pending map[string]map[string]any // var -> prop -> staged value (this list only)
+	for _, it := range items {
+		val := any(nil) // the null outcome stages a delete
+		if v, ok := ex.evalPending(it.Value, *r, pending); ok {
+			val = v
+		}
+		if id, ok := r.nodes[it.Var]; ok { // nil-map lookup: safe miss
+			key, okK := ex.boundNodeKey(id)
+			if !okK {
+				return &Error{1, 1, fmt.Sprintf("bound node %q does not resolve to a key", it.Var)}
+			}
+			n, err := ex.w.SetNodeProps(key, map[string]any{it.Prop: val})
+			if err != nil {
+				return err
+			}
+			ex.sum.PropertiesSet += n
+			ex.overlayNodeProp(id, it.Prop, val)
+		} else if id, ok := r.edges[it.Var]; ok {
+			ref, okR := ex.boundEdgeRef(id)
+			if !okR {
+				return &Error{1, 1, fmt.Sprintf("bound edge %q does not resolve to a triple", it.Var)}
+			}
+			n, err := ex.w.SetEdgeProps(ref.srcKey, ref.dstKey, ref.label, map[string]any{it.Prop: val})
+			if err != nil {
+				return err
+			}
+			ex.sum.PropertiesSet += n
+			ex.foldEdgeProp(ref, id, it.Prop, val)
+		} else {
+			// An OPTIONAL MATCH miss leaves the var unbound in the kept
+			// row; Neo4j parity is the explicit null error.
+			return &Error{1, 1, fmt.Sprintf("SET requires a bound node or edge variable; %s is null", it.Var)}
+		}
+		if pending == nil {
+			pending = make(map[string]map[string]any)
+		}
+		props, ok := pending[it.Var]
+		if !ok {
+			props = make(map[string]any)
+			pending[it.Var] = props
+		}
+		props[it.Prop] = val
+	}
+	return nil
 }
 
 // deleteStage executes one [DETACH] DELETE clause: per input row, vars
@@ -319,9 +334,11 @@ func (ex *executor) setStage(c *SetClause, rows []row) ([]row, error) {
 // that still has live incident edges errors the statement (first-error-
 // stops fires BEFORE any write: the node and its edges survive); with DETACH
 // or no edges, DeleteNodeCascade removes the node and its incident edges
-// (the cascade's edge kills are not countable through the Writer surface —
-// DeletedEdges stays an edge-var counter). An edge var resolves its triple
-// and DeleteEdgeTriple removes every parallel at once: DeletedEdges
+// and DeletedEdges accumulates the cascade's kill count. An edge var
+// resolves its triple, skipping SILENTLY when either endpoint is no longer
+// live (a DETACH DELETE a, r whose a-cascade already killed r — the edge
+// arm's mirror of the node arm's not-found no-op, never a leaked root
+// error), and DeleteEdgeTriple removes every parallel at once: DeletedEdges
 // accumulates the returned count, so one DELETE e of a two-parallel triple
 // counts 2 (the E6 divergence). An unbound var (OPTIONAL MATCH miss)
 // errors, the SET message shape. Rows pass through unchanged; the trailing
@@ -343,14 +360,25 @@ func (ex *executor) deleteStage(c *DeleteClause, rows []row) ([]row, error) {
 				if !c.Detach && ex.w.NodeHasEdges(key) {
 					return nil, &Error{1, 1, fmt.Sprintf("cannot delete node %s: it still has edges (use DETACH DELETE)", key)}
 				}
-				if err := ex.w.DeleteNodeCascade(key); err != nil {
+				killed, err := ex.w.DeleteNodeCascade(key)
+				if err != nil {
 					return nil, err
 				}
 				ex.sum.DeletedNodes++
+				ex.sum.DeletedEdges += killed
 			} else if id, ok := r.edges[v]; ok {
 				ref, okR := ex.boundEdgeRef(id)
 				if !okR {
 					return nil, &Error{1, 1, fmt.Sprintf("bound edge %q does not resolve to a triple", v)}
+				}
+				// A triple whose endpoint died earlier in this statement
+				// (the DETACH DELETE a, r case: a's cascade killed r) is
+				// already gone — skip, no count, no error.
+				if _, live := ex.w.NodeIDByKey(ref.srcKey); !live {
+					continue
+				}
+				if _, live := ex.w.NodeIDByKey(ref.dstKey); !live {
+					continue
 				}
 				n, err := ex.w.DeleteEdgeTriple(ref.srcKey, ref.dstKey, ref.label)
 				if err != nil {
@@ -365,6 +393,254 @@ func (ex *executor) deleteStage(c *DeleteClause, rows []row) ([]row, error) {
 		}
 	}
 	return rows, nil
+}
+
+// mergeStage executes one MERGE clause: per input row, the clause's single
+// pattern (validation guarantees exactly one — a lone node, or one directed
+// edge with both endpoints resolvable) is matched by IDENTITY, not by full
+// prop map (the documented divergence: a node by its logical key, an edge
+// by its (srcKey, dstKey, label) triple). The node arm and the edge arm
+// share the shape: probe the identity, bind on hit (created=false, ON
+// MATCH SET items apply), create on miss (created=true, ON CREATE SET
+// items apply); in both arms the pattern's own props are CREATION-TIME
+// ONLY — a hit never rewrites them (ON MATCH SET is the update path).
+// Summary counters move only on actual creates. First error stops the
+// statement; earlier rows' writes remain.
+func (ex *executor) mergeStage(c *MergeClause, rows []row) ([]row, error) {
+	if rows == nil {
+		rows = []row{{}} // bare MERGE statement: one implicit empty incoming row
+	}
+	out := make([]row, 0, len(rows))
+	for _, r := range rows {
+		nr := r.clone() // COW: new bindings below copy shared maps exactly once
+		nr.pos = 0      // stage-constructed row: no frontier to carry
+		if err := ex.mergePattern(c.Pattern, &nr, c.OnCreate, c.OnMatch); err != nil {
+			return nil, err
+		}
+		out = append(out, nr)
+	}
+	return out, nil
+}
+
+// mergePattern dispatches the MERGE pattern to its arm (the validation
+// shape: one node, or one edge between two nodes).
+func (ex *executor) mergePattern(pat *PathPattern, r *row, onCreate, onMatch []*SetItem) error {
+	if len(pat.Edges) == 0 {
+		return ex.mergeNode(pat.Nodes[0], r, onCreate, onMatch)
+	}
+	return ex.mergeEdge(pat, r, onCreate, onMatch)
+}
+
+// mergeNode merges one node pattern: the identity key comes from the row's
+// binding when the var is bound (the bare rebind spelling) or from the
+// pattern's evaluated "key" expression (validator-guaranteed on fresh node
+// patterns; the createStage runtime string check applies). A live key
+// binds the existing ID and fires the ON MATCH items; a dead key runs the
+// createStage create path and fires the ON CREATE items. A bound var whose
+// node died earlier in this statement (DELETE then MERGE) recreates by the
+// SAME key — the bare pattern contributes no label or props (validation),
+// so the resurrection is nameless but identity-stable.
+func (ex *executor) mergeNode(np *NodePattern, r *row, onCreate, onMatch []*SetItem) error {
+	key, bound := "", false
+	if np.Var != "" {
+		if id, ok := r.nodes[np.Var]; ok {
+			k, okK := ex.boundNodeKey(id)
+			if !okK {
+				line, col := np.Line, np.Col
+				if line == 0 {
+					line, col = 1, 1
+				}
+				return &Error{line, col, fmt.Sprintf("bound node %q does not resolve to a key", np.Var)}
+			}
+			key, bound = k, true
+		}
+	}
+	if !bound {
+		if kexpr, has := np.Exprs["key"]; has {
+			v, ok := ex.eval(kexpr, *r)
+			if !ok {
+				v = nil
+			}
+			if s, isStr := v.(string); isStr {
+				key = s
+			} else {
+				line, col := kexpr.pos()
+				if line == 0 {
+					line, col = 1, 1
+				}
+				return &Error{line, col, fmt.Sprintf("key property must be a string (the node's logical key); got %s", litTypeName(v))}
+			}
+		} else {
+			key = ex.w.NewNodeKey() // defensive: the grammar requires a key here; a keyless fresh merge can never hit
+		}
+	}
+	if id, live := ex.w.NodeIDByKey(key); live {
+		// hit: bind, never rewrite — the pattern's props are creation-time only
+		if np.Var != "" {
+			r.ownNodes()
+			r.nodes[np.Var] = id
+		}
+		return ex.applySetItems(onMatch, r)
+	}
+	if bound {
+		// the bound binding died earlier in this statement: recreate by the
+		// same key (createNode cannot be reused — a bare rebind pattern
+		// carries no key expression, so it would draw a ratchet key)
+		id, created, err := ex.w.CreateNode(key, np.Label, nil)
+		if err != nil {
+			return err
+		}
+		if created {
+			ex.sum.CreatedNodes++
+		}
+		ex.writtenNodes[id] = engine.NodeRec{Key: key, Label: np.Label}
+		r.ownNodes()
+		r.nodes[np.Var] = id
+		return ex.applySetItems(onCreate, r)
+	}
+	_, id, err := ex.createNode(np, *r) // the createStage path: props MINUS key, CreatedNodes on created
+	if err != nil {
+		return err
+	}
+	if np.Var != "" {
+		r.ownNodes()
+		r.nodes[np.Var] = id
+	}
+	return ex.applySetItems(onCreate, r)
+}
+
+// mergeEdge merges one directed edge pattern (the validation shape: two
+// nodes, one labeled fixed-hop outgoing edge). Endpoints resolve to
+// IDENTITIES first, before any write: a bound var through the refs memo
+// (the bare rebind spelling), a fresh pattern through its evaluated "key"
+// expression (a live key binds the existing node; a dead or keyless
+// pattern would create — keyless per CREATE's ratchet, so its triple can
+// never pre-exist). EdgeIDByTriple then decides the arm BEFORE any
+// endpoint is created (Neo4j full-pattern-match semantics: an existing
+// edge binds the whole pattern — endpoints included — and suppresses
+// endpoint creation even when the pattern spells them as fresh). The miss
+// arm creates only the endpoints that need it (createStage rules) and
+// writes the edge with UpsertEdgeTriple (fold semantics: same-row
+// duplicates of the triple collapse onto one). The edge var binds for
+// RETURN in both arms; the pattern's edge props are creation-time only.
+func (ex *executor) mergeEdge(pat *PathPattern, r *row, onCreate, onMatch []*SetItem) error {
+	ep := pat.Edges[0]
+	label := ep.Labels[0] // exactly one label per write edge: static checkWritePattern rule
+	keys, ids := make([]string, 2), make([]uint32, 2)
+	create := [2]bool{} // endpoint needs creation on the miss arm
+	known := true       // both endpoint keys resolved without the ratchet?
+	for i, np := range pat.Nodes {
+		if np.Var != "" {
+			if id, ok := r.nodes[np.Var]; ok { // rebind: the bound node is the identity
+				key, okK := ex.boundNodeKey(id)
+				if !okK {
+					line, col := np.Line, np.Col
+					if line == 0 {
+						line, col = 1, 1
+					}
+					return &Error{line, col, fmt.Sprintf("bound node %q does not resolve to a key", np.Var)}
+				}
+				keys[i], ids[i] = key, id
+				continue
+			}
+			if np.Label == "" && np.Exprs == nil {
+				// Bare form unbound in THIS row: the rebind spelling met an
+				// OPTIONAL MATCH null (the createStage rule) — merging a
+				// nameless fresh node would invent identity. Error.
+				line, col := np.Line, np.Col
+				if line == 0 {
+					line, col = 1, 1
+				}
+				return &Error{line, col, fmt.Sprintf("variable %q is not bound in this row (an OPTIONAL MATCH null); MERGE cannot rebind it", np.Var)}
+			}
+		}
+		if kexpr, has := np.Exprs["key"]; has {
+			v, ok := ex.eval(kexpr, *r)
+			if !ok {
+				v = nil
+			}
+			if s, isStr := v.(string); isStr {
+				keys[i] = s
+			} else {
+				line, col := kexpr.pos()
+				if line == 0 {
+					line, col = 1, 1
+				}
+				return &Error{line, col, fmt.Sprintf("key property must be a string (the node's logical key); got %s", litTypeName(v))}
+			}
+			if id, live := ex.w.NodeIDByKey(keys[i]); live {
+				ids[i] = id // the key names an existing endpoint: no creation
+			} else {
+				create[i] = true
+			}
+		} else {
+			// keyless fresh endpoint: CREATE's ratchet path — a generated
+			// key is unique, so this endpoint's triple cannot pre-exist.
+			create[i], known = true, false
+		}
+	}
+	if known {
+		if eid, hit := ex.w.EdgeIDByTriple(keys[0], keys[1], label); hit {
+			// hit: the whole pattern exists — endpoints are live (a live
+			// edge needs live endpoints) and bind by key; no writes at all.
+			for i, np := range pat.Nodes {
+				if np.Var != "" {
+					id, _ := ex.w.NodeIDByKey(keys[i])
+					r.ownNodes()
+					r.nodes[np.Var] = id
+				}
+			}
+			if ep.Var != "" {
+				r.ownEdges()
+				r.edges[ep.Var] = eid
+			}
+			return ex.applySetItems(onMatch, r)
+		}
+	}
+	// miss: create the endpoints that need it (fresh patterns only — a
+	// bound var or an existing key never creates), then the edge.
+	for i, np := range pat.Nodes {
+		if np.Var != "" && !create[i] {
+			r.ownNodes()
+			r.nodes[np.Var] = ids[i]
+		}
+		if !create[i] {
+			continue
+		}
+		key, id, err := ex.createNode(np, *r)
+		if err != nil {
+			return err
+		}
+		keys[i], ids[i] = key, id
+		if np.Var != "" {
+			r.ownNodes()
+			r.nodes[np.Var] = id
+		}
+	}
+	props := make(map[string]any, len(ep.Exprs))
+	for name, e := range ep.Exprs {
+		if v, ok := ex.eval(e, *r); ok && v != nil {
+			props[name] = v // null-valued props are skipped, never stored
+		}
+	}
+	created, err := ex.w.UpsertEdgeTriple(keys[0], keys[1], label, props)
+	if err != nil {
+		return err
+	}
+	if created {
+		ex.sum.CreatedEdges++
+	}
+	// Bind the edge var for RETURN: the write's canonical ID (the fold's
+	// winner), recorded in writtenEdges so the projection reads post-write
+	// truth — the pinned source does not know this edge.
+	if eid, ok := ex.w.EdgeIDByTriple(keys[0], keys[1], label); ok {
+		ex.writtenEdges[eid] = writtenEdge{src: ids[0], dst: ids[1], label: label, props: props}
+		if ep.Var != "" {
+			r.ownEdges()
+			r.edges[ep.Var] = eid
+		}
+	}
+	return ex.applySetItems(onCreate, r)
 }
 
 // evalPending evaluates one SET item's RHS: a property read the row's
