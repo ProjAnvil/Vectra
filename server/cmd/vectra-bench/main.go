@@ -67,6 +67,7 @@ func main() {
 	writeRate := flag.Int("writerate", 200, "mixed workload: paced write batches/s (engine mode; 0 disables; pacing accuracy degrades above ~500)")
 	writeBatch := flag.Int("writebatch", 50, "mixed workload: edges per write changeset (half prop upserts, half new edges)")
 	profileDir := flag.String("profile", "", "pprof output directory: per-workload cpu profile plus heap/mutex snapshots (attribution runs)")
+	authTokenFile := flag.String("auth-token-file", "", "http mode: enable bearer auth on the bench's own node (one token per line, same format as vectra-server) and send the first token on every request — measures the auth middleware's overhead")
 	flag.Parse()
 
 	spec, ok := sizes[*size]
@@ -125,7 +126,7 @@ func main() {
 		sink = gometrics.NewInmemSink(10*time.Second, time.Minute)
 		_, _ = gometrics.NewGlobal(&gometrics.Config{EnableHostname: false, FilterDefault: true}, sink)
 		var wantNodes, wantEdges int
-		baseURL, httpc, node, wantNodes, wantEdges = injectHTTP(rep, bg, dir, *sealInterval, *keep)
+		baseURL, httpc, node, wantNodes, wantEdges = injectHTTP(rep, bg, dir, *sealInterval, *keep, *authTokenFile)
 		defer node.Close()
 		queryGraph = waitPublished(node, wantNodes, wantEdges)
 	default:
@@ -409,7 +410,7 @@ func injectEngine(rep *report, bg *bench.Graph) *vectra.Graph {
 // from /v1/batch responses) and the unique-edge count. Batch edge writes are
 // true upserts collapsing duplicate (src,dst,label) triples, so what the
 // publisher can ever seal is the unique-triple count, not the generated one.
-func injectHTTP(rep *report, bg *bench.Graph, dir string, sealInterval time.Duration, keep bool) (string, *http.Client, *server.Node, int, int) {
+func injectHTTP(rep *report, bg *bench.Graph, dir string, sealInterval time.Duration, keep bool, authTokenFile string) (string, *http.Client, *server.Node, int, int) {
 	// Probe a free port and release it for server.New's TCP transport to bind
 	probe, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -424,11 +425,12 @@ func injectHTTP(rep *report, bg *bench.Graph, dir string, sealInterval time.Dura
 		os.Exit(1)
 	}
 	n, err := server.New(server.Config{
-		NodeID:       "bench-1",
-		HTTPAddr:     httpLn.Addr().String(),
-		RaftAddr:     raftAddr,
-		DataDir:      filepath.Join(dir, "node1"),
-		SealInterval: sealInterval,
+		NodeID:        "bench-1",
+		HTTPAddr:      httpLn.Addr().String(),
+		RaftAddr:      raftAddr,
+		DataDir:       filepath.Join(dir, "node1"),
+		SealInterval:  sealInterval,
+		AuthTokenFile: authTokenFile,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -451,6 +453,17 @@ func injectHTTP(rep *report, bg *bench.Graph, dir string, sealInterval time.Dura
 			MaxIdleConnsPerHost: 256,
 			IdleConnTimeout:     90 * time.Second,
 		},
+	}
+	if authTokenFile != "" {
+		// Same file format as vectra-server; the client side only needs the
+		// first token. Wrapping the Transport covers every request the bench
+		// makes (injection, awaits, workloads) in one place.
+		tok, err := firstTokenLine(authTokenFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "vectra-bench: -auth-token-file: %v\n", err)
+			os.Exit(1)
+		}
+		client.Transport = &bearerTransport{rt: client.Transport, token: tok}
 	}
 	base := "http://" + httpLn.Addr().String()
 
@@ -970,4 +983,33 @@ func rotators(p bench.QueryParams) (func() string, func() [2]string) {
 	}
 	nextPair := func() [2]string { return p.Pairs[j.Add(1)%int64(len(p.Pairs))] }
 	return nextStart, nextPair
+}
+
+// bearerTransport attaches the bench's bearer token to every request so
+// the http-mode node can run with auth enabled and the middleware's cost
+// shows up in the workload numbers.
+type bearerTransport struct {
+	rt    http.RoundTripper
+	token string
+}
+
+func (b *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	r := req.Clone(req.Context())
+	r.Header.Set("Authorization", "Bearer "+b.token)
+	return b.rt.RoundTrip(r)
+}
+
+// firstTokenLine reads the first non-blank, whitespace-trimmed line of a
+// vectra-server token file — the token the server accepts first.
+func firstTokenLine(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	for line := range strings.SplitSeq(strings.TrimPrefix(string(data), "\ufeff"), "\n") {
+		if tok := strings.Trim(line, " \t\r"); tok != "" {
+			return tok, nil
+		}
+	}
+	return "", fmt.Errorf("%s: no token lines", path)
 }
