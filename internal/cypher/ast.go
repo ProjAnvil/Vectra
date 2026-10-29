@@ -1,7 +1,9 @@
 package cypher
 
-// Query is one parsed statement: a sequence of clauses ending in RETURN.
-// The v0.13 clause pipeline: MATCH may repeat (disjoint variables produce
+// Query is one parsed statement: a sequence of clauses ending in RETURN —
+// or ending in a write clause (CREATE/MERGE/SET/DELETE) with the RETURN
+// omitted, the v0.14 write-statement form. The v0.13 clause pipeline:
+// MATCH may repeat (disjoint variables produce
 // a cartesian product, shared variables join — matching Neo4j); WITH and
 // UNWIND clauses are scope-validated here and parsed by their own arms.
 // Positions live on the expression nodes for error reports.
@@ -60,6 +62,47 @@ type UnwindClause struct {
 	Alias string // mandatory: UNWIND expr AS alias
 }
 
+// CreateClause is CREATE followed by comma-separated path patterns.
+// Endpoint patterns with a Var already in scope REBIND to that node
+// (they must be bare variables: no label, no props); fresh endpoints
+// are created. Edge patterns must be directed, fixed-length.
+type CreateClause struct{ Patterns []*PathPattern }
+
+// SetItem is one "var.prop = expr" assignment.
+type SetItem struct {
+	Var, Prop string
+	Value     Expr
+}
+
+// SetClause is SET followed by comma-separated items. Applied per row,
+// left to right (later items see earlier ones, matching Neo4j).
+type SetClause struct{ Items []*SetItem }
+
+// DeleteClause is [DETACH] DELETE var[, var...]. Node vars require DETACH
+// when the node has incident edges (runtime check); edge vars delete the
+// whole (src,dst,label) triple (documented divergence, see Review Focus 5).
+type DeleteClause struct {
+	Vars   []string
+	Detach bool
+}
+
+// MergeClause is MERGE with exactly one pattern (single node, or one
+// directed edge whose endpoints are bound-or-fresh) plus optional
+// ON CREATE SET / ON MATCH SET trailers.
+type MergeClause struct {
+	Pattern  *PathPattern
+	OnCreate []*SetItem // nil when absent
+	OnMatch  []*SetItem // nil when absent
+}
+
+// IndexClause is the DDL statement CREATE [FULLTEXT] INDEX ON (n.prop).
+// Label-scoped forms are rejected at parse time (indexes are global per
+// property key in Vectra).
+type IndexClause struct {
+	Prop     string
+	FullText bool
+}
+
 // PathPattern is one comma-separated path of the MATCH clause:
 // Nodes[i] --Edges[i]--> Nodes[i+1].
 type PathPattern struct {
@@ -70,7 +113,14 @@ type PathPattern struct {
 type NodePattern struct {
 	Var   string         // "" = anonymous
 	Label string         // "" = any
-	Props map[string]any // literal equality conditions; nil when absent
+	Props map[string]any // literal equality conditions; nil when absent (MATCH patterns only)
+	// Exprs holds WRITE-pattern property values as expressions: CREATE and
+	// MERGE parse every prop value with the expression parser (UNWIND ['a']
+	// AS k CREATE (n:P {key:k}) is the bulk-import shape). Mutually
+	// exclusive with Props by construction — MATCH fills Props (index
+	// anchoring depends on literals), write patterns fill Exprs; "key" is
+	// the logical-key pseudo-prop, not a stored property.
+	Exprs map[string]Expr
 	// Line, Col locate the Var token for validate-time errors that point
 	// at a named pattern variable (the nullability guard). Hand-built
 	// patterns leave them zero; the error path normalizes 0 to 1.
@@ -181,3 +231,9 @@ func (*MatchClause) isClause()  {}
 func (*WithClause) isClause()   {}
 func (*UnwindClause) isClause() {}
 func (*ReturnClause) isClause() {}
+
+func (*CreateClause) isClause() {}
+func (*SetClause) isClause()    {}
+func (*DeleteClause) isClause() {}
+func (*MergeClause) isClause()  {}
+func (*IndexClause) isClause()  {}

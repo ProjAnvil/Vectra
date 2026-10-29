@@ -72,23 +72,34 @@ func (p *parser) expectKw(word string) error {
 	return nil
 }
 
-// parseQuery parses a keyword-dispatched clause sequence. The grammar:
-// [OPTIONAL] MATCH (repeatable, comma-separated patterns + WHERE per
-// clause) ... [WITH [DISTINCT] items [ORDER BY ...] [SKIP n] [LIMIT n]
-// [WHERE expr]] ... [UNWIND expr AS ident] ... RETURN items [ORDER BY ...]
-// [SKIP n] [LIMIT n]. OPTIONAL prefixes MATCH (the two-keyword arm;
-// optionality covers the whole clause incl. its comma patterns). RETURN is
-// terminal — anything after it is an unexpected-token error.
+// parseQuery parses a keyword-dispatched clause sequence. The v0.14
+// grammar: read clauses ([OPTIONAL] MATCH with comma-separated patterns +
+// WHERE, WITH [DISTINCT] items + trailer + WHERE, UNWIND expr AS ident)
+// may repeat up to the first write clause (CREATE patterns, MERGE pattern
+// [ON CREATE SET | ON MATCH SET], SET items, [DETACH] DELETE vars); after
+// a write clause only write clauses and the final RETURN may appear — a
+// read clause there is a positioned error. CREATE [FULLTEXT] INDEX is a
+// standalone statement (two-token lookahead; no other clause may
+// accompany it). RETURN is terminal — anything after it is an
+// unexpected-token error — and optional when the statement contains at
+// least one write clause; a pure-read statement still requires it.
 func (p *parser) parseQuery() (*Query, error) {
-	if !p.kw("MATCH") && !p.atOptionalMatch() {
+	if !p.kw("MATCH") && !p.atOptionalMatch() && !p.kw("UNWIND") &&
+		!p.kw("CREATE") && !p.kw("MERGE") && !p.kw("SET") &&
+		!p.kw("DELETE") && !p.atDetachDelete() {
 		return nil, p.errf("expected MATCH, got %s", describe(p.cur()))
 	}
 	q := newQuery()
 	sawReturn := false
+	sawWrite := false
 	for !p.at(TEOF) {
 		if sawReturn {
 			return nil, p.errf("expected end of input, got %s", describe(p.cur()))
 		}
+		if sawWrite && (p.kw("MATCH") || p.atOptionalMatch() || p.kw("WITH") || p.kw("UNWIND")) {
+			return nil, p.errf("read clauses after a write clause are not supported in this version")
+		}
+		start := p.cur()
 		var (
 			c   Clause
 			err error
@@ -100,6 +111,18 @@ func (p *parser) parseQuery() (*Query, error) {
 			c, err = p.parseWithClause()
 		case p.kw("UNWIND"):
 			c, err = p.parseUnwindClause()
+		case p.kw("CREATE"):
+			if p.atCreateIndex() {
+				c, err = p.parseIndexClause()
+			} else {
+				c, err = p.parseCreateClause()
+			}
+		case p.kw("MERGE"):
+			c, err = p.parseMergeClause()
+		case p.kw("SET"):
+			c, err = p.parseSetClause()
+		case p.kw("DELETE"), p.atDetachDelete():
+			c, err = p.parseDeleteClause()
 		case p.kw("RETURN"):
 			c, err = p.parseReturnClause()
 			sawReturn = true
@@ -109,12 +132,61 @@ func (p *parser) parseQuery() (*Query, error) {
 		if err != nil {
 			return nil, err
 		}
+		if _, ddl := c.(*IndexClause); ddl && (len(q.Clauses) > 0 || !p.at(TEOF)) {
+			return nil, &Error{start.Line, start.Col, "CREATE INDEX is a standalone statement (no other clauses may accompany it)"}
+		}
+		if isWriteClause(c) {
+			sawWrite = true
+		}
 		q.Clauses = append(q.Clauses, c)
 	}
-	if !sawReturn {
+	if !sawReturn && !sawWrite {
 		return nil, p.errf("expected RETURN, got %s", describe(p.cur()))
 	}
 	return q, nil
+}
+
+// isWriteClause reports whether c mutates the graph (write clauses and
+// the CREATE INDEX DDL statement); RETURN-optional and the
+// read-after-write sequencing key off this.
+func isWriteClause(c Clause) bool {
+	switch c.(type) {
+	case *CreateClause, *SetClause, *DeleteClause, *MergeClause, *IndexClause:
+		return true
+	}
+	return false
+}
+
+// atDetachDelete reports whether the cursor sits on the two-keyword
+// DETACH DELETE prefix (the only DETACH spelling in the grammar). A lone
+// DETACH at clause position keeps the generic unexpected-token error.
+// The +1 index is safe: toks always ends with TEOF, and a cursor on
+// DETACH is never on that final token.
+func (p *parser) atDetachDelete() bool {
+	if !p.kw("DETACH") {
+		return false
+	}
+	t := p.toks[p.pos+1]
+	return t.Kind == TIdent && strings.EqualFold(t.Text, "DELETE")
+}
+
+// atCreateIndex reports whether the cursor sits on the CREATE
+// [FULLTEXT] INDEX DDL prefix (the two-token lookahead form; plain CREATE
+// parses path patterns). Both +1 and +2 indexes are safe: toks always
+// ends with TEOF, and each consumed token proves the next exists.
+func (p *parser) atCreateIndex() bool {
+	if !p.kw("CREATE") {
+		return false
+	}
+	t := p.toks[p.pos+1]
+	if t.Kind == TIdent && strings.EqualFold(t.Text, "INDEX") {
+		return true
+	}
+	if t.Kind == TIdent && strings.EqualFold(t.Text, "FULLTEXT") {
+		t2 := p.toks[p.pos+2]
+		return t2.Kind == TIdent && strings.EqualFold(t2.Text, "INDEX")
+	}
+	return false
 }
 
 // atOptionalMatch reports whether the cursor sits on the two-keyword
@@ -141,14 +213,14 @@ func (p *parser) parseMatchClause() (*MatchClause, error) {
 		m.Optional = true
 	}
 	p.next() // MATCH
-	pat, err := p.parsePath()
+	pat, err := p.parsePath(false)
 	if err != nil {
 		return nil, err
 	}
 	m.Patterns = append(m.Patterns, pat)
 	for p.at(TComma) {
 		p.next()
-		pat, err := p.parsePath()
+		pat, err := p.parsePath(false)
 		if err != nil {
 			return nil, err
 		}
@@ -286,6 +358,181 @@ func (p *parser) parseUnwindClause() (*UnwindClause, error) {
 	return &UnwindClause{Expr: expr, Alias: a.Text}, nil
 }
 
+// parseCreateClause parses "CREATE pattern[, pattern...]" — the same path
+// grammar as MATCH, but node-pattern props parse as expressions (see
+// parsePath). Validation (rebind bareness, edge direction/hops, literal
+// key type) lives in the validate pass. The CREATE keyword is still
+// unconsumed; the CREATE INDEX lookahead is resolved by parseQuery.
+func (p *parser) parseCreateClause() (*CreateClause, error) {
+	p.next() // CREATE
+	cc := &CreateClause{}
+	pat, err := p.parsePath(true)
+	if err != nil {
+		return nil, err
+	}
+	cc.Patterns = append(cc.Patterns, pat)
+	for p.at(TComma) {
+		p.next()
+		pat, err := p.parsePath(true)
+		if err != nil {
+			return nil, err
+		}
+		cc.Patterns = append(cc.Patterns, pat)
+	}
+	return cc, nil
+}
+
+// parseSetClause parses "SET var.prop = expr[, var.prop = expr ...]".
+// Whole-node map assignment (SET n = {...}) and SET n:Label are outside
+// the v0.14 grammar. The SET keyword is still unconsumed.
+func (p *parser) parseSetClause() (*SetClause, error) {
+	p.next() // SET
+	items, err := p.parseSetItems()
+	if err != nil {
+		return nil, err
+	}
+	return &SetClause{Items: items}, nil
+}
+
+// parseSetItems parses comma-separated "var.prop = expr" items, shared by
+// the SET clause and the MERGE ON CREATE SET / ON MATCH SET trailers.
+func (p *parser) parseSetItems() ([]*SetItem, error) {
+	var items []*SetItem
+	for {
+		v, err := p.expect(TIdent, "variable")
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(TDot, "\".\""); err != nil {
+			return nil, err
+		}
+		prop, err := p.expect(TIdent, "property name")
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(TEq, "\"=\""); err != nil {
+			return nil, err
+		}
+		val, err := p.parseOr()
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, &SetItem{Var: v.Text, Prop: prop.Text, Value: val})
+		if p.at(TComma) {
+			p.next()
+			continue
+		}
+		return items, nil
+	}
+}
+
+// parseDeleteClause parses "[DETACH] DELETE var[, var...]" — bare
+// variables only (label/prop forms are not part of the grammar). The
+// leading keyword(s) are still unconsumed (the clause loop verified
+// either DELETE or the two-keyword DETACH DELETE prefix).
+func (p *parser) parseDeleteClause() (*DeleteClause, error) {
+	d := &DeleteClause{}
+	if p.kw("DETACH") {
+		p.next() // DETACH
+		d.Detach = true
+	}
+	p.next() // DELETE
+	v, err := p.expect(TIdent, "variable")
+	if err != nil {
+		return nil, err
+	}
+	d.Vars = append(d.Vars, v.Text)
+	for p.at(TComma) {
+		p.next()
+		v, err := p.expect(TIdent, "variable")
+		if err != nil {
+			return nil, err
+		}
+		d.Vars = append(d.Vars, v.Text)
+	}
+	return d, nil
+}
+
+// parseMergeClause parses "MERGE pattern [ON CREATE SET items]
+// [ON MATCH SET items]" — exactly one path pattern (comma patterns are a
+// CREATE spelling), at most one trailer of each kind, in either order.
+// The MERGE keyword is still unconsumed.
+func (p *parser) parseMergeClause() (*MergeClause, error) {
+	p.next() // MERGE
+	pat, err := p.parsePath(true)
+	if err != nil {
+		return nil, err
+	}
+	if p.at(TComma) {
+		return nil, p.errf("MERGE takes exactly one pattern")
+	}
+	mc := &MergeClause{Pattern: pat}
+	for p.kw("ON") {
+		p.next() // ON
+		var target *[]*SetItem
+		switch {
+		case p.kw("CREATE"):
+			p.next()
+			target = &mc.OnCreate
+		case p.kw("MATCH"):
+			p.next()
+			target = &mc.OnMatch
+		default:
+			return nil, p.errf("expected CREATE or MATCH after ON, got %s", describe(p.cur()))
+		}
+		if err := p.expectKw("SET"); err != nil {
+			return nil, err
+		}
+		items, err := p.parseSetItems()
+		if err != nil {
+			return nil, err
+		}
+		*target = append(*target, items...)
+	}
+	return mc, nil
+}
+
+// parseIndexClause parses "CREATE [FULLTEXT] INDEX ON (ident.ident)". The
+// property variable is grammatically required but semantically ignored:
+// indexes are global per property key in Vectra, so a label in its place
+// ((n:Label.prop) or (n:Label)) is a positioned error. The CREATE keyword
+// is still unconsumed; parseQuery already verified the lookahead.
+func (p *parser) parseIndexClause() (*IndexClause, error) {
+	p.next() // CREATE
+	ic := &IndexClause{}
+	if p.kw("FULLTEXT") {
+		p.next()
+		ic.FullText = true
+	}
+	if err := p.expectKw("INDEX"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKw("ON"); err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(TParenL, "\"(\""); err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(TIdent, "variable"); err != nil {
+		return nil, err
+	}
+	if p.at(TColon) {
+		return nil, p.errf("indexes are global per property key; label-scoped indexes are not supported")
+	}
+	if _, err := p.expect(TDot, "\".\""); err != nil {
+		return nil, err
+	}
+	prop, err := p.expect(TIdent, "property name")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(TParenR, "\")\""); err != nil {
+		return nil, err
+	}
+	ic.Prop = prop.Text
+	return ic, nil
+}
+
 // parseOrderSkipLimit parses the shared ORDER BY / SKIP / LIMIT trailer
 // (in that order) into the caller's clause fields; each part is optional.
 func (p *parser) parseOrderSkipLimit(orderBy *[]OrderKey, skip, limit *int) error {
@@ -337,9 +584,14 @@ func (p *parser) parseOrderSkipLimit(orderBy *[]OrderKey, skip, limit *int) erro
 
 // parsePath parses nodePat (edgePat nodePat)*. Edge forms, by first token:
 // TDMinus (`--`, `-->`), TLt (`<--`, `<-[...]-`), TMinus (`-[...]-`, `-[...]->`).
-func (p *parser) parsePath() (*PathPattern, error) {
+// write selects the node-pattern prop spelling: MATCH patterns parse
+// literal maps into Props (index anchoring depends on literals), write
+// patterns (CREATE/MERGE) parse each value as an expression into Exprs.
+// Edge parsing is shared verbatim — direction/hop restrictions for write
+// patterns are validate-time rules.
+func (p *parser) parsePath(write bool) (*PathPattern, error) {
 	path := &PathPattern{}
-	n, err := p.parseNodePattern()
+	n, err := p.parseNodePattern(write)
 	if err != nil {
 		return nil, err
 	}
@@ -398,7 +650,7 @@ func (p *parser) parsePath() (*PathPattern, error) {
 			return path, nil
 		}
 		path.Edges = append(path.Edges, ep)
-		n, err := p.parseNodePattern()
+		n, err := p.parseNodePattern(write)
 		if err != nil {
 			return nil, err
 		}
@@ -476,7 +728,7 @@ func (p *parser) mustNum() int {
 	return n
 }
 
-func (p *parser) parseNodePattern() (*NodePattern, error) {
+func (p *parser) parseNodePattern(write bool) (*NodePattern, error) {
 	if _, err := p.expect(TParenL, "\"(\""); err != nil {
 		return nil, err
 	}
@@ -495,7 +747,11 @@ func (p *parser) parseNodePattern() (*NodePattern, error) {
 	}
 	if p.at(TBraceL) {
 		p.next()
-		np.Props = map[string]any{}
+		if write {
+			np.Exprs = map[string]Expr{}
+		} else {
+			np.Props = map[string]any{}
+		}
 		for {
 			k, err := p.expect(TIdent, "property name")
 			if err != nil {
@@ -504,11 +760,19 @@ func (p *parser) parseNodePattern() (*NodePattern, error) {
 			if _, err := p.expect(TColon, "\":\""); err != nil {
 				return nil, err
 			}
-			v, err := p.parseLiteral()
-			if err != nil {
-				return nil, err
+			if write {
+				e, err := p.parseOr()
+				if err != nil {
+					return nil, err
+				}
+				np.Exprs[k.Text] = e
+			} else {
+				v, err := p.parseLiteral()
+				if err != nil {
+					return nil, err
+				}
+				np.Props[k.Text] = v
 			}
-			np.Props[k.Text] = v
 			if p.at(TComma) {
 				p.next()
 				continue
@@ -1044,6 +1308,145 @@ func (sc *scope) markNullable(v string) {
 	sc.nullable[v] = true
 }
 
+// checkWritePattern validates one CREATE/MERGE path pattern and declares
+// its variables into the scope (write clauses EXTEND the scope; they never
+// start one — see the SET/DELETE no-scope errors). Rules: edges must be
+// outgoing and fixed single hop; an endpoint whose variable is already
+// bound must rebind BARE — no label, no props, the binding supplies the
+// node; a statically-literal "key" prop must be a string; every prop
+// expression must reference declared variables. Endpoints are processed
+// left to right and declared as they go, so a later map may read an
+// earlier endpoint's properties (Neo4j's creation order) but not the
+// reverse. mergeNode marks the lone-node MERGE form, whose fresh node
+// REQUIRES a "key" — Vectra node identity is the logical key, and without
+// it a MERGE has nothing to match on. Edge MERGE endpoints carry no extra
+// static rule: bound endpoints rebind, fresh ones are keyed or get a
+// generated key at runtime.
+func (sc *scope) checkWritePattern(pat *PathPattern, mergeNode bool) error {
+	for _, e := range pat.Edges {
+		if e.Dir != DirOut {
+			line, col := e.Line, e.Col
+			if line == 0 { // hand-built pattern or var-less "--" form
+				line, col = 1, 1
+			}
+			return &Error{line, col, "write edge patterns must be outgoing (-[...]->); undirected and incoming edges cannot be created"}
+		}
+		if e.MinHops != 1 || e.MaxHops != 1 {
+			line, col := e.Line, e.Col
+			if line == 0 {
+				line, col = 1, 1
+			}
+			return &Error{line, col, "variable-length edges are not supported in write patterns (fixed single hop only)"}
+		}
+	}
+	for _, n := range pat.Nodes {
+		fresh := true
+		if n.Var != "" {
+			if k, bound := sc.kinds[n.Var]; bound {
+				fresh = false
+				if k == kindScalar {
+					return &Error{1, 1, fmt.Sprintf("variable %q is a scalar; pattern variables must be nodes or edges", n.Var)}
+				}
+				if n.Label != "" || n.Props != nil || n.Exprs != nil {
+					line, col := n.Line, n.Col
+					if line == 0 {
+						line, col = 1, 1
+					}
+					return &Error{line, col, fmt.Sprintf("cannot re-specify label/props when rebinding %q (rebinding uses the bare variable; the bound node supplies identity)", n.Var)}
+				}
+			}
+		}
+		if mergeNode && fresh {
+			if _, ok := n.Exprs["key"]; !ok {
+				line, col := n.Line, n.Col
+				if line == 0 { // anonymous node carries no Var token
+					line, col = 1, 1
+				}
+				return &Error{line, col, "MERGE node requires a {key: ...} property — node identity in Vectra is the logical key"}
+			}
+		}
+		if key, ok := n.Exprs["key"]; ok {
+			if err := checkKeyExpr(key); err != nil {
+				return err
+			}
+		}
+		for _, e := range n.Exprs {
+			if err := sc.checkExpr(e); err != nil {
+				return err
+			}
+		}
+		if n.Var != "" {
+			sc.kinds[n.Var] = kindNode
+		}
+	}
+	for _, e := range pat.Edges {
+		if e.Var != "" {
+			sc.kinds[e.Var] = kindEdge
+			sc.edges[e.Var] = e
+		}
+	}
+	return nil
+}
+
+// checkKeyExpr enforces the "key" pseudo-prop rule shared by CREATE and
+// MERGE node patterns: a statically-literal key must be a string literal.
+// Non-literal keys (expressions) pass validation; the evaluated value must
+// be a string at runtime.
+func checkKeyExpr(e Expr) error {
+	l, ok := e.(*Lit)
+	if !ok {
+		return nil
+	}
+	if _, ok := l.Val.(string); ok {
+		return nil
+	}
+	return &Error{l.Line, l.Col, fmt.Sprintf("key property must be a string (the node's logical key); got %s", litTypeName(l.Val))}
+}
+
+// litTypeName names a literal value for error messages.
+func litTypeName(v any) string {
+	switch v.(type) {
+	case nil:
+		return "null"
+	case string:
+		return "string"
+	case float64:
+		return "number"
+	case bool:
+		return "boolean"
+	}
+	return fmt.Sprintf("%T", v)
+}
+
+// checkEntityVar validates one SET/DELETE target variable: declared, an
+// entity binding (a scalar carries no properties to set or entity to
+// delete), and not a variable-length edge binding. {1,1} positions match
+// the RETURN-item error convention (SetItem/DeleteClause carry none).
+func (sc *scope) checkEntityVar(v string) error {
+	k, ok := sc.kinds[v]
+	if !ok {
+		return sc.undefinedErr(1, 1, v)
+	}
+	if k == kindScalar {
+		return &Error{1, 1, fmt.Sprintf("SET/DELETE requires a node or edge variable; %q is a scalar", v)}
+	}
+	if ep := sc.edges[v]; ep != nil && (ep.MinHops != 1 || ep.MaxHops != 1) {
+		return sc.varlenErr(1, 1, v)
+	}
+	return nil
+}
+
+// checkSetItem validates one SET assignment (SET clause items and MERGE
+// ON CREATE SET / ON MATCH SET trailers): the target passes
+// checkEntityVar, and the value expression reference-checks like a WHERE
+// operand.
+func (sc *scope) checkSetItem(it *SetItem) error {
+	if err := sc.checkEntityVar(it.Var); err != nil {
+		return err
+	}
+	return sc.checkExpr(it.Value)
+}
+
 // applyWith validates one WITH clause and applies its projection: item
 // references are checked against the incoming scope, then the scope is
 // REPLACED by the projected names (bare variables keep their kind under
@@ -1233,7 +1636,14 @@ func (sc *scope) checkReturn(c *ReturnClause, matchCount int) error {
 // degenerate single-MATCH query, an UNWIND alias never shadows a
 // node/edge variable, WITH item names are unique within their clause,
 // and a nullable (OPTIONAL-MATCH-declared) variable never anchors or
-// joins in a later non-optional MATCH.
+// joins in a later non-optional MATCH. Write clauses extend the scope
+// instead of replacing it: CREATE/MERGE patterns declare their variables
+// (rebind endpoints must stay bare), SET/DELETE targets must be declared
+// entity variables and SET requires a non-empty incoming scope, CREATE
+// edges must be outgoing fixed hop, and a MERGE is a single node (with a
+// mandatory "key" on fresh nodes) or a single edge pattern. CREATE INDEX
+// never reaches this walk — the parser admits it only as a standalone
+// statement. Read-after-write sequencing is a parser rule (parseQuery).
 func (q *Query) validate() error {
 	sc := newScope()
 	matchCount := 0
@@ -1278,6 +1688,49 @@ func (q *Query) validate() error {
 			}
 			sc.kinds[c.Alias] = kindScalar
 			delete(sc.nullable, c.Alias) // the scalar rebind shadows any old pattern var
+		case *CreateClause:
+			for _, pat := range c.Patterns {
+				if err := sc.checkWritePattern(pat, false); err != nil {
+					return err
+				}
+			}
+		case *SetClause:
+			if len(sc.kinds) == 0 {
+				return &Error{1, 1, "SET has no scope to act on; it must follow a clause that binds variables (MATCH, MERGE, CREATE, WITH, UNWIND)"}
+			}
+			for _, it := range c.Items {
+				if err := sc.checkSetItem(it); err != nil {
+					return err
+				}
+			}
+		case *DeleteClause:
+			if len(sc.kinds) == 0 {
+				return &Error{1, 1, "DELETE has no scope to act on; it must follow a clause that binds variables (MATCH, MERGE, CREATE, WITH, UNWIND)"}
+			}
+			for _, v := range c.Vars {
+				if err := sc.checkEntityVar(v); err != nil {
+					return err
+				}
+			}
+		case *MergeClause:
+			singleNode := len(c.Pattern.Nodes) == 1 && len(c.Pattern.Edges) == 0
+			singleEdge := len(c.Pattern.Nodes) == 2 && len(c.Pattern.Edges) == 1
+			if !singleNode && !singleEdge {
+				return &Error{1, 1, "MERGE takes a single node or a single edge pattern"}
+			}
+			if err := sc.checkWritePattern(c.Pattern, singleNode); err != nil {
+				return err
+			}
+			for _, it := range c.OnCreate {
+				if err := sc.checkSetItem(it); err != nil {
+					return err
+				}
+			}
+			for _, it := range c.OnMatch {
+				if err := sc.checkSetItem(it); err != nil {
+					return err
+				}
+			}
 		case *ReturnClause:
 			if err := sc.checkReturn(c, matchCount); err != nil {
 				return err
