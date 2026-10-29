@@ -296,6 +296,249 @@ func TestCypherWriteWALRoundTrip(t *testing.T) {
 	}
 }
 
+// TestCypherSetNodeProp pins the SET statement's primary shape: per-item
+// property writes on a matched node (merge, never wholesale replace),
+// RETURN projecting the post-SET values, and PropertiesSet counting every
+// write.
+func TestCypherSetNodeProp(t *testing.T) {
+	g := New()
+	if _, err := g.AddNode("x", "Svc", map[string]any{"env": "dev"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := g.Cypher(`MATCH (a {key:'x'}) SET a.env = 'staging', a.weight = 3 RETURN a.env, a.weight`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("rows = %d want 1", len(res.Rows))
+	}
+	if got := res.Rows[0]["a.env"]; got != "staging" {
+		t.Errorf("a.env = %v want staging", got)
+	}
+	if got := res.Rows[0]["a.weight"]; got != 3.0 {
+		t.Errorf("a.weight = %v want 3", got)
+	}
+	if res.Summary == nil || res.Summary.PropertiesSet != 2 {
+		t.Fatalf("summary = %+v want PropertiesSet=2", res.Summary)
+	}
+	n, ok := g.NodeByKey("x")
+	if !ok {
+		t.Fatal("node x missing after SET")
+	}
+	if !maps.Equal(n.Props, map[string]any{"env": "staging", "weight": 3.0}) {
+		t.Errorf("stored props = %v want merged {env:staging, weight:3}", n.Props)
+	}
+}
+
+// TestCypherSetNullDeletes pins the null-RHS form: SET a.gone = null removes
+// the property, RETURN renders it null, and the delete still counts toward
+// PropertiesSet.
+func TestCypherSetNullDeletes(t *testing.T) {
+	g := New()
+	if _, err := g.AddNode("x", "Svc", map[string]any{"env": "dev", "gone": 1.0}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := g.Cypher(`MATCH (a {key:'x'}) SET a.gone = null RETURN a.gone, a.env`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := res.Rows[0]["a.gone"]; got != nil {
+		t.Errorf("a.gone = %v want nil (deleted)", got)
+	}
+	if got := res.Rows[0]["a.env"]; got != "dev" {
+		t.Errorf("a.env = %v want dev (untouched)", got)
+	}
+	if res.Summary == nil || res.Summary.PropertiesSet != 1 {
+		t.Fatalf("summary = %+v want PropertiesSet=1 (deletes count)", res.Summary)
+	}
+	n, _ := g.NodeByKey("x")
+	if _, has := n.Props["gone"]; has {
+		t.Errorf("stored props must not contain gone: %v", n.Props)
+	}
+}
+
+// TestCypherSetFromOtherVar pins RHS reads of OTHER entities: the value
+// resolves through the pinned pre-write source via the ordinary evaluator,
+// and only the target changes.
+func TestCypherSetFromOtherVar(t *testing.T) {
+	g := New()
+	if _, err := g.AddNode("x", "P", map[string]any{"env": "prod"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.AddNode("y", "P", map[string]any{"env": "canary"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := g.Cypher(`MATCH (a {key:'x'}), (b {key:'y'}) SET a.env = b.env RETURN a.env`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := res.Rows[0]["a.env"]; got != "canary" {
+		t.Fatalf("a.env = %v want canary (copied from b)", got)
+	}
+	if res.Summary == nil || res.Summary.PropertiesSet != 1 {
+		t.Fatalf("summary = %+v want PropertiesSet=1", res.Summary)
+	}
+	a, _ := g.NodeByKey("x")
+	if a.Props["env"] != "canary" {
+		t.Errorf("a.env stored = %v want canary", a.Props["env"])
+	}
+	b, _ := g.NodeByKey("y")
+	if b.Props["env"] != "canary" {
+		t.Errorf("b.env = %v want canary (source unchanged)", b.Props["env"])
+	}
+}
+
+// TestCypherSetSeesEarlierItem pins left-to-right item visibility: a later
+// item's RHS reads the value an earlier item staged in the same row, not
+// the pre-write value.
+func TestCypherSetSeesEarlierItem(t *testing.T) {
+	g := New()
+	if _, err := g.AddNode("x", "P", map[string]any{"x": 7.0}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := g.Cypher(`MATCH (a {key:'x'}) SET a.x = 1, a.y = a.x RETURN a.x, a.y`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := res.Rows[0]["a.x"]; got != 1.0 {
+		t.Errorf("a.x = %v want 1 (overwritten)", got)
+	}
+	if got := res.Rows[0]["a.y"]; got != 1.0 {
+		t.Errorf("a.y = %v want 1 (read the staged a.x, not the pre-write 7)", got)
+	}
+}
+
+// TestCypherSetEdgeProp pins the edge form on both fronts: same-row item
+// visibility through the pending overlay (the edge case the node tests
+// cannot reach), and the triple-addressed divergence — a MATCH-bound edge
+// variable writes EVERY live parallel, with the parallel count unchanged.
+func TestCypherSetEdgeProp(t *testing.T) {
+	g := New()
+	if _, err := g.Cypher(`CREATE (a:P {key:'a'})-[:CALLS {w:1}]->(b:P {key:'b'})`); err != nil {
+		t.Fatal(err)
+	}
+	// one parallel: one match row; item 2 reads item 1's staged value
+	res, err := g.Cypher(`MATCH (a {key:'a'})-[r:CALLS]->(b {key:'b'}) SET r.w = 9, r.note = r.w`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if es := liveTriple(t, g, "a", "b", "CALLS"); len(es) != 1 || es[0].Props["w"] != 9.0 || es[0].Props["note"] != 9.0 {
+		t.Fatalf("edge after same-row items = %+v want one CALLS {w:9, note:9}", es)
+	}
+	if res.Summary == nil || res.Summary.PropertiesSet != 2 {
+		t.Fatalf("summary = %+v want PropertiesSet=2", res.Summary)
+	}
+
+	// a second parallel: SET reaches BOTH parallels of the triple
+	if _, err := g.Cypher(`MATCH (a {key:'a'}), (b {key:'b'}) CREATE (a)-[:CALLS {w:2}]->(b)`); err != nil {
+		t.Fatal(err)
+	}
+	res, err = g.Cypher(`MATCH (a {key:'a'})-[r:CALLS]->(b {key:'b'}) SET r.tag = 'go'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	es := liveTriple(t, g, "a", "b", "CALLS")
+	if len(es) != 2 {
+		t.Fatalf("parallels = %d want 2 (count unchanged through the rewrite)", len(es))
+	}
+	ws := map[float64]bool{}
+	for _, e := range es {
+		if e.Props["tag"] != "go" {
+			t.Errorf("parallel %d tag = %v want go (triple-addressed)", e.ID, e.Props["tag"])
+		}
+		ws[e.Props["w"].(float64)] = true
+	}
+	if !ws[9.0] || !ws[2.0] {
+		t.Errorf("per-parallel w values = %v want {9, 2} preserved", ws)
+	}
+	// 2 match rows x 1 item x 2 parallels touched per call
+	if res.Summary.PropertiesSet != 4 {
+		t.Errorf("PropertiesSet = %d want 4 (2 rows x 2 edges touched)", res.Summary.PropertiesSet)
+	}
+}
+
+// TestCypherSetUnboundErrors pins the OPTIONAL MATCH miss: the target var
+// is unbound in the kept row and SET errors (Neo4j parity),
+// first-error-stops, inventing nothing.
+func TestCypherSetUnboundErrors(t *testing.T) {
+	g := New()
+	if _, err := g.AddNode("keep", "P", nil); err != nil {
+		t.Fatal(err)
+	}
+	_, err := g.Cypher(`OPTIONAL MATCH (a {key:'missing'}) SET a.x = 1`)
+	if err == nil {
+		t.Fatal("SET on an OPTIONAL MATCH null must error")
+	}
+	if !strings.Contains(err.Error(), "SET requires a bound node or edge variable") {
+		t.Fatalf("error = %v want the bound-variable message", err)
+	}
+	var ce *CypherError
+	if !errors.As(err, &ce) {
+		t.Fatalf("error = %T want *CypherError", err)
+	}
+	if n := g.NodeCount(); n != 1 {
+		t.Fatalf("node count = %d want 1 (nothing invented)", n)
+	}
+}
+
+// TestCypherCreateEdgeLabelRequired pins the one-label rule as a STATIC
+// check: a label-less write edge is a validation error BEFORE any row
+// executes, so no partial node writes survive the statement error (the old
+// runtime-per-row check let the endpoint creates land first).
+func TestCypherCreateEdgeLabelRequired(t *testing.T) {
+	g := New()
+	_, err := g.Cypher(`CREATE (a:P {key:'x'})-[r]->(b:P {key:'y'})`)
+	if err == nil || !strings.Contains(err.Error(), "write edge patterns require exactly one relationship label") {
+		t.Fatalf("err = %v want the one-label message", err)
+	}
+	if n := g.NodeCount(); n != 0 {
+		t.Fatalf("nodes = %d want 0 (static check precedes any write)", n)
+	}
+}
+
+// TestCypherSetEdgeWALRoundTrip pins WAL durability of the edge SET path:
+// SetEdgeProps rewrites each parallel as a delete+re-add composite (fresh
+// EdgeIDs), so a Cypher SET over a multi-parallel triple under WALMode
+// Always must reopen with every parallel carrying the new props and the
+// parallel count unchanged.
+func TestCypherSetEdgeWALRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "graph.db")
+	g, err := Open(path, Options{WALMode: ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Cypher(`CREATE (a:P {key:'a'}), (b:P {key:'b'})`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Cypher(`MATCH (a {key:'a'}), (b {key:'b'}) CREATE (a)-[:CALLS {w:1}]->(b) CREATE (a)-[:CALLS {w:2}]->(b)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Cypher(`MATCH (a {key:'a'})-[r:CALLS]->(b {key:'b'}) SET r.w = 9`); err != nil {
+		t.Fatal(err)
+	}
+	if es := liveTriple(t, g, "a", "b", "CALLS"); len(es) != 2 {
+		t.Fatalf("parallels before Close = %d want 2", len(es))
+	}
+	if err := g.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	g2, err := Open(path, Options{WALMode: ModeAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g2.Close()
+	es := liveTriple(t, g2, "a", "b", "CALLS")
+	if len(es) != 2 {
+		t.Fatalf("parallels after reopen = %d want 2 (count unchanged)", len(es))
+	}
+	for _, e := range es {
+		if e.Props["w"] != 9.0 {
+			t.Errorf("parallel %d w = %v want 9", e.ID, e.Props["w"])
+		}
+	}
+}
+
 // TestCypherWriteReadPathUnchanged pins three-source visibility around a
 // Cypher write: an existing read query over base + unmerged layer keeps its
 // exact results (minus the new row) after a Cypher CREATE appends another

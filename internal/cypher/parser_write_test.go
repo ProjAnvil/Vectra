@@ -271,6 +271,7 @@ func TestParseWriteErrors(t *testing.T) {
 		{"CREATE (a)--(b)", "must be outgoing", 1, 1},
 		{"CREATE (a)<--(b)", "must be outgoing", 1, 1},
 		{"CREATE (a)-[r:X*2]->(b)", "variable-length edges are not supported", 1, 13},
+		{"CREATE (a)-[r]->(b)", "write edge patterns require exactly one relationship label", 1, 13},
 		{`MATCH (a) CREATE (a:P {key:'y'})`, `cannot re-specify label/props when rebinding "a"`, 1, 19},
 		{"CREATE (n:P {key:1})", "key property must be a string", 1, 18},
 		{"MERGE (n:P)", "MERGE node requires a {key: ...} property", 1, 8},

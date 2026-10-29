@@ -2,6 +2,7 @@ package cypher
 
 import (
 	"fmt"
+	"maps"
 
 	"github.com/projanvil/vectra/internal/engine"
 )
@@ -180,13 +181,8 @@ func (ex *executor) createPattern(pat *PathPattern, r *row) error {
 		}
 	}
 	for i, ep := range pat.Edges {
-		if len(ep.Labels) != 1 { // nil or multi-label: no single triple to write
-			line, col := ep.Line, ep.Col
-			if line == 0 {
-				line, col = 1, 1
-			}
-			return &Error{line, col, "write edge patterns require exactly one relationship label"}
-		}
+		// Exactly one label per edge is a static checkWritePattern rule;
+		// Labels[0] below is safe by validation.
 		props := make(map[string]any, len(ep.Exprs))
 		for name, e := range ep.Exprs {
 			if v, ok := ex.eval(e, *r); ok && v != nil {
@@ -251,6 +247,130 @@ func (ex *executor) createNode(np *NodePattern, r row) (string, uint32, error) {
 	return key, id, nil
 }
 
+// setStage executes one SET clause: per input row, items left to right.
+// Each item resolves its target through the row's bindings (node key via
+// boundNodeKey, edge triple via boundEdgeRef — both memoized in the refs
+// sidecars), evaluates the RHS against the row plus a per-row pending
+// overlay of the values EARLIER items staged (SET a.x = 1, a.y = a.x must
+// see the 1), and writes exactly one property: a nil value DELETES the
+// key. PropertiesSet accumulates the writer's counts (sets + deletes for
+// nodes; edges touched for the triple-addressed edge form). First error
+// stops the statement; earlier rows' writes remain. Rows pass through
+// unchanged — SET mutates properties, never bindings.
+func (ex *executor) setStage(c *SetClause, rows []row) ([]row, error) {
+	if rows == nil {
+		rows = []row{{}} // defensive: validation requires a binding clause before SET
+	}
+	for _, r := range rows {
+		var pending map[string]map[string]any // var -> prop -> staged value (this row only)
+		for _, it := range c.Items {
+			val := any(nil) // the null outcome stages a delete
+			if v, ok := ex.evalPending(it.Value, r, pending); ok {
+				val = v
+			}
+			if id, ok := r.nodes[it.Var]; ok { // nil-map lookup: safe miss
+				key, okK := ex.boundNodeKey(id)
+				if !okK {
+					return nil, &Error{1, 1, fmt.Sprintf("bound node %q does not resolve to a key", it.Var)}
+				}
+				n, err := ex.w.SetNodeProps(key, map[string]any{it.Prop: val})
+				if err != nil {
+					return nil, err
+				}
+				ex.sum.PropertiesSet += n
+				ex.overlayNodeProp(id, it.Prop, val)
+			} else if id, ok := r.edges[it.Var]; ok {
+				ref, okR := ex.boundEdgeRef(id)
+				if !okR {
+					return nil, &Error{1, 1, fmt.Sprintf("bound edge %q does not resolve to a triple", it.Var)}
+				}
+				n, err := ex.w.SetEdgeProps(ref.srcKey, ref.dstKey, ref.label, map[string]any{it.Prop: val})
+				if err != nil {
+					return nil, err
+				}
+				ex.sum.PropertiesSet += n
+				if canon, okC := ex.w.EdgeIDByTriple(ref.srcKey, ref.dstKey, ref.label); okC {
+					ex.overlayEdgeProp(canon, it.Prop, val)
+				}
+			} else {
+				// An OPTIONAL MATCH miss leaves the var unbound in the kept
+				// row; Neo4j parity is the explicit null error.
+				return nil, &Error{1, 1, fmt.Sprintf("SET requires a bound node or edge variable; %s is null", it.Var)}
+			}
+			if pending == nil {
+				pending = make(map[string]map[string]any)
+			}
+			props, ok := pending[it.Var]
+			if !ok {
+				props = make(map[string]any)
+				pending[it.Var] = props
+			}
+			props[it.Prop] = val
+		}
+	}
+	return rows, nil
+}
+
+// evalPending evaluates one SET item's RHS: a property read the row's
+// pending overlay serves FIRST (values staged by earlier items of this
+// row), everything else falls through to the ordinary evaluator — reads of
+// other entities resolve through the pinned pre-write source, exactly as
+// CREATE's property expressions do.
+func (ex *executor) evalPending(e Expr, r row, pending map[string]map[string]any) (any, bool) {
+	if pending != nil {
+		if p, ok := e.(*PropRef); ok {
+			if props := pending[p.Var]; props != nil {
+				if v, seen := props[p.Name]; seen {
+					return v, v != nil // a staged nil is a delete: the null outcome
+				}
+			}
+		}
+	}
+	return ex.eval(e, r)
+}
+
+// overlayNodeProp folds one staged property into writtenNodes[id] so later
+// items, later stages, and the RETURN projection read post-SET truth — the
+// pinned source keeps serving the pre-write props. The record's props map
+// is copied on first touch (the source's maps are shared read-only); every
+// map ever stored into writtenNodes is executor-private, so later touches
+// mutate in place. A nil value deletes.
+func (ex *executor) overlayNodeProp(id uint32, prop string, val any) {
+	rec, ok := ex.writtenNodes[id]
+	if !ok {
+		rec, _ = ex.nodeInfo(id) // writtenNodes miss: base is the pinned record
+		p := make(map[string]any, len(rec.Props)+1)
+		maps.Copy(p, rec.Props)
+		rec.Props = p
+	}
+	if val == nil {
+		delete(rec.Props, prop)
+	} else {
+		rec.Props[prop] = val
+	}
+	ex.writtenNodes[id] = rec
+}
+
+// overlayEdgeProp is overlayNodeProp's edge twin, keyed by the CANONICAL
+// post-write edge of the triple (EdgeIDByTriple — the same ID rebindRows
+// remaps RETURN bindings to): SetEdgeProps rewrites parallels with fresh
+// EdgeIDs, so the bound ID itself would be missed after the rebind.
+func (ex *executor) overlayEdgeProp(id uint32, prop string, val any) {
+	we, ok := ex.writtenEdges[id]
+	if !ok {
+		src, dst, label, props, _ := ex.edgeInfo(id)
+		p := make(map[string]any, len(props)+1)
+		maps.Copy(p, props)
+		we = writtenEdge{src: src, dst: dst, label: label, props: p}
+	}
+	if val == nil {
+		delete(we.props, prop)
+	} else {
+		we.props[prop] = val
+	}
+	ex.writtenEdges[id] = we
+}
+
 // boundNodeKey resolves a bound node ID to its logical key: the refs memo
 // first (each entity dereferences at most once), then writtenNodes (nodes
 // this statement created), then the PINNED pre-write source. ok=false only
@@ -313,20 +433,36 @@ func (ex *executor) rebindNode(id uint32) (uint32, bool) {
 	return ex.w.NodeIDByKey(ref.key) // miss = deleted: the caller drops the var
 }
 
+// boundEdgeRef resolves a bound edge ID to its (srcKey, dstKey, label)
+// triple, memoized in edgeRefs (each entity dereferences at most once).
+//
+// Known limitation — the documented v1 contract: the triple-addressed
+// writer methods (SetEdgeProps among them) and EdgeIDByTriple all address
+// the lowest-ID live parallel, so a MATCH-bound edge variable addresses
+// its WHOLE triple under SET: with parallel edges, SET r.p writes p onto
+// every parallel, never just the one edge r happened to bind.
+func (ex *executor) boundEdgeRef(id uint32) (edgeRef, bool) {
+	if ref, ok := ex.edgeRefs[id]; ok {
+		return ref, true
+	}
+	src, dst, label, _, resolved := ex.edgeInfo(id)
+	if !resolved {
+		return edgeRef{}, false
+	}
+	srck, okS := ex.boundNodeKey(src) // endpoint IDs -> keys, pinned/memoized
+	dstk, okD := ex.boundNodeKey(dst)
+	if !okS || !okD {
+		return edgeRef{}, false
+	}
+	ref := edgeRef{srcKey: srck, dstKey: dstk, label: label}
+	ex.edgeRefs[id] = ref
+	return ref, true
+}
+
 func (ex *executor) rebindEdge(id uint32) (uint32, bool) {
-	ref, ok := ex.edgeRefs[id]
+	ref, ok := ex.boundEdgeRef(id)
 	if !ok {
-		src, dst, label, _, resolved := ex.edgeInfo(id)
-		if !resolved {
-			return id, true // created by this statement
-		}
-		srck, okS := ex.boundNodeKey(src) // endpoint IDs -> keys, pinned/memoized
-		dstk, okD := ex.boundNodeKey(dst)
-		if !okS || !okD {
-			return id, true
-		}
-		ref = edgeRef{srcKey: srck, dstKey: dstk, label: label}
-		ex.edgeRefs[id] = ref
+		return id, true // created by this statement: already post-write
 	}
 	return ex.w.EdgeIDByTriple(ref.srcKey, ref.dstKey, ref.label)
 }

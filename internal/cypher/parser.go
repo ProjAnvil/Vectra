@@ -1343,7 +1343,8 @@ func (sc *scope) markNullable(v string) {
 // checkWritePattern validates one CREATE/MERGE path pattern and declares
 // its variables into the scope (write clauses EXTEND the scope; they never
 // start one — see the SET/DELETE no-scope errors). Rules: edges must be
-// outgoing and fixed single hop; an endpoint whose variable is already
+// outgoing, fixed single hop, and carry exactly one relationship label (a
+// write edge addresses one triple); an endpoint whose variable is already
 // bound must rebind BARE — no label, no props, and a NODE binding (an
 // edge binding cannot be rebound as a node); edge pattern variables are
 // always fresh declarations (colliding with any binding in scope,
@@ -1373,6 +1374,17 @@ func (sc *scope) checkWritePattern(pat *PathPattern, mergeNode bool) error {
 				line, col = 1, 1
 			}
 			return &Error{line, col, "variable-length edges are not supported in write patterns (fixed single hop only)"}
+		}
+		// Exactly one label, checked statically: a label-less or multi-label
+		// write edge has no single triple to address, and a runtime check
+		// would sit per-row in the executor — after partial writes had
+		// already landed (the CREATE node pass runs before the edge pass).
+		if len(e.Labels) != 1 {
+			line, col := e.Line, e.Col
+			if line == 0 {
+				line, col = 1, 1
+			}
+			return &Error{line, col, "write edge patterns require exactly one relationship label"}
 		}
 	}
 	for _, n := range pat.Nodes {
