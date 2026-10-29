@@ -197,9 +197,15 @@ func runStatement(ex *executor, ast *Query) (*Result, error) {
 				return nil, err
 			}
 		case *IndexClause:
-			// Parsed and validated (Task 1) but not yet executable; an
-			// explicit error beats silently skipping a mutation.
-			return nil, &Error{1, 1, "only CREATE, SET, DELETE and MERGE write clauses are supported in this version"}
+			// Same write-path gating as CREATE (routing, not semantics).
+			if ex.w == nil {
+				return nil, &Error{1, 1, "write clause outside the write path (use RunWrite)"}
+			}
+			// A no-rows statement: applied once at the statement level,
+			// never through the per-row stage machinery (see indexStage).
+			if err := ex.indexStage(c); err != nil {
+				return nil, err
+			}
 		case *ReturnClause:
 			if ex.w != nil {
 				// Rebind entity bindings through the writer against the

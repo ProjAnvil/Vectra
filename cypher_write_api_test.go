@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"maps"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -1125,5 +1126,244 @@ func TestCypherMergeResurrectOnCreateNoPanic(t *testing.T) {
 	}
 	if _, has := n.Props["v"]; has {
 		t.Fatalf("props = %v want v gone (the delete killed the original props; AddNode revive does not resurrect them)", n.Props)
+	}
+}
+
+// TestCypherCreateIndexDDL pins the typed-index DDL statement's primary
+// shape: CREATE INDEX declares the property key globally (the pattern's
+// variable is grammatically required but semantically ignored), the summary
+// counts one index created per successfully-applied statement (an idempotent
+// re-declaration is still a creation request), no rows or columns ride the
+// result (the parser forbids RETURN alongside), and the declaration lands on
+// the typed kind only — never the full-text kind.
+func TestCypherCreateIndexDDL(t *testing.T) {
+	g := New()
+	res, err := g.Cypher(`CREATE INDEX ON (n.env)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Summary == nil || res.Summary.IndexesCreated != 1 {
+		t.Fatalf("summary = %+v want IndexesCreated=1", res.Summary)
+	}
+	if res.Summary.CreatedNodes != 0 || res.Summary.CreatedEdges != 0 ||
+		res.Summary.PropertiesSet != 0 || res.Summary.DeletedNodes != 0 || res.Summary.DeletedEdges != 0 {
+		t.Fatalf("summary = %+v want every other counter 0 (DDL touches no data)", res.Summary)
+	}
+	if len(res.Columns) != 0 || len(res.Rows) != 0 {
+		t.Fatalf("columns/rows = %d/%d want 0/0 (RETURN is forbidden alongside DDL)", len(res.Columns), len(res.Rows))
+	}
+	if keys := g.IndexedPropertyKeys(); !slices.Equal(keys, []string{"env"}) {
+		t.Fatalf("IndexedPropertyKeys = %v want [env]", keys)
+	}
+	if keys := g.FullTextIndexedKeys(); len(keys) != 0 {
+		t.Fatalf("typed declare leaked into FTS keys: %v", keys)
+	}
+
+	// idempotent re-declaration: still one creation request per statement,
+	// one declaration key (no duplicate, no error)
+	res, err = g.Cypher(`CREATE INDEX ON (m.env)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Summary == nil || res.Summary.IndexesCreated != 1 {
+		t.Fatalf("re-declare summary = %+v want IndexesCreated=1 (each applied statement counts)", res.Summary)
+	}
+	if keys := g.IndexedPropertyKeys(); !slices.Equal(keys, []string{"env"}) {
+		t.Fatalf("IndexedPropertyKeys after re-declare = %v want [env] once", keys)
+	}
+
+	// a second key on the same graph: both declarations stand, insertion
+	// order preserved
+	if _, err := g.Cypher(`CREATE INDEX ON (n.tier)`); err != nil {
+		t.Fatal(err)
+	}
+	if keys := g.IndexedPropertyKeys(); !slices.Equal(keys, []string{"env", "tier"}) {
+		t.Fatalf("IndexedPropertyKeys = %v want [env tier]", keys)
+	}
+}
+
+// TestCypherCreateFullTextDDL pins the full-text DDL statement: CREATE
+// FULLTEXT INDEX declares the key on the FTS kind only, and post-Seal the
+// declared key's `CONTAINS` predicate answers through the bigram prefilter
+// (the contains-pushdown test's shape: the folded prefilter admits the case
+// variant, Cypher's WHERE re-check stays case-sensitive). Pre-Seal the
+// pending declaration answers via the compensation scan — same correct rows.
+func TestCypherCreateFullTextDDL(t *testing.T) {
+	g := New()
+	ftsAdd(t, g, "s1", map[string]any{"desc": "payment gateway"})
+	ftsAdd(t, g, "s2", map[string]any{"desc": "Payment Gateway"})
+	if err := g.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	res, err := g.Cypher(`CREATE FULLTEXT INDEX ON (n.desc)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Summary == nil || res.Summary.IndexesCreated != 1 {
+		t.Fatalf("summary = %+v want IndexesCreated=1", res.Summary)
+	}
+	if len(res.Columns) != 0 || len(res.Rows) != 0 {
+		t.Fatalf("columns/rows = %d/%d want 0/0", len(res.Columns), len(res.Rows))
+	}
+	if keys := g.FullTextIndexedKeys(); !slices.Equal(keys, []string{"desc"}) {
+		t.Fatalf("FullTextIndexedKeys = %v want [desc]", keys)
+	}
+	if keys := g.IndexedPropertyKeys(); len(keys) != 0 {
+		t.Fatalf("FTS declare leaked into typed keys: %v", keys)
+	}
+
+	// pending (pre-Seal): the declaration answers via the full-scan
+	// compensation, not the gram buckets — correct rows, case-sensitive
+	pre, err := g.Cypher(`MATCH (n) WHERE n.desc CONTAINS 'payment' RETURN n.key`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pre.Rows) != 1 || pre.Rows[0]["n.key"] != "s1" {
+		t.Fatalf("pending CONTAINS rows = %+v want [s1] (compensation scan)", pre.Rows)
+	}
+
+	// Seal: the merge harvests the declaration into the base gram buckets
+	if err := g.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	if keys := g.FullTextIndexedKeys(); !slices.Equal(keys, []string{"desc"}) {
+		t.Fatalf("FullTextIndexedKeys after Seal = %v want [desc]", keys)
+	}
+	// post-Seal: the bigram prefilter narrows the anchor scan (a folded
+	// SUPERSET of the matches); the WHERE re-check keeps CONTAINS
+	// case-sensitive exactly like the plain scan
+	cases := []struct {
+		needle string
+		want   []string
+	}{
+		{"payment", []string{"s1"}}, // "Payment Gateway" fails the case-sensitive re-check
+		{"Payment", []string{"s2"}},
+		{"gateway", []string{"s1"}},
+		{"Gateway", []string{"s2"}},
+		{"zz", []string{}}, // no hits, declared key answers ok=true with zero rows
+	}
+	for _, tc := range cases {
+		q := "MATCH (n) WHERE n.desc CONTAINS '" + tc.needle + "' RETURN n.key"
+		res, err := g.Cypher(q)
+		if err != nil {
+			t.Fatalf("needle %q: %v", tc.needle, err)
+		}
+		got := make([]string, 0, len(res.Rows))
+		for _, r := range res.Rows {
+			got = append(got, r["n.key"].(string))
+		}
+		slices.Sort(got)
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("needle %q: post-Seal CONTAINS = %v want %v", tc.needle, got, tc.want)
+		}
+	}
+}
+
+// TestCypherIndexDDLRejectsLabel pins the parse-time label rejection through
+// the public entry: label-scoped index forms error with the global-per-key
+// message (both kinds), the error is a positioned CypherError, and the failed
+// statement leaves no declaration behind — no key registered, no layer
+// opened.
+func TestCypherIndexDDLRejectsLabel(t *testing.T) {
+	g := New()
+	for _, q := range []string{
+		`CREATE INDEX ON (n:Service.env)`,
+		`CREATE FULLTEXT INDEX ON (n:Service.desc)`,
+		`CREATE INDEX ON (n:Service)`,
+	} {
+		_, err := g.Cypher(q)
+		if err == nil {
+			t.Fatalf("%q: label-scoped form must error", q)
+		}
+		if !strings.Contains(err.Error(), "indexes are global per property key; label-scoped indexes are not supported") {
+			t.Fatalf("%q: error = %v want the label-scoped message", q, err)
+		}
+		var ce *CypherError
+		if !errors.As(err, &ce) {
+			t.Fatalf("%q: error = %T want *CypherError", q, err)
+		}
+	}
+	if keys := g.IndexedPropertyKeys(); len(keys) != 0 {
+		t.Fatalf("failed DDL registered typed keys: %v", keys)
+	}
+	if keys := g.FullTextIndexedKeys(); len(keys) != 0 {
+		t.Fatalf("failed DDL registered FTS keys: %v", keys)
+	}
+	if n := layerCount(g); n != 0 {
+		t.Fatalf("failed DDL opened %d layers, want 0", n)
+	}
+}
+
+// TestCypherIndexDDLPendingThenSeal pins the declaration lifecycle through
+// Cypher: CREATE INDEX over a sealed base opens a PENDING declaration layer
+// (the typed lookup answers via the compensation scan until the next Seal),
+// and the Seal harvests it into the base index — the same typed anchor query
+// returns the same correct rows on both sides of the lifecycle, with
+// post-Seal writes still carving correctly over the indexed base.
+func TestCypherIndexDDLPendingThenSeal(t *testing.T) {
+	g := New()
+	if _, err := g.AddNode("a", "Svc", map[string]any{"env": "prod"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.AddNode("b", "Svc", map[string]any{"env": "dev"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Seal(); err != nil { // sealed base WITHOUT the env index
+		t.Fatal(err)
+	}
+	if _, err := g.Cypher(`CREATE INDEX ON (n.env)`); err != nil {
+		t.Fatal(err)
+	}
+	// the declaration rides an unmerged layer: pending, not yet in the base
+	if n := layerCount(g); n != 1 {
+		t.Fatalf("layers after DDL = %d want 1 (pending declaration)", n)
+	}
+	// pre-Seal: the typed anchor answers via the pending full scan
+	// (compensation), not the base index — correct rows either way
+	pre, err := g.Cypher(`MATCH (a {env:'prod'}) RETURN a.key`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pre.Rows) != 1 || pre.Rows[0]["a.key"] != "a" {
+		t.Fatalf("pending typed anchor rows = %+v want [a]", pre.Rows)
+	}
+
+	// Seal: the declaration merges into the base; the same anchor now
+	// resolves through the base index
+	if err := g.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	if n := layerCount(g); n != 0 {
+		t.Fatalf("layers after Seal = %d want 0 (declaration merged)", n)
+	}
+	if keys := g.IndexedPropertyKeys(); !slices.Equal(keys, []string{"env"}) {
+		t.Fatalf("IndexedPropertyKeys after Seal = %v want [env]", keys)
+	}
+	post, err := g.Cypher(`MATCH (a {env:'prod'}) RETURN a.key`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(post.Rows) != 1 || post.Rows[0]["a.key"] != "a" {
+		t.Fatalf("post-Seal typed anchor rows = %+v want [a] (indexed, same answer)", post.Rows)
+	}
+
+	// post-Seal writes carve over the indexed base: a new layer record and
+	// an override of an indexed node both answer correctly
+	if _, err := g.AddNode("c", "Svc", map[string]any{"env": "prod"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.AddNode("b", "Svc", map[string]any{"env": "prod"}); err != nil { // override b
+		t.Fatal(err)
+	}
+	res, err := g.Cypher(`MATCH (a {env:'prod'}) RETURN a.key ORDER BY a.key`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(res.Rows))
+	for _, r := range res.Rows {
+		got = append(got, r["a.key"].(string))
+	}
+	if !slices.Equal(got, []string{"a", "b", "c"}) {
+		t.Fatalf("carved anchor rows = %v want [a b c] (layer record + override over the indexed base)", got)
 	}
 }

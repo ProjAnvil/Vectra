@@ -645,6 +645,30 @@ func (ex *executor) mergeEdge(pat *PathPattern, r *row, onCreate, onMatch []*Set
 	return ex.applySetItems(onCreate, r)
 }
 
+// indexStage applies one IndexClause: CREATE [FULLTEXT] INDEX declares the
+// property key on the writer — a statement-level effect with no data
+// touched. A no-rows statement by grammar (the parser admits an IndexClause
+// only standalone: no read prefix, no RETURN may accompany it), so it
+// applies exactly once per statement, never through the per-row stage
+// machinery. The declaration itself is idempotent and PENDING until the
+// next Seal (the Writer's root contract: lookups answer via the
+// compensation scan until the merge seals the index) — and every
+// successfully-applied statement counts one IndexesCreated, an idempotent
+// re-declaration included (it is still a creation request).
+func (ex *executor) indexStage(c *IndexClause) error {
+	if c.FullText {
+		if err := ex.w.IndexFullText(c.Prop); err != nil {
+			return err
+		}
+	} else {
+		if err := ex.w.IndexProperty(c.Prop); err != nil {
+			return err
+		}
+	}
+	ex.sum.IndexesCreated++
+	return nil
+}
+
 // evalPending evaluates one SET item's RHS: a property read the row's
 // pending overlay serves FIRST (values staged by earlier items of this
 // row), everything else falls through to the ordinary evaluator — reads of
