@@ -310,6 +310,63 @@ func (ex *executor) setStage(c *SetClause, rows []row) ([]row, error) {
 	return rows, nil
 }
 
+// deleteStage executes one [DETACH] DELETE clause: per input row, vars
+// left to right. A node var resolves its key through the refs sidecar
+// (pinned pre-write identity, memoized once — the rebind after the stage
+// reuses the memo), then: a node an earlier row already deleted resolves
+// nowhere (NodeIDByKey miss) and deletes as a SILENT no-op — no count, no
+// error, so DeletedNodes counts actual deletions; without DETACH a node
+// that still has live incident edges errors the statement (first-error-
+// stops fires BEFORE any write: the node and its edges survive); with DETACH
+// or no edges, DeleteNodeCascade removes the node and its incident edges
+// (the cascade's edge kills are not countable through the Writer surface —
+// DeletedEdges stays an edge-var counter). An edge var resolves its triple
+// and DeleteEdgeTriple removes every parallel at once: DeletedEdges
+// accumulates the returned count, so one DELETE e of a two-parallel triple
+// counts 2 (the E6 divergence). An unbound var (OPTIONAL MATCH miss)
+// errors, the SET message shape. Rows pass through unchanged; the trailing
+// RETURN's rebind drops deleted bindings.
+func (ex *executor) deleteStage(c *DeleteClause, rows []row) ([]row, error) {
+	if rows == nil {
+		rows = []row{{}} // defensive: validation requires a binding clause before DELETE
+	}
+	for _, r := range rows {
+		for _, v := range c.Vars {
+			if id, ok := r.nodes[v]; ok { // nil-map lookup: safe miss
+				key, okK := ex.boundNodeKey(id)
+				if !okK {
+					return nil, &Error{1, 1, fmt.Sprintf("bound node %q does not resolve to a key", v)}
+				}
+				if _, live := ex.w.NodeIDByKey(key); !live {
+					continue // an earlier row's delete removed it: no-op, no count
+				}
+				if !c.Detach && ex.w.NodeHasEdges(key) {
+					return nil, &Error{1, 1, fmt.Sprintf("cannot delete node %s: it still has edges (use DETACH DELETE)", key)}
+				}
+				if err := ex.w.DeleteNodeCascade(key); err != nil {
+					return nil, err
+				}
+				ex.sum.DeletedNodes++
+			} else if id, ok := r.edges[v]; ok {
+				ref, okR := ex.boundEdgeRef(id)
+				if !okR {
+					return nil, &Error{1, 1, fmt.Sprintf("bound edge %q does not resolve to a triple", v)}
+				}
+				n, err := ex.w.DeleteEdgeTriple(ref.srcKey, ref.dstKey, ref.label)
+				if err != nil {
+					return nil, err
+				}
+				ex.sum.DeletedEdges += n
+			} else {
+				// An OPTIONAL MATCH miss leaves the var unbound in the kept
+				// row; Neo4j parity is the explicit null error (SET shape).
+				return nil, &Error{1, 1, fmt.Sprintf("DELETE requires a bound node or edge variable; %s is null", v)}
+			}
+		}
+	}
+	return rows, nil
+}
+
 // evalPending evaluates one SET item's RHS: a property read the row's
 // pending overlay serves FIRST (values staged by earlier items of this
 // row), everything else falls through to the ordinary evaluator — reads of

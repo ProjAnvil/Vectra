@@ -176,10 +176,20 @@ func runStatement(ex *executor, ast *Query) (*Result, error) {
 			if err != nil {
 				return nil, err
 			}
-		case *DeleteClause, *MergeClause, *IndexClause:
+		case *DeleteClause:
+			// Same write-path gating as CREATE (routing, not semantics).
+			if ex.w == nil {
+				return nil, &Error{1, 1, "write clause outside the write path (use RunWrite)"}
+			}
+			var err error
+			rows, err = ex.deleteStage(c, rows)
+			if err != nil {
+				return nil, err
+			}
+		case *MergeClause, *IndexClause:
 			// Parsed and validated (Task 1) but not yet executable; an
 			// explicit error beats silently skipping a mutation.
-			return nil, &Error{1, 1, "only CREATE and SET write clauses are supported in this version"}
+			return nil, &Error{1, 1, "only CREATE, SET and DELETE write clauses are supported in this version"}
 		case *ReturnClause:
 			if ex.w != nil {
 				// Rebind entity bindings through the writer against the

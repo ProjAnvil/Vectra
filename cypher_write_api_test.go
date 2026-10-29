@@ -575,6 +575,170 @@ func TestCypherSetEdgeWALRoundTrip(t *testing.T) {
 	}
 }
 
+// TestCypherDeleteDetached pins DETACH DELETE: the node and every incident
+// edge die (cascade), the neighbors survive, and DeletedNodes counts ACTUAL
+// deletions — a node bound in several rows deletes once; the later rows are
+// silent no-ops (not-found: no count, no error).
+func TestCypherDeleteDetached(t *testing.T) {
+	g := New()
+	if _, err := g.Cypher(`CREATE (h:P {key:'hub'}), (x:P {key:'x'}), (y:P {key:'y'})`); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"x", "y"} {
+		if _, err := g.Cypher(`MATCH (h {key:'hub'}), (o {key:'` + k + `'}) CREATE (h)-[:E]->(o)`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, err := g.Cypher(`MATCH (h {key:'hub'}) DETACH DELETE h`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Summary == nil || res.Summary.DeletedNodes != 1 {
+		t.Fatalf("summary = %+v want DeletedNodes=1", res.Summary)
+	}
+	if _, ok := g.NodeByKey("hub"); ok {
+		t.Fatal("hub survived DETACH DELETE")
+	}
+	// both incident edges died with the cascade (EdgeCount, not EdgesOf:
+	// the hub key no longer resolves)
+	if n := g.EdgeCount(); n != 0 {
+		t.Fatalf("edge count = %d want 0 (cascade killed both)", n)
+	}
+	for _, k := range []string{"x", "y"} {
+		if _, ok := g.NodeByKey(k); !ok {
+			t.Fatalf("neighbor %q must survive the cascade", k)
+		}
+	}
+
+	// repeat-row no-op: t is bound once per :P row (5 rows here); row 1
+	// deletes it (no edges: DETACH not required), the rest resolve nowhere.
+	if _, err := g.Cypher(`CREATE (t:P {key:'t'}), (o1:P {key:'o1'}), (o2:P {key:'o2'})`); err != nil {
+		t.Fatal(err)
+	}
+	res, err = g.Cypher(`MATCH (t {key:'t'}), (o:P) DELETE t`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Summary == nil || res.Summary.DeletedNodes != 1 {
+		t.Fatalf("summary = %+v want DeletedNodes=1 (repeat rows are no-ops)", res.Summary)
+	}
+	if _, ok := g.NodeByKey("t"); ok {
+		t.Fatal("t survived DELETE")
+	}
+	if n := g.NodeCount(); n != 4 { // x, y, o1, o2
+		t.Fatalf("node count = %d want 4 (only t died)", n)
+	}
+}
+
+// TestCypherDeleteNodeWithEdgesErrors pins the non-DETACH guard: a node
+// with live incident edges errors with the DETACH guidance, and
+// first-error-stops fires BEFORE any write — the node and its edge survive.
+func TestCypherDeleteNodeWithEdgesErrors(t *testing.T) {
+	g := New()
+	if _, err := g.Cypher(`CREATE (a:P {key:'a'})-[:E]->(b:P {key:'b'})`); err != nil {
+		t.Fatal(err)
+	}
+	_, err := g.Cypher(`MATCH (a {key:'a'}) DELETE a`)
+	if err == nil {
+		t.Fatal("DELETE of an edge-holding node without DETACH must error")
+	}
+	if !strings.Contains(err.Error(), "use DETACH DELETE") {
+		t.Fatalf("error = %v want the DETACH guidance message", err)
+	}
+	var ce *CypherError
+	if !errors.As(err, &ce) {
+		t.Fatalf("error = %T want *CypherError", err)
+	}
+	if _, ok := g.NodeByKey("a"); !ok {
+		t.Fatal("node a must survive the guard error")
+	}
+	if es := liveTriple(t, g, "a", "b", "E"); len(es) != 1 {
+		t.Fatalf("edge must survive the guard error: %+v", es)
+	}
+}
+
+// TestCypherDeleteEdgeTripleParallel pins the E6 divergence (Review Focus
+// 5): one DELETE r removes EVERY parallel of the triple and counts them all
+// — two parallels bound as two match rows yield DeletedEdges=2 (row 1 kills
+// both, row 2 finds none), and the endpoints survive.
+func TestCypherDeleteEdgeTripleParallel(t *testing.T) {
+	g := New()
+	if _, err := g.Cypher(`CREATE (a:P {key:'a'}), (b:P {key:'b'})`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Cypher(`MATCH (a {key:'a'}), (b {key:'b'}) CREATE (a)-[:E]->(b) CREATE (a)-[:E]->(b)`); err != nil {
+		t.Fatal(err)
+	}
+	res, err := g.Cypher(`MATCH (a {key:'a'})-[r:E]->(b {key:'b'}) DELETE r`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Summary == nil || res.Summary.DeletedEdges != 2 {
+		t.Fatalf("summary = %+v want DeletedEdges=2 (one DELETE r removes both parallels)", res.Summary)
+	}
+	if res.Summary.DeletedNodes != 0 {
+		t.Errorf("DeletedNodes = %d want 0 (endpoints untouched)", res.Summary.DeletedNodes)
+	}
+	if es := liveTriple(t, g, "a", "b", "E"); len(es) != 0 {
+		t.Fatalf("parallels survived: %+v", es)
+	}
+	for _, k := range []string{"a", "b"} {
+		if _, ok := g.NodeByKey(k); !ok {
+			t.Fatalf("endpoint %q must survive an edge DELETE", k)
+		}
+	}
+}
+
+// TestCypherDeleteThenReturn pins the post-DELETE rebind (Review Focus 4):
+// the trailing RETURN keeps the row but DROPS the deleted binding, so the
+// projected scalar renders a nil cell — never a stale value, never an error.
+func TestCypherDeleteThenReturn(t *testing.T) {
+	g := New()
+	if _, err := g.AddNode("x", "P", map[string]any{"v": 1.0}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := g.Cypher(`MATCH (a {key:'x'}) DELETE a RETURN a.key`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("rows = %d want 1 (the row survives; the binding drops)", len(res.Rows))
+	}
+	if got := res.Rows[0]["a.key"]; got != nil {
+		t.Fatalf("a.key = %v want nil (deleted binding renders null)", got)
+	}
+	if res.Summary == nil || res.Summary.DeletedNodes != 1 {
+		t.Fatalf("summary = %+v want DeletedNodes=1", res.Summary)
+	}
+	if _, ok := g.NodeByKey("x"); ok {
+		t.Fatal("node x survived DELETE")
+	}
+}
+
+// TestCypherDeleteUnboundErrors pins the OPTIONAL MATCH miss on DELETE: the
+// var is unbound in the kept row and the statement errors (the SET message
+// shape), first-error-stops, deleting nothing.
+func TestCypherDeleteUnboundErrors(t *testing.T) {
+	g := New()
+	if _, err := g.AddNode("keep", "P", nil); err != nil {
+		t.Fatal(err)
+	}
+	_, err := g.Cypher(`OPTIONAL MATCH (a {key:'missing'}) DELETE a`)
+	if err == nil {
+		t.Fatal("DELETE on an OPTIONAL MATCH null must error")
+	}
+	if !strings.Contains(err.Error(), "DELETE requires a bound node or edge variable") {
+		t.Fatalf("error = %v want the bound-variable message", err)
+	}
+	var ce *CypherError
+	if !errors.As(err, &ce) {
+		t.Fatalf("error = %T want *CypherError", err)
+	}
+	if n := g.NodeCount(); n != 1 {
+		t.Fatalf("node count = %d want 1 (nothing deleted, nothing invented)", n)
+	}
+}
+
 // TestCypherWriteReadPathUnchanged pins three-source visibility around a
 // Cypher write: an existing read query over base + unmerged layer keeps its
 // exact results (minus the new row) after a Cypher CREATE appends another
