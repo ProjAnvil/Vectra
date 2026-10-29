@@ -18,10 +18,9 @@ for row in client.cypher("MATCH (n:Service) RETURN n.key")["rows"]:
     print(row["n.key"])
 ```
 
-Take the sequence number **before** the write: awaiting `publishedSeq + 1`
-read *after* the write stalls the full server timeout on an already
-caught-up server (it returns `reached: False`, never an error — the
-awaited index simply never arrives).
+Take the sequence number **before** the write: awaiting
+`(post-write stats)["publishedSeq"] + 1` stalls the full server timeout
+on an already caught-up server (`reached: False`, never an error).
 
 Optimistic transaction (read at a snapshot, commit under validation):
 

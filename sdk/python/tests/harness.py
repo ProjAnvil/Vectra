@@ -15,6 +15,7 @@ import socket
 import subprocess
 import tempfile
 import time
+from typing import Optional
 import unittest
 import urllib.error
 import urllib.request
@@ -100,7 +101,7 @@ class ServerFixture:
     """
 
     def __init__(self, binary: str, ready_timeout: float = 30.0,
-                 auth_token_file: str = None):
+                 auth_token_file: Optional[str] = None):
         self.binary = binary
         self.ready_timeout = ready_timeout
         self.auth_token_file = auth_token_file

@@ -553,6 +553,72 @@ describe("client validation (no server)", () => {
   });
 });
 
+describe("stub transport (no server)", () => {
+  // Fetch-override pins for the two behaviors the Python client pins with
+  // its http.server stub (sdk/python/tests/test_unit.py): the
+  // X-Vectra-Snapshot header is recorded even on error responses, and the
+  // non-envelope txn 409 still constructs TxnConflictError when the body
+  // lacks a usable conflictTotal. Serverless, so they never skip.
+
+  it("snapshot header is recorded on an error response", async () => {
+    const stubClient = new VectraClient({
+      baseUrl: "http://stub.example",
+      fetch: () =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              error: { code: "NODE_NOT_FOUND", message: "node not found" },
+            }),
+            { status: 404, headers: { "X-Vectra-Snapshot": "7" } },
+          ),
+        ),
+    });
+    assert.equal(stubClient.lastSnapshot, null); // null -> set
+    await assert.rejects(
+      () => stubClient.node("missing"),
+      (err: unknown) => {
+        assert.ok(err instanceof VectraNotFoundError);
+        assert.equal(err.code, "NODE_NOT_FOUND");
+        return true;
+      },
+    );
+    assert.equal(stubClient.lastSnapshot, 7);
+  });
+
+  it("txn 409 with absent conflictTotal falls back to conflicts.length", async () => {
+    // The defensive parse: conflictTotal missing OR null must never leak
+    // NaN/undefined into the error — the fallback is the list length.
+    const bodies = [
+      JSON.stringify({ committed: false, conflicts: ["k1", "k2"], hint: "h" }),
+      JSON.stringify({
+        committed: false,
+        conflicts: ["k1"],
+        conflictTotal: null,
+        hint: "h",
+      }),
+    ];
+    const expected = [2, 1];
+    for (let i = 0; i < bodies.length; i += 1) {
+      const stubClient = new VectraClient({
+        baseUrl: "http://stub.example",
+        fetch: () =>
+          Promise.resolve(new Response(bodies[i], { status: 409 })),
+      });
+      await assert.rejects(
+        () => stubClient.txn({ nodes: [{ key: "k1", label: "T" }], snapshot: 1 }),
+        (err: unknown) => {
+          assert.ok(err instanceof TxnConflictError);
+          assert.equal(err.code, "TXN_CONFLICT");
+          assert.equal(err.conflictTotal, expected[i]); // numeric fallback
+          assert.equal(Number.isNaN(err.conflictTotal), false);
+          assert.equal(err.committed, false);
+          return true;
+        },
+      );
+    }
+  });
+});
+
 describe("auth round trip", () => {
   // Boots a SECOND server with -auth-token-file: good token round-trips
   // writes/reads; a wrong token gets the typed 401 envelope; GET

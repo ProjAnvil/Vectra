@@ -236,9 +236,14 @@ export class ServerFixture {
       nodes: [{ key: "__harness_boot__", label: "System" }],
     });
     while (Date.now() < deadline) {
-      if (this.proc?.exitCode !== null) {
+      // Fail fast when the process is already gone: a clean exit sets
+      // exitCode, but a signal kill leaves exitCode null with signalCode
+      // set — either way, continuing to poll would only burn the deadline.
+      const exitCode = this.proc?.exitCode ?? null;
+      const signal = this.proc?.signalCode ?? null;
+      if (exitCode !== null || signal !== null) {
         throw new Error(
-          `vectra-server exited early with code ${this.proc?.exitCode}`,
+          `server exited during startup (exit=${exitCode}, signal=${signal})`,
         );
       }
       try {

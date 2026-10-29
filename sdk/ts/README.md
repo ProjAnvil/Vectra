@@ -85,7 +85,7 @@ new VectraClient({
 | `batch({nodes, edges, edgeDeletes, nodeDeletes})` | `POST /v1/batch` | auto-commit; fixed apply order node upserts -> edge upserts -> edge deletes -> node deletes |
 | `txn({..., snapshot, ser, readNodes, readEdges})` | `POST /v1/txn` | optimistic commit; rejects with `TxnConflictError` |
 | `awaitSeq(seq, timeoutMs)` | `GET /v1/await` | read-your-writes long poll; server caps the wait at 30s |
-| `vectorSearch(index, {queryVector, similarTo, k, ef, label})` | `POST /v1/vector/search` | exactly one of `queryVector` / `similarTo`; empty vector/anchor counts as absent (else `TypeError`) |
+| `vectorSearch(index, {queryVector, similarTo, k, ef, label})` | `POST /v1/vector/search` | exactly one of `queryVector` / `similarTo`; empty vector/anchor counts as absent (else `TypeError`); `similarTo` on a missing node → 400 `NODE_NOT_FOUND` |
 | `vectorCreateIndex(name, prop, dim, {metric, m, efConstruction})` | `POST /v1/vector/indexes` | `metric`: "cosine" (default) / "l2" / "dot" |
 | `vectorListIndexes()` | `GET /v1/vector/indexes` | declarations served from the published clone |
 | `vectorDropIndex(name)` | `DELETE /v1/vector/indexes/{name}` | typed 404 (`VECTOR_INDEX_NOT_FOUND`) when unknown |
@@ -116,7 +116,11 @@ if (isCypherWrite(res)) {
 `createdEdges`, `deletedNodes`, `deletedEdges`, `propertiesSet`,
 `indexesCreated`. `propertiesSet` counts SET assignments — a CREATE
 map-literal is part of node creation and does not count.
-`indexProperty` / `indexFullText` are typed as always-write calls.
+`indexProperty` / `indexFullText` are typed as always-write calls. The
+prop identifier is deferred to the server parser — there is no
+client-side identifier check (a regex would wrongly reject forms the
+engine accepts, e.g. backtick-quoted keys): an empty prop round-trips
+as `CREATE INDEX ON (n.)` and answers the server's 400 `PARSE`.
 
 ## Errors
 
@@ -130,6 +134,11 @@ Every non-2xx response maps onto a typed error class carrying `status`
 | `VectraNotFoundError` | 404 | `NODE_NOT_FOUND`, `VECTOR_INDEX_NOT_FOUND` |
 | `VectraConflictError` | 409 envelope | `VECTOR_INDEX_EXISTS` |
 | `VectraAuthError` | 401/403 | `UNAUTHORIZED` |
+
+Transport-level failures (DNS refused, connection reset, timeout) surface
+as the raw native-fetch `TypeError` / `TimeoutError` rather than typed
+exceptions — by design, keeping the SDK zero-dependency (the Python client
+has the same rule with `urllib.error.URLError`).
 
 ### The two 409 faces
 
