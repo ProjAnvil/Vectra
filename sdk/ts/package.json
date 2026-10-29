@@ -1,0 +1,48 @@
+{
+  "name": "@projanvil/vectra",
+  "version": "0.14.0",
+  "description": "Zero-dependency TypeScript client for the Vectra REST API (/v1/*): graph reads, traversals, Cypher, batch/txn writes, vector indexes, index DDL.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/tests/core.test.js dist-test/tests/txn-vector.test.js"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "typescript": "^5.5.0"
+  },
+  "keywords": [
+    "vectra",
+    "graph",
+    "database",
+    "raft",
+    "cypher",
+    "vector-search",
+    "sdk",
+    "client"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ProjAnvil/Vectra.git",
+    "directory": "sdk/ts"
+  }
+}
