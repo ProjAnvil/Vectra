@@ -76,6 +76,17 @@ func (op VectorIndexOp) exactlyOneSet() bool {
 	return (op.Create != nil) != (op.Drop != "")
 }
 
+// CypherWrite is the raft command carrying one Cypher write statement as
+// statement text: each replica re-executes it through the engine's write
+// path at FSM apply time. Re-execution (not pre-computed effects) keeps the
+// log the single source of truth and is deterministic by design — ratchet
+// keygen and key/triple addressing (pinned by the core module's
+// TestCypherMergeDeterminismReplicas / TestWriterNewNodeKeyDeterministic).
+// Never add time- or random-derived input to this command.
+type CypherWrite struct {
+	Query string
+}
+
 // Batch is a changeset carried by one raft log. Fixed apply order
 // (deterministic replay): vector index ops → node upserts → edge upserts →
 // edge deletes → node deletes.
@@ -105,6 +116,12 @@ type Batch struct {
 	// gob add-only evolution: the field is absent from older logs (decodes
 	// nil there) and silently ignored by older readers of new logs.
 	VectorIndexOps []VectorIndexOp
+	// Cypher routes a write statement through this entry instead of a
+	// changeset: nil on every changeset batch; when set, the FSM re-executes
+	// the statement via g.Cypher (see fsm.applyCypher) and the ApplyResult
+	// carries the statement outcome back to the submitting handler. Same
+	// gob add-only evolution discipline as VectorIndexOps.
+	Cypher *CypherWrite
 }
 
 // ChangesetOf returns the batch's core changeset projection (WAL frames,

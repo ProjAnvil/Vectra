@@ -318,11 +318,25 @@ type cypherIn struct {
 	Limit int    `json:"limit,omitempty" jsonschema:"max rows returned, default 1000"`
 }
 
+// cypherSummaryOut is the structured-output shape of the engine's write
+// counters. vectra.CypherWriteSummary carries no JSON tags (internal
+// counters), so the exact keys are pinned here, matching the HTTP API's
+// cypher summary object.
+type cypherSummaryOut struct {
+	CreatedNodes   int `json:"createdNodes" jsonschema:"nodes created by the statement"`
+	CreatedEdges   int `json:"createdEdges" jsonschema:"edges created by the statement"`
+	DeletedNodes   int `json:"deletedNodes" jsonschema:"nodes deleted by the statement"`
+	DeletedEdges   int `json:"deletedEdges" jsonschema:"edges deleted by the statement"`
+	PropertiesSet  int `json:"propertiesSet" jsonschema:"properties set by the statement"`
+	IndexesCreated int `json:"indexesCreated" jsonschema:"indexes created by the statement"`
+}
+
 type cypherOut struct {
-	Columns []string         `json:"columns"`
-	Rows    []map[string]any `json:"rows"`
-	Count   int              `json:"count" jsonschema:"rows returned in this call"`
-	Total   int              `json:"total" jsonschema:"true total (may be truncated by limit)"`
+	Columns []string          `json:"columns"`
+	Rows    []map[string]any  `json:"rows"`
+	Count   int               `json:"count" jsonschema:"rows returned in this call"`
+	Total   int               `json:"total" jsonschema:"true total (may be truncated by limit)"`
+	Summary *cypherSummaryOut `json:"summary,omitempty" jsonschema:"mutation counters, present only when the statement wrote"`
 }
 
 type vectorSearchIn struct {
@@ -430,13 +444,16 @@ func registerTools(s *mcp.Server, svc *service) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "cypher",
-		Description: "Query the graph with a Cypher-subset statement: [OPTIONAL] MATCH (a:Label {prop:value})-[e:REL*1..3]->(b) " +
+		Description: "Query or mutate the graph with a Cypher-subset statement. Reads: [OPTIONAL] MATCH (a:Label {prop:value})-[e:REL*1..3]->(b) " +
 			"(repeatable, comma patterns too) | WITH [DISTINCT] items [ORDER BY/SKIP/LIMIT] [WHERE] | UNWIND list AS x | " +
 			"RETURN items [ORDER BY/SKIP/LIMIT]. Example: MATCH (a)-[:CALLS]->(b) WITH a, count(b) AS n ORDER BY n DESC LIMIT 5 RETURN a.key, n. " +
 			"Node-pair semantics for *hops (shortest distance within the hop window); pseudo-props a.key/a.label/a.id; edge vars bind on " +
 			"fixed single hops only; vars from OPTIONAL MATCH may read null (they cannot anchor a later non-optional MATCH). " +
-			"Limit defaults to 1000 (total reports the true size).",
-		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+			"Limit defaults to 1000 (total reports the true size). Write clauses (CREATE/MERGE/SET/DELETE, CREATE INDEX) execute " +
+			"in-process on the live graph; the result carries a summary of mutation counters (createdNodes, createdEdges, " +
+			"deletedNodes, deletedEdges, propertiesSet, indexesCreated).",
+		// Not read-only: write clauses mutate the embedded graph.
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false},
 	}, svc.cypher)
 
 	mcp.AddTool(s, &mcp.Tool{
@@ -844,7 +861,22 @@ func (svc *service) cypher(_ context.Context, _ *mcp.CallToolRequest, in cypherI
 	if err != nil {
 		return nil, cypherOut{}, err
 	}
-	res, err := v.Cypher(in.Query)
+	// v0.14 write clauses: a mutating statement executes in-process on the
+	// live graph, so it serializes against inject_batch/seal under svc.mu
+	// (the engine's write lane is single-goroutine); reads stay lock-free
+	// exactly as before. Classification parse errors surface unchanged.
+	isWrite, err := vectra.CypherIsWrite(in.Query)
+	if err != nil {
+		return nil, cypherOut{}, err
+	}
+	var res *vectra.CypherResult
+	if isWrite {
+		svc.mu.Lock()
+		res, err = v.Cypher(in.Query)
+		svc.mu.Unlock()
+	} else {
+		res, err = v.Cypher(in.Query)
+	}
 	if err != nil {
 		return nil, cypherOut{}, err
 	}
@@ -860,6 +892,16 @@ func (svc *service) cypher(_ context.Context, _ *mcp.CallToolRequest, in cypherI
 		out.Rows = append(out.Rows, r)
 	}
 	out.Count = len(out.Rows)
+	if res.Summary != nil {
+		out.Summary = &cypherSummaryOut{
+			CreatedNodes:   res.Summary.CreatedNodes,
+			CreatedEdges:   res.Summary.CreatedEdges,
+			DeletedNodes:   res.Summary.DeletedNodes,
+			DeletedEdges:   res.Summary.DeletedEdges,
+			PropertiesSet:  res.Summary.PropertiesSet,
+			IndexesCreated: res.Summary.IndexesCreated,
+		}
+	}
 	return nil, out, nil
 }
 

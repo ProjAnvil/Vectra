@@ -519,9 +519,26 @@ type cypherRequest struct {
 	Query string `json:"query"`
 }
 
-// handleCypher runs one Cypher-subset statement against the published
-// snapshot. Parse/semantic errors are client errors (400 PARSE); execution
-// failures are 500.
+// cypherSummaryOut is the wire shape of vectra.CypherWriteSummary. The
+// engine type carries no JSON tags (internal counters), so the exact
+// response keys are pinned here.
+type cypherSummaryOut struct {
+	CreatedNodes   int `json:"createdNodes"`
+	CreatedEdges   int `json:"createdEdges"`
+	DeletedNodes   int `json:"deletedNodes"`
+	DeletedEdges   int `json:"deletedEdges"`
+	PropertiesSet  int `json:"propertiesSet"`
+	IndexesCreated int `json:"indexesCreated"`
+}
+
+// handleCypher runs one Cypher-subset statement. READ statements execute
+// against the published snapshot — behaviorally identical to pre-v0.14:
+// same response shape (columns/rows/count), still no raft hop. WRITE
+// statements (vectra.CypherIsWrite) replicate through raft exactly like
+// /v1/batch: the leader's FSM applies the statement and the response's
+// summary counts come from that APPLY result, never a local
+// pre-execution. Parse/semantic errors are client errors (400 PARSE);
+// apply failures share the batch write-endpoint error faces.
 func (n *Node) handleCypher(w http.ResponseWriter, r *http.Request) {
 	var req cypherRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
@@ -530,6 +547,21 @@ func (n *Node) handleCypher(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Query == "" {
 		writeErr(w, http.StatusBadRequest, "VALIDATION", "missing query")
+		return
+	}
+	isWrite, err := vectra.CypherIsWrite(req.Query)
+	if err != nil {
+		// Same face the read path gives unparseable statements.
+		var ce *vectra.CypherError
+		if errors.As(err, &ce) {
+			writeErr(w, http.StatusBadRequest, "PARSE", err.Error())
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "INTERNAL", err.Error())
+		return
+	}
+	if isWrite {
+		n.applyCypherWrite(w, r, req.Query)
 		return
 	}
 	g := n.graph(w)
@@ -548,6 +580,58 @@ func (n *Node) handleCypher(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"columns": res.Columns, "rows": res.Rows, "count": len(res.Rows)})
+}
+
+// applyCypherWrite submits one write statement as its own raft command and
+// renders the apply result. Follower/timeout/shutdown errors share the
+// batch write faces (writeApplyErr); a statement error surfacing at FSM
+// apply time replays deterministically on every replica and keeps the read
+// path's 400 PARSE face. The response carries columns/rows (a write's
+// RETURN clause, empty when absent) plus the summary — never the read
+// path's count key.
+func (n *Node) applyCypherWrite(w http.ResponseWriter, r *http.Request, query string) {
+	res, err := n.Apply(r.Context(), Batch{
+		Version: batchVersion,
+		Cypher:  &CypherWrite{Query: query},
+	})
+	if err != nil {
+		var ce *vectra.CypherError
+		if errors.As(err, &ce) {
+			writeErr(w, http.StatusBadRequest, "PARSE", err.Error())
+			return
+		}
+		n.writeApplyErr(w, err)
+		return
+	}
+	cr := res.Cypher
+	if cr == nil {
+		writeErr(w, http.StatusInternalServerError, "INTERNAL", "cypher apply returned no result")
+		return
+	}
+	cols := cr.Columns
+	if cols == nil {
+		cols = []string{}
+	}
+	rows := cr.Rows
+	if rows == nil {
+		rows = []map[string]any{}
+	}
+	sum := cr.Summary
+	if sum == nil {
+		sum = &vectra.CypherWriteSummary{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"columns": cols,
+		"rows":    rows,
+		"summary": cypherSummaryOut{
+			CreatedNodes:   sum.CreatedNodes,
+			CreatedEdges:   sum.CreatedEdges,
+			DeletedNodes:   sum.DeletedNodes,
+			DeletedEdges:   sum.DeletedEdges,
+			PropertiesSet:  sum.PropertiesSet,
+			IndexesCreated: sum.IndexesCreated,
+		},
+	})
 }
 
 func (n *Node) handleReachable(w http.ResponseWriter, r *http.Request) {

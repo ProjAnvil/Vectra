@@ -163,19 +163,29 @@ server.tool("cycles", "All dependency cycles (SCC member lists, largest first)."
 
 server.tool(
   "cypher",
-  "Query the graph with a Cypher-subset statement: MATCH (a:Label {prop:value})-[e:REL*1..3]->(b) " +
-    "WHERE b.w > 3 RETURN a.key, b ORDER BY b.w DESC LIMIT 10. Node-pair semantics for *hops; " +
-    "pseudo-props a.key/a.label/a.id; edge vars bind on fixed single hops only.",
+  "Query (or, since v0.14, mutate) the graph with a Cypher-subset statement: " +
+    "MATCH (a:Label {prop:value})-[e:REL*1..3]->(b) WHERE b.w > 3 RETURN a.key, b ORDER BY b.w DESC LIMIT 10. " +
+    "Node-pair semantics for *hops; pseudo-props a.key/a.label/a.id; edge vars bind on fixed single hops only. " +
+    "Write clauses (CREATE/MERGE/SET/DELETE, CREATE INDEX) go through the raft-replicated endpoint; " +
+    "a write response carries a summary of mutation counters.",
   { query: z.string(), limit: z.number().int().positive().optional().default(1000) },
   async ({ query, limit: lim }) => {
-    const res = await api<{ columns: string[]; rows: Record<string, unknown>[] }>("/v1/cypher", {
+    const res = await api<{ columns: string[]; rows: Record<string, unknown>[]; summary?: Record<string, number> }>("/v1/cypher", {
       method: "POST",
       body: JSON.stringify({ query }),
     });
+    const out: Record<string, unknown> = {
+      columns: res.columns,
+      count: Math.min(res.rows.length, lim),
+      total: res.rows.length,
+      rows: res.rows.slice(0, lim),
+    };
+    // Write statements carry the server's apply-result summary; reads have none.
+    if (res.summary) out.summary = res.summary;
     return {
       content: [{
         type: "text",
-        text: JSON.stringify({ columns: res.columns, count: Math.min(res.rows.length, lim), total: res.rows.length, rows: res.rows.slice(0, lim) }),
+        text: JSON.stringify(out),
       }],
     };
   },

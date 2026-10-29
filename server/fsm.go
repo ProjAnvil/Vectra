@@ -41,6 +41,11 @@ type ApplyResult struct {
 	Index         uint64   // raft log index of this entry
 	Conflicts     []string // conflicting keys, truncated to maxConflicts
 	ConflictTotal int      // total conflict count before truncation
+	// Cypher carries the write statement's full outcome (columns, rows and
+	// the mutation summary) when this entry was a Cypher write command;
+	// nil on changeset entries. It lives only in the leader's apply future
+	// (in-process) — never in logs or snapshots.
+	Cypher *vectra.CypherResult
 }
 
 // Metrics is the server's atomic counters (expvar is mounted in api.go).
@@ -134,6 +139,13 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	b, err := decodeBatch(l.Data)
 	if err != nil {
 		return err
+	}
+	// Cypher write statements are their own command lane: the engine
+	// re-executes the statement text against live on every replica, and
+	// the leader's ApplyResult carries the statement outcome back to the
+	// submitting handler. See applyCypher.
+	if b.Cypher != nil {
+		return f.applyCypher(b.Cypher, l.Index)
 	}
 	// Vector index ops are shape-validated against log content alone before
 	// anything mutates: a malformed op (neither create nor drop set, or
@@ -248,6 +260,48 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	res.Committed = true
 	res.Index = l.Index
 	return res
+}
+
+// applyCypher replays one Cypher write statement entry: the engine
+// re-executes the statement against live, so the summary the leader
+// returns to the client is the APPLY outcome, never a pre-execution.
+// Determinism is the core engine's contract (ratchet keygen + key/triple
+// addressing, pinned by TestCypherMergeDeterminismReplicas /
+// TestWriterNewNodeKeyDeterministic) — this side never feeds the statement
+// anything time- or random-derived.
+//
+// The statement mutates through the engine's own write path (g.Cypher
+// drives its layering and flush internally), so — like the vector
+// declaration ops — it runs directly under f.mu, NOT wrapped in a
+// g.Batch closure. A statement error is a function of log content and
+// log-derived state: every replica (and every replay) fails it
+// identically, mirroring the vector-index op error discipline.
+//
+// The write executor mutates as the statement goes, so a failed statement
+// may still have applied partial effects; because every replica fails
+// identically on the same state, those (identical) partial effects are
+// safe to publish — bookkeeping below advances unconditionally.
+//
+// Known limitation (deliberate, documented): the per-key version tables
+// (nodeVer/edgeVer) are not advanced — the engine's summary carries
+// counters, not touched keys — so a later TxnGuard batch cannot conflict
+// on keys written by Cypher statements. The global markers below keep
+// publishing and the published seq exact.
+func (f *fsm) applyCypher(c *CypherWrite, idx uint64) interface{} {
+	f.mu.Lock()
+	res, err := f.live.Cypher(c.Query)
+	f.dirty = true
+	f.version++
+	f.appliedIndex.Store(idx)
+	small := f.live.NodeCount()+f.live.EdgeCount() < f.smallGraphLimit
+	f.mu.Unlock()
+	if small {
+		f.wakePublisher()
+	}
+	if err != nil {
+		return err
+	}
+	return ApplyResult{Committed: true, Index: idx, Cypher: res}
 }
 
 // Published returns the most recently sealed-and-published graph (immutable, lock-free concurrent reads).

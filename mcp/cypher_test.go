@@ -82,3 +82,53 @@ func TestCypherTool(t *testing.T) {
 		t.Fatalf("limit: count=%d total=%d", out.Count, out.Total)
 	}
 }
+
+// TestMCPCypherSummary pins the cypher tool's write-result surface: the
+// embedded engine executes the statement and the structured output carries
+// the summary counters; reads keep the summary key absent.
+func TestMCPCypherSummary(t *testing.T) {
+	cs := newTestSession(t)
+	out := call[struct {
+		Columns []string         `json:"columns"`
+		Rows    []map[string]any `json:"rows"`
+		Summary *struct {
+			CreatedNodes   int `json:"createdNodes"`
+			CreatedEdges   int `json:"createdEdges"`
+			DeletedNodes   int `json:"deletedNodes"`
+			DeletedEdges   int `json:"deletedEdges"`
+			PropertiesSet  int `json:"propertiesSet"`
+			IndexesCreated int `json:"indexesCreated"`
+		} `json:"summary"`
+	}](t, cs, "cypher", map[string]any{
+		"query": `CREATE (n:Service {key:'gw', env:'prod'})`,
+	})
+	if out.Summary == nil || out.Summary.CreatedNodes != 1 || out.Summary.CreatedEdges != 0 {
+		t.Fatalf("create summary: %+v", out.Summary)
+	}
+
+	// The write is visible to the next read, which carries no summary.
+	read := call[struct {
+		Columns []string         `json:"columns"`
+		Rows    []map[string]any `json:"rows"`
+		Count   int              `json:"count"`
+		Summary *struct {
+			CreatedNodes int `json:"createdNodes"`
+		} `json:"summary"`
+	}](t, cs, "cypher", map[string]any{"query": `MATCH (n {key:'gw'}) RETURN n.env`})
+	if read.Count != 1 || len(read.Rows) != 1 || read.Rows[0]["n.env"] != "prod" {
+		t.Fatalf("read after write: %+v", read)
+	}
+	if read.Summary != nil {
+		t.Fatalf("read response must not carry summary: %+v", read.Summary)
+	}
+
+	// SET surfaces propertiesSet.
+	set := call[struct {
+		Summary *struct {
+			PropertiesSet int `json:"propertiesSet"`
+		} `json:"summary"`
+	}](t, cs, "cypher", map[string]any{"query": `MATCH (n {key:'gw'}) SET n.env = 'staging'`})
+	if set.Summary == nil || set.Summary.PropertiesSet != 1 {
+		t.Fatalf("set summary: %+v", set.Summary)
+	}
+}

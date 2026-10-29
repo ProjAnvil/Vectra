@@ -106,20 +106,28 @@ def cycles() -> dict:
 
 @mcp.tool
 def cypher(query: str, limit: int = 1000) -> dict:
-    """Query the graph with a Cypher-subset statement:
+    """Query (or, since v0.14, mutate) the graph with a Cypher-subset statement:
     MATCH (a:Label {prop:value})-[e:REL*1..3]->(b) WHERE b.w > 3
     RETURN a.key, b ORDER BY b.w DESC LIMIT 10.
     Node-pair semantics for *hops (shortest distance within the hop window);
     pseudo-props a.key/a.label/a.id; edge vars bind on fixed single hops
-    only. total reflects the true row count even when truncated by limit."""
+    only. total reflects the true row count even when truncated by limit.
+    Write clauses (CREATE/MERGE/SET/DELETE, CREATE INDEX) go through the
+    raft-replicated endpoint; a write response carries a summary of mutation
+    counters (createdNodes, createdEdges, deletedNodes, deletedEdges,
+    propertiesSet, indexesCreated)."""
     res = _c().cypher(query)
     rows = res.get("rows", [])
-    return {
+    out = {
         "columns": res.get("columns", []),
         "count": min(len(rows), limit),
         "total": len(rows),
         "rows": rows[:limit],
     }
+    # Write statements carry the server's apply-result summary; reads have none.
+    if "summary" in res:
+        out["summary"] = res["summary"]
+    return out
 
 
 @mcp.tool
