@@ -55,6 +55,11 @@ type Source interface {
 	LookupIndex(key, value string) ([]uint32, bool)
 	LookupNumber(key string, value float64) ([]uint32, bool)
 	LookupBool(key string, value bool) ([]uint32, bool)
+	// LookupContains is the full-text anchor prefilter: candidate IDs for
+	// `key CONTAINS substr` on an FTS-declared key — a case-insensitive
+	// SUPERSET of the matches (the executor keeps its exact WHERE re-check).
+	// ok=false means no prefilter is available (undeclared key, empty needle).
+	LookupContains(key, substr string) ([]uint32, bool)
 	FastAdjacency(dir int) (csr.Adjacency, bool)
 	Rows(u uint32, dir int) []csr.AdjRow
 }
@@ -361,6 +366,13 @@ type executor struct {
 	fastAdj bool // adjF/adjR carry the whole graph (expansion uses them)
 	// labelIDCache: name -> (id, found)
 	labelIDCache map[string]uint32
+	// ftsHints: the current MATCH clause's `var.key CONTAINS 'lit'`
+	// conjuncts (top-level AND chain only), keyed by pattern variable.
+	// anchorCandidates narrows a first-node anchor scan through the
+	// full-text prefilter when the key is FTS-declared; nil when the clause
+	// has no such conjunct, so every other query pays nothing. Set by
+	// matchRows/optionalRows for the duration of one clause.
+	ftsHints map[string][]containsHint
 	// BFS scratch shared across variable-length expansions: depths[i] is
 	// valid when gen[i] == current generation.
 	depths []uint32
@@ -437,6 +449,71 @@ func (ex *executor) lookupBool(key string, value bool) ([]uint32, bool) {
 	return ex.snap.LookupBool(key, value)
 }
 
+// lookupContains answers the full-text anchor prefilter on either
+// execution path. The merged-base path has no unmerged layers, so the raw
+// bigram posting intersection is already a superset of every row the WHERE
+// re-check can accept; the view path routes through the root facade, which
+// unions the layers and tombstones. A needle under two runes has no grams
+// — no prefilter, the anchor scans as before.
+func (ex *executor) lookupContains(key, substr string) ([]uint32, bool) {
+	if ex.src != nil {
+		return ex.src.LookupContains(key, substr)
+	}
+	if !slices.Contains(ex.snap.FTSKeys(), key) {
+		return nil, false
+	}
+	grams := engine.Bigrams(substr)
+	if len(grams) == 0 {
+		return nil, false
+	}
+	return ex.snap.LookupFTS(key, grams)
+}
+
+// containsHint is one `var.Key CONTAINS 'Needle'` conjunct lifted from a
+// MATCH clause's WHERE so the anchor scan can consult the full-text index.
+type containsHint struct {
+	Key, Needle string
+}
+
+// extractContainsHints collects the CONTAINS conjuncts of a WHERE
+// expression's top-level AND chain whose left side is a property reference
+// and whose right side is a string literal, keyed by variable. Anything
+// else (OR branches, NOT, non-literal needles) is left to the row filter —
+// the prefilter only has to be a superset, never a replacement. Returns nil
+// when the clause carries no usable conjunct, so the common case allocates
+// nothing.
+func extractContainsHints(where Expr) map[string][]containsHint {
+	var hints map[string][]containsHint
+	collectContainsHints(where, &hints)
+	return hints
+}
+
+func collectContainsHints(e Expr, hints *map[string][]containsHint) {
+	b, ok := e.(*Binary)
+	if !ok {
+		return
+	}
+	switch b.Op {
+	case "AND":
+		collectContainsHints(b.L, hints)
+		collectContainsHints(b.R, hints)
+	case "CONTAINS":
+		ref, okL := b.L.(*PropRef)
+		lit, okR := b.R.(*Lit)
+		if !okL || !okR {
+			return
+		}
+		needle, isStr := lit.Val.(string)
+		if !isStr || needle == "" {
+			return
+		}
+		if *hints == nil {
+			*hints = make(map[string][]containsHint, 1)
+		}
+		(*hints)[ref.Var] = append((*hints)[ref.Var], containsHint{Key: ref.Name, Needle: needle})
+	}
+}
+
 func (ex *executor) labelMask(labels []string) []bool {
 	if len(labels) == 0 {
 		return nil
@@ -476,6 +553,8 @@ func (ex *executor) matchRows(m *MatchClause, base []row) ([]row, error) {
 	if base != nil && len(base) == 0 {
 		return base, nil // strict empty stage: cartesian with the empty set stays empty
 	}
+	ex.ftsHints = extractContainsHints(m.Where)
+	defer func() { ex.ftsHints = nil }()
 	rows := base
 	for _, pat := range m.Patterns {
 		var err error
@@ -521,6 +600,8 @@ func (ex *executor) optionalRows(m *MatchClause, base []row) ([]row, error) {
 	if base == nil {
 		base = []row{{}} // first stage: one implicit empty incoming row
 	}
+	ex.ftsHints = extractContainsHints(m.Where)
+	defer func() { ex.ftsHints = nil }()
 	out := make([]row, 0, len(base))
 	scratch := make([]row, 1) // the per-base-row match base, reused: runPath never retains it
 	for _, b := range base {
@@ -698,7 +779,10 @@ func (ex *executor) runPath(pat *PathPattern, base []row) ([]row, error) {
 
 // anchorCandidates resolves a node pattern to start IDs: property-map equalities
 // on indexed keys narrow via the typed indexes (intersecting when several
-// apply); anything left falls back to a full scan with the node predicate.
+// apply), and a `var.key CONTAINS 'lit'` conjunct in the clause's WHERE
+// narrows through the full-text prefilter when key is FTS-declared (a
+// case-insensitive superset — the WHERE re-check keeps the exact
+// semantics); anything left falls back to a full scan with the node predicate.
 func (ex *executor) anchorCandidates(np *NodePattern) []uint32 {
 	n := uint32(ex.nodeCount())
 	var cand []uint32 // nil = unconstrained yet
@@ -722,6 +806,19 @@ func (ex *executor) anchorCandidates(np *NodePattern) []uint32 {
 			cand = ids
 		} else {
 			cand = intersectIDs(cand, ids)
+		}
+	}
+	if np.Var != "" {
+		for _, h := range ex.ftsHints[np.Var] {
+			ids, ok := ex.lookupContains(h.Key, h.Needle)
+			if !ok {
+				continue // not FTS-declared (or no grams): the row filter alone decides
+			}
+			if cand == nil {
+				cand = ids
+			} else {
+				cand = intersectIDs(cand, ids)
+			}
 		}
 	}
 	if cand == nil {

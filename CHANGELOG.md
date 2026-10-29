@@ -26,6 +26,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   renamed to `snapshotAtLeastV6`, a duplicated fragment in the 0.11.4
   changelog entry, and the missing zh-CN README vector-search section.
 
+### Added
+
+- Cypher `CONTAINS` anchor pushdown over full-text indexes: a top-level
+  `WHERE n.key CONTAINS 'literal'` conjunct now narrows the anchor scan
+  through the bigram buckets when `key` is FTS-declared. Semantics are
+  byte-identical — the prefilter is a case-insensitive superset and the
+  per-row case-sensitive `CONTAINS` re-check still decides — so queries on
+  declared keys stop full-scanning while undeclared keys scan exactly as
+  before (OR/NOT branches and non-literal needles are simply not lifted).
+  The existing alloc pins are untouched (244/177 on the 1-hop shapes;
+  hint extraction allocates only when a hint is found).
+- `vectra-bench -auth-token-file` (http mode): enables bearer auth on the
+  bench's own in-process node and attaches the first token to every client
+  request, so the auth middleware's overhead shows up in workload numbers.
+
 ## [0.13.0] - 2026-10-26
 
 The Cypher clause pipeline: queries are no longer one MATCH - they are a

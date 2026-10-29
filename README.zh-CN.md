@@ -95,7 +95,7 @@ g.IndexFullText("desc")                            // 声明（挂起至下次 S
 hits, ok := g.LookupByContains("desc", "支付网关")  // 大小写不敏感子串，按 NodeID 升序
 ```
 
-语义：`LookupByContains` **大小写不敏感**（值与检索词都折叠为小写），按相邻**二元组（bigram）**工作——Seal 时把声明 key 的各值切分为相邻两 rune 的 gram（"图数据库" → 图数 数据 据库；m 个 rune 的值去重后产出 m-1 个 gram），查询时交集检索词的 gram 倒排表，再对每个候选做真实的 `Contains` 复核——bigram 索引只是预过滤，gram 碰撞不会变成假命中。声明契约与 `IndexProperty` 一致：挂起至下次 merge（此前挂起 key 走全扫回答）、幂等、记 WAL、随 store v7 快照持久化；同一 key 可以**同时**被类型化索引与全文索引。未声明的 key 与空检索词返回 `(nil, false)`；短于两个 rune 的检索词走已文档化的全扫路径。交叉引用：Cypher 的 `CONTAINS` 不变——大小写敏感的全表扫描，与本索引无关。
+语义：`LookupByContains` **大小写不敏感**（值与检索词都折叠为小写），按相邻**二元组（bigram）**工作——Seal 时把声明 key 的各值切分为相邻两 rune 的 gram（"图数据库" → 图数 数据 据库；m 个 rune 的值去重后产出 m-1 个 gram），查询时交集检索词的 gram 倒排表，再对每个候选做真实的 `Contains` 复核——bigram 索引只是预过滤，gram 碰撞不会变成假命中。声明契约与 `IndexProperty` 一致：挂起至下次 merge（此前挂起 key 走全扫回答）、幂等、记 WAL、随 store v7 快照持久化；同一 key 可以**同时**被类型化索引与全文索引。未声明的 key 与空检索词返回 `(nil, false)`；短于两个 rune 的检索词走已文档化的全扫路径。交叉引用：Cypher 的 `CONTAINS` 语义保持大小写敏感不变，但在已声明全文索引的 key 上，其锚点扫描现在会借用同一批 bigram 桶做预过滤（大小写不敏感的超集收窄候选；最终仍由逐行的 `CONTAINS` 复核裁决）——声明过的 key 让 `WHERE n.k CONTAINS '...'` 不再全表扫描。
 
 **成本（按需开启）。** 只有声明的 key 才建桶，且每次 Seal/merge/clone 都重建。预算口径 ~24-30 B 每 (gram, id)：100 万节点 × 100 字符值 ≈ 3-5 GB。发布门（`BenchmarkSealFTS100K`：10 万点 / 100 万边、单 key、~32 rune 中英混排值）实测带 FTS 的 clone+seal 周期为无 FTS 线的 1.69 倍（+162 MB/op，0.34 s/op）。MCP 侧暴露为 `index_fulltext` / `lookup_contains`（Go 服务端）。
 

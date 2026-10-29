@@ -29,8 +29,9 @@ func (s *stubSource) LookupNumber(key string, value float64) ([]uint32, bool) {
 func (s *stubSource) LookupBool(key string, value bool) ([]uint32, bool) {
 	return nil, false
 }
-func (s *stubSource) FastAdjacency(dir int) (csr.Adjacency, bool) { return csr.Adjacency{}, false }
-func (s *stubSource) Rows(u uint32, dir int) []csr.AdjRow         { return s.rows[u] }
+func (s *stubSource) LookupContains(key, substr string) ([]uint32, bool) { return nil, false }
+func (s *stubSource) FastAdjacency(dir int) (csr.Adjacency, bool)        { return csr.Adjacency{}, false }
+func (s *stubSource) Rows(u uint32, dir int) []csr.AdjRow                { return s.rows[u] }
 
 // sinkSource adds the optional rowSink surface to stubSource.
 type sinkSource struct{ stubSource }

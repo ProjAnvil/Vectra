@@ -3315,10 +3315,19 @@ func (g *Graph) LookupByContains(key, substr string) ([]Node, bool) {
 	if substr == "" {
 		return nil, false
 	}
+	g.flushPend()
+	return lookupContainsOf(g.view.Load(), key, substr)
+}
+
+// lookupContainsOf is LookupByContains over a pinned generation — the
+// shared body behind the public API and the Cypher anchor prefilter
+// (cypherSource.LookupContains), so both answer identically: the bigram
+// bucket narrows the base scan, unmerged layers are unioned, and every
+// candidate is re-verified with a case-insensitive Contains. substr must be
+// non-empty (the public wrapper rejects "" before reaching here).
+func lookupContainsOf(v *genView, key, substr string) ([]Node, bool) {
 	needle := strings.ToLower(substr)
 	grams := engine.Bigrams(substr)
-	g.flushPend()
-	v := g.view.Load()
 	// The declaration probe runs before any path choice: with grams the
 	// base LookupFTS ok carries the verdict, but a 1-rune needle scans and
 	// would otherwise answer an undeclared key — so the probe is explicit

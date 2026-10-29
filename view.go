@@ -290,6 +290,21 @@ func (s cypherSource) LookupBool(key string, value bool) ([]uint32, bool) {
 	return nodesToIDs(ns), ok
 }
 
+// LookupContains is the Cypher anchor prefilter over the full-text kind:
+// the candidate set for `n.key CONTAINS 'substr'` on an FTS-declared key.
+// It is case-insensitive (the bigram index folds), so it is a SUPERSET of
+// Cypher's case-sensitive CONTAINS — the executor keeps its exact WHERE
+// re-check and only uses this to narrow the anchor scan. ok=false means
+// "no prefilter available" (undeclared key or empty needle): the executor
+// then anchors as before.
+func (s cypherSource) LookupContains(key, substr string) ([]uint32, bool) {
+	if substr == "" {
+		return nil, false
+	}
+	ns, ok := lookupContainsOf(s.gv, key, substr)
+	return nodesToIDs(ns), ok
+}
+
 func nodesToIDs(ns []Node) []uint32 {
 	ids := make([]uint32, len(ns))
 	for i, n := range ns {
