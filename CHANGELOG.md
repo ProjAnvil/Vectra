@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `go test -race ./...` is green end to end again. Two race-suite hygiene
+  items, both pre-existing since the v0.12/v0.13 arcs: the vector package's
+  600s budget died on `TestStateNoPhantomRetention` (8192x768 HNSW
+  construction runs ~30x under race instrumentation — 32s to 15m+; the test
+  is single-goroutine, so -race adds no coverage, and the Pack/merge paths
+  stay race-covered by the tier-cascade and death-compaction tests — it now
+  skips under race via the `raceEnabled` build-tag pair, mirroring the root
+  package's alloc-bound precedent), and the A7 recovery gate asserted its
+  3s line under -race, where instrumentation pushes a healthy 100K recovery
+  to ~2.9-3.0s (under `raceBuild` the line now logs with a 30s pathology
+  ceiling; the functional assertions and the non-race 3s contract are
+  unchanged).
+- Post-v0.13 cleanup bundle: gofmt on 4 pre-existing files, the stale
+  "snapshot v6" error string and comment (writes are v7), `snapshotIsV6`
+  renamed to `snapshotAtLeastV6`, a duplicated fragment in the 0.11.4
+  changelog entry, and the missing zh-CN README vector-search section.
+
 ## [0.13.0] - 2026-10-26
 
 The Cypher clause pipeline: queries are no longer one MATCH - they are a

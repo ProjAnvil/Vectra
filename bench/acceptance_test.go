@@ -625,7 +625,17 @@ func TestCrashRecoveryTimeToReady(t *testing.T) {
 	walBytes := g.WALSize()
 	t.Logf("A7: time-to-ready=%s (line <3s) | recovered %d nodes / %d edges | surviving log tail=%d bytes",
 		fmtDur(ready), nodes, edges, walBytes)
-	if ready >= 3*time.Second {
+	// The 3s line is a non-race contract (full-scale numbers come from
+	// non-race runs, per the raceBuild doctrine): -race instruments the
+	// replayed WAL frames and Open's recovery path ~2-5x, which pushed a
+	// healthy 100K recovery to ~3.0s. Under raceBuild the timing line only
+	// logs, with a generous pathology ceiling; the functional assertions
+	// (100K nodes recovered, WAL intact) stay hard either way.
+	if raceBuild {
+		if ready >= 30*time.Second {
+			t.Errorf("A7 FAIL: time-to-ready %s ≥ 30s race ceiling", fmtDur(ready))
+		}
+	} else if ready >= 3*time.Second {
 		t.Errorf("A7 FAIL: time-to-ready %s ≥ 3s", fmtDur(ready))
 	}
 	if err := g.Close(); err != nil {

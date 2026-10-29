@@ -236,6 +236,9 @@ func TestStateNoPhantomRetention(t *testing.T) {
 	if testing.Short() {
 		t.Skip("short mode")
 	}
+	if raceEnabled {
+		t.Skip("race: 8192x768 HNSW construction runs ~30x under instrumentation (32s -> 15m+) and blows the package's 600s budget; single-goroutine test, so -race adds no coverage — Pack/merge paths stay race-covered by the tier-cascade and death-compaction tests")
+	}
 	const n, dim = 8192, 768 // dim matters: at 128 the ~2-3MB fixed overhead (maps, links, slice headers) cannot amortize under 4MB theory and the line is meaningless
 	rng := rand.New(rand.NewSource(41))
 	s := NewState(Cosine, dim, 16, 200, 43)
