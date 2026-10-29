@@ -198,6 +198,12 @@ class TestVectorErrors(VectorTestCase):
         with self.assertRaises(ValueError):
             self.client.vector_search(self.INDEX, query_vector=[1.0, 0.0],
                                       similar_to="vl-a")  # both
+        with self.assertRaises(ValueError):
+            # empty vector == absent (the server's len==0 rule), so this is
+            # the "neither given" case client-side, not a zero-dim request
+            self.client.vector_search(self.INDEX, query_vector=[])
+        with self.assertRaises(ValueError):
+            self.client.vector_search(self.INDEX, similar_to="")  # ditto
 
 
 class TestIndexDDL(VectorTestCase):

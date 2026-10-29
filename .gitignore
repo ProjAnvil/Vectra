@@ -10,3 +10,7 @@ __pycache__/
 .DS_Store
 *.test
 .worktrees/
+
+# Python SDK build artifacts (wheel/sdist output; `dist/` above covers sdk/python/dist/ and sdk/ts/dist/)
+sdk/python/build/
+*.egg-info/

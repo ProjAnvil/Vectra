@@ -428,15 +428,18 @@ export class VectraClient {
    *
    * Exactly one of `queryVector` (dim must match the declaration;
    * enforced server-side as a 400) or `similarTo` (a node key holding a
-   * valid vector on the indexed prop) — anything else throws a
-   * TypeError synchronously. Returns `{"count", "hits"}` with hits of
-   * `{"key", "score"}` — smaller score is better. Unknown index rejects
-   * with VectraNotFoundError (VECTOR_INDEX_NOT_FOUND). */
+   * valid vector on the indexed prop) — anything else throws a TypeError
+   * synchronously. An empty vector or empty anchor counts as absent,
+   * mirroring the server's `(len===0)===(similarTo==="")` rule. Returns
+   * `{"count", "hits"}` with hits of `{"key", "score"}` — smaller score
+   * is better. Unknown index rejects with VectraNotFoundError
+   * (VECTOR_INDEX_NOT_FOUND). */
   vectorSearch(
     index: string,
     options: VectorSearchOptions = {},
   ): Promise<VectorSearchResult> {
-    const hasVector = options.queryVector !== undefined;
+    const hasVector =
+      options.queryVector !== undefined && options.queryVector.length > 0;
     const hasSimilarTo = options.similarTo !== undefined && options.similarTo !== "";
     if (hasVector === hasSimilarTo) {
       throw new TypeError(

@@ -62,8 +62,10 @@ new VectraClient({
   (copy-pasted tokens often carry a trailing newline that would
   otherwise guarantee a 401); a trailing slash on `baseUrl` is dropped.
 - `client.lastSnapshot` holds the sequence number from the most recent
-  `X-Vectra-Snapshot` response header (reads and awaits refresh it) —
-  use it as the snapshot token for optimistic transactions.
+  `X-Vectra-Snapshot` response header (reads and awaits refresh it — and
+  so do error responses from read endpoints, e.g. a 404 read: the server
+  sets the header before writing the error body) — use it as the snapshot
+  token for optimistic transactions.
 
 ## API
 
@@ -81,7 +83,7 @@ new VectraClient({
 | `batch({nodes, edges, edgeDeletes, nodeDeletes})` | `POST /v1/batch` | auto-commit; fixed apply order node upserts -> edge upserts -> edge deletes -> node deletes |
 | `txn({..., snapshot, ser, readNodes, readEdges})` | `POST /v1/txn` | optimistic commit; rejects with `TxnConflictError` |
 | `awaitSeq(seq, timeoutMs)` | `GET /v1/await` | read-your-writes long poll; server caps the wait at 30s |
-| `vectorSearch(index, {queryVector, similarTo, k, ef, label})` | `POST /v1/vector/search` | exactly one of `queryVector` / `similarTo` (else `TypeError`) |
+| `vectorSearch(index, {queryVector, similarTo, k, ef, label})` | `POST /v1/vector/search` | exactly one of `queryVector` / `similarTo`; empty vector/anchor counts as absent (else `TypeError`) |
 | `vectorCreateIndex(name, prop, dim, {metric, m, efConstruction})` | `POST /v1/vector/indexes` | `metric`: "cosine" (default) / "l2" / "dot" |
 | `vectorListIndexes()` | `GET /v1/vector/indexes` | declarations served from the published clone |
 | `vectorDropIndex(name)` | `DELETE /v1/vector/indexes/{name}` | typed 404 (`VECTOR_INDEX_NOT_FOUND`) when unknown |

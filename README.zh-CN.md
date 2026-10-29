@@ -204,6 +204,41 @@ claude mcp add vectra -- /path/to/vectra-mcp
 
 全部传输方式与宿主配置见 [mcp/README.md](mcp/README.md)。
 
+## SDK（Python / TypeScript）
+
+两个一等 REST 客户端——[sdk/python](sdk/python/README.md)（`vectra-graph`，仅标准库，Python 3.9+）与 [sdk/ts](sdk/ts/README.md)（`@projanvil/vectra`，原生 `fetch`，Node >= 18）——以**零运行时依赖**覆盖完整 `/v1/*` 面：图读取与遍历、Cypher 读+写（带变更摘要计数器）、两种 409 面皆为类型化冲突错误的 OCC 事务、读己之写 `await`、向量检索、向量索引 CRUD、索引 DDL。两者版本与服务端对齐在 0.14.0。
+
+```
+pip install vectra-graph
+npm install @projanvil/vectra
+```
+
+两个包均在仓库内 `sdk/` 下；PyPI/npm 发布待所有者执行——在此之前可从检出安装（`pip install ./sdk/python` / `npm install ./sdk/ts`）。
+
+Python 快速上手（连接 → 带摘要的 Cypher 写入 → 读回 → 向量检索）：
+
+```python
+from vectra_graph import Client
+
+client = Client(base_url="http://127.0.0.1:8080")          # 或 $VECTRA_URL / $VECTRA_TOKEN
+summary = client.cypher("CREATE (n:Doc {key:'d1', emb:[1.0,0.0,0.0]})")["summary"]
+client.await_seq(client.stats()["publishedSeq"] + 1)      # 读己之写
+rows = client.cypher("MATCH (n:Doc) RETURN n.key, n.emb")["rows"]
+hits = client.vector_search("docs", similar_to="d1", k=5)["hits"]  # "docs" 索引声明在 emb 上
+```
+
+TypeScript 快速上手：
+
+```js
+import { VectraClient } from "@projanvil/vectra";
+
+const vectra = new VectraClient({ baseUrl: "http://127.0.0.1:8080" });
+const write = await vectra.cypher("CREATE (n:Doc {key:'d1', emb:[1.0,0.0,0.0]})"); // write.summary.createdNodes === 1
+await vectra.awaitSeq((await vectra.stats()).publishedSeq + 1);      // 读己之写
+const rows = (await vectra.cypher("MATCH (n:Doc) RETURN n.key, n.emb")).rows;
+const hits = (await vectra.vectorSearch("docs", { similarTo: "d1", k: 5 })).hits;
+```
+
 ## 基准（M1 Pro，幂律图，完整报告见 [docs/benchmarks](docs/benchmarks)）
 
 | 负载 | 1千/1万 | 10万/100万 | 100万/1000万（设计上界） |

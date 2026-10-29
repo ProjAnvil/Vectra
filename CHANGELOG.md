@@ -60,6 +60,23 @@ counter summaries. Read statements keep the v0.13 pipeline byte-for-byte.
   interactive `/v1/txn` traffic and Cypher writes on the same keys — keep
   them on disjoint key sets or route the contested writes through `/v1/txn`'s
   node/edge items.
+- Python SDK `vectra-graph` (sdk/python) — synchronous, stdlib-only client
+  (`urllib` transport; the wheel declares zero runtime dependencies,
+  Python 3.9+, PyPI-ready pending the owner's publish). Covers the full
+  REST surface: reads/traversals, batch, Cypher reads and writes (summary
+  counters per statement), OCC `txn` with typed conflicts on both 409
+  faces (`TxnConflictError` exposes the non-envelope report's conflicts/
+  conflictTotal/hint), read-your-writes `await`, vector search + index
+  CRUD, and Cypher index DDL helpers. E2E suite boots a real vectra-server
+  (skips without a go toolchain; a serverless stub pins transport edges).
+- TypeScript SDK `@projanvil/vectra` (sdk/ts) — zero-dependency client
+  (native `fetch`, Node >= 18, strict-mode types with generated `.d.ts`,
+  npm-ready pending the owner's publish) covering the same surface: union-
+  typed Cypher results discriminated by `isCypherWrite`, `TxnConflictError`
+  for the txn 409 report, `lastSnapshot` tracking `X-Vectra-Snapshot`
+  (error responses included), vector search + index CRUD, index DDL. E2E
+  suite is node:test against a real vectra-server. Both SDK packages
+  version at 0.14.0, aligned with the server.
 
 ## [0.13.1] - 2026-10-29
 

@@ -70,7 +70,7 @@ token is non-empty, matching auth-off servers.
 | `batch(nodes, edges, edge_deletes, node_deletes)` | `POST /v1/batch` | auto-commit changeset, fixed apply order |
 | `txn(nodes, edges, edge_deletes, node_deletes, snapshot=0, ser=False, read_nodes=None, read_edges=None)` | `POST /v1/txn` | OCC commit; raises `TxnConflictError` on 409 |
 | `await_seq(seq, timeout_ms=5000)` | `GET /v1/await` | read-your-writes long poll; sets `last_snapshot` |
-| `vector_search(index, *, query_vector=None, similar_to="", k=10, ef=0, label="")` | `POST /v1/vector/search` | exactly one of `query_vector` / `similar_to` |
+| `vector_search(index, *, query_vector=None, similar_to="", k=10, ef=0, label="")` | `POST /v1/vector/search` | exactly one of `query_vector` / `similar_to` (an empty vector **is** the "neither" case, mirroring the server); `similar_to` to a missing node → 400 `NODE_NOT_FOUND` |
 | `vector_create_index(name, prop, dim, metric="cosine", m=0, ef_construction=0)` | `POST /v1/vector/indexes` | metric `cosine`/`l2`/`dot`; duplicate → 409 `VECTOR_INDEX_EXISTS` |
 | `vector_list_indexes()` | `GET /v1/vector/indexes` | declared indexes from the published clone |
 | `vector_drop_index(name)` | `DELETE /v1/vector/indexes/{name}` | typed 404 `VECTOR_INDEX_NOT_FOUND` |
@@ -101,7 +101,9 @@ typed exceptions above) — by design, keeping the SDK dependency-free.
 
 `txn()` wraps a batch in a guard: `snapshot` is the raft log index the
 caller's reads were based on — get it from `stats()["publishedSeq"]` or
-`Client.last_snapshot` (refreshed by every read and await).
+`Client.last_snapshot` (refreshed by every read and await — and by error
+responses from read endpoints too, e.g. a 404 read still updates it: the
+server sets the header before writing the error body).
 
 Validation covers **the batch's own write set always**: writing a key that
 any raft entry newer than `snapshot` touched rejects the whole commit
@@ -138,7 +140,12 @@ Declarations (`vector_create_index` / `vector_drop_index`) are raft writes;
 carry vectors as plain numeric arrays on the indexed prop
 (`{"embedding": [1.0, 0.0, 0.0]}`). `vector_search` takes exactly one of
 `query_vector` (dim must match the declaration) or `similar_to` (a node
-key); hits are `{"key", "score"}` with smaller scores better.
+key); hits are `{"key", "score"}` with smaller scores better. Two
+deliberate faces to know: `similar_to` pointing at a node that does not
+exist answers **400 `NODE_NOT_FOUND`** (a bad body reference, not the 404
+resource face), and an empty `query_vector` is treated as absent — the
+server's own rule is `(len == 0) == (similar_to == "")` — so the client
+raises the "exactly one" `ValueError` instead of sending a request.
 
 ## Index DDL and the Seal note
 
@@ -149,6 +156,10 @@ key** (label-scoped spellings are rejected) and stay **pending until the
 next Seal/publish**: lookups on a pending key answer via a compensation
 scan and switch to the index once the declaration merges. Re-declaring is
 idempotent (each applied statement still counts one `indexesCreated`).
+The prop identifier is deferred to the server parser — there is no
+client-side identifier check (a regex would wrongly reject forms the
+engine accepts, e.g. backtick-quoted keys): an empty prop round-trips as
+`CREATE INDEX ON (n.)` and answers the server's 400 `PARSE`.
 
 ## Tests
 

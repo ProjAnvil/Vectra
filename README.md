@@ -212,6 +212,41 @@ claude mcp add vectra -- /path/to/vectra-mcp
 
 See [mcp/README.md](mcp/README.md) for all transports and host configurations.
 
+## SDKs (Python / TypeScript)
+
+Two first-party REST clients — [sdk/python](sdk/python/README.md) (`vectra-graph`, stdlib-only, Python 3.9+) and [sdk/ts](sdk/ts/README.md) (`@projanvil/vectra`, native `fetch`, Node >= 18) — cover the full `/v1/*` surface with **zero runtime dependencies**: graph reads and traversals, Cypher reads and writes (with the mutation-summary counters), OCC transactions with typed conflict errors on both 409 faces, the read-your-writes `await`, vector search, vector index CRUD, and index DDL. Both are versioned with the server at 0.14.0.
+
+```
+pip install vectra-graph
+npm install @projanvil/vectra
+```
+
+Both packages live in-repo under `sdk/`; publishing to PyPI/npm is pending the owner's release — until then install from a checkout (`pip install ./sdk/python` / `npm install ./sdk/ts`).
+
+Python quickstart (connect → Cypher write with summary → read back → vector search):
+
+```python
+from vectra_graph import Client
+
+client = Client(base_url="http://127.0.0.1:8080")          # or $VECTRA_URL / $VECTRA_TOKEN
+summary = client.cypher("CREATE (n:Doc {key:'d1', emb:[1.0,0.0,0.0]})")["summary"]
+client.await_seq(client.stats()["publishedSeq"] + 1)      # read-your-writes
+rows = client.cypher("MATCH (n:Doc) RETURN n.key, n.emb")["rows"]
+hits = client.vector_search("docs", similar_to="d1", k=5)["hits"]  # index "docs" on emb
+```
+
+TypeScript quickstart:
+
+```js
+import { VectraClient } from "@projanvil/vectra";
+
+const vectra = new VectraClient({ baseUrl: "http://127.0.0.1:8080" });
+const write = await vectra.cypher("CREATE (n:Doc {key:'d1', emb:[1.0,0.0,0.0]})"); // write.summary.createdNodes === 1
+await vectra.awaitSeq((await vectra.stats()).publishedSeq + 1);      // read-your-writes
+const rows = (await vectra.cypher("MATCH (n:Doc) RETURN n.key, n.emb")).rows;
+const hits = (await vectra.vectorSearch("docs", { similarTo: "d1", k: 5 })).hits;
+```
+
 ## Benchmarks (M1 Pro, power-law graphs, full reports in [docs/benchmarks](docs/benchmarks))
 
 | Workload | 1K/10K | 100K/1M | 1M/10M (design ceiling) |

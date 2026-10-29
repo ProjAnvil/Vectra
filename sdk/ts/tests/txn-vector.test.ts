@@ -472,18 +472,6 @@ describe("vector errors", () => {
       },
     );
   });
-
-  it("client requires exactly one query mode", { skip: skipReason || false }, () => {
-    assert.throws(() => c().vectorSearch(INDEX), TypeError); // neither
-    assert.throws(
-      () =>
-        c().vectorSearch(INDEX, {
-          queryVector: [1.0, 0.0],
-          similarTo: "vl-a",
-        }),
-      TypeError, // both
-    );
-  });
 });
 
 describe("index DDL", () => {
@@ -533,6 +521,35 @@ describe("index DDL", () => {
     // pending declarations are idempotent to re-declare (still counted)
     const again = await c().indexFullText("desc");
     assert.equal(again.summary.indexesCreated, 1);
+  });
+});
+
+describe("client validation (no server)", () => {
+  // Pure argument validation: the TypeError raises synchronously before
+  // any request is built, so these run even when the server-backed tests
+  // skipped (go toolchain missing) — only spawn-dependent tests skip.
+  const validator = new VectraClient({ baseUrl: "http://validation-only.invalid" });
+
+  it("vectorSearch requires exactly one query mode", () => {
+    assert.throws(() => validator.vectorSearch("any-index"), TypeError); // neither
+    assert.throws(
+      () =>
+        validator.vectorSearch("any-index", {
+          queryVector: [1.0, 0.0],
+          similarTo: "anchor",
+        }),
+      TypeError, // both
+    );
+    // empty vector / empty anchor count as absent, mirroring the server's
+    // (len === 0) === (similarTo === "") rule
+    assert.throws(
+      () => validator.vectorSearch("any-index", { queryVector: [] }),
+      TypeError,
+    );
+    assert.throws(
+      () => validator.vectorSearch("any-index", { similarTo: "" }),
+      TypeError,
+    );
   });
 });
 

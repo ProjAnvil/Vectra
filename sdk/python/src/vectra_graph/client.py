@@ -51,8 +51,10 @@ class Client:
         self.token = token.strip()
         self.timeout = timeout
         #: Sequence number from the most recent ``X-Vectra-Snapshot`` response
-        #: header (reads and awaits carry it); ``None`` until one is seen.
-        #: Use it as the snapshot token for optimistic transactions.
+        #: header; ``None`` until one is seen. Reads, awaits, and error
+        #: responses from read endpoints all refresh it (the server sets the
+        #: header before writing any error body). Use it as the snapshot
+        #: token for optimistic transactions.
         self.last_snapshot: Optional[int] = None
 
     # ---- transport -----------------------------------------------------
@@ -84,17 +86,31 @@ class Client:
                 request, timeout=self.timeout if timeout is None else timeout
             ) as response:
                 raw = response.read()
-                snapshot = response.headers.get("X-Vectra-Snapshot")
+                self._record_snapshot(response.headers)
         except urllib.error.HTTPError as exc:
+            # Error responses carry X-Vectra-Snapshot too (the header is set
+            # before any error write on read endpoints) — record it the same
+            # way, matching the TS client.
+            self._record_snapshot(getattr(exc, "hdrs", None))
             raise self._typed_error(exc) from None
+        if not raw:
+            return {}
+        return json.loads(raw.decode("utf-8"))
+
+    def _record_snapshot(self, headers: Any) -> None:
+        """Set :attr:`last_snapshot` from a response-headers mapping.
+
+        A ``None`` mapping (or a header value that is not an integer) is a
+        no-op — never let snapshot bookkeeping mask the real response.
+        """
+        if headers is None:
+            return
+        snapshot = headers.get("X-Vectra-Snapshot")
         if snapshot is not None:
             try:
                 self.last_snapshot = int(snapshot)
             except ValueError:
                 pass
-        if not raw:
-            return {}
-        return json.loads(raw.decode("utf-8"))
 
     @staticmethod
     def _typed_error(exc: urllib.error.HTTPError) -> VectraError:
@@ -130,11 +146,15 @@ class Client:
         ):
             hint = str(payload.get("hint", ""))
             conflicts = payload.get("conflicts") or []
+            # conflictTotal is defensive: fall back to the list length when
+            # the field is missing or null rather than raising on int(None).
+            raw_total = payload.get("conflictTotal")
+            conflict_total = int(raw_total) if raw_total is not None else len(conflicts)
             message = "transaction conflict" + (": " + hint if hint else "")
             return TxnConflictError(
                 message,
                 conflicts=[str(c) for c in conflicts],
-                conflict_total=int(payload.get("conflictTotal", len(conflicts))),
+                conflict_total=conflict_total,
                 hint=hint,
             )
         if exc.code in (401, 403):
@@ -328,15 +348,23 @@ class Client:
         Exactly one of ``query_vector`` (dim must match the declaration;
         enforced client-side as ValueError, matching the server's 400) or
         ``similar_to`` (a node key holding a valid vector on the indexed
-        prop). Returns ``{"count", "hits"}`` with hits of
+        prop). An empty ``query_vector`` counts as absent — the server's
+        own rule is ``(len == 0) == (similar_to == "")`` — so it is the
+        "neither given" ValueError, not a request. Returns
+        ``{"count", "hits"}`` with hits of
         ``{"key", "score"}`` — smaller score is better. ``ef`` 0 takes the
         server's adaptive default; ``label`` filters hits by node label.
-        Unknown index raises VectraNotFoundError (VECTOR_INDEX_NOT_FOUND).
+        Unknown index raises VectraNotFoundError (VECTOR_INDEX_NOT_FOUND);
+        a ``similar_to`` key that does not exist answers 400
+        NODE_NOT_FOUND (a bad body reference, not the 404 resource face).
         """
-        if (query_vector is None) == (not similar_to):
+        # bool(): an empty list mirrors the server treating len==0 as absent.
+        has_vector = bool(query_vector)
+        has_anchor = bool(similar_to)
+        if has_vector == has_anchor:
             raise ValueError("provide exactly one of query_vector or similar_to")
         body: dict = {"index": index, "k": int(k)}
-        if query_vector is not None:
+        if has_vector:
             body["query_vector"] = [float(x) for x in query_vector]
         else:
             body["similar_to"] = similar_to
