@@ -82,12 +82,12 @@ func gate2bVecs(rng *rand.Rand, n, dim int) [][]float32 {
 
 func gate2bKey(i int) string { return fmt.Sprintf("n%08d", i) }
 
-// Lines 1+2, group-commit protocol (the spec's "组提交节流" budget):
+// Lines 1+2, group-commit protocol (the spec's group-commit throttling budget):
 // one Batch of 512 per measurement unit - the Batch boundary is the WAL
 // frame/fsync, and per-op fsync would cap ANY payload at disk speed
 // (~300/s here). Vector overhead shows as the throughput delta against
 // the same protocol with plain nodes; write p99 is the batch-boundary
-// latency (the existing 5ms throttle口径).
+// latency (the existing 5ms throttle reading).
 func gate2bWriteThroughput(t *testing.T) {
 	const n = 30_000
 	const batch = 512
@@ -142,7 +142,7 @@ func gate2bWriteThroughput(t *testing.T) {
 		t.Errorf("vector write throughput %.0f/s < 20k/s line", tp)
 	}
 
-	// Line 2's real口径: the vector subsystem must not tax NON-vector
+	// Line 2's real reading: the vector subsystem must not tax NON-vector
 	// writes - an indexed graph vs an unindexed graph, both writing plain
 	// nodes. (A vector-carrying frame is inherently heavier: 768-dim JSON
 	// is ~7.2KB/vector, the cost spec 12 accepts for v1 with a Phase-2

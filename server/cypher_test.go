@@ -44,7 +44,7 @@ func TestAPICypherEndpoint(t *testing.T) {
 		t.Fatal("snapshot header missing")
 	}
 
-	// 节点值投影（json 序列化的 Node）
+	// node value projection (a json-serialized Node)
 	resp, out = postJSON(t, leader.URL()+"/v1/cypher", map[string]any{
 		"query": `MATCH (s {type:'service'}) RETURN s LIMIT 1`,
 	})
@@ -57,19 +57,19 @@ func TestAPICypherEndpoint(t *testing.T) {
 		t.Fatalf("node: %v", node)
 	}
 
-	// 解析错 → 400 PARSE
+	// parse error → 400 PARSE
 	resp, out = postJSON(t, leader.URL()+"/v1/cypher", map[string]any{"query": `MATCH (a) RETURN b`})
 	if resp.StatusCode != http.StatusBadRequest || out["error"].(map[string]any)["code"] != "PARSE" {
 		t.Fatalf("parse error: %d %v", resp.StatusCode, out)
 	}
 
-	// 缺 query → 400 VALIDATION
+	// missing query → 400 VALIDATION
 	resp, out = postJSON(t, leader.URL()+"/v1/cypher", map[string]any{})
 	if resp.StatusCode != http.StatusBadRequest || out["error"].(map[string]any)["code"] != "VALIDATION" {
 		t.Fatalf("missing query: %d %v", resp.StatusCode, out)
 	}
 
-	// 坏 JSON → 400
+	// bad JSON → 400
 	resp2, err := http.Post(leader.URL()+"/v1/cypher", "application/json", bytes.NewReader([]byte("{")))
 	if err != nil {
 		t.Fatal(err)

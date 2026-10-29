@@ -11,7 +11,7 @@ func sealIdx(t *testing.T, keys []string, props []map[string]any) *Snapshot {
 	for i, p := range props {
 		nodes[i] = NodeRec{Key: string(rune('a' + i)), Label: "L", Props: p}
 	}
-	s, err := Seal(nodes, nil, []string{"L"}, keys, nil) // []string{"L"} = 边 label 注册表（LabelID 的查询对象）
+	s, err := Seal(nodes, nil, []string{"L"}, keys, nil) // []string{"L"} = the edge label registry (what LabelID resolves against)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,7 +25,7 @@ func TestTypedIndexBucketsAndLookups(t *testing.T) {
 		[]map[string]any{
 			{"type": "controller", "weight": 3, "on": true},
 			{"type": "service", "weight": 7.5, "on": false},
-			{"type": "controller", "weight": json.Number("5")}, // 无 on 字段 → bool 桶跳过
+			{"type": "controller", "weight": json.Number("5")}, // no "on" field → bool bucket skips it
 		})
 	if ids, ok := s.LookupIndex("type", "controller"); !ok || len(ids) != 2 || ids[0] != 0 || ids[1] != 2 {
 		t.Fatalf("string eq: %v %v", ids, ok)
@@ -33,10 +33,10 @@ func TestTypedIndexBucketsAndLookups(t *testing.T) {
 	if ids, ok := s.LookupNumber("weight", 7.5); !ok || len(ids) != 1 || ids[0] != 1 {
 		t.Fatalf("number eq: %v %v", ids, ok)
 	}
-	if ids, _ := s.LookupNumber("weight", 3); len(ids) != 1 || ids[0] != 0 { // int 3 → float64 3 命中
+	if ids, _ := s.LookupNumber("weight", 3); len(ids) != 1 || ids[0] != 0 { // int 3 hits as float64 3
 		t.Fatalf("int normalization: %v", ids)
 	}
-	if ids, _ := s.LookupNumberRange("weight", fp(3), fp(5)); len(ids) != 2 { // [3,5] → a 和 json.Number("5")
+	if ids, _ := s.LookupNumberRange("weight", fp(3), fp(5)); len(ids) != 2 { // [3,5] → a and json.Number("5")
 		t.Fatalf("range [3,5]: %v", ids)
 	}
 	if ids, _ := s.LookupNumberRange("weight", nil, fp(4)); len(ids) != 1 { // (-∞,4] → a
@@ -51,7 +51,7 @@ func TestTypedIndexBucketsAndLookups(t *testing.T) {
 	if _, ok := s.LookupIndex("absent", "x"); ok {
 		t.Fatal("unindexed key must return ok=false")
 	}
-	if ids, _ := s.LookupIndex("type", "nope"); len(ids) != 0 { // 注册但无命中 → 空集 + ok=true
+	if ids, _ := s.LookupIndex("type", "nope"); len(ids) != 0 { // registered but no hit → empty set + ok=true
 		t.Fatalf("empty hit: %v", ids)
 	}
 	if _, ok := s.LabelID("L"); !ok {
@@ -67,9 +67,10 @@ func TestTypedIndexSkipsNonIndexableValues(t *testing.T) {
 		[]map[string]any{
 			{"misc": []any{1, 2}},
 			{"misc": map[string]any{"k": "v"}},
-			{}, // nil 值
+			{}, // no props at all
 		})
-	// key 已注册（ok=true）但三桶皆空：所有查询返回空集而非 ok=false
+	// key registered (ok=true) but all three buckets empty: every query
+	// returns the empty set, not ok=false
 	if ids, ok := s.LookupIndex("misc", "x"); !ok || len(ids) != 0 {
 		t.Fatalf("string bucket empty: %v %v", ids, ok)
 	}

@@ -179,7 +179,7 @@ type cellResult struct {
 	ef        int
 	recall    float64
 	p50, p99  time.Duration
-	p99Over   time.Duration // p99 with overlay at full 2048 (spec 口径)
+	p99Over   time.Duration // p99 with overlay at full 2048 (the spec's reading)
 	buildTime time.Duration
 	liveAmp   float64 // HeapAlloc after GC / (n*dim*4)
 	inuseAmp  float64 // HeapInuse after GC / (n*dim*4)

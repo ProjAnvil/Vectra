@@ -224,7 +224,7 @@ func TestQueryLatencyDuringMerge(t *testing.T) {
 		}
 		return float64(b) / float64(a)
 	}
-	// Acceptance (hardening re-read of the line, idle口径): a query during
+	// Acceptance (hardening re-read of the line, idle reading): a query during
 	// the merge window stays within 2x the merged-base floor. The
 	// steady-write ratio (merge/writes) is reported alongside — merges are
 	// what bound the stack the steady state would otherwise grow unbounded.

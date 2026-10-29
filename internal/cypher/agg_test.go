@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// aggRow 取唯一一行（聚合无分组键时恰一行）。
+// aggRow fetches the single row (a keyless aggregation yields exactly one).
 func aggRow(t *testing.T, q string) map[string]any {
 	t.Helper()
 	res := run(t, q)
@@ -24,9 +24,9 @@ func aggNum(t *testing.T, r map[string]any, col string) float64 {
 	return v
 }
 
-// TestAggFunctionSet 覆盖全部六个聚合函数（:Service 三行 w=5,3,7）。
+// TestAggFunctionSet covers all six aggregate functions (three :Service rows w=5,3,7).
 func TestAggFunctionSet(t *testing.T) {
-	// 隐式分组：非聚合项 a.env 是分组键
+	// implicit grouping: the non-aggregating item a.env is the grouping key
 	res := run(t, `MATCH (a:Service) RETURN a.env, count(*)`)
 	want := map[string]float64{"prod": 2, "dev": 1}
 	if len(res.Rows) != len(want) {
@@ -63,26 +63,26 @@ func TestAggFunctionSet(t *testing.T) {
 		t.Fatalf("collect: %#v", r["collect(a.key)"])
 	}
 
-	// 全图（+store w=2 → sum 17, avg 4.25, min 2, max 7）
+	// whole graph (+store w=2 → sum 17, avg 4.25, min 2, max 7)
 	r = aggRow(t, `MATCH (a) RETURN sum(a.w), avg(a.w), min(a.w), max(a.w)`)
 	if aggNum(t, r, "sum(a.w)") != 17 || aggNum(t, r, "avg(a.w)") != 4.25 ||
 		aggNum(t, r, "min(a.w)") != 2 || aggNum(t, r, "max(a.w)") != 7 {
 		t.Fatalf("all-nodes aggregates: %+v", r)
 	}
 
-	// min/max 跳过 null，按 cmpVals 字符串序
+	// min/max skip nulls, ordered by cmpVals string order
 	if v := aggRow(t, `MATCH (a) RETURN min(a.env)`)["min(a.env)"]; v != "dev" {
 		t.Fatalf("min(a.env): %#v", v)
 	}
 }
 
-// TestAggCountNullDistinct：store 无 env（null）。
+// TestAggCountNullDistinct: store has no env (null).
 func TestAggCountNullDistinct(t *testing.T) {
 	r := aggRow(t, `MATCH (a) RETURN count(*), count(a.env), count(DISTINCT a.env)`)
 	if aggNum(t, r, "count(*)") != 4 {
 		t.Fatalf("count(*): %v", r["count(*)"])
 	}
-	if aggNum(t, r, "count(a.env)") != 3 { // null 跳过
+	if aggNum(t, r, "count(a.env)") != 3 { // nulls skipped
 		t.Fatalf("count(a.env): %v", r["count(a.env)"])
 	}
 	if aggNum(t, r, "count(DISTINCT a.env)") != 2 { // prod, dev
@@ -92,7 +92,7 @@ func TestAggCountNullDistinct(t *testing.T) {
 	if !ok || len(lst) != 2 || lst[0] != "prod" || lst[1] != "dev" {
 		t.Fatalf("collect(DISTINCT a.env): %#v", lst)
 	}
-	// null 分组键自成一组的独立编码
+	// a null grouping key forms its own group under a distinct encoding
 	res := run(t, `MATCH (a) RETURN a.env, count(*)`)
 	if len(res.Rows) != 3 {
 		t.Fatalf("env groups: %d rows %+v", len(res.Rows), res.Rows)
@@ -125,7 +125,7 @@ func TestAggMultiKeyGrouping(t *testing.T) {
 	}
 }
 
-// TestAggNoKeysEmptyInput：无分组键 + 零输入行 → 恰一行默认值。
+// TestAggNoKeysEmptyInput: no grouping key + zero input rows → exactly one default-valued row.
 func TestAggNoKeysEmptyInput(t *testing.T) {
 	r := aggRow(t, `MATCH (a:Missing) RETURN count(*), sum(a.w), avg(a.w), min(a.w), max(a.w), collect(a.key)`)
 	if aggNum(t, r, "count(*)") != 0 {
@@ -143,7 +143,7 @@ func TestAggNoKeysEmptyInput(t *testing.T) {
 	if !ok || len(lst) != 0 {
 		t.Fatalf("collect: %#v, want empty list", r["collect(a.key)"])
 	}
-	// 有分组键 + 零输入行 → 零行
+	// with a grouping key + zero input rows → zero rows
 	if res := run(t, `MATCH (a:Missing) RETURN a.env, count(*)`); len(res.Rows) != 0 {
 		t.Fatalf("keyed empty input: %d rows", len(res.Rows))
 	}
@@ -163,12 +163,12 @@ func TestAggAliasOrderLimit(t *testing.T) {
 	if res.Rows[1]["env"] != "dev" || aggNum(t, res.Rows[1], "total") != 7 {
 		t.Fatalf("second group: %+v", res.Rows[1])
 	}
-	// LIMIT 作用于聚合后的组行
+	// LIMIT applies to the aggregated group rows
 	res = run(t, `MATCH (a:Service) RETURN a.env AS env, sum(a.w) AS total ORDER BY total DESC LIMIT 1`)
 	if len(res.Rows) != 1 || res.Rows[0]["env"] != "prod" {
 		t.Fatalf("limit: %+v", res.Rows)
 	}
-	// 非聚合项的 AS 别名同样可进 ORDER BY（存储 prop 原生类型为 int）
+	// an AS alias of a non-aggregating item can also feed ORDER BY (the stored prop's native type is int)
 	res = run(t, `MATCH (a:Service) RETURN a.w AS w ORDER BY w DESC LIMIT 1`)
 	if len(res.Rows) != 1 || res.Rows[0]["w"] != 7 {
 		t.Fatalf("non-agg alias order: %+v", res.Rows)
@@ -185,7 +185,7 @@ func TestAggParseErrors(t *testing.T) {
 		{"MATCH (a) RETURN foo(a)", "unknown function"},
 		{"MATCH (a) RETURN a.key + count(*)", "unexpected character"},
 		{"MATCH (a) RETURN count(*) ORDER BY count(*)", "ORDER BY"},
-		{"MATCH (a) RETURN count(*) ORDER BY a.w", "RETURN"}, // 聚合时 ORDER BY 必须命中 RETURN 名/别名
+		{"MATCH (a) RETURN count(*) ORDER BY a.w", "RETURN"}, // under aggregation ORDER BY must reference a RETURN name/alias
 		{"MATCH (a) RETURN count(z.w)", `variable "z" is not declared`},
 		{"MATCH (a) RETURN count(DISTINCT *)", "not supported"},
 		{"MATCH (a) RETURN sum(*)", "not supported"},
@@ -205,7 +205,7 @@ func TestAggParseErrors(t *testing.T) {
 	}
 }
 
-// TestAggLimitDoesNotShortCircuit：LIMIT 在聚合之后才生效。
+// TestAggLimitDoesNotShortCircuit: LIMIT takes effect only after aggregation.
 func TestAggLimitDoesNotShortCircuit(t *testing.T) {
 	r := aggRow(t, `MATCH (a) RETURN count(*) LIMIT 1`)
 	if aggNum(t, r, "count(*)") != 4 {
@@ -217,13 +217,13 @@ func TestAggGroupCap(t *testing.T) {
 	old := maxGroups
 	maxGroups = 2
 	defer func() { maxGroups = old }()
-	_, err := Run(execSnap(t), `MATCH (a) RETURN a.key, count(*)`) // 4 组 > 2
+	_, err := Run(execSnap(t), `MATCH (a) RETURN a.key, count(*)`) // 4 groups > 2
 	if err == nil || !strings.Contains(err.Error(), "too many groups") {
 		t.Fatalf("group cap: %v", err)
 	}
 }
 
-// TestAggMixedItems：聚合项与多个非聚合项混排，输出列序 = 声明序。
+// TestAggMixedItems: aggregating and several non-aggregating items interleaved; output column order = declaration order.
 func TestAggMixedItems(t *testing.T) {
 	res := run(t, `MATCH (a:Service) RETURN count(*), a.env, collect(a.key)`)
 	if len(res.Columns) != 3 || res.Columns[0] != "count(*)" || res.Columns[1] != "a.env" || res.Columns[2] != "collect(a.key)" {

@@ -290,7 +290,7 @@ func TestChainRestartIdentity(t *testing.T) {
 // libraries), while the version-dispatch branch an older binary (one that
 // knows at most v5) takes on a v6 header is exercised through the honest
 // in-process proxy: THIS binary facing an unknown version byte
-// (TestMigratedLibRejectedByV4Decode's手法, v7 in place of the retired v6).
+// (TestMigratedLibRejectedByV4Decode's technique, v7 in place of the retired v6).
 func TestOldBinaryTripwireOnChain(t *testing.T) {
 	dir := t.TempDir()
 	db := filepath.Join(dir, "graph.db")

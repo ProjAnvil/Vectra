@@ -18,7 +18,7 @@ func buildTypedGraph(t *testing.T) *Graph {
 	must(err)
 	_, err = g.AddNode("orders", "Service", map[string]any{"type": "service", "weight": 7.5, "on": false})
 	must(err)
-	_, err = g.AddNode("db", "Store", map[string]any{"type": "store", "weight": 42}) // int，无 on
+	_, err = g.AddNode("db", "Store", map[string]any{"type": "store", "weight": 42}) // int, no "on" field
 	must(err)
 	_, err = g.AddEdge("gw", "orders", "CALLS", nil)
 	must(err)
@@ -60,7 +60,7 @@ func TestLookupTypedSurvivesJSONRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 写侧 int 42，JSON 回读成 float64 —— 归一化后数值查找仍然命中
+	// written as int 42, JSON round-trip reads float64 — the normalized numeric lookup still hits
 	if ns, ok := g2.LookupByNumber("weight", 42); !ok || len(ns) != 1 || ns[0].Key != "db" {
 		t.Fatalf("round-trip number eq: %v %v", ns, ok)
 	}

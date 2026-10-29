@@ -68,7 +68,7 @@ func TestCypherTool(t *testing.T) {
 		t.Fatalf("row: %v", out.Rows[0])
 	}
 
-	// limit 截断：total 报真实值
+	// limit truncates: total reports the true value
 	out = call[struct {
 		Columns []string         `json:"columns"`
 		Rows    []map[string]any `json:"rows"`

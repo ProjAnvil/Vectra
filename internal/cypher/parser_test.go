@@ -107,7 +107,7 @@ func TestParsePropsCommaPathsAndOps(t *testing.T) {
 	if !ret.Star || ret.Limit != 2 {
 		t.Fatalf("return: %+v", ret)
 	}
-	// 大小写不敏感关键词
+	// case-insensitive keywords
 	if _, err := Parse(`match (a) where a.x = 1 return a limit 3`); err != nil {
 		t.Fatalf("lowercase keywords: %v", err)
 	}
@@ -116,21 +116,21 @@ func TestParsePropsCommaPathsAndOps(t *testing.T) {
 func TestParseErrors(t *testing.T) {
 	cases := []struct {
 		src  string
-		want string // 错误信息子串
+		want string // expected error-message substring
 	}{
 		{"MATCH (a RETURN a", `expected ")"`},
 		{"MATCH (a) RETURN b", `variable "b" is not declared`},
-		{"MATCH (a) RETURN a WHERE b.x = 1", "expected end of input"}, // WHERE 在 RETURN 后
+		{"MATCH (a) RETURN a WHERE b.x = 1", "expected end of input"}, // WHERE after RETURN
 		{"MATCH (a)-[r:X*1..2]->(b) RETURN r", "variable-length edge"},
 		{"MATCH (a)-[r:X*1..2]->(b) WHERE r.y = 1 RETURN b", "variable-length edge"},
-		{"MATCH (a) RETURN a ORDER BY b.x", "is not declared"}, // ORDER BY 引用未声明变量
+		{"MATCH (a) RETURN a ORDER BY b.x", "is not declared"}, // ORDER BY references an undeclared variable
 		{"MATCH () RETURN *", "no named variables"},
-		{"MATCH (a) WHERE a.x = RETURN a", "expected"}, // 右操作数缺失
-		{"MATCH (a) WHERE = 1 RETURN a", "expected"},   // 左操作数非法
+		{"MATCH (a) WHERE a.x = RETURN a", "expected"}, // missing right operand
+		{"MATCH (a) WHERE = 1 RETURN a", "expected"},   // illegal left operand
 		{"MATCH (a) RETURN a LIMIT -", "expected number"},
-		{"MATCH (a)", `expected RETURN, got end of input`}, // RETURN 缺失
+		{"MATCH (a)", `expected RETURN, got end of input`}, // RETURN missing
 		{"MATCH (a) WHERE a.x = 1", `expected RETURN, got end of input`},
-		{"MATCH (a) LIMIT 1", `expected RETURN, got "LIMIT"`}, // 子句位置的非 RETURN 关键字
+		{"MATCH (a) LIMIT 1", `expected RETURN, got "LIMIT"`}, // non-RETURN keyword at clause position
 	}
 	for _, c := range cases {
 		_, err := Parse(c.src)

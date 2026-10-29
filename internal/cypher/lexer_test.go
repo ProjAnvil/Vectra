@@ -21,7 +21,7 @@ func TestLexSnippets(t *testing.T) {
 		{"a.x <> 3", []Token{tk(TIdent, "a"), tk(TDot, "."), tk(TIdent, "x"), tk(TNe, "<>"), tk(TNumber, "3")}},
 		{"w >= 2 AND w <= 4 OR w = 5", []Token{tk(TIdent, "w"), tk(TGe, ">="), tk(TNumber, "2"), tk(TIdent, "AND"), tk(TIdent, "w"), tk(TLe, "<="), tk(TNumber, "4"), tk(TIdent, "OR"), tk(TIdent, "w"), tk(TEq, "="), tk(TNumber, "5")}},
 		{"{type: 'controller', n: 3}", []Token{tk(TBraceL, "{"), tk(TIdent, "type"), tk(TColon, ":"), tk(TString, "controller"), tk(TComma, ","), tk(TIdent, "n"), tk(TColon, ":"), tk(TNumber, "3"), tk(TBraceR, "}")}},
-		{"match RETURN", []Token{tk(TIdent, "match"), tk(TIdent, "RETURN")}}, // 关键词大小写不敏感，原文保留
+		{"match RETURN", []Token{tk(TIdent, "match"), tk(TIdent, "RETURN")}}, // keywords are case-insensitive, raw text preserved
 		{"// comment\nMATCH", []Token{tk(TIdent, "MATCH")}},
 	}
 	for _, c := range cases {
@@ -46,7 +46,7 @@ func TestLexPositionsAndErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if toks[3].Line != 2 || toks[3].Col != 1 || toks[3].Kind != TMinus { // ( a ) 换行后 - b：'-' 是第 4 个 token
+	if toks[3].Line != 2 || toks[3].Col != 1 || toks[3].Kind != TMinus { // "( a ) newline - b": '-' is the 4th token
 		t.Fatalf("line/col: %+v", toks[3])
 	}
 	if _, err := Lex("(a) @"); err == nil {

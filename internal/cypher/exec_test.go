@@ -10,14 +10,14 @@ import (
 	"github.com/projanvil/vectra/internal/engine"
 )
 
-// fixture 图（LabelID: CALLS=0, USES=1）：
+// fixture graph (LabelID: CALLS=0, USES=1):
 //
 //	gw(controller,prod,w5) ──CALLS──> order(service,prod,w3) ──USES──> store(store,w2)
 //	│                                   │      ↑                        │
-//	└──CALLS──> pay(service,dev,w7) <───┘ CALLS×2 (weight 3,1 并行)     │
-//	             │   pay ──CALLS──> order（成环）                       │
-//	             └──USES──────────────────────────────────────> store <┘? (见下方边表)
-//	store ──CALLS──> gw（成环，供变长深度测试）
+//	└──CALLS──> pay(service,dev,w7) <───┘ CALLS×2 (weight 3,1 parallel)  │
+//	             │   pay ──CALLS──> order (cycle)                        │
+//	             └──USES──────────────────────────────────────> store <┘? (see the edge table below)
+//	store ──CALLS──> gw (cycle, for var-length depth tests)
 func execSnap(t *testing.T) *engine.Snapshot {
 	t.Helper()
 	nodes := []engine.NodeRec{
@@ -33,8 +33,8 @@ func execSnap(t *testing.T) *engine.Snapshot {
 		{Src: 1, Dst: 3, LabelID: USES},
 		{Src: 2, Dst: 3, LabelID: USES},
 		{Src: 3, Dst: 0, LabelID: CALLS},
-		{Src: 1, Dst: 2, LabelID: CALLS, Props: map[string]any{"weight": 3}}, // 并行边 1
-		{Src: 1, Dst: 2, LabelID: CALLS, Props: map[string]any{"weight": 1}}, // 并行边 2
+		{Src: 1, Dst: 2, LabelID: CALLS, Props: map[string]any{"weight": 3}}, // parallel edge 1
+		{Src: 1, Dst: 2, LabelID: CALLS, Props: map[string]any{"weight": 1}}, // parallel edge 2
 		{Src: 2, Dst: 1, LabelID: CALLS},
 	}
 	s, err := engine.Seal(nodes, edges, []string{"CALLS", "USES"}, []string{"type", "env", "w"}, nil)
@@ -53,7 +53,7 @@ func run(t *testing.T, q string) *Result {
 	return res
 }
 
-// keysOf 提取每行 name 列的字符串值（用于断言）。
+// keysOf extracts each row's string value of the name column (for assertions).
 func keysOf(res *Result, name string) []string {
 	var out []string
 	for _, r := range res.Rows {
@@ -86,15 +86,15 @@ func sameSet(got []string, want ...string) bool {
 }
 
 func TestExecAnchorIndexedAndFallback(t *testing.T) {
-	res := run(t, `MATCH (a {type:'controller'}) RETURN a.key`) // 命中索引
+	res := run(t, `MATCH (a {type:'controller'}) RETURN a.key`) // hits the index
 	if k := keysOf(res, "a.key"); len(k) != 1 || k[0] != "gw" {
 		t.Fatalf("indexed anchor: %v", k)
 	}
-	res = run(t, `MATCH (a {w:5}) RETURN a.key`) // w 已索引；等值数值锚定
+	res = run(t, `MATCH (a {w:5}) RETURN a.key`) // w is indexed; numeric equality anchor
 	if k := keysOf(res, "a.key"); len(k) != 1 || k[0] != "gw" {
 		t.Fatalf("numeric anchor: %v", k)
 	}
-	res = run(t, `MATCH (a {nosuch: 1}) RETURN a`) // 未注册 key → 全扫回退，无命中
+	res = run(t, `MATCH (a {nosuch: 1}) RETURN a`) // unregistered key → full-scan fallback, no hit
 	if len(res.Rows) != 0 {
 		t.Fatalf("unindexed fallback: %d rows", len(res.Rows))
 	}
@@ -108,12 +108,14 @@ func TestExecLabelAndPropFilter(t *testing.T) {
 }
 
 func TestExecChainAndDedup(t *testing.T) {
-	// b 具名：经 order 与经 pay 两条路径绑定不同 → 两行（Cypher 行语义）
+	// b named: the via-order and via-pay paths bind it differently → two
+	// rows (Cypher row semantics)
 	res := run(t, `MATCH (a {type:'controller'})-[:CALLS]->(b)-[:USES]->(c) RETURN a.key, c.key`)
 	if len(res.Rows) != 2 {
 		t.Fatalf("named b: %d rows %+v", len(res.Rows), res.Rows)
 	}
-	// b 匿名：行身份 = 具名绑定 + 终点 → 两条路径终点都是 store → 去重为一行
+	// b anonymous: row identity = named bindings + endpoint → both paths
+	// end at store → dedup to one row
 	res = run(t, `MATCH (a {type:'controller'})-[:CALLS]->()-[:USES]->(c) RETURN a.key, c.key`)
 	if len(res.Rows) != 1 {
 		t.Fatalf("anonymous dedup: %d rows %+v", len(res.Rows), res.Rows)
@@ -121,15 +123,15 @@ func TestExecChainAndDedup(t *testing.T) {
 }
 
 func TestExecDirections(t *testing.T) {
-	res := run(t, `MATCH (b {type:'service'})<-[:CALLS]-(a) RETURN a.key`) // b 区分绑定 → 4 行
+	res := run(t, `MATCH (b {type:'service'})<-[:CALLS]-(a) RETURN a.key`) // b distinguishes bindings → 4 rows
 	if k := keysOf(res, "a.key"); !sameSet(k, "gw", "pay", "gw", "order") {
 		t.Fatalf("reverse: %v", k)
 	}
-	res = run(t, `MATCH (a {key:'store'})--(b) RETURN b.key`) // 双向：gw + order + pay
+	res = run(t, `MATCH (a {key:'store'})--(b) RETURN b.key`) // undirected: gw + order + pay
 	if k := keysOf(res, "b.key"); !sameSet(k, "gw", "order", "pay") {
 		t.Fatalf("undirected: %v", k)
 	}
-	res = run(t, `MATCH (a {key:'gw'})-[:CALLS|USES]->(b) RETURN b.key`) // label 掩码并集
+	res = run(t, `MATCH (a {key:'gw'})-[:CALLS|USES]->(b) RETURN b.key`) // label-mask union
 	if k := keysOf(res, "b.key"); !sameSet(k, "order", "pay") {
 		t.Fatalf("label alternation: %v", k)
 	}
@@ -137,7 +139,7 @@ func TestExecDirections(t *testing.T) {
 
 func TestExecEdgeVarParallelEdges(t *testing.T) {
 	res := run(t, `MATCH (a {key:'order'})-[e:CALLS]->(b) RETURN e, b.key`)
-	if len(res.Rows) != 2 { // 并行边各一行
+	if len(res.Rows) != 2 { // one row per parallel edge
 		t.Fatalf("parallel rows: %d", len(res.Rows))
 	}
 	ids := map[any]bool{}
@@ -179,7 +181,7 @@ func TestExecCommaCartesianAndJoin(t *testing.T) {
 		t.Fatalf("cartesian: %d rows", len(res.Rows))
 	}
 	res = run(t, `MATCH (a)-[:CALLS]->(b), (b)-[:USES]->(c) RETURN a.key, b.key, c.key`)
-	// 共享 b join：gw→{order,pay}→store，加上 order↔pay 的 CALLS 环 → 4 行
+	// shared-b join: gw→{order,pay}→store, plus the order↔pay CALLS cycle → 4 rows
 	if len(res.Rows) != 4 {
 		t.Fatalf("join: %d rows %+v", len(res.Rows), res.Rows)
 	}
@@ -190,36 +192,40 @@ func TestExecVarLengthWindows(t *testing.T) {
 	if k := keysOf(res, "b.key"); !sameSet(k, "order", "pay") {
 		t.Fatalf("*1..2 CALLS: %v", k)
 	}
-	res = run(t, `MATCH (a {key:'gw'})-[*2..]->(b) RETURN b.key`) // 最短距离 d>=2：只有 store(2)；gw 自身 d=0 不匹配（D1 语义）
+	res = run(t, `MATCH (a {key:'gw'})-[*2..]->(b) RETURN b.key`) // shortest distance d>=2: only store(2); gw itself at d=0 does not match (D1 semantics)
 	if k := keysOf(res, "b.key"); !sameSet(k, "store") {
 		t.Fatalf("*2..: %v", k)
 	}
-	res = run(t, `MATCH (a {key:'gw'})-[*0..1]->(b) RETURN b.key`) // 含起点 d=0
+	res = run(t, `MATCH (a {key:'gw'})-[*0..1]->(b) RETURN b.key`) // includes the start at d=0
 	if k := keysOf(res, "b.key"); !sameSet(k, "gw", "order", "pay") {
 		t.Fatalf("*0..1: %v", k)
 	}
-	res = run(t, `MATCH (a {key:'gw'})-[:CALLS*]->(b) RETURN b.key`) // 无界=经 CALLS 可达
+	res = run(t, `MATCH (a {key:'gw'})-[:CALLS*]->(b) RETURN b.key`) // unbounded = reachable via CALLS
 	if k := keysOf(res, "b.key"); !sameSet(k, "order", "pay") {
 		t.Fatalf("*: %v", k)
 	}
-	// *2 = 最短距离恰好为 2：经 CALLS 的目标最短距离都是 1（环路带来的"长度 2 的路径"不算，D1 最短距离语义）→ 0 行
+	// *2 = shortest distance exactly 2: every CALLS target sits at shortest
+	// distance 1 (the "length-2 path" through the cycle does not count, D1
+	// shortest-distance semantics) → 0 rows
 	res = run(t, `MATCH (a {key:'gw'})-[:CALLS*2]->(b) RETURN b.key`)
 	if k := keysOf(res, "b.key"); len(k) != 0 {
 		t.Fatalf("*2: %v", k)
 	}
-	res = run(t, `MATCH (a {key:'gw'})-[*2]->(b) RETURN b.key`) // 全 label：store 最短距离恰为 2
+	res = run(t, `MATCH (a {key:'gw'})-[*2]->(b) RETURN b.key`) // all labels: store sits at shortest distance exactly 2
 	if k := keysOf(res, "b.key"); !sameSet(k, "store") {
 		t.Fatalf("*2 all-labels: %v", k)
 	}
 }
 
 func TestExecVarLengthIntermediatesNotFiltered(t *testing.T) {
-	// 中间节点 order/pay 不是 Store，但 2 跳端点 store 命中 —— 变长段中间节点不施加目标谓词
+	// the intermediate nodes order/pay are not Stores, but the 2-hop
+	// endpoint store hits — intermediates of a var-length segment take no
+	// target predicate
 	res := run(t, `MATCH (a {key:'gw'})-[:CALLS|USES*2]->(b:Store) RETURN b.key`)
 	if k := keysOf(res, "b.key"); len(k) != 1 || k[0] != "store" {
 		t.Fatalf("intermediate unfiltered: %v", k)
 	}
-	// 对照：定长 1 跳直接邻居没有 Store
+	// control: the fixed 1-hop direct neighbors contain no Store
 	res = run(t, `MATCH (a {key:'gw'})-[:CALLS|USES]->(b:Store) RETURN b.key`)
 	if len(res.Rows) != 0 {
 		t.Fatalf("fixed hop filtered: %d", len(res.Rows))
@@ -239,7 +245,7 @@ func TestExecWhereOperators(t *testing.T) {
 	if k := keysOf(res, "a.key"); !sameSet(k, "gw", "order") {
 		t.Fatalf("contains: %v", k)
 	}
-	res = run(t, `MATCH (a) WHERE a.env ENDS WITH 'v' RETURN a.key`) // 只有 "dev" 以 v 结尾（"prod" 也以 d 结尾）
+	res = run(t, `MATCH (a) WHERE a.env ENDS WITH 'v' RETURN a.key`) // only "dev" ends with v
 	if k := keysOf(res, "a.key"); len(k) != 1 || k[0] != "pay" {
 		t.Fatalf("ends: %v", k)
 	}
@@ -247,27 +253,27 @@ func TestExecWhereOperators(t *testing.T) {
 	if k := keysOf(res, "a.key"); len(k) != 1 || k[0] != "pay" {
 		t.Fatalf("in: %v", k)
 	}
-	res = run(t, `MATCH (a) WHERE a.label = 'Store' RETURN a.key`) // 伪属性 label
+	res = run(t, `MATCH (a) WHERE a.label = 'Store' RETURN a.key`) // pseudo-property label
 	if k := keysOf(res, "a.key"); len(k) != 1 || k[0] != "store" {
 		t.Fatalf("pseudo label: %v", k)
 	}
-	res = run(t, `MATCH (a) WHERE a.id = 2 RETURN a.key`) // 伪属性 id（数值）
+	res = run(t, `MATCH (a) WHERE a.id = 2 RETURN a.key`) // pseudo-property id (numeric)
 	if k := keysOf(res, "a.key"); len(k) != 1 || k[0] != "pay" {
 		t.Fatalf("pseudo id: %v", k)
 	}
-	// 边 props 谓词：并行边只有 weight=3 的那条满足 >=2
+	// edge-prop predicate: of the parallel edges only the weight=3 one satisfies >=2
 	res = run(t, `MATCH (a {key:'order'})-[e:CALLS]->(b) WHERE e.weight >= 2 RETURN b.key`)
 	if len(res.Rows) != 1 {
 		t.Fatalf("edge props: %d rows", len(res.Rows))
 	}
-	// null 简化：缺失属性的比较为假，NOT 不救活
+	// null simplification: a comparison over a missing property is false, NOT does not rescue it
 	if res := run(t, `MATCH (a) WHERE a.missing = 1 RETURN a.key`); len(res.Rows) != 0 {
 		t.Fatalf("missing prop: %d", len(res.Rows))
 	}
 	if res := run(t, `MATCH (a) WHERE NOT a.missing = 1 RETURN a.key`); len(res.Rows) != 0 {
 		t.Fatalf("NOT must not rescue null: %d", len(res.Rows))
 	}
-	// 优先级：AND 高于 OR
+	// precedence: AND binds tighter than OR
 	res = run(t, `MATCH (a) WHERE a.env = 'prod' AND a.w > 4 OR a.type = 'store' RETURN a.key`)
 	if k := keysOf(res, "a.key"); !sameSet(k, "gw", "store") {
 		t.Fatalf("precedence: %v", k)
@@ -283,12 +289,12 @@ func TestExecProjectionOrderLimit(t *testing.T) {
 	if k := keysOf(res, "a.key"); len(k) != 3 || k[0] != "order" || k[2] != "pay" {
 		t.Fatalf("order asc: %v", k)
 	}
-	// ORDER BY 可引用不在 RETURN 中的 var.prop（贴近 Cypher）
+	// ORDER BY may reference a var.prop absent from RETURN (close to Cypher)
 	res = run(t, `MATCH (a:Service) RETURN a.key ORDER BY a.w DESC`)
 	if k := keysOf(res, "a.key"); k[0] != "pay" {
 		t.Fatalf("order by non-returned: %v", k)
 	}
-	// RETURN * 列序 = 声明序（含边变量）
+	// RETURN * column order = declaration order (edge variables included)
 	res = run(t, `MATCH (a {key:'gw'})-[e:CALLS]->(b) RETURN *`)
 	if len(res.Columns) != 3 || res.Columns[0] != "a" || res.Columns[2] != "b" {
 		t.Fatalf("star columns: %v", res.Columns)
@@ -348,9 +354,10 @@ func TestExecRowCap(t *testing.T) {
 	}
 }
 
-// renderRows 把结果按行序渲染成 "col=val" 串（保持结果顺序，供有序比较）；
-// rowSet 复制并排序，供多重集（顺序无关）比较 —— 变长展开经 map 迭代，
-// 行序按构造即不确定。
+// renderRows renders result rows in order as "col=val" strings (order
+// preserved, for ordered comparison); rowSet copies and sorts them for
+// multiset (order-insensitive) comparison — var-length expansion iterates
+// a map, so its row order is nondeterministic by construction.
 func renderRows(res *Result) []string {
 	out := make([]string, 0, len(res.Rows))
 	for _, r := range res.Rows {
@@ -460,8 +467,9 @@ func TestExecStageLoopDegenerateGoldens(t *testing.T) {
 	}
 }
 
-// TestExecRepeatedMatchCartesian: 第二个 MATCH 与第一个无共享变量 → 跨阶段笛卡尔积，
-// 结果多重集必须与逗号分隔的单 MATCH 写法完全一致（2 行：gw × {order,pay}）。
+// TestExecRepeatedMatchCartesian: the second MATCH shares no variable with
+// the first → a cross-stage cartesian product; the result multiset must
+// match the comma-separated single-MATCH form exactly (2 rows: gw × {order,pay}).
 func TestExecRepeatedMatchCartesian(t *testing.T) {
 	q := `MATCH (a {key:'gw'}) MATCH (b {type:'service'}) RETURN a.key, b.key`
 	res := run(t, q)
@@ -478,8 +486,9 @@ func TestExecRepeatedMatchCartesian(t *testing.T) {
 	}
 }
 
-// TestExecRepeatedMatchJoin: 共享变量跨阶段 join —— 语义与单 MATCH 逗号形式一致
-// （4 行），包括并行边去重后的行恒等。
+// TestExecRepeatedMatchJoin: a shared variable joins across stages — the
+// semantics match the single-MATCH comma form (4 rows), including row
+// identity after parallel-edge dedup.
 func TestExecRepeatedMatchJoin(t *testing.T) {
 	q := `MATCH (a)-[:CALLS]->(b) MATCH (b)-[:USES]->(c) RETURN a.key, b.key, c.key`
 	res := run(t, q)
@@ -502,11 +511,12 @@ func TestExecRepeatedMatchJoin(t *testing.T) {
 	}
 }
 
-// TestExecStageWhereAcrossStages: WHERE 可引用前一阶段绑定的变量（作用域链
-// 逐句累积），过滤器在整阶段行集上执行；第一个 MATCH 的 WHERE 在第二个
-// MATCH 之前裁剪行集。
+// TestExecStageWhereAcrossStages: WHERE may reference variables bound by
+// an earlier stage (the scope chain accumulates clause by clause); the
+// filter runs over the full stage row set, and the first MATCH's WHERE
+// prunes the rows before the second MATCH executes.
 func TestExecStageWhereAcrossStages(t *testing.T) {
-	// 服务 w：gw=5, order=3, pay=7 → b.w>a.w 的对：(gw,pay),(order,gw),(order,pay)
+	// Service w: gw=5, order=3, pay=7 → pairs with b.w>a.w: (gw,pay),(order,gw),(order,pay)
 	res := run(t, `MATCH (a:Service) MATCH (b:Service) WHERE b.w > a.w RETURN a.key, b.key`)
 	got := rowSet(renderRows(res))
 	want := []string{
@@ -518,8 +528,9 @@ func TestExecStageWhereAcrossStages(t *testing.T) {
 		t.Fatalf("WHERE across stages:\n got  %v\n want %v", got, want)
 	}
 
-	// 阶段间过滤：第一个 MATCH 的 WHERE 先裁到 prod 服务 {gw,order}，
-	// 第二个 MATCH 笛卡尔展开 USES 出边 {order,pay}→store → 2×2=4 行。
+	// Cross-stage filtering: the first MATCH's WHERE prunes to the prod
+	// services {gw,order}; the second MATCH cartesiates the USES out-edges
+	// {order,pay}→store → 2×2=4 rows.
 	res = run(t, `MATCH (a:Service) WHERE a.env = 'prod' MATCH (b)-[:USES]->(c) RETURN a.key, b.key, c.key`)
 	got = rowSet(renderRows(res))
 	want = []string{

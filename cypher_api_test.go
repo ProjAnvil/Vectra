@@ -28,7 +28,7 @@ func TestCypherFacadeEndToEnd(t *testing.T) {
 		t.Fatalf("rows: %+v", res.Rows)
 	}
 
-	// var 值投影为公有 Node/Edge 类型
+	// var values project as the public Node/Edge types
 	res, err = g.Cypher(`MATCH (a {type:'controller'}) RETURN a`)
 	if err != nil {
 		t.Fatal(err)
@@ -38,7 +38,7 @@ func TestCypherFacadeEndToEnd(t *testing.T) {
 		t.Fatalf("node value: %#v", res.Rows[0]["a"])
 	}
 
-	// 数值谓词 + 伪属性
+	// numeric predicate + pseudo-property
 	res, err = g.Cypher(`MATCH (s:Service) WHERE s.w > 4 AND s.label = 'Service' RETURN s.key`)
 	if err != nil {
 		t.Fatal(err)
@@ -47,7 +47,7 @@ func TestCypherFacadeEndToEnd(t *testing.T) {
 		t.Fatalf("where: %+v", res.Rows)
 	}
 
-	// 未 Seal 合法（门已溶解）：对空 base 作答（遍历族 base-only，Task 4 收口）
+	// un-Sealed is legal (the gate dissolved): answers over the empty base (the traversal family is base-only, the Task 4 closure)
 	res2, err := New().Cypher(`MATCH (a) RETURN a`)
 	if err != nil {
 		t.Fatalf("unsealed: %v", err)
@@ -56,7 +56,7 @@ func TestCypherFacadeEndToEnd(t *testing.T) {
 		t.Fatalf("unsealed rows = %d, want 0 (empty base)", len(res2.Rows))
 	}
 
-	// 解析/语义错误是定位的 CypherError
+	// parse/semantic errors are positioned CypherErrors
 	_, err = g.Cypher(`MATCH (a) RETURN b`)
 	var ce *CypherError
 	if !errors.As(err, &ce) || ce.Line != 1 {
