@@ -15,6 +15,7 @@ import urllib.request
 from typing import Any, Mapping, Optional
 
 from .errors import (
+    TxnConflictError,
     VectraAuthError,
     VectraConflictError,
     VectraError,
@@ -27,7 +28,8 @@ class Client:
 
     Args:
         base_url: server base URL; defaults to ``$VECTRA_URL`` then
-            ``http://127.0.0.1:8080``.
+            ``http://127.0.0.1:8080`` (both whitespace-stripped, trailing
+            slash dropped).
         token: bearer token; defaults to ``$VECTRA_TOKEN`` (stripped —
             copy-pasted tokens often carry a trailing newline that would
             otherwise guarantee a 401). The Authorization header is only
@@ -43,7 +45,7 @@ class Client:
     ) -> None:
         self.base_url = (
             base_url or os.environ.get("VECTRA_URL", "http://127.0.0.1:8080")
-        ).rstrip("/")
+        ).strip().rstrip("/")
         if token is None:
             token = os.environ.get("VECTRA_TOKEN", "")
         self.token = token.strip()
@@ -96,20 +98,45 @@ class Client:
 
     @staticmethod
     def _typed_error(exc: urllib.error.HTTPError) -> VectraError:
-        """Decode the {"error": {"code", "message"}} envelope and pick the
-        exception class by HTTP status: 401/403 -> Auth, 404 -> NotFound,
-        409 -> Conflict, anything else -> base VectraError."""
+        """Decode the response body and pick the exception class.
+
+        The ``{"error": {"code", "message"}}`` envelope maps by HTTP status:
+        401/403 -> Auth, 404 -> NotFound, 409 -> Conflict, anything else ->
+        base VectraError. One documented deviation: a 409 whose body is the
+        txn conflict *report* (``committed``/``conflicts`` keys, no
+        envelope — server/api.go handleTxn) becomes
+        :class:`TxnConflictError` carrying the conflict fields.
+        """
         code = ""
         message = str(exc.reason)
+        payload = None
         try:
             payload = json.loads(exc.read().decode("utf-8"))
-            envelope = payload.get("error") or {}
-            code = str(envelope.get("code", ""))
-            server_message = str(envelope.get("message", ""))
-            if server_message:
-                message = server_message
-        except (ValueError, AttributeError):
+        except (ValueError, OSError):
             pass
+        if isinstance(payload, dict):
+            envelope = payload.get("error")
+            if isinstance(envelope, dict):
+                code = str(envelope.get("code", ""))
+                server_message = str(envelope.get("message", ""))
+                if server_message:
+                    message = server_message
+        if (
+            exc.code == 409
+            and not code
+            and isinstance(payload, dict)
+            and "committed" in payload
+            and "conflicts" in payload
+        ):
+            hint = str(payload.get("hint", ""))
+            conflicts = payload.get("conflicts") or []
+            message = "transaction conflict" + (": " + hint if hint else "")
+            return TxnConflictError(
+                message,
+                conflicts=[str(c) for c in conflicts],
+                conflict_total=int(payload.get("conflictTotal", len(conflicts))),
+                hint=hint,
+            )
         if exc.code in (401, 403):
             return VectraAuthError(message, exc.code, code)
         if exc.code == 404:
@@ -121,7 +148,12 @@ class Client:
     # ---- reads ----------------------------------------------------------
 
     def health(self) -> dict:
-        """GET /v1/health — liveness plus leader/term (no readiness gate)."""
+        """GET /v1/health — liveness plus leader/term.
+
+        Gated on the FSM's first raft publish (503 "starting" before it,
+        i.e. before the first write); :meth:`await_seq` is the endpoint
+        with no readiness gate.
+        """
         return self._request("GET", "/v1/health")
 
     def stats(self) -> dict:
@@ -210,6 +242,58 @@ class Client:
             },
         )
 
+    def txn(
+        self,
+        nodes: Optional[list] = None,
+        edges: Optional[list] = None,
+        edge_deletes: Optional[list] = None,
+        node_deletes: Optional[list] = None,
+        snapshot: int = 0,
+        ser: bool = False,
+        read_nodes: Optional[list] = None,
+        read_edges: Optional[list] = None,
+    ) -> dict:
+        """POST /v1/txn — optimistic-concurrency (OCC) transactional commit.
+
+        Item shapes and fixed apply order match :meth:`batch`; the extra
+        ``txn`` guard carries the snapshot token the caller's reads were
+        based on (a raft log index — take it from
+        ``stats()["publishedSeq"]`` or ``Client.last_snapshot``, refreshed
+        by every read/await) plus an optional SER read set.
+
+        Validation always covers the batch's own write set: a key written
+        by a raft entry newer than ``snapshot`` rejects the whole commit.
+        With ``ser=True`` the read set is validated the same way —
+        ``read_nodes`` are node keys, ``read_edges`` are
+        ``{"src", "dst", "label"}`` dicts. ``snapshot=0`` means "read at
+        epoch 0" and conflicts with any prior write to the same keys, so
+        always pass a real snapshot (fresh never-written keys commit fine
+        at 0).
+
+        A rejected commit raises :class:`TxnConflictError` — the txn 409
+        body is a conflict report, not an error envelope — exposing
+        ``conflicts``/``conflict_total``/``hint``; refresh the snapshot and
+        retry. A commit returns ``{"committed": True, "index",
+        "nodesApplied", "edgesApplied", "edgesSkipped", "edgesDeleted",
+        "nodesDeleted", "nodesSkipped"}``.
+        """
+        guard: dict = {"snapshot": int(snapshot), "ser": bool(ser)}
+        if read_nodes:
+            guard["readNodes"] = list(read_nodes)
+        if read_edges:
+            guard["readEdges"] = list(read_edges)
+        return self._request(
+            "POST",
+            "/v1/txn",
+            body={
+                "nodes": nodes or [],
+                "edges": edges or [],
+                "edgeDeletes": edge_deletes or [],
+                "nodeDeletes": node_deletes or [],
+                "txn": guard,
+            },
+        )
+
     def await_seq(self, seq: int, timeout_ms: int = 5000) -> dict:
         """GET /v1/await — read-your-writes long poll.
 
@@ -226,3 +310,106 @@ class Client:
             params={"seq": seq, "timeoutMs": timeout_ms},
             timeout=effective_timeout,
         )
+
+    # ---- vector indexes + index DDL -------------------------------------
+
+    def vector_search(
+        self,
+        index: str,
+        *,
+        query_vector: Optional[list] = None,
+        similar_to: str = "",
+        k: int = 10,
+        ef: int = 0,
+        label: str = "",
+    ) -> dict:
+        """POST /v1/vector/search — approximate top-k over a declared index.
+
+        Exactly one of ``query_vector`` (dim must match the declaration;
+        enforced client-side as ValueError, matching the server's 400) or
+        ``similar_to`` (a node key holding a valid vector on the indexed
+        prop). Returns ``{"count", "hits"}`` with hits of
+        ``{"key", "score"}`` — smaller score is better. ``ef`` 0 takes the
+        server's adaptive default; ``label`` filters hits by node label.
+        Unknown index raises VectraNotFoundError (VECTOR_INDEX_NOT_FOUND).
+        """
+        if (query_vector is None) == (not similar_to):
+            raise ValueError("provide exactly one of query_vector or similar_to")
+        body: dict = {"index": index, "k": int(k)}
+        if query_vector is not None:
+            body["query_vector"] = [float(x) for x in query_vector]
+        else:
+            body["similar_to"] = similar_to
+        if ef:
+            body["ef"] = int(ef)
+        if label:
+            body["label"] = label
+        return self._request("POST", "/v1/vector/search", body=body)
+
+    def vector_create_index(
+        self,
+        name: str,
+        prop: str,
+        dim: int,
+        metric: str = "cosine",
+        m: int = 0,
+        ef_construction: int = 0,
+    ) -> dict:
+        """POST /v1/vector/indexes — declare a vector index (raft write).
+
+        ``metric`` is one of ``cosine``/``l2``/``dot``; ``dim`` 1..4096;
+        zero ``m``/``ef_construction`` take the engine defaults (16/200).
+        A duplicate name raises VectraConflictError with the server's
+        envelope code ``VECTOR_INDEX_EXISTS``; a bad metric/dim raises
+        VectraError 400 ``VALIDATION``. Returns ``{"index": {...}}`` —
+        the declaration reaches reads once published (await the seq
+        bumped by this raft entry when in doubt).
+        """
+        body: dict = {
+            "name": name,
+            "prop": prop,
+            "dim": int(dim),
+            "metric": metric,
+        }
+        if m:
+            body["m"] = int(m)
+        if ef_construction:
+            body["efConstruction"] = int(ef_construction)
+        return self._request("POST", "/v1/vector/indexes", body=body)
+
+    def vector_list_indexes(self) -> list:
+        """GET /v1/vector/indexes — declared vector indexes.
+
+        Each entry carries ``name``/``prop``/``dim``/``metric``/``m``/
+        ``efConstruction``. Served from the published clone.
+        """
+        return self._request("GET", "/v1/vector/indexes")["indexes"]
+
+    def vector_drop_index(self, name: str) -> None:
+        """DELETE /v1/vector/indexes/{name} — drop a declaration.
+
+        Raft write; returns None on success. Dropping an unknown name
+        raises VectraNotFoundError (VECTOR_INDEX_NOT_FOUND).
+        """
+        quoted = urllib.parse.quote(name, safe="")
+        self._request("DELETE", "/v1/vector/indexes/" + quoted)
+
+    def index_property(self, prop: str) -> dict:
+        """Cypher ``CREATE INDEX ON (n.prop)`` — declare a typed index.
+
+        Declarations are global per property key (label-scoped spellings
+        are rejected by the engine) and PENDING until the next
+        Seal/publish — typed lookups answer via compensation scan until
+        the declaration merges, then serve from the index. Idempotent:
+        re-declaring still counts one ``summary.indexesCreated``. Returns
+        the cypher write response; check ``summary.indexesCreated == 1``.
+        """
+        return self.cypher("CREATE INDEX ON (n.%s)" % prop)
+
+    def index_full_text(self, prop: str) -> dict:
+        """Cypher ``CREATE FULLTEXT INDEX ON (n.prop)`` — declare an FTS index.
+
+        Same declaration contract as :meth:`index_property`: pending until
+        the next Seal, idempotent, counted in ``summary.indexesCreated``.
+        """
+        return self.cypher("CREATE FULLTEXT INDEX ON (n.%s)" % prop)

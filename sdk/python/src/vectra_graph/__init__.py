@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .client import Client
 from .errors import (
+    TxnConflictError,
     VectraAuthError,
     VectraConflictError,
     VectraError,
@@ -15,5 +16,6 @@ __all__ = [
     "VectraError",
     "VectraNotFoundError",
     "VectraConflictError",
+    "TxnConflictError",
     "VectraAuthError",
 ]

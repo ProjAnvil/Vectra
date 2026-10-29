@@ -76,6 +76,17 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
+def _first_token_line(path: str) -> str:
+    """First non-blank trimmed line of a token file (the server's loader
+    accepts one token per line; the fixture uses the first for bootstrap)."""
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                return line
+    return ""
+
+
 class ServerFixture:
     """One single-node vectra-server bound to a free port and a temp dir.
 
@@ -83,11 +94,20 @@ class ServerFixture:
     ``/v1/health`` until it returns 200 (deadline-bounded); ``__exit__``
     terminates (then kills) the process and removes the data dir even when
     the test failed. Empty ``-join`` boots a single-node raft cluster.
+    ``auth_token_file`` (optional) enables static bearer auth: the flag is
+    passed through, and the readiness bootstrap write presents the file's
+    first token (GET /v1/health stays open — the exempt probe route).
     """
 
-    def __init__(self, binary: str, ready_timeout: float = 30.0):
+    def __init__(self, binary: str, ready_timeout: float = 30.0,
+                 auth_token_file: str = None):
         self.binary = binary
         self.ready_timeout = ready_timeout
+        self.auth_token_file = auth_token_file
+        #: bearer token for the readiness bootstrap write ("" = auth off)
+        self.auth_token = (
+            _first_token_line(auth_token_file) if auth_token_file else ""
+        )
         self.url = ""
         self.port = 0
         self._proc = None
@@ -101,14 +121,17 @@ class ServerFixture:
         # to an unspecified IP, which hashicorp/raft rejects as "not
         # advertisable" — a dedicated free port keeps parallel runs safe too.
         raft_port = _free_port()
+        argv = [
+            self.binary,
+            "-id", "t1",
+            "-data", self._data_dir,
+            "-http", "127.0.0.1:%d" % self.port,
+            "-raft", "127.0.0.1:%d" % raft_port,
+        ]
+        if self.auth_token_file:
+            argv += ["-auth-token-file", self.auth_token_file]
         self._proc = subprocess.Popen(
-            [
-                self.binary,
-                "-id", "t1",
-                "-data", self._data_dir,
-                "-http", "127.0.0.1:%d" % self.port,
-                "-raft", "127.0.0.1:%d" % raft_port,
-            ],
+            argv,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -132,12 +155,17 @@ class ServerFixture:
         /v1/health 200.
         """
         deadline = time.monotonic() + self.ready_timeout
+        headers = {"Content-Type": "application/json"}
+        if self.auth_token:
+            # auth gates every route but GET /v1/health; the bootstrap
+            # write must present a valid token or the FSM never publishes
+            headers["Authorization"] = "Bearer " + self.auth_token
         boot_request = urllib.request.Request(
             self.url + "/v1/batch",
             data=json.dumps(
                 {"nodes": [{"key": "__harness_boot__", "label": "System"}]}
             ).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         while time.monotonic() < deadline:
