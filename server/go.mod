@@ -7,6 +7,7 @@ require (
 	github.com/hashicorp/raft v1.8.0
 	github.com/hashicorp/raft-boltdb/v2 v2.4.2
 	github.com/projanvil/vectra v0.0.0
+	golang.org/x/term v0.47.0
 )
 
 require (
@@ -20,7 +21,6 @@ require (
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	go.etcd.io/bbolt v1.4.1 // indirect
 	golang.org/x/sys v0.49.0 // indirect
-	golang.org/x/term v0.47.0 // indirect
 )
 
 replace github.com/projanvil/vectra => ../
