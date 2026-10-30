@@ -29,6 +29,9 @@ func main() {
 	httpCert := flag.String("http-cert", "", "PEM cert file for the HTTPS API (empty = plain HTTP; requires -http-key)")
 	httpKey := flag.String("http-key", "", "PEM key file for the HTTPS API (requires -http-cert)")
 	httpClientCA := flag.String("http-client-ca", "", "PEM CA file; when set, clients must present a certificate (mTLS)")
+	nodeCert := flag.String("node-cert", "", "PEM cert file for raft node-to-node mTLS (empty = plain TCP; requires -node-key and -node-ca-cert)")
+	nodeKey := flag.String("node-key", "", "PEM key file for raft node-to-node mTLS (requires -node-cert)")
+	nodeCACert := flag.String("node-ca-cert", "", "PEM CA file for raft node-to-node mTLS: peers are verified against it and must verify us (requires -node-cert)")
 	sealInterval := flag.Duration("seal-interval", server.DefaultSealInterval, "publish throttle interval for large graphs")
 	flag.Parse()
 
@@ -47,6 +50,9 @@ func main() {
 		HTTPCert:      *httpCert,
 		HTTPKey:       *httpKey,
 		HTTPClientCA:  *httpClientCA,
+		NodeCert:      *nodeCert,
+		NodeKey:       *nodeKey,
+		NodeCACert:    *nodeCACert,
 		SealInterval:  *sealInterval,
 	})
 	if err != nil {
@@ -56,6 +62,9 @@ func main() {
 	banner := fmt.Sprintf("vectra-server %s http=%s raft=%s data=%s", *id, *httpAddr, *raftAddr, *dataDir)
 	if n.HTTPTLSConfig() != nil {
 		banner += " tls=http"
+	}
+	if *nodeCert != "" {
+		banner += " tls=raft"
 	}
 	fmt.Fprintln(os.Stderr, banner)
 

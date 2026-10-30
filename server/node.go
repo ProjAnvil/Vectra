@@ -20,6 +20,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,6 +56,9 @@ type Config struct {
 	HTTPCert      string // PEM cert file for the HTTP API; requires HTTPKey
 	HTTPKey       string // PEM key file for the HTTP API
 	HTTPClientCA  string // optional PEM CA; when set, clients must present a cert (mTLS)
+	NodeCert      string // PEM cert file for raft node-to-node mTLS; requires NodeKey+NodeCACert
+	NodeKey       string // PEM key file for raft node-to-node mTLS
+	NodeCACert    string // PEM CA file for raft node-to-node mTLS (verifies peers, signs our leaf)
 	SealInterval  time.Duration
 	LogStore      raft.LogStore
 	StableStore   raft.StableStore
@@ -139,6 +143,32 @@ func New(cfg Config) (*Node, error) {
 		// honoring it by serving plaintext would be the silent fallback.
 		return nil, errors.New("server: HTTPClientCA requires HTTPCert and HTTPKey")
 	}
+	// Node TLS (raft plane): same fail-fast, all-or-nothing contract. All
+	// three fields empty keeps the plain-TCP transport path unchanged.
+	var nodeTLS *tls.Config
+	switch {
+	case cfg.NodeCert != "" && cfg.NodeKey != "" && cfg.NodeCACert != "":
+		c, err := buildNodeTLSConfig(cfg.NodeCert, cfg.NodeKey, cfg.NodeCACert)
+		if err != nil {
+			return nil, err
+		}
+		nodeTLS = c
+	case cfg.NodeCert == "" && cfg.NodeKey == "" && cfg.NodeCACert == "":
+		// No node TLS: plain TCP raft transport (legacy path).
+	default:
+		var missing []string
+		if cfg.NodeCert == "" {
+			missing = append(missing, "NodeCert")
+		}
+		if cfg.NodeKey == "" {
+			missing = append(missing, "NodeKey")
+		}
+		if cfg.NodeCACert == "" {
+			missing = append(missing, "NodeCACert")
+		}
+		return nil, fmt.Errorf("server: node TLS is all-or-nothing, missing %s (cert=%q key=%q ca=%q)",
+			strings.Join(missing, ", "), cfg.NodeCert, cfg.NodeKey, cfg.NodeCACert)
+	}
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -176,15 +206,25 @@ func New(cfg Config) (*Node, error) {
 		}
 	}
 	if cfg.Transport == nil {
-		addr, err := net.ResolveTCPAddr("tcp", cfg.RaftAddr)
-		if err != nil {
-			n.Close()
-			return nil, err
-		}
-		cfg.Transport, err = raft.NewTCPTransport(cfg.RaftAddr, addr, 3, 10*time.Second, os.Stderr)
-		if err != nil {
-			n.Close()
-			return nil, err
+		if nodeTLS != nil {
+			// Raft plane mTLS: TLS listener + peer dials (same pool/timeout
+			// numbers as the TCP default below).
+			cfg.Transport, err = newTLSTransport(cfg.RaftAddr, nodeTLS)
+			if err != nil {
+				n.Close()
+				return nil, err
+			}
+		} else {
+			addr, err := net.ResolveTCPAddr("tcp", cfg.RaftAddr)
+			if err != nil {
+				n.Close()
+				return nil, err
+			}
+			cfg.Transport, err = raft.NewTCPTransport(cfg.RaftAddr, addr, 3, 10*time.Second, os.Stderr)
+			if err != nil {
+				n.Close()
+				return nil, err
+			}
 		}
 	}
 	n.trans = cfg.Transport
