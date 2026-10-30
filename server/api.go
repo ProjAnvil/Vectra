@@ -73,6 +73,7 @@ func (n *Node) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/health", n.handleHealth)
 	mux.HandleFunc("GET /v1/stats", n.handleStats)
 	mux.HandleFunc("GET /v1/await", n.handleAwait)
+	mux.HandleFunc("GET /v1/backup", n.handleBackup)
 	mux.HandleFunc("GET /v1/nodes/{key}", n.handleNode)
 	mux.HandleFunc("GET /v1/neighbors", n.handleNeighbors)
 	mux.HandleFunc("POST /v1/query", n.handleQuery)
