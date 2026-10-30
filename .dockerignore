@@ -1,0 +1,11 @@
+# Mirrors .gitignore plus build-context-only exclusions (.git, docs/).
+.git
+benchdata/
+bin/
+node_modules/
+dist/
+dist-test/
+__pycache__/
+*.test
+.worktrees/
+docs/
