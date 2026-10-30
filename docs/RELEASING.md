@@ -172,11 +172,12 @@ Run it before tagging a release, and after any change to the module
 layout:
 
 ```sh
-make goget-smoke                  # VERSION defaults to 0.15.0
+make goget-smoke                  # VERSION defaults to the Makefile's
+                                  # explicit 0.15.0 pin
 make goget-smoke VERSION=0.16.0   # explicit
 scripts/goget-smoke.sh 0.16.0     # without make; with no argument the
-                                  # version is a minor bump of the top
-                                  # CHANGELOG version (0.14.0 -> 0.15.0)
+                                  # version defaults to the minor bump of
+                                  # the top CHANGELOG version at run time
 ```
 
 Every step prints PASS or FAIL and the script exits non-zero on the first

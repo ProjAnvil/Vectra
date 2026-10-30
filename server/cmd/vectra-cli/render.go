@@ -22,7 +22,12 @@ func formatValue(v any) string {
 	case bool:
 		return strconv.FormatBool(t)
 	case float64:
-		if math.Trunc(t) == t {
+		// Integral values render without a decimal point — but only when
+		// they fit int64. Outside that range (1e300) the float-to-int
+		// conversion is implementation-defined garbage, so fall through to
+		// %g. The upper bound must be strict: math.MaxInt64 rounds up to
+		// 2^63 as a float64, which does not fit.
+		if math.Trunc(t) == t && t >= math.MinInt64 && t < math.MaxInt64 {
 			return strconv.FormatInt(int64(t), 10)
 		}
 		return strconv.FormatFloat(t, 'g', -1, 64)

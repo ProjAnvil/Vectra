@@ -17,8 +17,8 @@
 #
 # Usage:
 #   scripts/goget-smoke.sh [VERSION]   # default: minor bump of the top
-#                                      # CHANGELOG version (0.14.0 -> 0.15.0)
-#   make goget-smoke [VERSION=0.15.0]
+#                                      # CHANGELOG version at run time
+#   make goget-smoke [VERSION=0.15.0]  # make pins its own explicit default
 #
 # Safety: everything lives under one mktemp -d removed on exit; no global
 # git config is touched (the insteadOf rewrite is injected per git process

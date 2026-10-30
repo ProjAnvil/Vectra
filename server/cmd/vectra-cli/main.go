@@ -94,7 +94,9 @@ func run() int {
 }
 
 // runOneShot executes a single statement (with the same cleanup the REPL
-// applies) and renders it: 0 on success, 1 on an execution error.
+// applies) and renders it: 0 on success, 1 on an execution error. Unlike
+// the REPL, execution errors go to stderr, keeping stdout data-only for
+// scripted use (`vectra-cli -c ... >out 2>err`).
 func runOneShot(query string, c *cypherClient, timeout time.Duration) int {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -102,7 +104,7 @@ func runOneShot(query string, c *cypherClient, timeout time.Duration) int {
 	if stmt == "" {
 		return 0
 	}
-	if err := execute(ctx, c, stmt, os.Stdout); err != nil {
+	if err := execute(ctx, c, stmt, os.Stdout, os.Stderr); err != nil {
 		return 1
 	}
 	return 0

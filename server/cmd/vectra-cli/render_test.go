@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"math"
 	"testing"
 )
 
@@ -20,6 +21,16 @@ func TestFormatValue(t *testing.T) {
 		{float64(0), "0"},
 		{float64(3.5), "3.5"},
 		{float64(-0.25), "-0.25"},
+		// Integral floats outside int64 range must render via %g, not the
+		// implementation-defined int64 conversion (amd64 yields
+		// -9223372036854775808 for 1e300).
+		{1e300, "1e+300"},
+		{-1e300, "-1e+300"},
+		// Boundaries: MinInt64 is exactly representable and still formats
+		// as an integer; MaxInt64 rounds up to 2^63 as a float64, which no
+		// longer fits, so it takes the %g path.
+		{float64(math.MinInt64), "-9223372036854775808"},
+		{float64(math.MaxInt64), "9.223372036854776e+18"},
 		{[]any{float64(1), float64(2)}, "[1,2]"},
 		{map[string]any{"key": "v"}, `{"key":"v"}`},
 	}

@@ -86,18 +86,20 @@ func runREPL(ctx context.Context, c *cypherClient, src lineSource, out io.Writer
 		if stmt == "" {
 			continue // the buffer held only ';' and whitespace
 		}
-		execute(ctx, c, stmt, out) // errors are printed, never fatal
+		execute(ctx, c, stmt, out, out) // errors are printed, never fatal
 	}
 }
 
 // execute sends one statement and renders the response (shared by the REPL
-// and one-shot mode). The returned error has already been printed to out as
-// an "error: ..." line.
-func execute(ctx context.Context, c *cypherClient, stmt string, out io.Writer) error {
+// and one-shot mode). An execution error is printed to errW as an
+// "error: ..." line and returned: the REPL passes its own out so in-loop
+// errors stay in the session transcript, while one-shot mode passes stderr
+// so `vectra-cli -c ... >out 2>err` keeps stdout data-only.
+func execute(ctx context.Context, c *cypherClient, stmt string, out, errW io.Writer) error {
 	resp, err := c.cypher(ctx, stmt)
 	if err != nil {
 		// *apiError formats itself as "<code>: <message>".
-		fmt.Fprintf(out, "error: %v\n", err)
+		fmt.Fprintf(errW, "error: %v\n", err)
 		return err
 	}
 	if resp.Summary != nil { // write

@@ -69,8 +69,8 @@ build: ## build all binaries into bin/ (vectra-server, vectra-bench, vectra-cli,
 test: ## run all tests (three modules)
 	@for m in $(MODULES); do echo "== go test $$m =="; (cd $$m && go test ./...) || exit 1; done
 
-race: ## run the root module test suite under the race detector (slow)
-	go test -race ./...
+race: ## run the root module test suite under the race detector (slow; README shape: -count=1 -timeout 40m)
+	go test -race ./... -count=1 -timeout 40m
 
 allocs: ## root allocation gate: Cypher Allocs tests, single run
 	go test -run 'TestCypher.*Allocs' -count=1 .
