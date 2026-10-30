@@ -2,6 +2,8 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
+[![CI](https://github.com/ProjAnvil/Vectra/actions/workflows/ci.yml/badge.svg)](https://github.com/ProjAnvil/Vectra/actions/workflows/ci.yml)
+
 An embedded, in-memory graph engine for Go, built for **enterprise dependency graphs** — service call graphs, data lineage, permission inheritance (100K–10M edges). At this scale, the machinery big graph databases carry (buffer managers, disk page caches, WAL transactions) is pure overhead. Vectra bets on the opposite: the graph always fits in memory, reads are lock-free, and the whole graph is one atomic file.
 
 Since v0.2 the same engine upgrades into an optional **multi-replica infrastructure service**: a separate `server` module wraps it with hashicorp/raft (leader election, write replication) plus an HTTP API — the rqlite pattern applied to graphs. And it speaks **MCP** in Go, Python and TypeScript, so AI agents can query your dependency graph directly.
@@ -76,6 +78,15 @@ v0.7 dissolves the sealed-snapshot gate. Every write (or `Batch`) materializes i
 **Memory:** a merge allocates the new base before the old generation becomes garbage, so peak RSS at the 1M/10M tier approaches 2× the ~4.1 GB live set (9–11 GB momentary; spec §9 R11). Budget ≥16 GB for merge-heavy 1M-tier workloads, or enable the wrapper's `GCTune` (drops GOGC to 50 around merges).
 
 **⚠️ Upgrading to 0.5.0.** Store snapshots are now written in the v3 format. The incompatibility is one-directional: v1/v2 files remain readable, but pre-0.5 binaries cannot read v3 files — embedded and MCP users who exchange `.vg` snapshots across versions need both sides on 0.5+. The raft cluster mixed-version policy is unchanged (already unsupported).
+
+## Concurrency discipline (SQLite-style)
+
+Embedded mode follows the SQLite rule: **one process owns the data dir.** Inside that process, all goroutines share a single `*Vectra` handle — readers are lock-free (they race nothing but the atomic generation pointer; that is the [micro-layer model above](#continuous-writes-micro-layer-generations-v07)) and writes are single-writer. There is no cross-process lock: two processes opening the same data dir will corrupt each other's WAL frames and snapshots, exactly like two `sqlite3` writers on one file. Multi-process or remote access is what server mode is for — one owning process per data dir, raft replication and the HTTP API in front:
+
+| Access shape | Use |
+|---|---|
+| Many goroutines, one process | One shared `*Vectra` (or its `internal/writer` handle) — any number of concurrent readers, one writer |
+| Many processes / remote clients / auth | `vectra-server` owns the data dir; everyone else speaks `/v1/*` |
 
 ## Vector search (v0.9, Phase 1)
 
@@ -170,6 +181,47 @@ Semantics: writes are linearizable (raft commit) — upserts plus logical-key de
 
 **Bearer-token auth (v0.12, optional).** `-auth-token-file <file>` enables static bearer auth: the file holds one token per line — multiple lines are all accepted, which is the rotation story (append the new token to every node, roll restarts, then remove the old one). Blank lines and CRLF endings are tolerated; a line with internal whitespace, an unreadable file, or an empty file aborts startup — auth never degrades into a silently open database. Every route then requires `Authorization: Bearer <token>` (SHA-256 digests, constant-time comparison) except exactly `GET /v1/health`, which stays open for the load-balancer probe. A joining node's `-join` requests carry its own token — one trust domain, every node shares the same token file. **Boundary:** HTTP auth protects HTTP only; the raft channel between nodes stays plaintext and unauthenticated, so bind `-raft` to a private interface and keep cluster traffic off untrusted networks (and terminate TLS in front of the HTTP port if tokens must not cross it in the clear — the server has no built-in TLS).
 
+**Docker.** The repo-root [Dockerfile](Dockerfile) builds a single-node image — multi-stage (`golang:1.27-alpine` build → `FROM scratch` runtime), so the shipped image contains the static binary and nothing else:
+
+```bash
+docker build -t vectra-server .        # from the repo root (the build context spans all three modules)
+docker run -d -p 8080:8080 -v vectra-data:/data vectra-server
+```
+
+The container runs as non-root (uid 65534), exposes 8080 (HTTP) and 9000 (raft), and declares `VOLUME /data` — `/data` is created in the image already owned by the runtime user, so the volume Docker mounts over it inherits writable ownership (copy-up preserves image ownership). The default CMD is the seed-node form above (`-id n1 -data /data -http :8080 -raft :9000`); the binary is the ENTRYPOINT, so different flags go after the image name. Liveness: `GET /v1/health` — deliberately no `HEALTHCHECK` directive, since the scratch runtime has no shell to run a probe with; check from outside (that route stays open under bearer auth).
+
+## vectra-cli (Cypher REPL)
+
+`make build` also emits `bin/vectra-cli` (source: `server/cmd/vectra-cli`) — a thin client of the server's `POST /v1/cypher` endpoint for ad-hoc queries against a running cluster:
+
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `-url` | `VECTRA_URL` | `http://127.0.0.1:8080` | server base URL |
+| `-token` | `VECTRA_TOKEN` | empty | bearer token, sent as `Authorization` (set it when the server runs `-auth-token-file`) |
+| `-c` | — | — | one-shot: execute one statement, render, exit |
+| `-timeout` | — | `30s` | per-request timeout |
+| `-history` | — | `$HOME/.vectra_history` | history file; empty path disables persistence |
+
+```bash
+./bin/vectra-cli                                                    # REPL against a local server
+VECTRA_URL=http://n1:8080 VECTRA_TOKEN=s3cr3t ./bin/vectra-cli     # auth token via env
+./bin/vectra-cli -c 'MATCH (n:Service) RETURN n.key LIMIT 5'       # one-shot, no REPL
+```
+
+Statements end with `;` and may span multiple lines (`> ` is the prompt, `... ` the continuation). Reads render an aligned table plus a `(N rows)` line; Cypher writes render the mutation summary — `Summary: created N nodes, ...` — plus a table when the statement carried `RETURN`; errors print as `error: <code>: <message>` and the loop continues. Line editing is readline-style (rune-wise edits, arrow-key history recall — the one dependency this adds to the `server` module is `golang.org/x/term`) and the history file persists across sessions; piped stdin just executes, no prompts. `:help` lists the REPL commands; `:q`, `:quit`, `:exit`, `quit`, `exit` leave (recognized only on an empty buffer). The auth token rides the flag or env, never a statement:
+
+```
+$ ./bin/vectra-cli
+> MATCH (s:Service {env:'prod'}) RETURN s.key LIMIT 2;
+s.key
+gateway
+payments
+(2 rows)
+> CREATE (n:Service {key:'billing', env:'prod'});
+Summary: created 1 nodes
+> :q
+```
+
 ## Transactions
 
 Since v0.4 the server supports **interactive optimistic transactions** on the same raft log — OCC against a per-key version table (each key's last-modified raft index). No locks are held across the conversation; validation is deterministic table lookups inside `fsm.Apply`, so every replica reaches the same commit/conflict decision:
@@ -251,7 +303,13 @@ const hits = (await vectra.vectorSearch("docs", { similarTo: "d1", k: 5 })).hits
 
 Note the split: the Cypher write demos the summary counters on scalar props, while the vector rides a `batch`/`txn` node prop — the Cypher subset has no list literals (CREATE maps and SET both take scalars only).
 
-## Benchmarks (M1 Pro, power-law graphs, full reports in [docs/benchmarks](docs/benchmarks))
+## Examples
+
+[examples/](examples/README.md) runs one scenario — a small "project knowledge graph" — in three languages: [Go against the embedded engine](examples/go-embedded) (no server; a durable WAL session in a scratch data dir) and the [Python](examples/python) / [TypeScript](examples/typescript) SDK examples against a running server. Every variant batch-upserts `Person`/`Project` nodes and `WORKS_ON` edges, declares a `FULLTEXT` index and queries a CJK name through it, runs a Cypher write with `RETURN` plus a `MATCH ... RETURN` read, and answers a top-1 vector search.
+
+## Benchmarks (power-law graphs; hardware per report — see the English summary)
+
+English summary and report index: [docs/benchmarks/README.md](docs/benchmarks/README.md) — headline results with the report and the machine each number came from.
 
 | Workload | 1K/10K | 100K/1M | 1M/10M (design ceiling) |
 |---|---|---|---|
@@ -288,15 +346,21 @@ internal/store       snapshot codec (v3: indexKey section + CRC32 trailer, v1/v2
 server/              separate module: raft replication + HTTP API + hot-swap publisher
                      ├─ cmd/vectra-server   service binary
                      ├─ cmd/vectra-bench    stress-test harness
+                     └─ cmd/vectra-cli      Cypher REPL against a running server
 mcp/                 separate module: MCP servers
                      ├─ cmd/vectra-mcp      Go (embedded engine, stdio + HTTP, snapshot or WAL session)
                      ├─ python/             FastMCP (wraps HTTP API)
                      └─ ts/                 TypeScript (wraps HTTP API)
+sdk/                 first-party SDKs: python/ (vectra-graph) + ts/ (@projanvil/vectra)
+examples/            runnable examples: go-embedded (engine), python + typescript (SDKs)
 testdata/            real dataset fixture (SNAP email-Eu-core, cited)
-docs/benchmarks/     stress-test design + results
+docs/benchmarks/     stress-test design + results (README.md is the English summary)
+docs/RELEASING.md    three-module release guide (annotated tags + go-get verification)
+scripts/             tooling scripts (goget-smoke.sh — release tag smoke)
+.github/workflows/   CI (ci.yml): three-module vet/test, root race, Cypher alloc gate, SDK suites, examples
 ```
 
-The core module has **zero third-party dependencies** (`go.sum` absent). The `server` module adds hashicorp/raft v1.8.0 + raft-boltdb/v2; the `mcp` module adds the official MCP Go SDK. Choose what you deploy.
+The core module has **zero third-party dependencies** (`go.sum` absent). The `server` module adds hashicorp/raft v1.8.0 + raft-boltdb/v2, plus `golang.org/x/term` for the CLI's line editing; the `mcp` module adds the official MCP Go SDK. Choose what you deploy.
 
 ## Benchmark & gate commands
 

@@ -2,6 +2,8 @@
 
 [English](README.md) | **简体中文**
 
+[![CI](https://github.com/ProjAnvil/Vectra/actions/workflows/ci.yml/badge.svg)](https://github.com/ProjAnvil/Vectra/actions/workflows/ci.yml)
+
 面向**企业依赖图谱**（服务调用图、数据血缘、权限继承，10 万～1000 万边）的 Go 嵌入式内存图引擎。在这个量级，大图数据库背负的机制（buffer manager、磁盘页缓存、WAL 事务）全是纯成本。Vectra 押注相反的方向：图永远装得进内存，读免锁，整张图就是一份原子文件。
 
 v0.2 起，同一引擎可升级为**多副本基础服务**：独立的 `server` 模块用 hashicorp/raft（leader 选举、写复制）加 HTTP API 包住引擎——rqlite 模式的图版。并且原生说 **MCP**（Go / Python / TypeScript 三语实现），AI agent 可以直接查询你的依赖图谱。
@@ -75,6 +77,15 @@ v0.7 溶解了密封快照门。每次写入（或 `Batch`）把变更物化为�
 **内存：**merge 在旧世代成为垃圾前先分配新 base，1M/10M 档的峰值 RSS 接近 4.1 GB 活集的 2 倍（瞬时 9–11 GB；spec §9 R11）。merge 密集的 1M 档负载请预算 ≥16 GB 内存，或启用包装层的 `GCTune`（merge 前后把 GOGC 降到 50）。
 
 **⚠️ 升级到 0.5.0。** 存储快照改以 v3 格式写入。不兼容是单向的：v1/v2 旧文件仍可读，但 0.5 之前的二进制读不了 v3 文件——跨版本交换 `.vg` 快照的嵌入式与 MCP 用户需要两端都在 0.5+。raft 集群新旧混布策略不变（本就不支持）。
+
+## 并发纪律（SQLite 式）
+
+嵌入式遵循 SQLite 规则：**数据目录由一个进程独占。**进程内所有 goroutine 共享同一个 `*Vectra` 句柄——读者免锁（只与原子世代指针竞争，即[上文的微层模型](#持续写模型微层世代v07)），写者单写。不存在跨进程锁：两个进程打开同一数据目录会互相破坏对方的 WAL 帧与快照，正如两个 `sqlite3` 写者写同一个文件。多进程或远程访问正是服务模式的用途——每个数据目录一个属主进程，前面挡上 raft 复制与 HTTP API：
+
+| 访问形态 | 用法 |
+|---|---|
+| 单进程多 goroutine | 共享同一个 `*Vectra`（或其 `internal/writer` 句柄）——任意多并发读者 + 一个写者 |
+| 多进程 / 远程客户端 / 需要认证 | 数据目录交给 `vectra-server`；其余一切走 `/v1/*` |
 
 ## 向量检索（v0.9, Phase 1）
 
@@ -162,6 +173,47 @@ cd server && go build -o vectra-server ./cmd/vectra-server
 
 **Bearer 令牌认证（v0.12，可选）。** `-auth-token-file <文件>` 启用静态 bearer 认证：文件每行一个令牌——多行全部接受，这也是轮换方式（先把新令牌追加到所有节点，滚动重启，再删旧令牌）。空行与 CRLF 被容忍；行内含空白、文件不可读或为空都会中止启动——认证绝不静默退化成敞开的数据库。此后除 `GET /v1/health`（留给负载均衡探活）外，所有路由都要求 `Authorization: Bearer <令牌>`（SHA-256 摘要、常数时间比较）。加入节点的 `-join` 请求自带令牌——单一信任域，所有节点共享同一份令牌文件。**边界：**HTTP 认证只保护 HTTP；节点间 raft 信道仍是明文无认证，请把 `-raft` 绑到私有网卡，别让集群流量经过不受信网络（若令牌不能明文过网，需在 HTTP 端口前终结 TLS——服务端不内置 TLS）。
 
+**Docker。** 仓库根目录的 [Dockerfile](Dockerfile) 构建单节点镜像——多阶段（`golang:1.27-alpine` 构建 → `FROM scratch` 运行时），成品镜像里只有静态二进制：
+
+```bash
+docker build -t vectra-server .        # 在仓库根执行（构建上下文横跨全部三个模块）
+docker run -d -p 8080:8080 -v vectra-data:/data vectra-server
+```
+
+容器以非 root（uid 65534）运行，暴露 8080（HTTP）与 9000（raft），并声明 `VOLUME /data`——`/data` 在镜像内已归属运行时用户，Docker 挂载卷经 copy-up 继承其可写属主。默认 CMD 即上面的首节点形态（`-id n1 -data /data -http :8080 -raft :9000`）；二进制是 ENTRYPOINT，换参数直接跟在镜像名后面。存活探活：`GET /v1/health`——刻意不设 `HEALTHCHECK`（scratch 运行时没有 shell 可跑探针），请从外部探测（bearer 认证下该路由保持开放）。
+
+## vectra-cli（Cypher REPL）
+
+`make build` 同时产出 `bin/vectra-cli`（源码：`server/cmd/vectra-cli`）——服务端 `POST /v1/cypher` 端点的轻客户端，面向运行中集群的即席查询：
+
+| 标志 | 环境变量 | 默认值 | 含义 |
+|---|---|---|---|
+| `-url` | `VECTRA_URL` | `http://127.0.0.1:8080` | server 基地址 |
+| `-token` | `VECTRA_TOKEN` | 空 | bearer 令牌，以 `Authorization` 头发送（服务端启用 `-auth-token-file` 时必设） |
+| `-c` | — | — | 单次执行：跑一条语句、渲染、退出 |
+| `-timeout` | — | `30s` | 单请求超时 |
+| `-history` | — | `$HOME/.vectra_history` | 历史文件；空路径关闭持久化 |
+
+```bash
+./bin/vectra-cli                                                    # 对本地 server 开 REPL
+VECTRA_URL=http://n1:8080 VECTRA_TOKEN=s3cr3t ./bin/vectra-cli     # 经环境变量给认证令牌
+./bin/vectra-cli -c 'MATCH (n:Service) RETURN n.key LIMIT 5'       # 单次执行，不开 REPL
+```
+
+语句以 `;` 结尾、可跨多行（提示符 `> `，续行 `... `）。读语句渲染对齐表格加一行 `(N rows)`；Cypher 写语句渲染变更摘要——`Summary: created N nodes, ...`——语句带 `RETURN` 时同样渲染表格；错误打印为 `error: <code>: <message>`，循环继续。行编辑是 readline 风格（按 rune 编辑、方向键召回历史——这给 `server` 模块新增的唯一依赖是 `golang.org/x/term`），历史文件跨会话持久；管道 stdin 直接执行、无提示符。`:help` 列出 REPL 命令；`:q`、`:quit`、`:exit`、`quit`、`exit` 退出（仅在空缓冲时识别）。认证令牌走标志或环境变量，绝不进语句：
+
+```
+$ ./bin/vectra-cli
+> MATCH (s:Service {env:'prod'}) RETURN s.key LIMIT 2;
+s.key
+gateway
+payments
+(2 rows)
+> CREATE (n:Service {key:'billing', env:'prod'});
+Summary: created 1 nodes
+> :q
+```
+
 ## 事务
 
 v0.4 起服务端在同一条 raft 日志上支持**交互式乐观事务**——基于每键版本表（各键最后被改的 raft index）的 OCC。会话期间不持任何锁；验证只是 `fsm.Apply` 内的确定性查表，每个副本必然得出相同的提交/冲突结论：
@@ -243,7 +295,13 @@ const hits = (await vectra.vectorSearch("docs", { similarTo: "d1", k: 5 })).hits
 
 注意这里的分工：Cypher 写入在标量属性上演示摘要计数器，而向量经由 `batch`/`txn` 的节点属性写入——Cypher 子集没有列表字面量（CREATE 属性表和 SET 都只接受标量）。
 
-## 基准（M1 Pro，幂律图，完整报告见 [docs/benchmarks](docs/benchmarks)）
+## 示例
+
+[examples/](examples/README.md) 用三种语言跑同一个场景——一张小型"项目知识图谱"：[Go 直连嵌入引擎](examples/go-embedded)（无需 server；在临时数据目录开持久 WAL 会话），以及 [Python](examples/python) / [TypeScript](examples/typescript) SDK 示例（对着运行中的 server）。每个变体都批量 upsert `Person`/`Project` 节点与 `WORKS_ON` 边、声明 `FULLTEXT` 索引并用 CJK 名字查询、跑一条带 `RETURN` 的 Cypher 写加一条 `MATCH ... RETURN` 读、最后回答一次 top-1 向量检索。
+
+## 基准（幂律图；硬件以各报告为准——见英文摘要）
+
+英文摘要与报告索引：[docs/benchmarks/README.md](docs/benchmarks/README.md)——头条结果及其来源报告与所在机器。
 
 | 负载 | 1千/1万 | 10万/100万 | 100万/1000万（设计上界） |
 |---|---|---|---|
@@ -280,15 +338,21 @@ internal/store       快照编解码（v3：索引声明区 + CRC32 尾校验，
 server/              独立模块：raft 复制 + HTTP API + 热替换发布器
                      ├─ cmd/vectra-server   服务二进制
                      ├─ cmd/vectra-bench    压测工具
+                     └─ cmd/vectra-cli      面向运行中 server 的 Cypher REPL
 mcp/                 独立模块：MCP 服务
                      ├─ cmd/vectra-mcp      Go（嵌入引擎，stdio + HTTP，快照或 WAL 会话）
                      ├─ python/             FastMCP（包装 HTTP API）
                      └─ ts/                 TypeScript（包装 HTTP API）
+sdk/                 一方 SDK：python/（vectra-graph）+ ts/（@projanvil/vectra）
+examples/            可运行示例：go-embedded（嵌入引擎）、python + typescript（SDK）
 testdata/            真实数据集夹具（SNAP email-Eu-core，含引用）
-docs/benchmarks/     压测设计与结果
+docs/benchmarks/     压测设计与结果（README.md 为英文摘要）
+docs/RELEASING.md    三模块发布指南（附 tag + go get 验证）
+scripts/             工具脚本（goget-smoke.sh——发布标签冒烟）
+.github/workflows/   CI（ci.yml）：三模块 vet/test、根模块 race、Cypher 分配门、SDK 套件、示例
 ```
 
-核心模块**零第三方依赖**（无 go.sum）。`server` 模块引入 hashicorp/raft v1.8.0 + raft-boltdb/v2；`mcp` 模块引入 MCP 官方 Go SDK。部署什么引入什么。
+核心模块**零第三方依赖**（无 go.sum）。`server` 模块引入 hashicorp/raft v1.8.0 + raft-boltdb/v2，以及 CLI 行编辑所需的 `golang.org/x/term`；`mcp` 模块引入 MCP 官方 Go SDK。部署什么引入什么。
 
 ## 基准与门禁命令
 

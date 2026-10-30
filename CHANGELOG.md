@@ -5,6 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - Unreleased
+
+Release engineering and operability: a Cypher REPL for talking to a
+running server, a Docker image for running one, CI over all three
+modules and both SDKs, runnable examples, and a release guide with a
+tag-strategy smoke test. Engine and server semantics are unchanged
+from 0.14.0 — this arc adds no behavior to the engine, the server, or
+the MCP servers.
+
+### Added
+
+- `vectra-cli` (`server/cmd/vectra-cli`) — a thin client of the
+  server's `POST /v1/cypher` endpoint: a readline-style REPL with
+  persistent history (`-history`, default `$HOME/.vectra_history`;
+  rune-wise editing and arrow-key recall via `golang.org/x/term`, the
+  one dependency this adds to the `server` module) and a one-shot
+  `-c '<statement>'` mode. Statements end with `;` and may span
+  multiple lines; `:help` lists the commands, and `:q` / `:quit` /
+  `:exit` / `quit` / `exit` leave (recognized only on an empty
+  buffer). Reads render an aligned table plus a `(N rows)` line;
+  Cypher writes render the mutation summary (`Summary: created N
+  nodes, ...`; a table too when the statement carried `RETURN`).
+  Connection: `-url` (env `VECTRA_URL`, default
+  `http://127.0.0.1:8080`), `-token` (env `VECTRA_TOKEN`, the bearer
+  token for `-auth-token-file` servers), `-timeout` per request
+  (default 30s). Piped stdin executes without prompts.
+- `Dockerfile` (repo root) — multi-stage (`golang:1.27-alpine` build
+  → `FROM scratch` runtime) single-node vectra-server image: non-root
+  (uid 65534), `EXPOSE 8080 9000`, `VOLUME /data` created in the
+  image already owned by the runtime user so the mounted volume
+  inherits writable ownership (copy-up), default CMD
+  `-id n1 -data /data -http :8080 -raft :9000` with the binary as
+  ENTRYPOINT. Liveness is `GET /v1/health` from outside — no
+  HEALTHCHECK directive, since the scratch runtime has no shell to
+  run a probe with.
+- GitHub Actions CI (`.github/workflows/ci.yml`) — a `go` job (vet +
+  test for all three modules, the root module under `-race`, the
+  Cypher allocation gate), `sdk-python` and `sdk-ts` jobs for both
+  SDK suites, and an `examples` job running the three examples end
+  to end.
+- `examples/` — one scenario (a small project knowledge graph) in
+  three languages: Go against the embedded engine (a durable WAL
+  session in a scratch data dir; rerunnable against a kept `-data`
+  dir) and the Python (`vectra-graph`) / TypeScript
+  (`@projanvil/vectra`) SDK examples against a running server. Each
+  variant batch-upserts Person/Project nodes and WORKS_ON edges,
+  declares a FULLTEXT index and queries a CJK name through it, runs
+  a Cypher write with `RETURN` plus a `MATCH ... RETURN` read, and
+  answers a top-1 vector search.
+- English benchmarks index (`docs/benchmarks/README.md`) — headline
+  table and per-report index with the hardware each report ran on;
+  every number copied verbatim from the linked report.
+- `docs/RELEASING.md` — the three-module release guide (one
+  version-prep commit carrying the root `vX.Y.Z`, `server/vX.Y.Z`,
+  and `mcp/vX.Y.Z` annotated tags) plus `scripts/goget-smoke.sh`,
+  which verifies the tag strategy by releasing into a throwaway
+  local module mirror and `go get`ing all three modules from it.
+
+### Changed
+
+- `make build` now also emits `bin/vectra-cli` (previously
+  vectra-server, vectra-bench, and vectra-mcp).
+- New Make targets: `make race` (root module under the race
+  detector), `make allocs` (the root Cypher allocation gate, single
+  run), and `make goget-smoke [VERSION=0.15.0]` (the tag-strategy
+  smoke above).
+
 ## [0.14.0] - Unreleased
 
 The Cypher write path: the subset grows from a read pipeline into a statement
