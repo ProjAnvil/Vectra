@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -14,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hashicorp/raft"
 )
 
 // ============================================================
@@ -513,5 +517,153 @@ func TestBackupEmptyLeaderInternalFace(t *testing.T) {
 	resp, body = fetchBackup(t, bn.url, "")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("post-write GET /v1/backup = %d (%s), want 200", resp.StatusCode, body)
+	}
+}
+
+// backupErrBody decodes a writeErr JSON body into code + message.
+func backupErrBody(t *testing.T, body []byte) (code, msg string) {
+	t.Helper()
+	var out struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("error body %s: %v", body, err)
+	}
+	return out.Error.Code, out.Error.Message
+}
+
+// (c4) Snapshot-materialization 500 stays path-free: with the snapshots
+// store directory unwritable, raft's Create fails with a *os.PathError over
+// the absolute DataDir path — the response body must collapse that to the
+// generic reason and echo neither the DataDir nor the snapshot dir layout.
+func TestBackupCreateFailureFaceScrubbed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission bits are advisory for root; the scrub cannot be forced")
+	}
+	dataDir := t.TempDir()
+	bn := bootBackupNode(t, "bk-creatfail", dataDir, "", "")
+	waitBackupLeader(t, bn, 10*time.Second)
+	seedBackupGraph(t, bn.url, "")
+	waitBackupPublished(t, bn, 2, 1, 5*time.Second)
+
+	snapDir := filepath.Join(dataDir, "snapshots")
+	if err := os.Chmod(snapDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(snapDir, 0o755) })
+
+	resp, body := fetchBackup(t, bn.url, "")
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("unwritable-store GET /v1/backup = %d (%s), want 500", resp.StatusCode, body)
+	}
+	code, msg := backupErrBody(t, body)
+	if code != "INTERNAL" || msg != "snapshot: failed" {
+		t.Fatalf("500 face = %s %q, want INTERNAL \"snapshot: failed\"", code, msg)
+	}
+	if strings.Contains(msg, dataDir) || strings.Contains(msg, snapDir) {
+		t.Fatalf("500 message %q leaks the server-side path", msg)
+	}
+	// Remedy check: writable store restores the streaming face.
+	if err := os.Chmod(snapDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resp, body = fetchBackup(t, bn.url, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("recovered GET /v1/backup = %d (%s), want 200", resp.StatusCode, body)
+	}
+}
+
+// (c5) Member-open 500 names only the archive-relative member: deleting the
+// node-identity member after boot makes os.Open fail with a *os.PathError
+// carrying the absolute DataDir path; the body must keep the member name
+// plus a generic errno-class reason and no path.
+func TestBackupMemberOpenFailureFaceScrubbed(t *testing.T) {
+	dataDir := t.TempDir()
+	bn := bootBackupNode(t, "bk-memfail", dataDir, "", "")
+	waitBackupLeader(t, bn, 10*time.Second)
+	seedBackupGraph(t, bn.url, "")
+	waitBackupPublished(t, bn, 2, 1, 5*time.Second)
+
+	if err := os.Remove(filepath.Join(dataDir, "meta.json")); err != nil {
+		t.Fatal(err)
+	}
+	resp, body := fetchBackup(t, bn.url, "")
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("missing-member GET /v1/backup = %d (%s), want 500", resp.StatusCode, body)
+	}
+	code, msg := backupErrBody(t, body)
+	if code != "INTERNAL" || msg != "open meta.json: missing" {
+		t.Fatalf("500 face = %s %q, want INTERNAL \"open meta.json: missing\"", code, msg)
+	}
+	if strings.Contains(msg, dataDir) {
+		t.Fatalf("500 message %q leaks the server-side path", msg)
+	}
+}
+
+// (c6) Snapshot-failure face mapping, unit level. Forcing the race for real
+// is impractical on two counts: n.r is a concrete *raft.Raft (no seam to
+// fail Snapshot()), and raft v1.8.0 answers the user-snapshot future from
+// the state-agnostic runSnapshots loop, so a live stepdown never yields
+// ErrNotLeader from it — the handler branch guards the gate race for
+// wrapped/future variants. The classifier is therefore pinned directly:
+// leader-loss errors take the 503 NOT_LEADER face (wrapped errors
+// included), ErrNothingNewToSnapshot keeps the runbook's exact message,
+// and no failure's message may echo a server-side path.
+func TestBackupSnapshotFailureFace(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		err               error
+		wantStatus        int
+		wantCode, wantMsg string
+	}{
+		{
+			name:       "leader lost between gate and snapshot",
+			err:        raft.ErrNotLeader,
+			wantStatus: http.StatusServiceUnavailable,
+			wantCode:   "NOT_LEADER",
+			wantMsg:    "send backup to the leader",
+		},
+		{
+			name:       "wrapped ErrNotLeader still unwraps to the race face",
+			err:        fmt.Errorf("runSnapshot failed: %w", raft.ErrNotLeader),
+			wantStatus: http.StatusServiceUnavailable,
+			wantCode:   "NOT_LEADER",
+			wantMsg:    "send backup to the leader",
+		},
+		{
+			name:       "leadership lost one hop later",
+			err:        raft.ErrLeadershipLost,
+			wantStatus: http.StatusServiceUnavailable,
+			wantCode:   "NOT_LEADER",
+			wantMsg:    "send backup to the leader",
+		},
+		{
+			name:       "dataless leader keeps the documented message",
+			err:        raft.ErrNothingNewToSnapshot,
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   "INTERNAL",
+			wantMsg:    "snapshot: nothing new to snapshot",
+		},
+		{
+			name:       "store failure collapses to a path-free generic",
+			err:        &fs.PathError{Op: "mkdir", Path: "/srv/vectra/data/snapshots/3-9-824.tmp", Err: fs.ErrPermission},
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   "INTERNAL",
+			wantMsg:    "snapshot: failed",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, code, msg := snapshotFailureFace(tc.err)
+			if status != tc.wantStatus || code != tc.wantCode || msg != tc.wantMsg {
+				t.Fatalf("snapshotFailureFace(%v) = %d %s %q, want %d %s %q",
+					tc.err, status, code, msg, tc.wantStatus, tc.wantCode, tc.wantMsg)
+			}
+			if strings.Contains(msg, "/srv/vectra") {
+				t.Fatalf("message %q echoes the server-side path", msg)
+			}
+		})
 	}
 }

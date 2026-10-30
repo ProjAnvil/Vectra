@@ -200,7 +200,7 @@ docker run -d -p 8080:8080 -v vectra-data:/data vectra-server
 curl -f http://n1:8080/v1/backup -o b.tar.gz        # 启用 -auth-token-file 时加 -H 'Authorization: Bearer <token>'
 ```
 
-follower 返回 503 `NOT_LEADER`，并以 `X-Vectra-Leader` 头指向 leader（与所有写路由一样，跟着它重试）。归档恰好三个条目——`meta.json`（节点身份）、`snapshots/<id>/meta.json`、`snapshots/<id>/state.bin`（FileSnapshotStore 那一对；`<id>` 即 `<term>-<index>-<msec>`）。两个已知的 500：从未提交过写入的 leader 磁盘上没有可流的快照（`nothing new to snapshot`——先写一笔，再备份）；同一窗口内的第三个并发备份请求可能偶发 500——快照存储只保留两份快照，回收会与流的打开竞态——干净的 500，绝不会产出损坏的归档，因此请串行化备份拉取（或直接重试）。
+follower 返回 503 `NOT_LEADER`，并以 `X-Vectra-Leader` 头指向 leader（与所有写路由一样，跟着它重试）。归档恰好三个条目——`meta.json`（节点身份）、`snapshots/<id>/meta.json`、`snapshots/<id>/state.bin`（FileSnapshotStore 那一对；`<id>` 即 `<term>-<index>-<msec>`）。两个已知的 500：从未提交过写入的 leader 磁盘上没有可流的快照（`snapshot: nothing new to snapshot`——先写一笔，再备份）；同一窗口内的第三个并发备份请求可能偶发 500——快照存储只保留两份快照，回收会与流的打开竞态——干净的 500，绝不会产出损坏的归档，因此请串行化备份拉取（或直接重试）。
 
 恢复 = 解包到空目录 + 以**同一 node ID** 启动：raft 找到快照，FSM 恢复图（类型化索引、FTS 键、向量索引声明全部随行往返），节点以全新 term 服务：
 
