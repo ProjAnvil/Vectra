@@ -1,0 +1,11 @@
+{
+  "name": "vectra-example-typescript",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@projanvil/vectra": "file:../../sdk/ts"
+  }
+}
