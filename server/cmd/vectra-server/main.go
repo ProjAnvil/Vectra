@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -25,6 +26,9 @@ func main() {
 	dataDir := flag.String("data", "", "data directory (required: raft.db/snapshots/meta.json)")
 	join := flag.String("join", "", "seed node HTTP address (empty = single-node bootstrap; anti-split-brain: non-empty Join never bootstraps)")
 	authTokenFile := flag.String("auth-token-file", "", "file of bearer tokens, one per line (empty = auth disabled)")
+	httpCert := flag.String("http-cert", "", "PEM cert file for the HTTPS API (empty = plain HTTP; requires -http-key)")
+	httpKey := flag.String("http-key", "", "PEM key file for the HTTPS API (requires -http-cert)")
+	httpClientCA := flag.String("http-client-ca", "", "PEM CA file; when set, clients must present a certificate (mTLS)")
 	sealInterval := flag.Duration("seal-interval", server.DefaultSealInterval, "publish throttle interval for large graphs")
 	flag.Parse()
 
@@ -40,13 +44,20 @@ func main() {
 		DataDir:       *dataDir,
 		Join:          *join,
 		AuthTokenFile: *authTokenFile,
+		HTTPCert:      *httpCert,
+		HTTPKey:       *httpKey,
+		HTTPClientCA:  *httpClientCA,
 		SealInterval:  *sealInterval,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "vectra-server %s http=%s raft=%s data=%s\n", *id, *httpAddr, *raftAddr, *dataDir)
+	banner := fmt.Sprintf("vectra-server %s http=%s raft=%s data=%s", *id, *httpAddr, *raftAddr, *dataDir)
+	if n.HTTPTLSConfig() != nil {
+		banner += " tls=http"
+	}
+	fmt.Fprintln(os.Stderr, banner)
 
 	srv := &http.Server{
 		Addr:              *httpAddr,
@@ -68,9 +79,23 @@ func main() {
 		n.Close()
 		close(done)
 	}()
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	// TLS on: build the listener from the parsed config; TLS off: today's
+	// plain ListenAndServe path, unchanged.
+	var serveErr error
+	if tlsCfg := n.HTTPTLSConfig(); tlsCfg != nil {
+		l, lerr := tls.Listen("tcp", *httpAddr, tlsCfg)
+		if lerr != nil {
+			n.Close()
+			fmt.Fprintln(os.Stderr, lerr)
+			os.Exit(1)
+		}
+		serveErr = srv.Serve(l)
+	} else {
+		serveErr = srv.ListenAndServe()
+	}
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 		n.Close()
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, serveErr)
 		os.Exit(1)
 	}
 	<-done

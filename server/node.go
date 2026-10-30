@@ -12,6 +12,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,6 +52,9 @@ type Config struct {
 	DataDir       string // Persistence directory (raft.db / snapshots / meta.json)
 	Join          string // Seed node's HTTP address; empty = single-node bootstrap
 	AuthTokenFile string // Bearer tokens, one per line; empty = auth disabled
+	HTTPCert      string // PEM cert file for the HTTP API; requires HTTPKey
+	HTTPKey       string // PEM key file for the HTTP API
+	HTTPClientCA  string // optional PEM CA; when set, clients must present a cert (mTLS)
 	SealInterval  time.Duration
 	LogStore      raft.LogStore
 	StableStore   raft.StableStore
@@ -77,6 +81,8 @@ type Node struct {
 
 	bolt  *raftboltdb.BoltStore // Held in production mode; nil in test mode
 	trans raft.Transport
+
+	httpTLS *tls.Config // Parsed HTTP API TLS config; nil = plain HTTP (legacy path)
 
 	regMu    sync.Mutex
 	registry map[string]string // raftAddr -> httpAddr (best-effort hint table)
@@ -114,6 +120,25 @@ func New(cfg Config) (*Node, error) {
 		authDigests = authDigestsFrom(tokens)
 		authToken = tokens[0]
 	}
+	// HTTP TLS: same fail-fast contract as the token file — an unreadable or
+	// malformed cert/CA aborts startup, never a silent plaintext fallback.
+	// All three fields empty keeps the plain-HTTP path byte-for-byte unchanged.
+	var httpTLS *tls.Config
+	switch {
+	case cfg.HTTPCert != "" && cfg.HTTPKey != "":
+		c, err := buildHTTPTLSConfig(cfg.HTTPCert, cfg.HTTPKey, cfg.HTTPClientCA)
+		if err != nil {
+			return nil, err
+		}
+		httpTLS = c
+	case cfg.HTTPCert != "" || cfg.HTTPKey != "":
+		return nil, fmt.Errorf("server: HTTPCert and HTTPKey must be set together (cert=%q key=%q)",
+			cfg.HTTPCert, cfg.HTTPKey)
+	case cfg.HTTPClientCA != "":
+		// A client CA without a server cert cannot mean anything but mTLS;
+		// honoring it by serving plaintext would be the silent fallback.
+		return nil, errors.New("server: HTTPClientCA requires HTTPCert and HTTPKey")
+	}
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -131,6 +156,7 @@ func New(cfg Config) (*Node, error) {
 		closed:      make(chan struct{}),
 		authDigests: authDigests,
 		authToken:   authToken,
+		httpTLS:     httpTLS,
 	}
 
 	// Persistence and transport
@@ -213,6 +239,10 @@ func New(cfg Config) (*Node, error) {
 	}
 	return n, nil
 }
+
+// HTTPTLSConfig exposes the parsed HTTP TLS config so main.go can build its
+// listener; nil when HTTP TLS is off.
+func (n *Node) HTTPTLSConfig() *tls.Config { return n.httpTLS }
 
 func (n *Node) raftConfig() *raft.Config {
 	if n.cfg.RaftConfig != nil {
