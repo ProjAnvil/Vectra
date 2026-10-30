@@ -34,7 +34,10 @@ MODULES := . server mcp
 # flags and fall back to the source value, which release commits keep current.
 MCP_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null)
 
-.PHONY: help bench build test vet fmt clean deepclean
+# goget-smoke: version the smoke releases into its throwaway mirror
+VERSION ?= 0.15.0
+
+.PHONY: help bench build test vet fmt clean deepclean race allocs goget-smoke
 
 help: ## show this help
 	@awk -F ':.*## ' '/^[a-zA-Z][a-zA-Z_-]*:.*## / {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -53,9 +56,10 @@ bench: ## run the stress benchmark, e.g. make bench [SIZE=medium] [MODE=http] [W
 	    -datadir "$$dir/data" -out "$$dir/report.md" $(BENCH_EXTRA)) \
 	  && { cat "$$dir/report.md" 2>/dev/null || true; }
 
-build: ## build all binaries into bin/ (vectra-server, vectra-bench, vectra-mcp)
+build: ## build all binaries into bin/ (vectra-server, vectra-bench, vectra-cli, vectra-mcp)
 	cd server && go build -o ../bin/vectra-server ./cmd/vectra-server
 	cd server && go build -o ../bin/vectra-bench  ./cmd/vectra-bench
+	cd server && go build -o ../bin/vectra-cli    ./cmd/vectra-cli
 	cd mcp && if [ -n '$(MCP_VERSION)' ]; then \
 	    go build -ldflags "-X github.com/projanvil/vectra/mcp.Version=$(MCP_VERSION)" -o ../bin/vectra-mcp ./cmd/vectra-mcp; \
 	else \
@@ -64,6 +68,15 @@ build: ## build all binaries into bin/ (vectra-server, vectra-bench, vectra-mcp)
 
 test: ## run all tests (three modules)
 	@for m in $(MODULES); do echo "== go test $$m =="; (cd $$m && go test ./...) || exit 1; done
+
+race: ## run the root module test suite under the race detector (slow)
+	go test -race ./...
+
+allocs: ## root allocation gate: Cypher Allocs tests, single run
+	go test -run 'TestCypher.*Allocs' -count=1 .
+
+goget-smoke: ## run the go get tag smoke (local mirror), e.g. make goget-smoke [VERSION=0.15.0]
+	bash scripts/goget-smoke.sh $(VERSION)
 
 vet: ## go vet (three modules)
 	@for m in $(MODULES); do echo "== go vet $$m =="; (cd $$m && go vet ./...) || exit 1; done
