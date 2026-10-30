@@ -27,6 +27,13 @@ go run ./examples/go-embedded           # from the repo root
 go run ./examples/go-embedded -data /tmp/my-example-data
 ```
 
+Both commands rerun cleanly: the default path starts from a fresh dir
+each run, and a kept `-data` dir also works — node/edge writes are
+idempotent upserts and the vector block drops and re-creates its index —
+though, as with the SDK examples below, the Cypher `CREATE` appends a
+parallel `WORKS_ON` edge on rerun (pattern reads dedup it), so a fresh
+dir gives byte-identical output.
+
 ## Run the server (both SDK examples)
 
 The Python and TypeScript examples talk to a running server. Build the

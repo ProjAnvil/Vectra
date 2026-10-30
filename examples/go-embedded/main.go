@@ -12,6 +12,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -43,7 +44,8 @@ func main() {
 
 	// A durable WAL session: writes log to example-data/knowledge.vg.wal
 	// and Close checkpoints into the snapshot. AddNode and UpsertEdge are
-	// idempotent upserts, so even a leftover data dir reruns cleanly.
+	// idempotent upserts, and the vector block below drops and re-creates
+	// its index, so reruns against a kept -data dir complete cleanly too.
 	g, err := vectra.Open(filepath.Join(*dataDir, "knowledge.vg"), vectra.Options{WALMode: vectra.ModeInterval})
 	if err != nil {
 		log.Fatalf("open graph: %v", err)
@@ -116,7 +118,11 @@ RETURN p.name AS person, pr.name AS project ORDER BY p.name`)
 
 	// [6] Vector search: declare a 4-dim cosine index, write one vector
 	// through batch node props (the Cypher subset has no list literals),
-	// then query top-1.
+	// then query top-1. Dropping a previous declaration first keeps a
+	// kept -data dir rerunnable (a duplicate name errors).
+	if err := g.DropVectorIndex("person-emb"); err != nil && !errors.Is(err, vectra.ErrVectorIndexNotFound) {
+		log.Fatalf("drop vector index: %v", err)
+	}
 	if err := g.CreateVectorIndex(vectra.VectorIndexDecl{
 		Name: "person-emb", Prop: "emb", Dim: 4, Metric: "cosine",
 	}); err != nil {
