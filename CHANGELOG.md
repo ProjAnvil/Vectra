@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - Unreleased
+
+Transport security and disaster recovery for the server: HTTPS with
+optional client-cert mTLS on the HTTP API, X.509 mutual TLS for raft
+node-to-node traffic, and a leader-served `GET /v1/backup` streaming
+a restore-ready tar.gz of the raft snapshot. Engine semantics, the
+wire shapes of existing endpoints, and the no-flags behavior are
+unchanged — with no TLS flags set, the server is byte-for-byte the
+0.15.0 plain-HTTP, plain-TCP one.
+
+### Added
+
+- HTTPS on the HTTP API (`-http-cert` + `-http-key`; either flag
+  alone is a startup error) with optional client-certificate mTLS
+  (`-http-client-ca` — clients without a cert from that CA fail the
+  handshake; a client CA without the cert/key pair is a startup
+  error too). Std-lib only (`crypto/tls`); unreadable or malformed
+  cert/key/CA files abort startup naming the file — never a silent
+  plaintext fallback.
+- X.509 mutual TLS on the raft plane (`-node-cert` + `-node-key` +
+  `-node-ca-cert`, all-or-nothing: a partial set aborts startup
+  naming the missing flags) — every peer presents a leaf signed by
+  the shared CA and verifies every other peer against it (TLS 1.2
+  minimum). Rotation on both planes is restart-to-rotate (no hot
+  reload). Client trust for a private CA rides the platform:
+  `SSL_CERT_FILE` for the Go clients (`vectra-cli`, `vectra-mcp`),
+  `NODE_EXTRA_CA_CERTS` for `sdk/ts` and the TS MCP flavor,
+  `SSL_CERT_FILE`/`SSL_CERT_DIR` for Python; a joiner whose seed
+  runs HTTPS trusts the seed's CA via `SSL_CERT_FILE` set before it
+  starts.
+- `GET /v1/backup` (leader-only; followers answer 503 `NOT_LEADER`
+  with the `X-Vectra-Leader` hint) streams a chunked, never-in-memory
+  tar.gz of the node's materialized raft snapshot — exactly
+  `meta.json` + `snapshots/<id>/meta.json` + `snapshots/<id>/state.bin`.
+  Restore per the README runbook: untar into an empty dir and boot
+  `vectra-server -id <same-ID> -data <dir>`; a restored backup must
+  never run concurrently with the original cluster (same node ID,
+  empty raft log = fresh term) — disaster recovery / new clusters
+  only, not fan-out.
+
 ## [0.15.0] - Unreleased
 
 Release engineering and operability: a Cypher REPL for talking to a

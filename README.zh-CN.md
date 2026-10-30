@@ -171,7 +171,7 @@ cd server && go build -o vectra-server ./cmd/vectra-server
 
 一致性语义：写线性一致（raft 提交即返回）——upsert 加逻辑键删除（删点级联删边）；读有界过期（≤ SealInterval，小图即时）。批量与事务写入中边的身份是 `(srcKey, dstKey, label)` 三元组——upsert 折叠平行边、props 后写覆盖；边条目设 `"allowParallel": true` 则改为追加真正的平行边。Cypher 写语句走同一条路：`POST /v1/cypher` 对每条语句分类（读保持本地、逐字节不变），写与 batch 完全一样经 raft 提交，响应为 `{columns, rows, summary}`，计数器（`createdNodes / createdEdges / deletedNodes / deletedEdges / propertiesSet / indexesCreated`）来自 APPLY 结果——绝无读路径的 `count` 键。防脑裂：设了 `Join` 的节点绝不引导。三节点进程内混沌测试（leader 宕机切换、日志回放追平、重发布期间查询零失败）在 `-race` 下进 CI。
 
-**Bearer 令牌认证（v0.12，可选）。** `-auth-token-file <文件>` 启用静态 bearer 认证：文件每行一个令牌——多行全部接受，这也是轮换方式（先把新令牌追加到所有节点，滚动重启，再删旧令牌）。空行与 CRLF 被容忍；行内含空白、文件不可读或为空都会中止启动——认证绝不静默退化成敞开的数据库。此后除 `GET /v1/health`（留给负载均衡探活）外，所有路由都要求 `Authorization: Bearer <令牌>`（SHA-256 摘要、常数时间比较）。加入节点的 `-join` 请求自带令牌——单一信任域，所有节点共享同一份令牌文件。**边界：**HTTP 认证只保护 HTTP；节点间 raft 信道仍是明文无认证，请把 `-raft` 绑到私有网卡，别让集群流量经过不受信网络（若令牌不能明文过网，需在 HTTP 端口前终结 TLS——服务端不内置 TLS）。
+**Bearer 令牌认证（v0.12，可选）。** `-auth-token-file <文件>` 启用静态 bearer 认证：文件每行一个令牌——多行全部接受，这也是轮换方式（先把新令牌追加到所有节点，滚动重启，再删旧令牌）。空行与 CRLF 被容忍；行内含空白、文件不可读或为空都会中止启动——认证绝不静默退化成敞开的数据库。此后除 `GET /v1/health`（留给负载均衡探活）外，所有路由都要求 `Authorization: Bearer <令牌>`（SHA-256 摘要、常数时间比较）。加入节点的 `-join` 请求自带令牌——单一信任域，所有节点共享同一份令牌文件。**边界：**HTTP 认证只保护 HTTP；不启用 TLS（默认）时，节点间 raft 信道是明文无认证，请把 `-raft` 绑到私有网卡，别让集群流量经过不受信网络——或启用下文的内置 TLS（API 走 HTTPS + 可选 mTLS、节点间 X.509 双向 TLS），令牌就无需明文过网。
 
 **Docker。** 仓库根目录的 [Dockerfile](Dockerfile) 构建单节点镜像——多阶段（`golang:1.27-alpine` 构建 → `FROM scratch` 运行时），成品镜像里只有静态二进制：
 
@@ -181,6 +181,35 @@ docker run -d -p 8080:8080 -v vectra-data:/data vectra-server
 ```
 
 容器以非 root（uid 65534）运行，暴露 8080（HTTP）与 9000（raft），并声明 `VOLUME /data`——`/data` 在镜像内已归属运行时用户，Docker 挂载卷经 copy-up 继承其可写属主。默认 CMD 即上面的首节点形态（`-id n1 -data /data -http :8080 -raft :9000`）；二进制是 ENTRYPOINT，换参数直接跟在镜像名后面。存活探活：`GET /v1/health`——刻意不设 `HEALTHCHECK`（scratch 运行时没有 shell 可跑探针），请从外部探测（bearer 认证下该路由保持开放）。
+
+**TLS（v0.16，可选；两个独立平面，仅标准库）。** HTTP API 平面：`-http-cert` + `-http-key` 启用 HTTPS（成对全有或全无——只给其中一个会中止启动）；`-http-client-ca <文件>` 追加客户端证书 mTLS——没有该 CA 签发证书的客户端在 TLS 握手阶段即被拒绝，任何路由都还没跑——且它要求 cert/key 成对，因此没有服务端 TLS 却设 client CA 同样中止启动（那只可能是配错的 mTLS）。raft 平面：`-node-cert` + `-node-key` + `-node-ca-cert` 为节点间提供 X.509 **双向** TLS——每个节点出示由共享 CA 签发的叶子证书，并以此 CA 校验所有对端（最低 TLS 1.2）；三件套全有或全无，缺任何一个都会中止启动并报出缺失的标志。两个平面相互独立——HTTPS 配明文 raft（或反过来）是合法配置；完全不设 TLS 标志时，服务端与纯 HTTP、纯 TCP 的旧行为逐字节一致。证书/密钥/CA 文件不可读或格式错误都会中止启动并指名文件；TLS 绝不静默回退明文。轮换即重启轮换：换好文件后重启所有节点——没有热加载。
+
+客户端都不带 CA 参数；各技术栈经平台机制信任自签/私有 CA：
+
+| 客户端 | 信任私有 CA 的方式 |
+|---|---|
+| Go 二进制：`vectra-cli`、`vectra-mcp` | 环境变量 `SSL_CERT_FILE=<ca.pem>`（Unix） |
+| [sdk/ts](sdk/ts/README.md) 与 TS 版 MCP（[mcp/ts](mcp/ts)） | `NODE_EXTRA_CA_CERTS=<ca.pem>` |
+| [sdk/python](sdk/python/README.md) | `SSL_CERT_FILE` 或 `SSL_CERT_DIR` |
+
+经 TLS 加入集群：把加入节点的 `-join` 指向首节点的 `https://` URL，并**在加入节点启动前**就在其环境里设好 `SSL_CERT_FILE`——Go 在首次 TLS 使用时缓存根证书池，进程中途修改不会生效。加入节点自身若要跑 raft mTLS，须在 `-join` 前备齐三件套。有一个坑要知道：join 处理器跑在 HTTP 平面上，看不到 raft future，因此出示**错误**节点 TLS 材料的加入节点仍可能让 `AddVoter` 提交成功——集群从此持有一个永远不可达的 voter。别留下这种僵尸：3 个 voter 的集群里，一个永久不可达 voter 再加一次故障就会卡死写入（无多数派）。join 失败后，先清理死 voter 再加新节点——本版本没有移除 voter 的端点，支持的路径是修好加入节点的 TLS 材料（改正 cert/key/CA）、以**同一 node ID** 重新 join：重复的 `AddVoter` 是幂等的，会把既有 voter 条目重新指向可用地址。
+
+**备份与恢复（v0.16）。** 在 **leader** 上 `GET /v1/backup` 以 tar.gz 流式返回该节点已物化的 raft 快照——分块传输（`Content-Disposition: attachment; filename="vectra-backup-<snapshot-id>.tar.gz"`），全程不在内存缓冲：
+
+```bash
+curl -f http://n1:8080/v1/backup -o b.tar.gz        # 启用 -auth-token-file 时加 -H 'Authorization: Bearer <token>'
+```
+
+follower 返回 503 `NOT_LEADER`，并以 `X-Vectra-Leader` 头指向 leader（与所有写路由一样，跟着它重试）。归档恰好三个条目——`meta.json`（节点身份）、`snapshots/<id>/meta.json`、`snapshots/<id>/state.bin`（FileSnapshotStore 那一对；`<id>` 即 `<term>-<index>-<msec>`）。两个已知的 500：从未提交过写入的 leader 磁盘上没有可流的快照（`nothing new to snapshot`——先写一笔，再备份）；同一窗口内的第三个并发备份请求可能偶发 500——快照存储只保留两份快照，回收会与流的打开竞态——干净的 500，绝不会产出损坏的归档，因此请串行化备份拉取（或直接重试）。
+
+恢复 = 解包到空目录 + 以**同一 node ID** 启动：raft 找到快照，FSM 恢复图（类型化索引、FTS 键、向量索引声明全部随行往返），节点以全新 term 服务：
+
+```bash
+mkdir /data/n1-restored && tar -xzf b.tar.gz -C /data/n1-restored
+./vectra-server -id n1 -data /data/n1-restored -http :8080 -raft :9000
+```
+
+**恢复出的备份绝不能与原集群同时运行**——它带着同一 node ID 与空 raft 日志（全新 term），两者永远无法并成一个集群；恢复只用于灾难恢复或拉起新集群，不能用来扇出。
 
 ## vectra-cli（Cypher REPL）
 

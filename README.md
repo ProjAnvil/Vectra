@@ -179,7 +179,7 @@ cd server && go build -o vectra-server ./cmd/vectra-server
 
 Semantics: writes are linearizable (raft commit) — upserts plus logical-key deletes (node deletes cascade incident edges); reads are bounded-stale (≤ SealInterval, immediate for small graphs). Edge identity in batch and transaction writes is the `(srcKey, dstKey, label)` triple — upserts collapse parallels and the last write wins on props; set `"allowParallel": true` on an edge item to append a true parallel edge instead. Cypher write statements join the same path: `POST /v1/cypher` classifies each statement (reads stay local and byte-for-byte unchanged), a write commits through raft exactly like a batch, and the response is `{columns, rows, summary}` with the mutation counters (`createdNodes / createdEdges / deletedNodes / deletedEdges / propertiesSet / indexesCreated` from the APPLY result) — never the read path's `count` key. Anti-split-brain: nodes with `Join` set never bootstrap. The 3-node in-process chaos suite (leader failover, log replay catch-up, zero query failures during republish) runs under `-race` in CI.
 
-**Bearer-token auth (v0.12, optional).** `-auth-token-file <file>` enables static bearer auth: the file holds one token per line — multiple lines are all accepted, which is the rotation story (append the new token to every node, roll restarts, then remove the old one). Blank lines and CRLF endings are tolerated; a line with internal whitespace, an unreadable file, or an empty file aborts startup — auth never degrades into a silently open database. Every route then requires `Authorization: Bearer <token>` (SHA-256 digests, constant-time comparison) except exactly `GET /v1/health`, which stays open for the load-balancer probe. A joining node's `-join` requests carry its own token — one trust domain, every node shares the same token file. **Boundary:** HTTP auth protects HTTP only; the raft channel between nodes stays plaintext and unauthenticated, so bind `-raft` to a private interface and keep cluster traffic off untrusted networks (and terminate TLS in front of the HTTP port if tokens must not cross it in the clear — the server has no built-in TLS).
+**Bearer-token auth (v0.12, optional).** `-auth-token-file <file>` enables static bearer auth: the file holds one token per line — multiple lines are all accepted, which is the rotation story (append the new token to every node, roll restarts, then remove the old one). Blank lines and CRLF endings are tolerated; a line with internal whitespace, an unreadable file, or an empty file aborts startup — auth never degrades into a silently open database. Every route then requires `Authorization: Bearer <token>` (SHA-256 digests, constant-time comparison) except exactly `GET /v1/health`, which stays open for the load-balancer probe. A joining node's `-join` requests carry its own token — one trust domain, every node shares the same token file. **Boundary:** HTTP auth protects HTTP only; with TLS off (the default) the raft channel between nodes is plaintext and unauthenticated, so bind `-raft` to a private interface and keep cluster traffic off untrusted networks — or enable the built-in TLS below (HTTPS + optional mTLS on the API, X.509 mutual TLS between nodes) so tokens never cross the wire in the clear.
 
 **Docker.** The repo-root [Dockerfile](Dockerfile) builds a single-node image — multi-stage (`golang:1.27-alpine` build → `FROM scratch` runtime), so the shipped image contains the static binary and nothing else:
 
@@ -189,6 +189,35 @@ docker run -d -p 8080:8080 -v vectra-data:/data vectra-server
 ```
 
 The container runs as non-root (uid 65534), exposes 8080 (HTTP) and 9000 (raft), and declares `VOLUME /data` — `/data` is created in the image already owned by the runtime user, so the volume Docker mounts over it inherits writable ownership (copy-up preserves image ownership). The default CMD is the seed-node form above (`-id n1 -data /data -http :8080 -raft :9000`); the binary is the ENTRYPOINT, so different flags go after the image name. Liveness: `GET /v1/health` — deliberately no `HEALTHCHECK` directive, since the scratch runtime has no shell to run a probe with; check from outside (that route stays open under bearer auth).
+
+**TLS (v0.16, optional; two independent planes, std-lib only).** The HTTP API plane: `-http-cert` + `-http-key` serve HTTPS (an all-or-nothing pair — either flag alone aborts startup); `-http-client-ca <file>` adds client-certificate mTLS — clients without a cert from that CA fail the TLS handshake before any route runs — and it requires the cert/key pair, so a client CA without server TLS aborts startup too (it could only ever be a misconfigured mTLS). The raft plane: `-node-cert` + `-node-key` + `-node-ca-cert` give X.509 **mutual** TLS between nodes — every peer presents a leaf certificate signed by the shared CA and verifies every other peer against it (TLS 1.2 minimum); the trio is all-or-nothing, and a partial set aborts startup naming the missing flags. The planes are independent — HTTPS over a plain raft channel (or the reverse) is a valid configuration — and with no TLS flags at all the server is byte-for-byte the plain-HTTP, plain-TCP one. Unreadable or malformed cert/key/CA files abort startup naming the file; TLS never silently falls back to plaintext. Rotation is restart-to-rotate: replace the files and restart every node — there is no hot reload.
+
+None of the clients take a CA flag; each stack trusts a self-signed/private CA through its platform mechanism:
+
+| Client | Trusts a private CA via |
+|---|---|
+| Go binaries: `vectra-cli`, `vectra-mcp` | `SSL_CERT_FILE=<ca.pem>` in the environment (Unix) |
+| [sdk/ts](sdk/ts/README.md) and the TS MCP flavor ([mcp/ts](mcp/ts)) | `NODE_EXTRA_CA_CERTS=<ca.pem>` |
+| [sdk/python](sdk/python/README.md) | `SSL_CERT_FILE` or `SSL_CERT_DIR` |
+
+Joining over TLS: point the joiner's `-join` at the seed's `https://` URL and set `SSL_CERT_FILE` in the joining node's environment **before it starts** — Go caches the root pool at first TLS use, so mid-process changes are not picked up. A joiner whose raft plane must run mTLS needs its trio in place before `-join`. One trap to know: the join handler runs on the HTTP plane and cannot see the raft future, so a joiner presenting **wrong** node-TLS material can still have its `AddVoter` committed — the cluster then holds a voter it can never reach. Never leave one behind: in a 3-voter cluster, one permanently unreachable voter plus one further failure stalls writes (no majority). After a failed join, clean up the dead voter before adding others — this release ships no voter-removal endpoint, so the supported path is to repair the joiner (correct cert/key/CA) and re-join with the **same node ID**: the duplicate `AddVoter` is idempotent and re-points the existing voter entry at the now-working address.
+
+**Backup & restore (v0.16).** `GET /v1/backup` on the **leader** streams a tar.gz of the node's materialized raft snapshot — chunked (`Content-Disposition: attachment; filename="vectra-backup-<snapshot-id>.tar.gz"`), never buffered in memory:
+
+```bash
+curl -f http://n1:8080/v1/backup -o b.tar.gz        # add -H 'Authorization: Bearer <token>' when -auth-token-file is on
+```
+
+A follower answers 503 `NOT_LEADER` with the `X-Vectra-Leader` header pointing at the leader (follow it, like every write-facing route). The archive holds exactly three entries — `meta.json` (node identity), `snapshots/<id>/meta.json`, `snapshots/<id>/state.bin` (the FileSnapshotStore pair; `<id>` is `<term>-<index>-<msec>`). Two known 500 faces: a leader that has never committed a write has nothing on disk to stream (`nothing new to snapshot` — write once, then back up), and a third concurrent pull inside the same window can spuriously 500 — the snapshot store retains two snapshots and its reaping races the stream open; that is a clean 500, never a corrupt archive, so serialize backup pulls (or just retry).
+
+Restore = untar into an empty directory and boot with the **same node ID**: raft finds the snapshot, the FSM restores the graph (typed indexes, FTS keys, and vector index declarations all round-trip), and the node serves a fresh term:
+
+```bash
+mkdir /data/n1-restored && tar -xzf b.tar.gz -C /data/n1-restored
+./vectra-server -id n1 -data /data/n1-restored -http :8080 -raft :9000
+```
+
+**A restored backup must never run concurrently with the original cluster** — it carries the same node ID and an empty raft log (a fresh term), so the two can never form one cluster; restore is for disaster recovery or seeding a new cluster, not for fan-out.
 
 ## vectra-cli (Cypher REPL)
 
