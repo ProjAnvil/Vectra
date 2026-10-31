@@ -38,6 +38,56 @@ func TestNewValidationErrors(t *testing.T) {
 	}
 }
 
+// TestLoadOrCreateMetaWritePath pins loadOrCreateMeta's write contract
+// (audit F-31): a fresh directory creates meta.json carrying the node
+// identity and the announced addresses; an existing file is read back with
+// its identity preserved while drifted addresses are rewritten; a
+// mismatched identity still aborts with ErrDirMismatch; and the atomic
+// (temp + rename) write never leaves a temp file behind in the data dir.
+func TestLoadOrCreateMetaWritePath(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{NodeID: "n1", DataDir: dir, HTTPAddr: "127.0.0.1:8080", RaftAddr: "127.0.0.1:9090"}
+
+	// Fresh directory: meta.json is created with the node identity.
+	m, err := loadOrCreateMeta(cfg)
+	if err != nil {
+		t.Fatalf("fresh create: %v", err)
+	}
+	if m.NodeID != "n1" || m.HTTPAddr != cfg.HTTPAddr || m.RaftAddr != cfg.RaftAddr {
+		t.Fatalf("fresh meta = %+v", m)
+	}
+	onDisk, err := os.ReadFile(filepath.Join(dir, "meta.json"))
+	if err != nil {
+		t.Fatalf("meta.json not written: %v", err)
+	}
+	var persisted nodeMeta
+	if err := json.Unmarshal(onDisk, &persisted); err != nil {
+		t.Fatalf("meta.json on disk not valid JSON: %v", err)
+	}
+	if persisted != (nodeMeta{NodeID: "n1", HTTPAddr: cfg.HTTPAddr, RaftAddr: cfg.RaftAddr}) {
+		t.Fatalf("on-disk meta = %+v", persisted)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, "*.tmp")); len(left) != 0 {
+		t.Fatalf("temp files left behind: %v", left)
+	}
+
+	// Existing file: identity is read (not rewritten), drifted addresses are.
+	cfg.HTTPAddr, cfg.RaftAddr = "127.0.0.1:8081", "127.0.0.1:9091"
+	m, err = loadOrCreateMeta(cfg)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if m.NodeID != "n1" || m.HTTPAddr != "127.0.0.1:8081" || m.RaftAddr != "127.0.0.1:9091" {
+		t.Fatalf("reload meta = %+v", m)
+	}
+
+	// Identity mismatch still aborts startup.
+	cfg.NodeID = "other"
+	if _, err := loadOrCreateMeta(cfg); !errors.Is(err, ErrDirMismatch) {
+		t.Fatalf("mismatch = %v, want ErrDirMismatch", err)
+	}
+}
+
 func TestNodeJoinBadSeedStillStarts(t *testing.T) {
 	// Unreachable Join is not fatal: the node still starts (stays candidate; ops can retry)
 	tn := newTestNode(t, "solo", "http://127.0.0.1:1")

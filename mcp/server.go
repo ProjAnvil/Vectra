@@ -366,6 +366,10 @@ func registerTools(s *mcp.Server, svc *service) {
 			"edge identity is (srcKey,dstKey,label) — set allowParallel=true on an edge to append a true " +
 			"parallel edge instead of collapsing onto the existing one; deleteEdges removes by " +
 			"(srcKey,dstKey,label), deleteNodes removes nodes and cascades their edges). " +
+			"Failure contract: an edge whose endpoints do not exist is skipped and counted in " +
+			"edgesSkipped; a failed node write or node delete (e.g. a unique-constraint violation, or " +
+			"deleting a missing key) aborts the batch and returns an error — items before the failure " +
+			"remain applied (no rollback). " +
 			"Everything applied is immediately visible to query tools.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false},
 	}, svc.injectBatch)
@@ -465,6 +469,12 @@ func registerTools(s *mcp.Server, svc *service) {
 
 // ---- tool implementations ----
 
+// abortDisclosure closes every inject_batch abort error: the batch's partial
+// effects are real (the boundary published them as one layer, no rollback),
+// so the caller is told explicitly that earlier items landed despite the
+// rejection.
+const abortDisclosure = "; earlier items in the batch were applied"
+
 func (svc *service) injectBatch(_ context.Context, _ *mcp.CallToolRequest, in injectIn) (*mcp.CallToolResult, countsOut, error) {
 	if svc.openErr != nil {
 		return nil, countsOut{}, svc.openErr
@@ -476,16 +486,31 @@ func (svc *service) injectBatch(_ context.Context, _ *mcp.CallToolRequest, in in
 	// micro-layer and — in WAL mode — flushes as one frame (one fsync), not
 	// one layer/frame per op (v0.7 per-op writes were an order of magnitude
 	// slower). Within-batch visibility is preserved (endpoint validation and
-	// upsert folding consult the builder mirrors), and the loops keep their
-	// lenient per-op error semantics: a failed item is counted as skipped,
-	// never fatal. The boundary's own flush error keeps the same lenient
-	// surface — the ops already hit memory and stay buffered in pendOps for
-	// the next successful flush (see Batch's direct-mode limitation note).
+	// upsert folding consult the builder mirrors).
+	//
+	// Error policy (F-03): node writes and node deletes are
+	// first-error-stops — the first op the engine rejects (a
+	// unique-constraint violation, deleting a missing key) aborts the
+	// injection and fails the tool call; items before it stay applied (the
+	// boundary publishes them as one layer; no rollback). Parity note: the
+	// node-WRITE abort aligns with the server lane's /v1/batch; node
+	// deletes abort here too — deliberately stricter than the server lane,
+	// which skip-counts missing delete keys (server/fsm.go NodesSkipped) —
+	// so an MCP caller always learns a delete missed (F-02's apply-loop
+	// unification must keep this per-lane split). The edge lanes keep the
+	// lenient deterministic-skip discipline: an edge whose endpoints do not
+	// exist is skipped and counted, never fatal. The boundary's own flush
+	// error keeps the same lenient surface — the ops already hit memory and
+	// stay buffered in pendOps for the next successful flush (see Batch's
+	// direct-mode limitation note).
+	var abort error
 	_ = svc.live.Batch(func(g *vectra.Graph) {
-		for _, n := range in.Nodes {
-			if _, err := g.AddNode(n.Key, n.Label, n.Props); err == nil {
-				out.NodesApplied++
+		for i, n := range in.Nodes {
+			if _, err := g.AddNode(n.Key, n.Label, n.Props); err != nil {
+				abort = fmt.Errorf("inject_batch aborted at nodes[%d] (%s): %w"+abortDisclosure, i, n.Key, err)
+				return
 			}
+			out.NodesApplied++
 			for k := range n.Props {
 				svc.propKeys[k] = true
 			}
@@ -511,13 +536,23 @@ func (svc *service) injectBatch(_ context.Context, _ *mcp.CallToolRequest, in in
 				out.EdgesDeleted += n
 			}
 		}
-		for _, k := range in.DeleteNodes {
-			if n, err := g.DeleteNode(k); err == nil {
-				out.NodesDeleted++
-				out.EdgesDeleted += n
+		for i, k := range in.DeleteNodes {
+			n, err := g.DeleteNode(k)
+			if err != nil {
+				abort = fmt.Errorf("inject_batch aborted at deleteNodes[%d] (%s): %w"+abortDisclosure, i, k, err)
+				return
 			}
+			out.NodesDeleted++
+			out.EdgesDeleted += n
 		}
 	})
+	if abort != nil {
+		// The aborted batch's partial effects are real (the boundary already
+		// published them); surface the rejection without counts — the error
+		// text carries the underlying payload and the partial-application
+		// disclosure.
+		return nil, countsOut{}, abort
+	}
 	return nil, out, nil
 }
 

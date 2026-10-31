@@ -311,10 +311,48 @@ func loadOrCreateMeta(cfg Config) (nodeMeta, error) {
 	// Addresses may drift (restart with new ports); IDs may not
 	m.HTTPAddr, m.RaftAddr = cfg.HTTPAddr, cfg.RaftAddr
 	data, _ := json.MarshalIndent(m, "", "  ")
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return m, err
+	if err := writeMetaFile(path, data); err != nil {
+		return m, fmt.Errorf("server: write meta.json: %w", err)
 	}
 	return m, nil
+}
+
+// writeMetaFile persists the node-identity file atomically — temp file in
+// the same directory, write, fsync, rename, then a best-effort directory
+// fsync (the same discipline as the WAL manifest, internal/wal.WriteManifest;
+// audit F-31). meta.json is the file whose mismatch aborts startup, so a
+// crash or disk-full mid-write must never leave a truncated copy behind:
+// with the rename ritual the identity file is always either the previous
+// complete version or the new complete one. Wire content is unchanged.
+func writeMetaFile(path string, data []byte) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		d.Sync()
+		d.Close()
+	}
+	return nil
 }
 
 // Join registers this node with the seed (the seed side runs AddVoter and returns the registry).

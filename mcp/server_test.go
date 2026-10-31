@@ -19,8 +19,16 @@ import (
 // newTestSession starts an in-process server and connects an MCP client to it (real protocol path).
 func newTestSession(t *testing.T) *mcp.ClientSession {
 	t.Helper()
+	return newSession(t, vectra.New(), Options{})
+}
+
+// newSession is newTestSession over a caller-built graph and options — the
+// entry point for tests that need pre-seeded engine state (e.g. a declared
+// unique constraint) on the very graph the MCP service embeds.
+func newSession(t *testing.T, g *vectra.Graph, opts Options) *mcp.ClientSession {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	s := New(vectra.New(), Options{})
+	s := New(g, opts)
 	ct, st := mcp.NewInMemoryTransports()
 	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
 	go func() { _ = s.Run(ctx, st) }() // server must be up first so the handshake can complete
@@ -272,6 +280,147 @@ func TestInjectCountsAndImmediateVisibility(t *testing.T) {
 	}](t, cs, "stats", nil)
 	if st.Nodes != 3 || st.Edges != 2 {
 		t.Fatalf("stats right after inject: %+v, want 3/2", st)
+	}
+}
+
+// ---- inject_batch failure contract (audit F-03) --------------------------------
+//
+// Node writes and node deletes are first-error-stops. The node-WRITE abort
+// mirrors the server lane's /v1/batch FSM abort; node deletes abort here too
+// — deliberately stricter than the server lane's skip-counted deletes
+// (server/fsm.go NodesSkipped) — while the edge lanes keep their documented
+// deterministic-skip discipline. The three tests below pin that boundary.
+
+// callErr invokes a tool that must fail and returns the tool-error text (the
+// transport itself must succeed; res.IsError is the tool-error surface).
+func callErr(t *testing.T, cs *mcp.ClientSession, tool string, args map[string]any) string {
+	t.Helper()
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      tool,
+		Arguments: args,
+	})
+	if err != nil {
+		t.Fatalf("CallTool(%s): %v", tool, err)
+	}
+	if !res.IsError {
+		t.Fatalf("CallTool(%s) should have returned a tool error, got %+v", tool, res.StructuredContent)
+	}
+	if len(res.Content) == 0 {
+		t.Fatal("tool error carries no content")
+	}
+	tc, ok := res.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("tool error content is %T, want TextContent", res.Content[0])
+	}
+	return tc.Text
+}
+
+// newConstraintSession starts a session over a graph carrying a declared
+// unique constraint (the engine surface the MCP server embeds): node "a"
+// owns (Service, name)="alpha".
+func newConstraintSession(t *testing.T) *mcp.ClientSession {
+	t.Helper()
+	g := vectra.New()
+	if _, err := g.AddNode("a", "Service", map[string]any{"name": "alpha"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.DeclareUnique("Service", "name"); err != nil {
+		t.Fatal(err)
+	}
+	return newSession(t, g, Options{})
+}
+
+// TestInjectNodeViolationAborts: a node write the engine rejects (unique
+// constraint) aborts the whole injection with a tool error whose text carries
+// the underlying violation payload and states that earlier items were
+// applied. The violating node is absent, items after it never ran, and the
+// items before it REMAIN applied (documented partial application, no
+// rollback) — never again a 200-shaped silent drop (F-03).
+func TestInjectNodeViolationAborts(t *testing.T) {
+	cs := newConstraintSession(t)
+
+	errText := callErr(t, cs, "inject_batch", map[string]any{
+		"nodes": []map[string]any{
+			{"key": "ok1", "label": "Service"},
+			{"key": "dup", "label": "Service", "props": map[string]any{"name": "alpha"}}, // violates: "a" owns it
+			{"key": "after", "label": "Service"},                                         // past the failure: never applied
+		},
+	})
+	for _, want := range []string{
+		"unique constraint violation", // the *vectra.UniqueViolationError payload
+		`owned by key "a"`,
+		"applied", // the partial-application disclosure
+	} {
+		if !strings.Contains(errText, want) {
+			t.Errorf("error text %q missing %q", errText, want)
+		}
+	}
+
+	// earlier items stay applied and are immediately visible
+	ok1 := call[struct {
+		Key string `json:"key"`
+	}](t, cs, "get_node", map[string]any{"key": "ok1"})
+	if ok1.Key != "ok1" {
+		t.Fatalf("ok1 after abort: %+v", ok1)
+	}
+	// the violating node and everything after it are absent
+	for _, key := range []string{"dup", "after"} {
+		if text := callErr(t, cs, "get_node", map[string]any{"key": key}); !strings.Contains(text, "does not exist") {
+			t.Errorf("get_node(%s) after abort: %q, want does-not-exist", key, text)
+		}
+	}
+	st := call[struct {
+		Nodes int `json:"nodes"`
+	}](t, cs, "stats", nil)
+	if st.Nodes != 2 { // "a" + "ok1"
+		t.Fatalf("stats after abort = %+v, want 2 nodes (dup rejected, after never ran)", st)
+	}
+}
+
+// TestInjectDeleteMissingNodeAborts: deleting a nonexistent key aborts the
+// injection with a tool error; writes earlier in the same batch (nodes are
+// applied before deletes) remain applied.
+func TestInjectDeleteMissingNodeAborts(t *testing.T) {
+	cs := newTestSession(t)
+
+	errText := callErr(t, cs, "inject_batch", map[string]any{
+		"nodes":       []map[string]any{{"key": "a"}, {"key": "b"}},
+		"deleteNodes": []string{"a", "ghost"}, // "a" deletes fine, "ghost" aborts
+	})
+	for _, want := range []string{"node key not found", "applied"} {
+		if !strings.Contains(errText, want) {
+			t.Errorf("error text %q missing %q", errText, want)
+		}
+	}
+
+	// "a" was deleted before the abort; "b" (written, not deleted) stays.
+	if text := callErr(t, cs, "get_node", map[string]any{"key": "a"}); !strings.Contains(text, "does not exist") {
+		t.Errorf("get_node(a) after abort: %q, want does-not-exist", text)
+	}
+	call[struct {
+		Key string `json:"key"`
+	}](t, cs, "get_node", map[string]any{"key": "b"})
+}
+
+// TestInjectEdgeSkipStillLenient: the abort ruling does NOT reach the edge
+// lanes — an edge referencing a nonexistent node is skipped, counted in
+// edgesSkipped, and never fatal (documented behavior, unchanged).
+func TestInjectEdgeSkipStillLenient(t *testing.T) {
+	cs := newTestSession(t)
+
+	inj := call[struct {
+		NodesApplied int `json:"nodesApplied"`
+		EdgesApplied int `json:"edgesApplied"`
+		EdgesSkipped int `json:"edgesSkipped"`
+	}](t, cs, "inject_batch", map[string]any{
+		"nodes": []map[string]any{{"key": "a"}, {"key": "b"}},
+		"edges": []map[string]any{
+			{"srcKey": "a", "dstKey": "b", "label": "E"},
+			{"srcKey": "ghost", "dstKey": "a", "label": "E"}, // endpoint miss: skipped, counted
+		},
+	})
+	if inj.NodesApplied != 2 || inj.EdgesApplied != 1 || inj.EdgesSkipped != 1 {
+		t.Fatalf("edge-skip counts = %+v, want 2 nodes / 1 edge / 1 skipped", inj)
 	}
 }
 
