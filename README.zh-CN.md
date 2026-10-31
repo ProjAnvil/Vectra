@@ -127,7 +127,7 @@ res, _ := g.Cypher(`MATCH (b {type:'controller'})-[:CALLS*1..2]->(s)
 
 语法（v0.13 子句管线）：子句按任意顺序串联——`[OPTIONAL] MATCH pattern[, pattern...] [WHERE expr]`（可重复）、`WITH [DISTINCT] items [ORDER BY item [ASC|DESC]...] [SKIP n] [LIMIT n] [WHERE expr]`、`UNWIND list AS alias`——以 `RETURN *|items [ORDER BY item [ASC|DESC]...] [SKIP n] [LIMIT n]` 收尾；节点 `(var:Label {prop:literal})`，边 `-[var:REL|REL*n..m]->` / `<-[...]-` / `--`（无方向）；WHERE 支持 `= <> < <= > >=`、`STARTS/ENDS WITH`、`CONTAINS`、`IN [...]`、`AND/OR/NOT`、伪属性 `var.key / var.label / var.id`，以及定长单跳上的边属性谓词（`WHERE e.weight > 3`——并行边各绑定一行）。
 
-写子句与 DDL（v0.14）：`CREATE pattern[, pattern...]`、`SET var.prop = expr, ...`（`null` 右值删除该属性）、`[DETACH] DELETE var[, var...]`、`MERGE pattern [ON CREATE SET items] [ON MATCH SET items]`，以及独立成句的 `CREATE [FULLTEXT] INDEX ON (n.prop)`。写模式里的属性值是**表达式**（`{key: k, weight: 2}`——批量导入形态），不同于读模式的字面量：
+写子句与 DDL（v0.14）：`CREATE pattern[, pattern...]`、`SET var.prop = expr, ...`（`null` 右值删除该属性）、`[DETACH] DELETE var[, var...]`、`MERGE pattern [ON CREATE SET items] [ON MATCH SET items]`，以及独立成句的 `CREATE [FULLTEXT] INDEX ON (n.prop)`；v0.16 追加独立成句的唯一约束 DDL（见下文）。写模式里的属性值是**表达式**（`{key: k, weight: 2}`——批量导入形态），不同于读模式的字面量：
 
 ```go
 g.Cypher(`CREATE (s:Service {key:'payments', env:'prod'}) RETURN s`) // 带键创建（RETURN 可省）
@@ -137,9 +137,11 @@ g.Cypher(`MATCH (s {key:'payments'}) DETACH DELETE s`)              // 节点 + 
 g.Cypher(`MERGE (s:Service {key:'payments'}) ON CREATE SET s.fresh = true ON MATCH SET s.seen = true`)
 g.Cypher(`CREATE INDEX ON (n.env)`)                                 // 类型化
 g.Cypher(`CREATE FULLTEXT INDEX ON (n.desc)`)                       // 全文
+g.Cypher(`CREATE CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE`) // 唯一约束（v0.16，独立成句）
+g.Cypher(`DROP CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE`)   // ……及其删除形式
 ```
 
-语句形态：可选的读前缀（`MATCH` / `WITH` / `UNWIND`）逐行喂给写子句（从左到右），可选的尾部 `RETURN` 投影写后状态（被删绑定渲染 null）。本版本不允许写子句之后再出现读子句。写语句的结果带 `summary`——`createdNodes / createdEdges / deletedNodes / deletedEdges / propertiesSet / indexesCreated`。
+语句形态：可选的读前缀（`MATCH` / `WITH` / `UNWIND`）逐行喂给写子句（从左到右），可选的尾部 `RETURN` 投影写后状态（被删绑定渲染 null）。本版本不允许写子句之后再出现读子句。写语句的结果带 `summary`——`createdNodes / createdEdges / deletedNodes / deletedEdges / propertiesSet / indexesCreated / constraintsCreated`。
 
 语义（刻意设计并已文档化）：变长边采用**节点对语义**——目标的最短距离落在跳数窗口内即匹配（`[:CALLS*1..2]` = 按最短路径 1..2 跳；环不会制造更长的匹配），中间节点不施加目标模式过滤，变长段不绑定边变量。行按具名绑定 + 终点去重；WHERE 采用 null 传播逻辑（属性缺失永不满足，`NOT` 救不回来）。锚定在模式允许时走类型化属性索引（`{type:'controller'}`），否则全扫。中间行数上限 1,000,000（超限报错并提示收窄模式或加 `LIMIT`）。
 
@@ -148,6 +150,10 @@ g.Cypher(`CREATE FULLTEXT INDEX ON (n.desc)`)                       // 全文
 差异与限制（刻意设计）：`UNWIND` 扇出与所有中间阶段同受 1,000,000 行预算约束；`OPTIONAL MATCH` 不跨基行去重（重复输入保持重复）；关键字可作别名（`WITH a AS match`）；首次声明于 `OPTIONAL MATCH` 的模式变量是可空变量——在后续非 OPTIONAL 的 `MATCH` 中用作模式变量会被校验期报错，并给出两种改法（把模式折进该 `OPTIONAL MATCH`，或把后续 `MATCH` 标记为 OPTIONAL；语法中没有 `IS [NOT] NULL`）；`RETURN *` 仍仅限退化单 `MATCH` 查询；`WITH *`、`range()`、`RETURN DISTINCT` 与通用表达式项暂缓（聚合 `count/sum/avg/min/max/collect`——含 count/collect 内的 `DISTINCT`——在 RETURN 与 WITH 项中可用）。
 
 写路径身份与差异（v0.14，刻意设计）：写模式 props 里的 `key` 是节点的逻辑键——作为身份提取，绝不存成属性；无键 CREATE 取确定性的引擎生成键 `_c<id>`（`_c` 前缀保留），对已存在键的 CREATE 是 `AddNode` 式 upsert（label 与 props 整体替换）。`MERGE` 仅按键匹配节点——模式里的其余 props 只在建时生效，命中绝不回写（`ON MATCH SET` 才是更新路径）——边按 `(src, dst, label)` 三元组匹配（已存在的边绑定整个模式并抑制端点创建）。对边变量做 `SET`/`DELETE` 寻址的是整个三元组：一次 SET 写入每条并行边，一次 DELETE 全部删除（两条并行的三元组上一次 `DELETE r` 计 `deletedEdges: 2`）；`DETACH DELETE` 删节点时，级联杀掉的关联边同样计入 `deletedEdges`；`DETACH DELETE a, r` 中若 a 的级联已杀掉 r，r 是静默 no-op。重绑定解析存活并行中 ID 最小的一条，因此多边图上 RETURN 的边标量可能渲染出另一条并行边未被触碰的属性。错误采用 first-error-stops、已应用写入保留（与 `Batch` 同契约——不回滚）；对仍有边的节点做普通 `DELETE` 在任何写入落地前即失败。`CREATE INDEX ON (n.prop)` 声明的是按属性键全局（GLOBAL）的索引——带 label 的写法被拒绝——声明挂起至下次 Seal/merge（幂等；每个成功应用的语句计一次 `indexesCreated`）。写语句运行在单写者路径上：嵌入式即 `AddNode`/`UpsertEdge` 的调用约定，服务模式即每语句一次 raft `Apply`。
+
+**唯一约束（v0.16）。** `CREATE CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE` 在一个 `(label, prop)` 对上声明属性值唯一约束；`DROP CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE` 将其删除。两者都是独立成句的语句（不得伴随其他子句），只有 REQUIRE 形式——没有命名形式：`(label, prop)` 对即约束的身份。Go API 一一对应：`g.DeclareUnique("Person", "email")`、`g.DropUnique("Person", "email")`、`g.UniqueConstraints()`（排序副本）。声明先校验存量数据（Neo4j 社区版规则）：若该 `(label, prop)` 对已存在重复的字符串值，声明即告失败——错误匹配 `ErrUniqueViolation` 并列出至多十个重复的 值/键 对（有序——每个 raft 副本完全一致），约束**不会**注册。重复声明报 `ErrConstraintExists`；删除未声明的约束报 `ErrConstraintNotFound`；两种声明在 `g.Batch` 内部都会被拒绝（请在窗口外声明——与 `CreateVectorIndex` 同先例，因为校验扫描需要完整存活视图）。此后执法挂在仅有的两个节点变更根入口（`AddNode`/`DeleteNode`——其余表面都汇入它们）：会让同 label 的两个存活节点在该 prop 上持有同一字符串值的写入，在写方法入口即被拒绝，返回 `*UniqueViolationError`（可经 `errors.Is` 匹配 `ErrUniqueViolation`；报出 label、prop、值与两个键），且该操作零副作用；删除节点立即释放其占有的值（同批次内即可复用），覆盖写先释放旧值再注册新值。只有**字符串**属性值参与约束——非字符串值不可见（既不冲突也不报错；这是与 Neo4j 的刻意差异，后者对错误类型直接报错）。声明扫描为每约束一次 O(存活节点数)——与 Seal 时的全文索引构建同一成本档。
+
+**部分应用按表面区分。** Go `Batch` 契约保持 first-error-stops：违规之前的写入持久且已发布，违规操作零副作用，其后的操作不再执行——不回滚。服务端上，`/v1/batch` 与 `/v1/txn` 在节点 upsert 违反唯一约束时**现在会中止**——这是刻意的行为变更：该路径此前不可能因节点写入失败（失败的 upsert 被静默跳过——返回 200 但节点缺失）。中止是确定性的（约束状态由日志推导，每个副本在同一个操作上同样拒绝——沿用向量 shape 校验先例），请求应答 **400 `UNIQUE_VIOLATION`**；`/v1/cypher` 对违规写语句给出同样的 400 面（绝不是 400 `PARSE`，也不是 500）。违规之前的条目已经应用——first-error-stops、不回滚，与其他写错误同一契约。声明经 WAL 持久化（整表帧、回放即整体替换——被删除的约束不会复活）并写入 **store v8** 快照；v7 及更早的文件原样打开（零约束）并在下次 compact 升到 v8，而 v8 文件无法被 0.16 之前的二进制读取——与历次存储版本递增同款的单向 tripwire（规划降级前请先读 CHANGELOG 的 0.16.0 说明）。
 
 其他接入面：server `POST /v1/cypher` 对语句分类——读仍从本地 published 快照应答、逐字节不变（`{"query": "..."}` → `{columns, rows, count}`），写与 `/v1/batch` 一样经 raft 复制并返回 `{columns, rows, summary}`（即上述计数键，绝无 `count`）；两种路径的解析错都是 400 `PARSE`。三语 MCP 的 `cypher` 工具（默认 limit 1000，`total` 报真实总数）因写子句标注为非只读；Go 服务端在嵌入引擎上进程内执行写语句并透出同一 summary 对象（Python/TS 代理原样透传）。
 
@@ -169,7 +175,7 @@ cd server && go build -o vectra-server ./cmd/vectra-server
 ./vectra-server -id n2 -data /data/n2 -join http://n1:8080         # 加入集群
 ```
 
-一致性语义：写线性一致（raft 提交即返回）——upsert 加逻辑键删除（删点级联删边）；读有界过期（≤ SealInterval，小图即时）。批量与事务写入中边的身份是 `(srcKey, dstKey, label)` 三元组——upsert 折叠平行边、props 后写覆盖；边条目设 `"allowParallel": true` 则改为追加真正的平行边。Cypher 写语句走同一条路：`POST /v1/cypher` 对每条语句分类（读保持本地、逐字节不变），写与 batch 完全一样经 raft 提交，响应为 `{columns, rows, summary}`，计数器（`createdNodes / createdEdges / deletedNodes / deletedEdges / propertiesSet / indexesCreated`）来自 APPLY 结果——绝无读路径的 `count` 键。防脑裂：设了 `Join` 的节点绝不引导。三节点进程内混沌测试（leader 宕机切换、日志回放追平、重发布期间查询零失败）在 `-race` 下进 CI。
+一致性语义：写线性一致（raft 提交即返回）——upsert 加逻辑键删除（删点级联删边）；读有界过期（≤ SealInterval，小图即时）。批量与事务写入中边的身份是 `(srcKey, dstKey, label)` 三元组——upsert 折叠平行边、props 后写覆盖；边条目设 `"allowParallel": true` 则改为追加真正的平行边。Cypher 写语句走同一条路：`POST /v1/cypher` 对每条语句分类（读保持本地、逐字节不变），写与 batch 完全一样经 raft 提交，响应为 `{columns, rows, summary}`，计数器（`createdNodes / createdEdges / deletedNodes / deletedEdges / propertiesSet / indexesCreated / constraintsCreated`）来自 APPLY 结果——绝无读路径的 `count` 键。唯一约束违规会在每个副本上确定性地中止整个 batch/txn/cypher 写 apply，并应答 400 `UNIQUE_VIOLATION`（完整契约见 Cypher 一节——包括它取代的 0.16 前静默跳过路径）。防脑裂：设了 `Join` 的节点绝不引导。三节点进程内混沌测试（leader 宕机切换、日志回放追平、重发布期间查询零失败）在 `-race` 下进 CI。
 
 **Bearer 令牌认证（v0.12，可选）。** `-auth-token-file <文件>` 启用静态 bearer 认证：文件每行一个令牌——多行全部接受，这也是轮换方式（先把新令牌追加到所有节点，滚动重启，再删旧令牌）。空行与 CRLF 被容忍；行内含空白、文件不可读或为空都会中止启动——认证绝不静默退化成敞开的数据库。此后除 `GET /v1/health`（留给负载均衡探活）外，所有路由都要求 `Authorization: Bearer <令牌>`（SHA-256 摘要、常数时间比较）。加入节点的 `-join` 请求自带令牌——单一信任域，所有节点共享同一份令牌文件。**边界：**HTTP 认证只保护 HTTP；不启用 TLS（默认）时，节点间 raft 信道是明文无认证，请把 `-raft` 绑到私有网卡，别让集群流量经过不受信网络——或启用下文的内置 TLS（API 走 HTTPS + 可选 mTLS、节点间 X.509 双向 TLS），令牌就无需明文过网。
 
@@ -259,6 +265,8 @@ v0.4 起服务端在同一条 raft 日志上支持**交互式乐观事务**—�
 
 **⚠️ Cypher 写入对 OCC 验证不可见（v0.14 已知限制）。** Cypher 写语句不推进每键版本表——写 summary 带的是计数器而非被写键集——因此 OCC/SI/SER 事务无法对经 Cypher 写过的键做冲突检测：`/v1/txn` 批次的读集或写集若与 Cypher 写过的键重叠，验证时会当作这些键从未变过。在引擎级 touched-key 追踪落地之前，不要在相同的键上混用交互式 `/v1/txn` 流量与 Cypher 写——让两者落在不相交的键集上，或把有争议的写入改走 `/v1/txn` 的 node/edge 条目。
 
+**唯一约束违规在 apply 时中止，不在验证时（v0.16）。** OCC 验证比较的是版本而非值：`/v1/txn`（或 `/v1/batch`）批次里的节点 upsert 若会撞上已声明的唯一约束值，会先通过验证、随后在 `fsm.Apply` 确定性失败——每个副本得出同一结论——应答 **400 `UNIQUE_VIOLATION`**，而不是 409 冲突报告。违规之前的条目已经应用（first-error-stops；不回滚）。0.16 之前该路径会静默跳过失败的节点 upsert 并返回 200；约束完整契约见 Cypher 一节。
+
 **读集覆盖**——`ser: true` 时应记录哪些键：
 
 | 端点 | 记录 |
@@ -277,7 +285,7 @@ v0.4 起服务端在同一条 raft 日志上支持**交互式乐观事务**—�
 
 ## MCP（AI agent）
 
-三个一等实现——[Go（嵌入引擎）](mcp)、[Python（FastMCP）](mcp/python)、[TypeScript](mcp/ts)——把一跳/多跳/最短路/可达性/循环依赖（含环内边）/Cypher 子集模式查询暴露为 MCP 工具，另提供 `inject_batch` 写入（支持 `allowParallel`；`lookup_property` 接受 string/number/bool 值）。v0.14 起 `cypher` 工具也接受写子句（CREATE/MERGE/SET/DELETE、CREATE INDEX）：标注为非只读，Go 服务端在嵌入引擎上进程内执行，写结果带 `summary` 计数器（`createdNodes / createdEdges / deletedNodes / deletedEdges / propertiesSet / indexesCreated`；读结果不含该键）。Go 服务端每笔已应用写入立即可查——无需 seal 往返；`seal` 是可选维护（merge + checkpoint），`-wal <dir>` 则运行可跨重启恢复的持久会话：
+三个一等实现——[Go（嵌入引擎）](mcp)、[Python（FastMCP）](mcp/python)、[TypeScript](mcp/ts)——把一跳/多跳/最短路/可达性/循环依赖（含环内边）/Cypher 子集模式查询暴露为 MCP 工具，另提供 `inject_batch` 写入（支持 `allowParallel`；`lookup_property` 接受 string/number/bool 值）。v0.14 起 `cypher` 工具也接受写子句（CREATE/MERGE/SET/DELETE、CREATE INDEX）：标注为非只读，Go 服务端在嵌入引擎上进程内执行，写结果带 `summary` 计数器（`createdNodes / createdEdges / deletedNodes / deletedEdges / propertiesSet / indexesCreated / constraintsCreated`；读结果不含该键）。Go 服务端每笔已应用写入立即可查——无需 seal 往返；`seal` 是可选维护（merge + checkpoint），`-wal <dir>` 则运行可跨重启恢复的持久会话。v0.16 的约束 DDL 走同一个 `cypher` 工具。**运维提示：**经 `inject_batch` 注入的图可能带有历史重复数据——在这类图上声明唯一约束会在声明时失败并附重复清单（设计如此；声明会校验存量数据）。请**先**声明约束**再**注入，或先去重：
 
 ```bash
 claude mcp add vectra -- /path/to/vectra-mcp

@@ -166,6 +166,28 @@ client-side identifier check (a regex would wrongly reject forms the
 engine accepts, e.g. backtick-quoted keys): an empty prop round-trips as
 `CREATE INDEX ON (n.)` and answers the server's 400 `PARSE`.
 
+## Unique constraints (v0.16)
+
+Constraint DDL rides `cypher(...)` — there is no dedicated endpoint:
+
+```python
+client.cypher("CREATE CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE")
+client.cypher("DROP CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE")
+```
+
+Declaring validates existing data: duplicate string values already on
+the `(label, prop)` pair fail the declaration (the message lists the
+duplicate value/key pairs); only string prop values participate
+(non-string values are invisible). Afterwards any write that would
+duplicate a declared value — `batch`, `txn`, or a Cypher write —
+aborts and raises `VectraError` with `status=400` and
+`code="UNIQUE_VIOLATION"`; the message names the constraint, the
+contended value, and both node keys. Partial application is
+first-error-stops: entries before the violating one are already
+applied, so retry the remainder with a fresh value, not the whole
+batch. On `/v1/txn` this is the 400 abort, not the 409 OCC conflict
+face.
+
 ## Tests
 
 End-to-end tests boot real `vectra-server` processes (skipped with a

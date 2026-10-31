@@ -10,12 +10,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Transport security and disaster recovery for the server: HTTPS with
 optional client-cert mTLS on the HTTP API, X.509 mutual TLS for raft
 node-to-node traffic, and a leader-served `GET /v1/backup` streaming
-a restore-ready tar.gz of the raft snapshot. Engine semantics, the
-wire shapes of existing endpoints, and the no-flags behavior are
-unchanged — with no TLS flags set, the server is byte-for-byte the
-0.15.0 plain-HTTP, plain-TCP one.
+a restore-ready tar.gz of the raft snapshot. This release also adds
+property-value **unique constraints** (Neo4j-community semantics) on
+every write path — the one deliberate change to an existing endpoint's
+error surface is flagged under Changed below. With no TLS flags set,
+the TLS planes are exactly the 0.15.0 plain-HTTP, plain-TCP ones.
 
 ### Added
+
+- Unique constraints over `(label, prop)` pairs, enforced on every
+  write path (Go API, `Batch`, Cypher writes, WAL replay, server raft
+  apply). Cypher DDL — standalone statements, REQUIRE form only, no
+  name form (the pair is the identity):
+
+      CREATE CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE
+      DROP CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE
+
+  The Go API mirrors them (`DeclareUnique` / `DropUnique` /
+  `UniqueConstraints`; a duplicate declare fails with
+  `ErrConstraintExists`, an unknown drop with `ErrConstraintNotFound`,
+  and both are rejected inside `g.Batch`). Only `string` prop values
+  participate — non-string values are invisible (a deliberate
+  divergence from Neo4j, which errors on the wrong type). After
+  declaration, a write that would give two live nodes of the label the
+  same string value fails at the write-method entry with
+  `*UniqueViolationError` (zero side effects for that operation);
+  deleting a node frees its value immediately, and an override
+  releases the old value first. Write summaries gain a
+  `constraintsCreated` counter (0 or 1; a duplicate declare is an
+  ERROR, unlike idempotent index re-declarations).
+- Declaring validates existing data (the Neo4j community rule):
+  `DeclareUnique` / `CREATE CONSTRAINT` scans full live state and
+  fails atomically when the pair already holds a duplicated string
+  value — the error lists up to ten duplicate value/key pairs (sorted,
+  identical on every raft replica) and the constraint is not
+  registered. The scan is O(live nodes) once per declaration.
+- Constraint declarations persist: WAL `IndexDecl` frames carry the
+  full declaration list with replace-on-replay semantics (dropped
+  constraints stay dropped across recovery), store snapshots stamp
+  **v8** (v7 layout + trailing unique-constraint section; see the
+  downgrade tripwire under Changed), and raft backup/restore
+  (`GET /v1/backup`) round-trips them.
 
 - HTTPS on the HTTP API (`-http-cert` + `-http-key`; either flag
   alone is a startup error) with optional client-certificate mTLS
@@ -44,6 +79,30 @@ unchanged — with no TLS flags set, the server is byte-for-byte the
   never run concurrently with the original cluster (same node ID,
   empty raft log = fresh term) — disaster recovery / new clusters
   only, not fan-out.
+
+### Changed
+
+- **`/v1/batch` and `/v1/txn` now fail on a unique-constraint
+  violation — a lane that previously could not fail on a node write.**
+  The FSM's node lane used to silently skip a failing node upsert (the
+  apply counter only incremented `if err == nil`); with constraints,
+  that silent skip would answer 200 with the node missing. The apply
+  now aborts on the first violation — deterministically on every
+  replica (constraint state is log-derived; the vector
+  shape-validation abort precedent) — and the request answers
+  **400 `UNIQUE_VIOLATION`** with the violation payload (constraint,
+  contended value, both keys) as the message. `/v1/cypher` gives a
+  violating write statement the same 400 face (never 400 `PARSE`,
+  never 500). Partial application is unchanged `Batch` semantics:
+  entries before the violating one are applied, the violating entry
+  has zero side effects, entries after it do not execute — no
+  rollback.
+- Store snapshots stamp **v8** (v7 layout + a trailing
+  unique-constraint section; a v7 file is v8 minus that section).
+  Pre-v8 readers — every v0.15.x binary — hard-fail on the version
+  byte: libraries checkpointed by 0.16.0 cannot be downgraded past
+  0.15.x (same discipline as v5/v6/v7). v7-and-older files load
+  unchanged (zero constraints, recompact-eligible to v8).
 
 ## [0.15.0] - Unreleased
 
