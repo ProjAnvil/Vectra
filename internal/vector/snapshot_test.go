@@ -199,11 +199,13 @@ func TestSnapshotWithLiveOverlay(t *testing.T) {
 	}
 	// Live side sees the re-added value win: k0 now holds vecs[1], the
 	// same vector k1 holds - both sit at distance 0, and tie order is not
-	// guaranteed (spec D8), so assert set membership in the top-2.
+	// guaranteed (spec D8), so assert set membership in the top-2. The
+	// score is a float32 distance that leaves a ~6e-8 rounding residue
+	// on some platforms (amd64 CI runners), so match within epsilon.
 	live := s.Search(vecs[1], 2, 64)
 	foundK0 := false
 	for _, h := range live {
-		if h.Key == "k0" && h.Score == 0 {
+		if h.Key == "k0" && h.Score <= 1e-6 {
 			foundK0 = true
 		}
 	}

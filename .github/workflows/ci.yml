@@ -25,7 +25,11 @@ jobs:
       - name: vet root module
         run: go vet ./...
       - name: test root module
-        run: go test ./...
+        # -short skips the wall-clock acceptance/perf gates (bench package
+        # and the A-series lines in acceptance_test.go via benchSecs): they
+        # are calibrated for dedicated hardware and flake on shared CI
+        # runners. Run them locally with `make test` / `make bench`.
+        run: go test -short ./...
       - name: vet server module
         run: cd server && go vet ./...
       - name: test server module
@@ -37,8 +41,9 @@ jobs:
       - name: race root module
         # Same shape the README prescribes: -count=1 disables test caching
         # and the explicit timeout clears the 600s default that the slow
-        # internal/vector package would trip spuriously.
-        run: go test -race ./... -count=1 -timeout 40m
+        # internal/vector package would trip spuriously. -short skips the
+        # wall-clock perf gates (see the test root module step).
+        run: go test -race -short ./... -count=1 -timeout 40m
       - name: cypher alloc gate
         run: go test -run 'TestCypher.*Allocs' -count=1 .
 

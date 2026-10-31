@@ -89,11 +89,14 @@ func TestQueryVectorBasics(t *testing.T) {
 	g, vecs := buildVectorGraph(t, 500, 64)
 	defer g.Close()
 	// Read-your-write: exact hits for an indexed vector (overlay state).
+	// The score is a float32 distance: on some platforms (observed on
+	// amd64 CI runners) the dot product leaves a ~6e-8 rounding residue
+	// instead of an exact 0, so assert within epsilon.
 	hits, err := g.QueryVector("mem", vecs[7], vectra.QueryVectorOptions{K: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(hits) != 1 || hits[0].Key != keyN(7) || hits[0].Score != 0 {
+	if len(hits) != 1 || hits[0].Key != keyN(7) || hits[0].Score > 1e-6 {
 		t.Fatalf("exact self-query: %+v", hits)
 	}
 	// Unknown index / dim mismatch error; K defaults; ef override.
@@ -220,7 +223,7 @@ func TestQueryVectorLabelFilter(t *testing.T) {
 			t.Fatalf("label filter leaked %q (label %s)", h.Key, n.Label)
 		}
 	}
-	if hits[0].Key != keyN(3) || hits[0].Score != 0 {
+	if hits[0].Key != keyN(3) || hits[0].Score > 1e-6 {
 		t.Fatalf("self-hit must lead: %+v", hits[0])
 	}
 	if len(hits) < 5 {
