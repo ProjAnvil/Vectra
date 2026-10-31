@@ -97,3 +97,28 @@ func TestDirectionsFallbackEquivalence(t *testing.T) {
 			tgP, eidP, lbP, tgS, eidS, lbS)
 	}
 }
+
+// TestParseVarPropOperandAllocs pins the parse path's allocation profile for
+// var.prop references — the most common query shape (WHERE operands,
+// RETURN items). The F-29 parseVarProp extraction briefly built the
+// "var.prop" display name eagerly at every call site, adding one heap
+// alloc per var.prop WHERE operand (50 vs the pre-extraction 48 on this
+// query) on operand/UNWIND sites that never use the name; parseVarProp now
+// returns only the tokens and the item-grammar sites concatenate via
+// varPropName. The exact count is deliberate: any new allocation on this
+// path is a regression. (The pre-existing view-path gates never parsed this
+// shape — hence this pin.)
+func TestParseVarPropOperandAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("alloc counts differ under -race")
+	}
+	const q = `MATCH (a)-[r:REL]->(b) WHERE a.key = 'x' AND b.key STARTS WITH 'y' RETURN b.key`
+	allocs := testing.AllocsPerRun(200, func() {
+		if _, err := Parse(q); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs != 48 {
+		t.Fatalf("Parse(var.prop operand query) = %.0f allocs/op, want 48", allocs)
+	}
+}

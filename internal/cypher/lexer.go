@@ -65,12 +65,15 @@ func Lex(src string) ([]Token, error) {
 	var toks []Token
 	line, col := 1, 1
 	i := 0
-	next := func() (byte, bool) { // current byte advanced past
+	// cur returns the CURRENT byte without advancing (false at end of
+	// input); adv consumes it and maintains line/col. peek(off) is the
+	// forward-looking form for off >= 1 — at off 0 it would just repeat
+	// cur, so call cur directly there.
+	cur := func() (byte, bool) {
 		if i >= len(src) {
 			return 0, false
 		}
-		c := src[i]
-		return c, true
+		return src[i], true
 	}
 	peek := func(off int) (byte, bool) {
 		if i+off >= len(src) {
@@ -95,7 +98,7 @@ func Lex(src string) ([]Token, error) {
 	for {
 		// skip whitespace and // comments
 		for {
-			c, ok := next()
+			c, ok := cur()
 			if !ok {
 				break
 			}
@@ -106,7 +109,7 @@ func Lex(src string) ([]Token, error) {
 			if c == '/' {
 				if p, _ := peek(1); p == '/' {
 					for {
-						c2, ok2 := next()
+						c2, ok2 := cur()
 						if !ok2 || c2 == '\n' {
 							break
 						}
@@ -118,7 +121,7 @@ func Lex(src string) ([]Token, error) {
 			break
 		}
 		sl, sc := line, col
-		c, ok := next()
+		c, ok := cur()
 		if !ok {
 			emit(TEOF, sl, sc, "")
 			break
@@ -127,7 +130,7 @@ func Lex(src string) ([]Token, error) {
 		case isIdentStart(c):
 			var sb strings.Builder
 			for {
-				c2, ok2 := next()
+				c2, ok2 := cur()
 				if !ok2 || !isIdentPart(c2) {
 					break
 				}
@@ -137,17 +140,17 @@ func Lex(src string) ([]Token, error) {
 		case c >= '0' && c <= '9':
 			var sb strings.Builder
 			for {
-				c2, ok2 := next()
+				c2, ok2 := cur()
 				if !ok2 || c2 < '0' || c2 > '9' {
 					break
 				}
 				sb.WriteByte(adv())
 			}
-			if p, okp := peek(0); okp && p == '.' { // fraction only when a digit follows
+			if p, okp := cur(); okp && p == '.' { // fraction only when a digit follows
 				if p2, okp2 := peek(1); okp2 && p2 >= '0' && p2 <= '9' {
 					sb.WriteByte(adv()) // '.'
 					for {
-						c2, ok2 := next()
+						c2, ok2 := cur()
 						if !ok2 || c2 < '0' || c2 > '9' {
 							break
 						}
@@ -161,7 +164,7 @@ func Lex(src string) ([]Token, error) {
 			var sb strings.Builder
 			closed := false
 			for {
-				c2, ok2 := next()
+				c2, ok2 := cur()
 				if !ok2 {
 					break
 				}
@@ -174,7 +177,7 @@ func Lex(src string) ([]Token, error) {
 					break
 				}
 				if ch == '\\' {
-					if _, okE := next(); !okE {
+					if _, okE := cur(); !okE {
 						break
 					}
 					e := adv()
@@ -188,14 +191,14 @@ func Lex(src string) ([]Token, error) {
 					case '\\', '\'', '"':
 						sb.WriteByte(e)
 					default:
-						return nil, &Error{sl, sc, fmt.Sprintf("unknown escape \\%c", e)}
+						return nil, &Error{Line: sl, Col: sc, Msg: fmt.Sprintf("unknown escape \\%c", e)}
 					}
 					continue
 				}
 				sb.WriteByte(ch)
 			}
 			if !closed {
-				return nil, &Error{sl, sc, "unterminated string"}
+				return nil, &Error{Line: sl, Col: sc, Msg: "unterminated string"}
 			}
 			emit(TString, sl, sc, sb.String())
 		default:
@@ -224,7 +227,7 @@ func Lex(src string) ([]Token, error) {
 			case '|':
 				emit(TPipe, sl, sc, "|")
 			case '-':
-				if p, _ := peek(0); p == '>' {
+				if p, _ := cur(); p == '>' {
 					adv()
 					emit(TArrowR, sl, sc, "->")
 				} else if p == '-' {
@@ -234,7 +237,7 @@ func Lex(src string) ([]Token, error) {
 					emit(TMinus, sl, sc, "-")
 				}
 			case '<':
-				if p, _ := peek(0); p == '=' {
+				if p, _ := cur(); p == '=' {
 					adv()
 					emit(TLe, sl, sc, "<=")
 				} else if p == '>' {
@@ -244,7 +247,7 @@ func Lex(src string) ([]Token, error) {
 					emit(TLt, sl, sc, "<")
 				}
 			case '>':
-				if p, _ := peek(0); p == '=' {
+				if p, _ := cur(); p == '=' {
 					adv()
 					emit(TGe, sl, sc, ">=")
 				} else {
@@ -253,7 +256,7 @@ func Lex(src string) ([]Token, error) {
 			case '=':
 				emit(TEq, sl, sc, "=")
 			default:
-				return nil, &Error{sl, sc, fmt.Sprintf("unexpected character %q", string(rune(c)))}
+				return nil, &Error{Line: sl, Col: sc, Msg: fmt.Sprintf("unexpected character %q", string(rune(c)))}
 			}
 		}
 	}

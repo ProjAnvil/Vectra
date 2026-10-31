@@ -246,6 +246,18 @@ func (e *VarRef) pos() (int, int)  { return e.Line, e.Col }
 func (e *Lit) pos() (int, int)     { return e.Line, e.Col }
 func (e *ListLit) pos() (int, int) { return e.Line, e.Col }
 
+// pos1 normalizes a pattern or expression position for error construction:
+// parser-produced positions are always real (1-based), but HAND-BUILT
+// patterns and expressions (tests, programmatic Queries) can carry zeros,
+// and the error face requires 1-based positions. It is the single home of
+// the `if line == 0 { line, col = 1, 1 }` idiom (audit F-28).
+func pos1(line, col int) (int, int) {
+	if line == 0 {
+		return 1, 1
+	}
+	return line, col
+}
+
 func (*MatchClause) isClause()  {}
 func (*WithClause) isClause()   {}
 func (*UnwindClause) isClause() {}

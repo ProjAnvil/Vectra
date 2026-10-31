@@ -124,6 +124,13 @@ func runStatement(ex *executor, ast *Query) (*Result, error) {
 	var rows []row
 	var starMatch *MatchClause
 	for _, c := range ast.Clauses {
+		// Write clauses and the DDL statements (isWriteClause covers exactly
+		// the six write dispatch arms) exist only on the RunWrite path
+		// (ex.w != nil); one reaching Run/RunView is a routing bug, not a
+		// silent no-op. One upfront guard replaces the per-arm copies.
+		if isWriteClause(c) && ex.w == nil {
+			return nil, &Error{Line: 1, Col: 1, Msg: "write clause outside the write path (use RunWrite)"}
+		}
 		switch c := c.(type) {
 		case *MatchClause:
 			var err error
@@ -157,62 +164,36 @@ func runStatement(ex *executor, ast *Query) (*Result, error) {
 				return nil, err
 			}
 		case *CreateClause:
-			// Write stages exist only on the RunWrite path (ex.w != nil);
-			// a write clause reaching Run/RunView is a routing bug, not a
-			// silent no-op.
-			if ex.w == nil {
-				return nil, &Error{1, 1, "write clause outside the write path (use RunWrite)"}
-			}
 			var err error
 			rows, err = ex.createStage(c, rows)
 			if err != nil {
 				return nil, err
 			}
 		case *SetClause:
-			// Same write-path gating as CREATE (routing, not semantics).
-			if ex.w == nil {
-				return nil, &Error{1, 1, "write clause outside the write path (use RunWrite)"}
-			}
 			var err error
 			rows, err = ex.setStage(c, rows)
 			if err != nil {
 				return nil, err
 			}
 		case *DeleteClause:
-			// Same write-path gating as CREATE (routing, not semantics).
-			if ex.w == nil {
-				return nil, &Error{1, 1, "write clause outside the write path (use RunWrite)"}
-			}
 			var err error
 			rows, err = ex.deleteStage(c, rows)
 			if err != nil {
 				return nil, err
 			}
 		case *MergeClause:
-			// Same write-path gating as CREATE (routing, not semantics).
-			if ex.w == nil {
-				return nil, &Error{1, 1, "write clause outside the write path (use RunWrite)"}
-			}
 			var err error
 			rows, err = ex.mergeStage(c, rows)
 			if err != nil {
 				return nil, err
 			}
 		case *IndexClause:
-			// Same write-path gating as CREATE (routing, not semantics).
-			if ex.w == nil {
-				return nil, &Error{1, 1, "write clause outside the write path (use RunWrite)"}
-			}
 			// A no-rows statement: applied once at the statement level,
 			// never through the per-row stage machinery (see indexStage).
 			if err := ex.indexStage(c); err != nil {
 				return nil, err
 			}
 		case *ConstraintClause:
-			// Same write-path gating as CREATE (routing, not semantics).
-			if ex.w == nil {
-				return nil, &Error{1, 1, "write clause outside the write path (use RunWrite)"}
-			}
 			// A no-rows statement: applied once at the statement level,
 			// never through the per-row stage machinery (see
 			// constraintStage). Writer errors pass through RAW (§2.6).
@@ -287,7 +268,7 @@ func (ex *executor) unwindStage(c *UnwindClause, rows []row) ([]row, error) {
 			l, isList := v.([]any)
 			if !isList {
 				line, col := c.Expr.pos()
-				return nil, &Error{line, col, fmt.Sprintf("UNWIND requires a list, got %T", v)}
+				return nil, &Error{Line: line, Col: col, Msg: fmt.Sprintf("UNWIND requires a list, got %T", v)}
 			}
 			list = l
 		} // null outcome or nil value: list stays nil, the row drops
@@ -298,7 +279,7 @@ func (ex *executor) unwindStage(c *UnwindClause, rows []row) ([]row, error) {
 			nr.vals[c.Alias] = el
 			out = append(out, nr)
 			if len(out) > maxRows {
-				return nil, &Error{1, 1, fmt.Sprintf("result too large: more than %d intermediate rows; narrow the pattern or add LIMIT", maxRows)}
+				return nil, &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("result too large: more than %d intermediate rows; narrow the pattern or add LIMIT", maxRows)}
 			}
 		}
 	}
@@ -700,7 +681,7 @@ func (ex *executor) matchRows(m *MatchClause, base []row) ([]row, error) {
 		}
 		rows = dedupRows(rows)
 		if len(rows) > maxRows {
-			return nil, &Error{1, 1, fmt.Sprintf("result too large: more than %d intermediate rows; narrow the pattern or add LIMIT", maxRows)}
+			return nil, &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("result too large: more than %d intermediate rows; narrow the pattern or add LIMIT", maxRows)}
 		}
 	}
 	if rows == nil {
@@ -754,7 +735,7 @@ func (ex *executor) optionalRows(m *MatchClause, base []row) ([]row, error) {
 			}
 			sub = dedupRows(sub)
 			if len(sub) > maxRows {
-				return nil, &Error{1, 1, fmt.Sprintf("result too large: more than %d intermediate rows; narrow the pattern or add LIMIT", maxRows)}
+				return nil, &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("result too large: more than %d intermediate rows; narrow the pattern or add LIMIT", maxRows)}
 			}
 		}
 		if m.Where != nil {
@@ -767,7 +748,7 @@ func (ex *executor) optionalRows(m *MatchClause, base []row) ([]row, error) {
 			out = append(out, sub...)
 		}
 		if len(out) > maxRows {
-			return nil, &Error{1, 1, fmt.Sprintf("result too large: more than %d intermediate rows; narrow the pattern or add LIMIT", maxRows)}
+			return nil, &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("result too large: more than %d intermediate rows; narrow the pattern or add LIMIT", maxRows)}
 		}
 	}
 	return out, nil
@@ -924,7 +905,7 @@ func (ex *executor) runPath(pat *PathPattern, base []row) ([]row, error) {
 		}
 	}
 	if len(rows) > maxRows {
-		return nil, &Error{1, 1, fmt.Sprintf("result too large: more than %d intermediate rows; narrow the pattern or add LIMIT", maxRows)}
+		return nil, &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("result too large: more than %d intermediate rows; narrow the pattern or add LIMIT", maxRows)}
 	}
 	for i, ep := range pat.Edges {
 		var err error
@@ -933,7 +914,7 @@ func (ex *executor) runPath(pat *PathPattern, base []row) ([]row, error) {
 			return nil, err
 		}
 		if len(rows) > maxRows {
-			return nil, &Error{1, 1, fmt.Sprintf("result too large: more than %d intermediate rows; narrow the pattern or add LIMIT", maxRows)}
+			return nil, &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("result too large: more than %d intermediate rows; narrow the pattern or add LIMIT", maxRows)}
 		}
 	}
 	return rows, nil

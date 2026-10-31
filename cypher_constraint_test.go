@@ -73,7 +73,8 @@ func TestCypherConstraintCreateAndDrop(t *testing.T) {
 // TestCypherConstraintDropRoutesThroughWritePath is the layer-1 pin: DROP
 // CONSTRAINT spells none of the original write-clause keywords, so the
 // root-package prefilter (writeClauseKeywords) must know "constraint" or
-// the statement dies on the read path as "expected MATCH, got DROP". The
+// the statement dies on the read path at the parser's entry gate
+// ("expected a clause (MATCH, UNWIND, or a write clause), got DROP"). The
 // direct prefilter probe plus the end-to-end drop cover layers 1-4.
 func TestCypherConstraintDropRoutesThroughWritePath(t *testing.T) {
 	g := New()

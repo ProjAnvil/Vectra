@@ -91,7 +91,7 @@ func (p *parser) parseQuery() (*Query, error) {
 	if !p.kw("MATCH") && !p.atOptionalMatch() && !p.kw("UNWIND") &&
 		!p.kw("CREATE") && !p.kw("MERGE") && !p.kw("SET") &&
 		!p.kw("DELETE") && !p.kw("DROP") && !p.atDetachDelete() {
-		return nil, p.errf("expected MATCH, got %s", describe(p.cur()))
+		return nil, p.errf("expected a clause (MATCH, UNWIND, or a write clause), got %s", describe(p.cur()))
 	}
 	q := newQuery()
 	sawReturn := false
@@ -141,14 +141,14 @@ func (p *parser) parseQuery() (*Query, error) {
 			return nil, err
 		}
 		if _, ddl := c.(*IndexClause); ddl && (len(q.Clauses) > 0 || !p.at(TEOF)) {
-			return nil, &Error{start.Line, start.Col, "CREATE INDEX is a standalone statement (no other clauses may accompany it)"}
+			return nil, &Error{Line: start.Line, Col: start.Col, Msg: "CREATE INDEX is a standalone statement (no other clauses may accompany it)"}
 		}
 		if cc, ddl := c.(*ConstraintClause); ddl && (len(q.Clauses) > 0 || !p.at(TEOF)) {
 			kw := "CREATE CONSTRAINT"
 			if cc.Drop {
 				kw = "DROP CONSTRAINT"
 			}
-			return nil, &Error{start.Line, start.Col, kw + " is a standalone statement (no other clauses may accompany it)"}
+			return nil, &Error{Line: start.Line, Col: start.Col, Msg: kw + " is a standalone statement (no other clauses may accompany it)"}
 		}
 		if isWriteClause(c) {
 			sawWrite = true
@@ -361,16 +361,14 @@ func (p *parser) parseUnwindClause() (*UnwindClause, error) {
 		}
 		expr = e
 	case t.Kind == TIdent:
-		p.next()
-		if p.at(TDot) {
-			p.next()
-			prop, err := p.expect(TIdent, "property name")
-			if err != nil {
-				return nil, err
-			}
-			expr = &PropRef{Var: t.Text, Name: prop.Text, Line: t.Line, Col: t.Col}
+		v, prop, err := p.parseVarProp()
+		if err != nil {
+			return nil, err
+		}
+		if prop.Kind == TIdent {
+			expr = &PropRef{Var: v.Text, Name: prop.Text, Line: v.Line, Col: v.Col}
 		} else {
-			expr = &VarRef{Var: t.Text, Line: t.Line, Col: t.Col}
+			expr = &VarRef{Var: v.Text, Line: v.Line, Col: v.Col}
 		}
 	default:
 		return nil, p.errf("expected variable, property reference or list literal, got %s", describe(t))
@@ -925,7 +923,7 @@ func (p *parser) parseLiteral() (any, error) {
 		p.next()
 		f, err := strconv.ParseFloat(t.Text, 64)
 		if err != nil {
-			return nil, &Error{t.Line, t.Col, fmt.Sprintf("bad number %q", t.Text)}
+			return nil, &Error{Line: t.Line, Col: t.Col, Msg: fmt.Sprintf("bad number %q", t.Text)}
 		}
 		return f, nil
 	case p.at(TMinus) && p.toks[p.pos+1].Kind == TNumber:
@@ -933,7 +931,7 @@ func (p *parser) parseLiteral() (any, error) {
 		n := p.next()
 		f, err := strconv.ParseFloat(n.Text, 64)
 		if err != nil {
-			return nil, &Error{t.Line, t.Col, fmt.Sprintf("bad number %q", n.Text)}
+			return nil, &Error{Line: t.Line, Col: t.Col, Msg: fmt.Sprintf("bad number %q", n.Text)}
 		}
 		return -f, nil
 	case p.kw("TRUE"):
@@ -949,25 +947,55 @@ func (p *parser) parseLiteral() (any, error) {
 	return nil, p.errf("expected literal, got %s", describe(t))
 }
 
+// parseVarProp parses the item grammar's shared tail "var" or "var.prop":
+// it expects the variable token, then consumes the optional "." + property
+// name. prop is the zero Token when the reference is bare (test with
+// prop.Kind == TIdent). The error wording is the item grammar's own
+// ("expected variable, got ...", "expected property name, got ..."), so the
+// five callers (RETURN/WITH items, aggregation arguments, ORDER BY keys,
+// WHERE operands, UNWIND sources) keep their exact error faces (audit
+// F-29). The helper deliberately returns ONLY the tokens: the "var.prop"
+// display-name concatenation is left to the item-grammar sites that need
+// it — the operand/UNWIND sites never build the name, and an eager concat
+// there cost one heap alloc per occurrence on the most common query shape
+// (2026-11-01 review; pinned by TestParseVarPropOperandAllocs).
+func (p *parser) parseVarProp() (v, prop Token, err error) {
+	v, err = p.expect(TIdent, "variable")
+	if err != nil {
+		return Token{}, Token{}, err
+	}
+	if p.at(TDot) {
+		p.next()
+		prop, err = p.expect(TIdent, "property name")
+		if err != nil {
+			return Token{}, Token{}, err
+		}
+	}
+	return v, prop, nil
+}
+
+// varPropName renders the display name of a parseVarProp result ("var" or
+// "var.prop"); only the item-grammar sites call it (see parseVarProp).
+func varPropName(v, prop Token) string {
+	if prop.Kind == TIdent {
+		return v.Text + "." + prop.Text
+	}
+	return v.Text
+}
+
 // parseReturnItem parses one RETURN item: var[.prop], an aggregation call
 // count(*) or fn([DISTINCT] var[.prop]), each with an optional AS alias.
 func (p *parser) parseReturnItem() (*ReturnItem, error) {
-	v, err := p.expect(TIdent, "variable")
+	v, prop, err := p.parseVarProp()
 	if err != nil {
 		return nil, err
 	}
-	if p.at(TParenL) { // aggregation call: ident "(" ...
+	if prop.Kind != TIdent && p.at(TParenL) { // aggregation call: ident "(" ...
 		return p.parseAggItem(v)
 	}
-	item := &ReturnItem{Var: v.Text, Name: v.Text}
-	if p.at(TDot) {
-		p.next()
-		prop, err := p.expect(TIdent, "property name")
-		if err != nil {
-			return nil, err
-		}
+	item := &ReturnItem{Var: v.Text, Name: varPropName(v, prop)}
+	if prop.Kind == TIdent {
 		item.Prop = prop.Text
-		item.Name = v.Text + "." + prop.Text
 	}
 	return p.parseAlias(item)
 }
@@ -999,8 +1027,8 @@ var aggFuncs = map[string]bool{
 func (p *parser) parseAggItem(fn Token) (*ReturnItem, error) {
 	name := strings.ToLower(fn.Text)
 	if !aggFuncs[name] {
-		return nil, &Error{fn.Line, fn.Col,
-			fmt.Sprintf("unknown function %q; supported aggregations: count, sum, avg, min, max, collect", fn.Text)}
+		return nil, &Error{Line: fn.Line, Col: fn.Col,
+			Msg: fmt.Sprintf("unknown function %q; supported aggregations: count, sum, avg, min, max, collect", fn.Text)}
 	}
 	p.next() // (
 	call := AggCall{Func: name}
@@ -1019,22 +1047,16 @@ func (p *parser) parseAggItem(fn Token) (*ReturnItem, error) {
 		p.next()
 		call.Star = true
 	default:
-		v, err := p.expect(TIdent, "variable")
+		av, prop, err := p.parseVarProp()
 		if err != nil {
 			return nil, err
 		}
-		if p.at(TParenL) { // e.g. sum(count(x)): no nested aggregations
-			return nil, p.errf("nested aggregation %s(%s(...)) is not supported", name, v.Text)
+		if prop.Kind != TIdent && p.at(TParenL) { // e.g. sum(count(x)): no nested aggregations
+			return nil, p.errf("nested aggregation %s(%s(...)) is not supported", name, av.Text)
 		}
-		arg := &ReturnItem{Var: v.Text, Name: v.Text}
-		if p.at(TDot) {
-			p.next()
-			prop, err := p.expect(TIdent, "property name")
-			if err != nil {
-				return nil, err
-			}
+		arg := &ReturnItem{Var: av.Text, Name: varPropName(av, prop)}
+		if prop.Kind == TIdent {
 			arg.Prop = prop.Text
-			arg.Name = v.Text + "." + prop.Text
 		}
 		call.Arg = arg
 	}
@@ -1058,23 +1080,14 @@ func aggText(c AggCall) string {
 }
 
 func (p *parser) parseOrderKey() (OrderKey, error) {
-	v, err := p.expect(TIdent, "variable")
+	v, prop, err := p.parseVarProp()
 	if err != nil {
 		return OrderKey{}, err
 	}
-	if p.at(TParenL) { // e.g. ORDER BY count(*): bare aggregation is not allowed
+	if prop.Kind != TIdent && p.at(TParenL) { // e.g. ORDER BY count(*): bare aggregation is not allowed
 		return OrderKey{}, p.errf("aggregation is not allowed in ORDER BY; assign it an alias in RETURN (AS) and order by the alias")
 	}
-	name := v.Text
-	if p.at(TDot) {
-		p.next()
-		prop, err := p.expect(TIdent, "property name")
-		if err != nil {
-			return OrderKey{}, err
-		}
-		name = v.Text + "." + prop.Text
-	}
-	key := OrderKey{Name: name}
+	key := OrderKey{Name: varPropName(v, prop)}
 	if p.kw("ASC") {
 		p.next()
 	} else if p.kw("DESC") {
@@ -1203,16 +1216,14 @@ func (p *parser) parseOperand() (Expr, error) {
 		}
 		return &Lit{Val: v, Line: t.Line, Col: t.Col}, nil
 	case t.Kind == TIdent: // var.prop, or a bare scalar variable (WITH alias)
-		p.next()
-		if !p.at(TDot) {
-			return &VarRef{Var: t.Text, Line: t.Line, Col: t.Col}, nil
-		}
-		p.next()
-		prop, err := p.expect(TIdent, "property name")
+		v, prop, err := p.parseVarProp()
 		if err != nil {
 			return nil, err
 		}
-		return &PropRef{Var: t.Text, Name: prop.Text, Line: t.Line, Col: t.Col}, nil
+		if prop.Kind == TIdent {
+			return &PropRef{Var: v.Text, Name: prop.Text, Line: v.Line, Col: v.Col}, nil
+		}
+		return &VarRef{Var: v.Text, Line: v.Line, Col: v.Col}, nil
 	}
 	return nil, p.errf("expected variable, property reference or literal, got %s", describe(t))
 }
@@ -1287,14 +1298,14 @@ func newScope() *scope {
 // scope state.
 func (sc *scope) undefinedErr(line, col int, v string) *Error {
 	if sc.sawReset {
-		return &Error{line, col, fmt.Sprintf("variable %q is not defined in this scope (WITH starts a new scope; only projected variables survive)", v)}
+		return &Error{Line: line, Col: col, Msg: fmt.Sprintf("variable %q is not defined in this scope (WITH starts a new scope; only projected variables survive)", v)}
 	}
-	return &Error{line, col, fmt.Sprintf("variable %q is not declared in the pattern", v)}
+	return &Error{Line: line, Col: col, Msg: fmt.Sprintf("variable %q is not declared in the pattern", v)}
 }
 
 // varlenErr reports v when it names a variable-length edge binding.
 func (sc *scope) varlenErr(line, col int, v string) *Error {
-	return &Error{line, col, fmt.Sprintf("edge variable %q is on a variable-length edge and cannot be referenced (node-pair semantics)", v)}
+	return &Error{Line: line, Col: col, Msg: fmt.Sprintf("edge variable %q is on a variable-length edge and cannot be referenced (node-pair semantics)", v)}
 }
 
 // checkExpr reference-checks a WHERE-expression tree: every PropRef var is
@@ -1309,7 +1320,7 @@ func (sc *scope) checkExpr(e Expr) error {
 			return sc.undefinedErr(x.Line, x.Col, x.Var)
 		}
 		if k == kindScalar {
-			return &Error{x.Line, x.Col, fmt.Sprintf("variable %q is a scalar; property access requires a node or edge", x.Var)}
+			return &Error{Line: x.Line, Col: x.Col, Msg: fmt.Sprintf("variable %q is a scalar; property access requires a node or edge", x.Var)}
 		}
 		if k == kindEdge {
 			if ep := sc.edges[x.Var]; ep != nil && (ep.MinHops != 1 || ep.MaxHops != 1) {
@@ -1323,7 +1334,7 @@ func (sc *scope) checkExpr(e Expr) error {
 			return sc.undefinedErr(x.Line, x.Col, x.Var)
 		}
 		if k != kindScalar {
-			return &Error{x.Line, x.Col, fmt.Sprintf("variable %q is a node or edge; a bare variable reference requires a scalar (WITH/UNWIND projection)", x.Var)}
+			return &Error{Line: x.Line, Col: x.Col, Msg: fmt.Sprintf("variable %q is a node or edge; a bare variable reference requires a scalar (WITH/UNWIND projection)", x.Var)}
 		}
 		return nil
 	case *Binary:
@@ -1347,7 +1358,7 @@ func (sc *scope) checkItemVar(v string, propAccess bool) error {
 		return sc.undefinedErr(1, 1, v)
 	}
 	if k == kindScalar && propAccess {
-		return &Error{1, 1, fmt.Sprintf("variable %q is a scalar; property access requires a node or edge", v)}
+		return &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("variable %q is a scalar; property access requires a node or edge", v)}
 	}
 	if k == kindEdge {
 		if ep := sc.edges[v]; ep != nil && (ep.MinHops != 1 || ep.MaxHops != 1) {
@@ -1365,13 +1376,11 @@ func (sc *scope) checkItemVar(v string, propAccess bool) error {
 // error (null rows would silently cartesian; Neo4j yields zero rows).
 func (sc *scope) declarePattern(m *MatchClause) error {
 	scalarErr := func(v string) *Error {
-		return &Error{1, 1, fmt.Sprintf("variable %q is a scalar; pattern variables must be nodes or edges", v)}
+		return &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("variable %q is a scalar; pattern variables must be nodes or edges", v)}
 	}
 	nullableErr := func(line, col int, v string) *Error {
-		if line == 0 { // hand-built pattern without positions
-			line, col = 1, 1
-		}
-		return &Error{line, col, fmt.Sprintf("variable %q may be null from OPTIONAL MATCH; a later MATCH cannot use it as a pattern variable (IS NOT NULL is not supported - fold the pattern into the OPTIONAL MATCH or mark the later MATCH OPTIONAL)", v)}
+		line, col = pos1(line, col) // hand-built pattern without positions
+		return &Error{Line: line, Col: col, Msg: fmt.Sprintf("variable %q may be null from OPTIONAL MATCH; a later MATCH cannot use it as a pattern variable (IS NOT NULL is not supported - fold the pattern into the OPTIONAL MATCH or mark the later MATCH OPTIONAL)", v)}
 	}
 	// nullable vars stay legal as join vars under another OPTIONAL clause
 	// (they stay nullable); only a non-optional MATCH is fenced out.
@@ -1454,29 +1463,20 @@ func (sc *scope) markNullable(v string) {
 func (sc *scope) checkWritePattern(pat *PathPattern, mergeNode bool) error {
 	for _, e := range pat.Edges {
 		if e.Dir != DirOut {
-			line, col := e.Line, e.Col
-			if line == 0 { // hand-built pattern or var-less "--" form
-				line, col = 1, 1
-			}
-			return &Error{line, col, "write edge patterns must be outgoing (-[...]->); undirected and incoming edges cannot be created"}
+			line, col := pos1(e.Line, e.Col) // hand-built pattern or var-less "--" form
+			return &Error{Line: line, Col: col, Msg: "write edge patterns must be outgoing (-[...]->); undirected and incoming edges cannot be created"}
 		}
 		if e.MinHops != 1 || e.MaxHops != 1 {
-			line, col := e.Line, e.Col
-			if line == 0 {
-				line, col = 1, 1
-			}
-			return &Error{line, col, "variable-length edges are not supported in write patterns (fixed single hop only)"}
+			line, col := pos1(e.Line, e.Col)
+			return &Error{Line: line, Col: col, Msg: "variable-length edges are not supported in write patterns (fixed single hop only)"}
 		}
 		// Exactly one label, checked statically: a label-less or multi-label
 		// write edge has no single triple to address, and a runtime check
 		// would sit per-row in the executor — after partial writes had
 		// already landed (the CREATE node pass runs before the edge pass).
 		if len(e.Labels) != 1 {
-			line, col := e.Line, e.Col
-			if line == 0 {
-				line, col = 1, 1
-			}
-			return &Error{line, col, "write edge patterns require exactly one relationship label"}
+			line, col := pos1(e.Line, e.Col)
+			return &Error{Line: line, Col: col, Msg: "write edge patterns require exactly one relationship label"}
 		}
 	}
 	for _, n := range pat.Nodes {
@@ -1485,31 +1485,22 @@ func (sc *scope) checkWritePattern(pat *PathPattern, mergeNode bool) error {
 			if k, bound := sc.kinds[n.Var]; bound {
 				fresh = false
 				if k == kindScalar {
-					return &Error{1, 1, fmt.Sprintf("variable %q is a scalar; pattern variables must be nodes or edges", n.Var)}
+					return &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("variable %q is a scalar; pattern variables must be nodes or edges", n.Var)}
 				}
 				if k == kindEdge {
-					line, col := n.Line, n.Col
-					if line == 0 {
-						line, col = 1, 1
-					}
-					return &Error{line, col, fmt.Sprintf("variable %q is an edge; node patterns rebind node variables only", n.Var)}
+					line, col := pos1(n.Line, n.Col)
+					return &Error{Line: line, Col: col, Msg: fmt.Sprintf("variable %q is an edge; node patterns rebind node variables only", n.Var)}
 				}
 				if n.Label != "" || n.Props != nil || n.Exprs != nil {
-					line, col := n.Line, n.Col
-					if line == 0 {
-						line, col = 1, 1
-					}
-					return &Error{line, col, fmt.Sprintf("cannot re-specify label/props when rebinding %q (rebinding uses the bare variable; the bound node supplies identity)", n.Var)}
+					line, col := pos1(n.Line, n.Col)
+					return &Error{Line: line, Col: col, Msg: fmt.Sprintf("cannot re-specify label/props when rebinding %q (rebinding uses the bare variable; the bound node supplies identity)", n.Var)}
 				}
 			}
 		}
 		if mergeNode && fresh {
 			if _, ok := n.Exprs["key"]; !ok {
-				line, col := n.Line, n.Col
-				if line == 0 { // anonymous node carries no Var token
-					line, col = 1, 1
-				}
-				return &Error{line, col, "MERGE node requires a {key: ...} property — node identity in Vectra is the logical key"}
+				line, col := pos1(n.Line, n.Col) // anonymous node carries no Var token
+				return &Error{Line: line, Col: col, Msg: "MERGE node requires a {key: ...} property — node identity in Vectra is the logical key"}
 			}
 		}
 		if key, ok := n.Exprs["key"]; ok {
@@ -1544,11 +1535,8 @@ func (sc *scope) checkWritePattern(pat *PathPattern, mergeNode bool) error {
 		// existing binding (node, edge, or scalar) as an edge would leave
 		// earlier references pointing at the wrong kind of entity.
 		if _, bound := sc.kinds[e.Var]; bound {
-			line, col := e.Line, e.Col
-			if line == 0 {
-				line, col = 1, 1
-			}
-			return &Error{line, col, fmt.Sprintf("edge variable %q is already declared; edge pattern variables must be fresh names", e.Var)}
+			line, col := pos1(e.Line, e.Col)
+			return &Error{Line: line, Col: col, Msg: fmt.Sprintf("edge variable %q is already declared; edge pattern variables must be fresh names", e.Var)}
 		}
 		sc.kinds[e.Var] = kindEdge
 		sc.edges[e.Var] = e
@@ -1568,7 +1556,7 @@ func checkKeyExpr(e Expr) error {
 	if _, ok := l.Val.(string); ok {
 		return nil
 	}
-	return &Error{l.Line, l.Col, fmt.Sprintf("key property must be a string (the node's logical key); got %s", litTypeName(l.Val))}
+	return &Error{Line: l.Line, Col: l.Col, Msg: fmt.Sprintf("key property must be a string (the node's logical key); got %s", litTypeName(l.Val))}
 }
 
 // litTypeName names a literal value for error messages.
@@ -1596,7 +1584,7 @@ func (sc *scope) checkEntityVar(v string) error {
 		return sc.undefinedErr(1, 1, v)
 	}
 	if k == kindScalar {
-		return &Error{1, 1, fmt.Sprintf("SET/DELETE requires a node or edge variable; %q is a scalar", v)}
+		return &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("SET/DELETE requires a node or edge variable; %q is a scalar", v)}
 	}
 	if ep := sc.edges[v]; ep != nil && (ep.MinHops != 1 || ep.MaxHops != 1) {
 		return sc.varlenErr(1, 1, v)
@@ -1632,11 +1620,11 @@ func (sc *scope) checkSetItem(it *SetItem) error {
 func (sc *scope) applyWith(c *WithClause) error {
 	sc.sawReset = true
 	if len(c.Items) == 0 {
-		return &Error{1, 1, "WITH requires at least one item"}
+		return &Error{Line: 1, Col: 1, Msg: "WITH requires at least one item"}
 	}
 	next := make(map[string]varKind, len(c.Items))
 	dupErr := func(v string) *Error {
-		return &Error{1, 1, fmt.Sprintf("variable %q is already declared in this WITH clause; item names must be unique", v)}
+		return &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("variable %q is already declared in this WITH clause; item names must be unique", v)}
 	}
 	var nextNullable map[string]bool // lazily: only when a nullable var survives
 	for _, it := range c.Items {
@@ -1647,7 +1635,7 @@ func (sc *scope) applyWith(c *WithClause) error {
 				}
 			}
 			if it.Alias == "" {
-				return &Error{1, 1, "expression in WITH must be aliased (use AS)"}
+				return &Error{Line: 1, Col: 1, Msg: "expression in WITH must be aliased (use AS)"}
 			}
 			if _, dup := next[it.Alias]; dup {
 				return dupErr(it.Alias)
@@ -1660,7 +1648,7 @@ func (sc *scope) applyWith(c *WithClause) error {
 		}
 		if it.Prop != "" { // var.prop is an expression: it requires AS
 			if it.Alias == "" {
-				return &Error{1, 1, "expression in WITH must be aliased (use AS)"}
+				return &Error{Line: 1, Col: 1, Msg: "expression in WITH must be aliased (use AS)"}
 			}
 			if _, dup := next[it.Alias]; dup {
 				return dupErr(it.Alias)
@@ -1697,12 +1685,12 @@ func (sc *scope) applyWith(c *WithClause) error {
 		}
 		kind, ok := next[varPart]
 		if !ok {
-			return &Error{1, 1, fmt.Sprintf("ORDER BY variable %q is not defined in this scope (WITH starts a new scope; only projected variables survive)", varPart)}
+			return &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("ORDER BY variable %q is not defined in this scope (WITH starts a new scope; only projected variables survive)", varPart)}
 		}
 		// A projected scalar carries no properties: without this branch
 		// ORDER BY scalar.prop silently sorts all-null keys (T4 review).
 		if propAccess && kind == kindScalar {
-			return &Error{1, 1, fmt.Sprintf("variable %q is a scalar; property access requires a node or edge", varPart)}
+			return &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("variable %q is a scalar; property access requires a node or edge", varPart)}
 		}
 	}
 	if c.Where != nil {
@@ -1724,13 +1712,13 @@ func (sc *scope) checkReturn(c *ReturnClause, matchCount int) error {
 	}
 	if c.Star {
 		if matchCount > 1 || sc.sawReset {
-			return &Error{1, 1, "RETURN * is not supported after WITH/UNWIND or multiple MATCH clauses"}
+			return &Error{Line: 1, Col: 1, Msg: "RETURN * is not supported after WITH/UNWIND or multiple MATCH clauses"}
 		}
 		if aggQuery {
-			return &Error{1, 1, "RETURN * cannot be combined with aggregation"}
+			return &Error{Line: 1, Col: 1, Msg: "RETURN * cannot be combined with aggregation"}
 		}
 		if len(items) > 0 {
-			return &Error{1, 1, "RETURN * cannot be combined with other RETURN items"}
+			return &Error{Line: 1, Col: 1, Msg: "RETURN * cannot be combined with other RETURN items"}
 		}
 		named := 0
 		for _, k := range sc.kinds {
@@ -1739,12 +1727,12 @@ func (sc *scope) checkReturn(c *ReturnClause, matchCount int) error {
 			}
 		}
 		if named == 0 {
-			return &Error{1, 1, "RETURN * with no named variables in the pattern"}
+			return &Error{Line: 1, Col: 1, Msg: "RETURN * with no named variables in the pattern"}
 		}
 		return nil // RETURN * + ORDER BY is supported: keys evaluate on the bindings (see project)
 	}
 	if len(items) == 0 {
-		return &Error{1, 1, "RETURN requires at least one item"}
+		return &Error{Line: 1, Col: 1, Msg: "RETURN requires at least one item"}
 	}
 	names := map[string]bool{}
 	for _, it := range items {
@@ -1766,7 +1754,7 @@ func (sc *scope) checkReturn(c *ReturnClause, matchCount int) error {
 			// After aggregation only projected columns exist: the key must
 			// match a RETURN item name (aliases included).
 			if !names[k.Name] {
-				return &Error{1, 1, fmt.Sprintf("ORDER BY name %q must appear in RETURN when aggregating; use an AS alias", k.Name)}
+				return &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("ORDER BY name %q must appear in RETURN when aggregating; use an AS alias", k.Name)}
 			}
 			continue
 		}
@@ -1776,15 +1764,15 @@ func (sc *scope) checkReturn(c *ReturnClause, matchCount int) error {
 		}
 		if _, declared := sc.kinds[varPart]; !declared && !names[k.Name] {
 			if sc.sawReset {
-				return &Error{1, 1, fmt.Sprintf("ORDER BY variable %q is not defined in this scope (WITH starts a new scope; only projected variables survive)", varPart)}
+				return &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("ORDER BY variable %q is not defined in this scope (WITH starts a new scope; only projected variables survive)", varPart)}
 			}
-			return &Error{1, 1, fmt.Sprintf("ORDER BY variable %q is not declared in the pattern", varPart)}
+			return &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("ORDER BY variable %q is not declared in the pattern", varPart)}
 		}
 		// A scalar carries no properties: without this branch ORDER BY
 		// scalar.prop silently sorts all-null keys (the T4 applyWith
 		// rider, mirrored here on the RETURN path in T6).
 		if propAccess && sc.kinds[varPart] == kindScalar {
-			return &Error{1, 1, fmt.Sprintf("variable %q is a scalar; property access requires a node or edge", varPart)}
+			return &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("variable %q is a scalar; property access requires a node or edge", varPart)}
 		}
 		if vk := sc.kinds[varPart]; vk == kindEdge {
 			if ep := sc.edges[varPart]; ep != nil && (ep.MinHops != 1 || ep.MaxHops != 1) {
@@ -1823,12 +1811,12 @@ func (q *Query) validate() error {
 		if sawReturn {
 			// Defensive: the parser never emits clauses after RETURN, but a
 			// hand-constructed Query must not silently drop them.
-			return &Error{1, 1, "RETURN must be the final clause"}
+			return &Error{Line: 1, Col: 1, Msg: "RETURN must be the final clause"}
 		}
 		if sawWrite {
 			switch c.(type) {
 			case *MatchClause, *WithClause, *UnwindClause:
-				return &Error{1, 1, "read clauses after a write clause are not supported in this version"}
+				return &Error{Line: 1, Col: 1, Msg: "read clauses after a write clause are not supported in this version"}
 			}
 		}
 		switch c := c.(type) {
@@ -1849,14 +1837,14 @@ func (q *Query) validate() error {
 		case *UnwindClause:
 			sc.sawReset = true // the clause is being processed: scope-chain family applies
 			if c.Alias == "" {
-				return &Error{1, 1, "UNWIND expression must be aliased (use AS)"}
+				return &Error{Line: 1, Col: 1, Msg: "UNWIND expression must be aliased (use AS)"}
 			}
 			// The alias binds into vals at execution, but itemValue reads
 			// nodes/edges before vals: an alias shadowing a pattern variable
 			// would return the stale entity. Rebinding a SCALAR (self-rebind
 			// UNWIND ks AS ks included) is fine — vals overwrite vals.
 			if k, bound := sc.kinds[c.Alias]; bound && k != kindScalar {
-				return &Error{1, 1, fmt.Sprintf("variable %q is already declared as a node or edge; the UNWIND alias must be a fresh name", c.Alias)}
+				return &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("variable %q is already declared as a node or edge; the UNWIND alias must be a fresh name", c.Alias)}
 			}
 			if c.Expr != nil {
 				if err := sc.checkExpr(c.Expr); err != nil {
@@ -1873,7 +1861,7 @@ func (q *Query) validate() error {
 			}
 		case *SetClause:
 			if len(sc.kinds) == 0 {
-				return &Error{1, 1, "SET has no scope to act on; it must follow a clause that binds variables (MATCH, MERGE, CREATE, WITH, UNWIND)"}
+				return &Error{Line: 1, Col: 1, Msg: "SET has no scope to act on; it must follow a clause that binds variables (MATCH, MERGE, CREATE, WITH, UNWIND)"}
 			}
 			for _, it := range c.Items {
 				if err := sc.checkSetItem(it); err != nil {
@@ -1882,7 +1870,7 @@ func (q *Query) validate() error {
 			}
 		case *DeleteClause:
 			if len(sc.kinds) == 0 {
-				return &Error{1, 1, "DELETE has no scope to act on; it must follow a clause that binds variables (MATCH, MERGE, CREATE, WITH, UNWIND)"}
+				return &Error{Line: 1, Col: 1, Msg: "DELETE has no scope to act on; it must follow a clause that binds variables (MATCH, MERGE, CREATE, WITH, UNWIND)"}
 			}
 			for _, v := range c.Vars {
 				if err := sc.checkEntityVar(v); err != nil {
@@ -1893,7 +1881,7 @@ func (q *Query) validate() error {
 			singleNode := len(c.Pattern.Nodes) == 1 && len(c.Pattern.Edges) == 0
 			singleEdge := len(c.Pattern.Nodes) == 2 && len(c.Pattern.Edges) == 1
 			if !singleNode && !singleEdge {
-				return &Error{1, 1, "MERGE takes a single node or a single edge pattern"}
+				return &Error{Line: 1, Col: 1, Msg: "MERGE takes a single node or a single edge pattern"}
 			}
 			if err := sc.checkWritePattern(c.Pattern, singleNode); err != nil {
 				return err

@@ -178,11 +178,8 @@ func (ex *executor) createPattern(pat *PathPattern, r *row) error {
 			if id, ok := r.nodes[np.Var]; ok { // rebind: the bound node is the identity
 				key, ok := ex.boundNodeKey(id)
 				if !ok {
-					line, col := np.Line, np.Col
-					if line == 0 { // hand-built pattern: no token positions
-						line, col = 1, 1
-					}
-					return &Error{line, col, fmt.Sprintf("bound node %q does not resolve to a key", np.Var)}
+					line, col := pos1(np.Line, np.Col) // hand-built pattern: no token positions
+					return &Error{Line: line, Col: col, Msg: fmt.Sprintf("bound node %q does not resolve to a key", np.Var)}
 				}
 				keys[i], ids[i] = key, id
 				continue
@@ -194,11 +191,8 @@ func (ex *executor) createPattern(pat *PathPattern, r *row) error {
 			// bound it. Creating a nameless fresh node instead would
 			// silently invent data — error.
 			if np.Label == "" && np.Exprs == nil {
-				line, col := np.Line, np.Col
-				if line == 0 {
-					line, col = 1, 1
-				}
-				return &Error{line, col, fmt.Sprintf("variable %q is not bound in this row (an OPTIONAL MATCH miss, an earlier DELETE in this statement, or a statement shape that never bound it); CREATE cannot rebind it", np.Var)}
+				line, col := pos1(np.Line, np.Col)
+				return &Error{Line: line, Col: col, Msg: fmt.Sprintf("variable %q is not bound in this row (an OPTIONAL MATCH miss, an earlier DELETE in this statement, or a statement shape that never bound it); CREATE cannot rebind it", np.Var)}
 			}
 		}
 		key, id, err := ex.createNode(np, *r)
@@ -234,6 +228,23 @@ func (ex *executor) createPattern(pat *PathPattern, r *row) error {
 	return nil
 }
 
+// evalKeyString evaluates one write-pattern "key" expression and requires a
+// string (the node's logical key): the shared block of the three write arms
+// (createNode, mergeNode, mergeEdge), one positioned error face across all
+// of them (audit F-28). The null outcome (unbound reference, NULL literal)
+// evaluates as nil and fails the string check with the same error.
+func (ex *executor) evalKeyString(e Expr, r row) (string, error) {
+	v, ok := ex.eval(e, r)
+	if !ok {
+		v = nil
+	}
+	if s, isStr := v.(string); isStr {
+		return s, nil
+	}
+	line, col := pos1(e.pos())
+	return "", &Error{Line: line, Col: col, Msg: fmt.Sprintf("key property must be a string (the node's logical key); got %s", litTypeName(v))}
+}
+
 // createNode evaluates one fresh node pattern against the row and writes
 // it: the "key" expression (when present) must evaluate to a string —
 // positioned runtime error otherwise — the evaluated property map MINUS
@@ -242,19 +253,11 @@ func (ex *executor) createPattern(pat *PathPattern, r *row) error {
 func (ex *executor) createNode(np *NodePattern, r row) (string, uint32, error) {
 	var key string
 	if kexpr, has := np.Exprs["key"]; has {
-		v, ok := ex.eval(kexpr, r)
-		if !ok {
-			v = nil
+		k, err := ex.evalKeyString(kexpr, r)
+		if err != nil {
+			return "", 0, err
 		}
-		if s, isStr := v.(string); isStr {
-			key = s
-		} else {
-			line, col := kexpr.pos()
-			if line == 0 {
-				line, col = 1, 1
-			}
-			return "", 0, &Error{line, col, fmt.Sprintf("key property must be a string (the node's logical key); got %s", litTypeName(v))}
-		}
+		key = k
 	} else {
 		key = ex.w.NewNodeKey()
 	}
@@ -315,7 +318,7 @@ func (ex *executor) applySetItems(items []*SetItem, r *row) error {
 		if id, ok := r.nodes[it.Var]; ok { // nil-map lookup: safe miss
 			key, okK := ex.boundNodeKey(id)
 			if !okK {
-				return &Error{1, 1, fmt.Sprintf("bound node %q does not resolve to a key", it.Var)}
+				return &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("bound node %q does not resolve to a key", it.Var)}
 			}
 			n, err := ex.w.SetNodeProps(key, map[string]any{it.Prop: val})
 			if err != nil {
@@ -326,7 +329,7 @@ func (ex *executor) applySetItems(items []*SetItem, r *row) error {
 		} else if id, ok := r.edges[it.Var]; ok {
 			ref, okR := ex.boundEdgeRef(id)
 			if !okR {
-				return &Error{1, 1, fmt.Sprintf("bound edge %q does not resolve to a triple", it.Var)}
+				return &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("bound edge %q does not resolve to a triple", it.Var)}
 			}
 			n, err := ex.w.SetEdgeProps(ref.srcKey, ref.dstKey, ref.label, map[string]any{it.Prop: val})
 			if err != nil {
@@ -337,7 +340,7 @@ func (ex *executor) applySetItems(items []*SetItem, r *row) error {
 		} else {
 			// An OPTIONAL MATCH miss leaves the var unbound in the kept
 			// row; Neo4j parity is the explicit null error.
-			return &Error{1, 1, fmt.Sprintf("SET requires a bound node or edge variable; %s is null", it.Var)}
+			return &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("SET requires a bound node or edge variable; %s is null", it.Var)}
 		}
 		if pending == nil {
 			pending = make(map[string]map[string]any)
@@ -379,13 +382,13 @@ func (ex *executor) deleteStage(c *DeleteClause, rows []row) ([]row, error) {
 			if id, ok := r.nodes[v]; ok { // nil-map lookup: safe miss
 				key, okK := ex.boundNodeKey(id)
 				if !okK {
-					return nil, &Error{1, 1, fmt.Sprintf("bound node %q does not resolve to a key", v)}
+					return nil, &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("bound node %q does not resolve to a key", v)}
 				}
 				if _, live := ex.w.NodeIDByKey(key); !live {
 					continue // an earlier row's delete removed it: no-op, no count
 				}
 				if !c.Detach && ex.w.NodeHasEdges(key) {
-					return nil, &Error{1, 1, fmt.Sprintf("cannot delete node %s: it still has edges (use DETACH DELETE)", key)}
+					return nil, &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("cannot delete node %s: it still has edges (use DETACH DELETE)", key)}
 				}
 				killed, err := ex.w.DeleteNodeCascade(key)
 				if err != nil {
@@ -396,7 +399,7 @@ func (ex *executor) deleteStage(c *DeleteClause, rows []row) ([]row, error) {
 			} else if id, ok := r.edges[v]; ok {
 				ref, okR := ex.boundEdgeRef(id)
 				if !okR {
-					return nil, &Error{1, 1, fmt.Sprintf("bound edge %q does not resolve to a triple", v)}
+					return nil, &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("bound edge %q does not resolve to a triple", v)}
 				}
 				// A triple whose endpoint died earlier in this statement
 				// (the DETACH DELETE a, r case: a's cascade killed r) is
@@ -415,7 +418,7 @@ func (ex *executor) deleteStage(c *DeleteClause, rows []row) ([]row, error) {
 			} else {
 				// An OPTIONAL MATCH miss leaves the var unbound in the kept
 				// row; Neo4j parity is the explicit null error (SET shape).
-				return nil, &Error{1, 1, fmt.Sprintf("DELETE requires a bound node or edge variable; %s is null", v)}
+				return nil, &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("DELETE requires a bound node or edge variable; %s is null", v)}
 			}
 		}
 	}
@@ -473,30 +476,19 @@ func (ex *executor) mergeNode(np *NodePattern, r *row, onCreate, onMatch []*SetI
 		if id, ok := r.nodes[np.Var]; ok {
 			k, okK := ex.boundNodeKey(id)
 			if !okK {
-				line, col := np.Line, np.Col
-				if line == 0 {
-					line, col = 1, 1
-				}
-				return &Error{line, col, fmt.Sprintf("bound node %q does not resolve to a key", np.Var)}
+				line, col := pos1(np.Line, np.Col)
+				return &Error{Line: line, Col: col, Msg: fmt.Sprintf("bound node %q does not resolve to a key", np.Var)}
 			}
 			key, bound = k, true
 		}
 	}
 	if !bound {
 		if kexpr, has := np.Exprs["key"]; has {
-			v, ok := ex.eval(kexpr, *r)
-			if !ok {
-				v = nil
+			k, err := ex.evalKeyString(kexpr, *r)
+			if err != nil {
+				return err
 			}
-			if s, isStr := v.(string); isStr {
-				key = s
-			} else {
-				line, col := kexpr.pos()
-				if line == 0 {
-					line, col = 1, 1
-				}
-				return &Error{line, col, fmt.Sprintf("key property must be a string (the node's logical key); got %s", litTypeName(v))}
-			}
+			key = k
 		} else {
 			key = ex.w.NewNodeKey() // defensive: the grammar requires a key here; a keyless fresh merge can never hit
 		}
@@ -563,11 +555,8 @@ func (ex *executor) mergeEdge(pat *PathPattern, r *row, onCreate, onMatch []*Set
 			if id, ok := r.nodes[np.Var]; ok { // rebind: the bound node is the identity
 				key, okK := ex.boundNodeKey(id)
 				if !okK {
-					line, col := np.Line, np.Col
-					if line == 0 {
-						line, col = 1, 1
-					}
-					return &Error{line, col, fmt.Sprintf("bound node %q does not resolve to a key", np.Var)}
+					line, col := pos1(np.Line, np.Col)
+					return &Error{Line: line, Col: col, Msg: fmt.Sprintf("bound node %q does not resolve to a key", np.Var)}
 				}
 				keys[i], ids[i] = key, id
 				continue
@@ -577,27 +566,16 @@ func (ex *executor) mergeEdge(pat *PathPattern, r *row, onCreate, onMatch []*Set
 				// OPTIONAL MATCH miss, a DELETE earlier in the statement, or
 				// a statement shape that never bound it — merging a
 				// nameless fresh node would invent identity. Error.
-				line, col := np.Line, np.Col
-				if line == 0 {
-					line, col = 1, 1
-				}
-				return &Error{line, col, fmt.Sprintf("variable %q is not bound in this row (an OPTIONAL MATCH miss, an earlier DELETE in this statement, or a statement shape that never bound it); MERGE cannot rebind it", np.Var)}
+				line, col := pos1(np.Line, np.Col)
+				return &Error{Line: line, Col: col, Msg: fmt.Sprintf("variable %q is not bound in this row (an OPTIONAL MATCH miss, an earlier DELETE in this statement, or a statement shape that never bound it); MERGE cannot rebind it", np.Var)}
 			}
 		}
 		if kexpr, has := np.Exprs["key"]; has {
-			v, ok := ex.eval(kexpr, *r)
-			if !ok {
-				v = nil
+			k, err := ex.evalKeyString(kexpr, *r)
+			if err != nil {
+				return err
 			}
-			if s, isStr := v.(string); isStr {
-				keys[i] = s
-			} else {
-				line, col := kexpr.pos()
-				if line == 0 {
-					line, col = 1, 1
-				}
-				return &Error{line, col, fmt.Sprintf("key property must be a string (the node's logical key); got %s", litTypeName(v))}
-			}
+			keys[i] = k
 			if id, live := ex.w.NodeIDByKey(keys[i]); live {
 				ids[i] = id // the key names an existing endpoint: no creation
 			} else {

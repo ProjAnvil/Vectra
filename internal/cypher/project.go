@@ -90,7 +90,7 @@ func (ex *executor) aggregate(items []*ReturnItem, rows []row) (keyIdx, aggIdx [
 		st := groups[ks]
 		if st == nil {
 			if len(groups) >= maxGroups {
-				return nil, nil, nil, &Error{1, 1, fmt.Sprintf("too many groups: aggregation exceeded %d groups; add grouping keys or filters", maxGroups)}
+				return nil, nil, nil, &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("too many groups: aggregation exceeded %d groups; add grouping keys or filters", maxGroups)}
 			}
 			st = &accState{keys: keys, aggs: make([]*aggAcc, len(aggIdx))}
 			groups[ks] = st
@@ -320,7 +320,7 @@ func (ex *executor) accum(it *ReturnItem, ac *aggAcc, r row) error {
 	case "sum", "avg":
 		f, ok := v.(float64) // numerics were normalized above
 		if !ok {
-			return &Error{1, 1, fmt.Sprintf("%s(): non-numeric input %T", call.Func, v)}
+			return &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("%s(): non-numeric input %T", call.Func, v)}
 		}
 		ac.sum += f
 		ac.sumN++
