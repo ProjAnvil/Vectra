@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"sync"
 	"testing"
@@ -325,5 +326,77 @@ func TestFSMApplyOneLayerPerBatch(t *testing.T) {
 	}
 	if layers != 1 {
 		t.Fatalf("unmerged layers = %d, want 1 (one micro-layer per committed entry, not per op)", layers)
+	}
+}
+
+// TestFSMApplyUniqueViolationAborts pins the §2.4 ruling: the node lane is
+// first-error-stops. Before unique constraints the FSM silently skipped a
+// rejected AddNode (`if err == nil { NodesApplied++ }`, no else) — a
+// violating batch would have returned an ApplyResult with the node missing.
+// Now the whole Apply fails with the violation error: ops before the
+// violation are durable (one micro-layer — the documented partial
+// application), the violating op has zero side effects, ops after it never
+// run, and re-applying the same entry aborts identically (the rejection is
+// log-content-derived, so replay and every replica agree).
+func TestFSMApplyUniqueViolationAborts(t *testing.T) {
+	f := newFSM(time.Hour)
+
+	// The constraint enters through the Cypher lane — statement
+	// re-execution is the server's persistence (§4.3).
+	decl := f.Apply(&raft.Log{Data: mustGob(t, Batch{
+		Version: batchVersion, Cypher: &CypherWrite{Query: constraintCreateStmt},
+	}), Index: 1})
+	dres, ok := decl.(ApplyResult)
+	if !ok || !dres.Committed {
+		t.Fatalf("declare entry = %+v (%T), want a committed ApplyResult", decl, decl)
+	}
+	if dres.Cypher == nil || dres.Cypher.Summary == nil || dres.Cypher.Summary.ConstraintsCreated != 1 {
+		t.Fatalf("declare summary = %+v, want ConstraintsCreated=1", dres.Cypher)
+	}
+
+	seed := f.Apply(&raft.Log{Data: mustGob(t, Batch{Version: 1, Nodes: []NodeUpsert{
+		{Key: "a", Label: "Person", Props: map[string]any{"email": "a@x"}},
+	}}), Index: 2})
+	if _, ok := seed.(ApplyResult); !ok {
+		t.Fatalf("seed entry = %v (%T), want ApplyResult", seed, seed)
+	}
+
+	viol := Batch{Version: 1, Nodes: []NodeUpsert{
+		{Key: "b", Label: "Person", Props: map[string]any{"email": "b@x"}},
+		{Key: "c", Label: "Person", Props: map[string]any{"email": "a@x"}}, // violates a@x
+		{Key: "d", Label: "Person", Props: map[string]any{"email": "d@x"}},
+	}}
+	got := f.Apply(&raft.Log{Data: mustGob(t, viol), Index: 3})
+	err, ok := got.(error)
+	if !ok {
+		t.Fatalf("violating batch = %+v (%T), want an error (silent-skip regression)", got, got)
+	}
+	if !errors.Is(err, vectra.ErrUniqueViolation) {
+		t.Fatalf("abort error = %v, want the ErrUniqueViolation class", err)
+	}
+	var uv *vectra.UniqueViolationError
+	if !errors.As(err, &uv) || uv.Value != "a@x" || uv.ExistingKey != "a" || uv.AttemptedKey != "c" {
+		t.Fatalf("violation payload = %+v, want value a@x owner a attempted c", uv)
+	}
+
+	f.mu.RLock()
+	_, bOK := f.live.NodeByKey("b")
+	_, cOK := f.live.NodeByKey("c")
+	_, dOK := f.live.NodeByKey("d")
+	n := f.live.NodeCount()
+	f.mu.RUnlock()
+	if !bOK {
+		t.Fatal("op before the violation must be durable (partial application)")
+	}
+	if cOK || dOK {
+		t.Fatal("violating op must have zero side effects and later ops must not run")
+	}
+	if n != 2 {
+		t.Fatalf("live nodes = %d, want 2 (a + b)", n)
+	}
+
+	// Replay of the same entry aborts at the same op with the same class.
+	if got := f.Apply(&raft.Log{Data: mustGob(t, viol), Index: 3}); !errors.Is(got.(error), vectra.ErrUniqueViolation) {
+		t.Fatalf("replayed abort = %v, want the ErrUniqueViolation class", got)
 	}
 }

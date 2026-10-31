@@ -168,6 +168,23 @@ func (n *Node) writeApplyErr(w http.ResponseWriter, err error) {
 	writeErr(w, http.StatusInternalServerError, "INTERNAL", err.Error())
 }
 
+// writeUniqueViolation renders the §2.6 client face for an apply error
+// carrying a unique-constraint violation: 400 with code UNIQUE_VIOLATION
+// and the violation payload as the message (constraint identity, contended
+// value, current owner). A violation is a CLIENT error, so this runs
+// AHEAD of writeApplyErr (which would land it on 500 INTERNAL) and, on the
+// Cypher lane, ahead of the CypherError branch (which would land it on 400
+// PARSE with the payload hidden). Returns false when err is not a
+// violation, so callers fall through to the generic mappings.
+func writeUniqueViolation(w http.ResponseWriter, err error) bool {
+	var uve *vectra.UniqueViolationError
+	if !errors.As(err, &uve) {
+		return false
+	}
+	writeErr(w, http.StatusBadRequest, "UNIQUE_VIOLATION", err.Error())
+	return true
+}
+
 // wireableProps rewrites JSON-decoded numeric arrays in props in place:
 // encoding/json decodes every JSON array into []any, and encoding/gob (the
 // raft log codec) has no concrete type registered for []any, so a vector
@@ -227,6 +244,9 @@ func (n *Node) handleBatch(w http.ResponseWriter, r *http.Request) {
 		NodeDeletes: req.NodeDeletes,
 	})
 	if err != nil {
+		if writeUniqueViolation(w, err) {
+			return
+		}
 		n.writeApplyErr(w, err)
 		return
 	}
@@ -280,6 +300,12 @@ func (n *Node) handleTxn(w http.ResponseWriter, r *http.Request) {
 		Txn:         req.Txn,
 	})
 	if err != nil {
+		// /v1/txn rides the same FSM batch lane as /v1/batch, so a
+		// constraint violation aborts the guarded entry the same way —
+		// this is a client error, not a 409 guard conflict, not a 500.
+		if writeUniqueViolation(w, err) {
+			return
+		}
 		n.writeApplyErr(w, err)
 		return
 	}
@@ -524,12 +550,13 @@ type cypherRequest struct {
 // engine type carries no JSON tags (internal counters), so the exact
 // response keys are pinned here.
 type cypherSummaryOut struct {
-	CreatedNodes   int `json:"createdNodes"`
-	CreatedEdges   int `json:"createdEdges"`
-	DeletedNodes   int `json:"deletedNodes"`
-	DeletedEdges   int `json:"deletedEdges"`
-	PropertiesSet  int `json:"propertiesSet"`
-	IndexesCreated int `json:"indexesCreated"`
+	CreatedNodes       int `json:"createdNodes"`
+	CreatedEdges       int `json:"createdEdges"`
+	DeletedNodes       int `json:"deletedNodes"`
+	DeletedEdges       int `json:"deletedEdges"`
+	PropertiesSet      int `json:"propertiesSet"`
+	IndexesCreated     int `json:"indexesCreated"`
+	ConstraintsCreated int `json:"constraintsCreated"` // 0 or 1; a duplicate declare is an error, unlike idempotent index re-declares
 }
 
 // handleCypher runs one Cypher-subset statement. READ statements execute
@@ -585,17 +612,23 @@ func (n *Node) handleCypher(w http.ResponseWriter, r *http.Request) {
 
 // applyCypherWrite submits one write statement as its own raft command and
 // renders the apply result. Follower/timeout/shutdown errors share the
-// batch write faces (writeApplyErr); a statement error surfacing at FSM
-// apply time replays deterministically on every replica and keeps the read
-// path's 400 PARSE face. The response carries columns/rows (a write's
-// RETURN clause, empty when absent) plus the summary — never the read
-// path's count key.
+// batch write faces (writeApplyErr); a unique-constraint violation keeps
+// the 400 UNIQUE_VIOLATION client face (§2.6, checked BEFORE the CypherError
+// branch — the engine passes violations through unwrapped, but if one ever
+// arrived wrapped, the violation class must win over 400 PARSE); any other
+// statement error surfacing at FSM apply time replays deterministically on
+// every replica and keeps the read path's 400 PARSE face. The response
+// carries columns/rows (a write's RETURN clause, empty when absent) plus
+// the summary — never the read path's count key.
 func (n *Node) applyCypherWrite(w http.ResponseWriter, r *http.Request, query string) {
 	res, err := n.Apply(r.Context(), Batch{
 		Version: batchVersion,
 		Cypher:  &CypherWrite{Query: query},
 	})
 	if err != nil {
+		if writeUniqueViolation(w, err) {
+			return
+		}
 		var ce *vectra.CypherError
 		if errors.As(err, &ce) {
 			writeErr(w, http.StatusBadRequest, "PARSE", err.Error())
@@ -625,12 +658,13 @@ func (n *Node) applyCypherWrite(w http.ResponseWriter, r *http.Request, query st
 		"columns": cols,
 		"rows":    rows,
 		"summary": cypherSummaryOut{
-			CreatedNodes:   sum.CreatedNodes,
-			CreatedEdges:   sum.CreatedEdges,
-			DeletedNodes:   sum.DeletedNodes,
-			DeletedEdges:   sum.DeletedEdges,
-			PropertiesSet:  sum.PropertiesSet,
-			IndexesCreated: sum.IndexesCreated,
+			CreatedNodes:       sum.CreatedNodes,
+			CreatedEdges:       sum.CreatedEdges,
+			DeletedNodes:       sum.DeletedNodes,
+			DeletedEdges:       sum.DeletedEdges,
+			PropertiesSet:      sum.PropertiesSet,
+			IndexesCreated:     sum.IndexesCreated,
+			ConstraintsCreated: sum.ConstraintsCreated,
 		},
 	})
 }

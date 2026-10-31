@@ -196,11 +196,27 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	// deliberately: it depends on local disk state (not log content) and must
 	// never influence ApplyResult or the in-memory replay, or replicas could
 	// diverge; live has no WAL attached here, so it cannot fire anyway.
+	//
+	// Node upserts are first-error-stops (spec 2026-10-30 §2.4): a node op
+	// the engine rejects — unique-constraint violations today — fails the
+	// whole entry instead of the pre-0.16 silent skip (`err == nil` guard
+	// with no else, which would have answered 200 with the node missing).
+	// Like the vector shape-validation abort above, the rejection is a
+	// function of log content and log-derived state, so every replica and
+	// every replay aborts at the same op; unlike it, ops before the
+	// rejection are already durable inside this batch's micro-layer (the
+	// documented partial application), so the bookkeeping below must still
+	// advance before the error surfaces. Edge lanes stay skip-counted:
+	// edge ops cannot violate node constraints in v1, so they keep the
+	// deterministic-skip discipline.
+	var nodeErr error
 	_ = f.live.Batch(func(g *vectra.Graph) {
-		for _, n := range b.Nodes {
-			if _, err := g.AddNode(n.Key, n.Label, n.Props); err == nil {
-				res.NodesApplied++
+		for i, n := range b.Nodes {
+			if _, err := g.AddNode(n.Key, n.Label, n.Props); err != nil {
+				nodeErr = fmt.Errorf("server: batch nodes[%d] (%s): %w", i, n.Key, err)
+				return
 			}
+			res.NodesApplied++
 		}
 		for _, e := range b.Edges {
 			var err error
@@ -245,6 +261,16 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	small := f.live.NodeCount()+f.live.EdgeCount() < f.smallGraphLimit
 	f.mu.Unlock()
 
+	if nodeErr != nil {
+		// The aborted entry's partial effects are real: publish them (same
+		// discipline as applyCypher's failed statement — bookkeeping above
+		// advanced unconditionally), but report no batch-completion metrics
+		// and skip the txn-commit count (the entry did not commit).
+		if small {
+			f.wakePublisher()
+		}
+		return nodeErr
+	}
 	if b.Txn != nil {
 		f.metrics.TxnCommits.Add(1)
 	}
@@ -278,9 +304,13 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 // identically, mirroring the vector-index op error discipline.
 //
 // The write executor mutates as the statement goes, so a failed statement
-// may still have applied partial effects; because every replica fails
+// may still have applied partial effects; because every replica fails it
 // identically on the same state, those (identical) partial effects are
-// safe to publish — bookkeeping below advances unconditionally.
+// safe to publish — bookkeeping below advances unconditionally. A
+// unique-constraint violation rides this lane as the RAW
+// *vectra.UniqueViolationError (the engine's Cypher layer passes it
+// through unwrapped), so the HTTP face can classify it 400
+// UNIQUE_VIOLATION instead of the generic apply mapping.
 //
 // Known limitation (deliberate, documented): the per-key version tables
 // (nodeVer/edgeVer) are not advanced — the engine's summary carries
