@@ -357,6 +357,18 @@ type Graph struct {
 	bIndex     []string              // pending index declarations (this batch)
 	bFTS       []string              // pending full-text index declarations (this batch, 2026-10-26 FTS plan)
 
+	// unique-constraint registry (unique-constraints spec 2026-10-30 §3.1),
+	// writer-private like the mirrors and persistent across publishes —
+	// folds/Seal/CaptureMerge renumber IDs, never keys/labels/props, so the
+	// registry is fold-immune and needs no per-publish reset. nil/empty = no
+	// constraints: every write path's fast path is a single len check, zero
+	// cost and zero allocations on unconstrained graphs. uniqueStale marks
+	// the registry suspect (Batch panic recovery, rebase repair — flagged in
+	// a later task) and the next registry touch rebuilds every map from live
+	// state (uniqueEnsureFresh).
+	uniqueIdx   map[UniqueConstraint]map[string]string // constraint -> value -> owning key
+	uniqueStale bool
+
 	// WAL session state (all zero for New()/Load() graphs — v0.6 behavior).
 	wal    *wal.WAL // nil = no recording
 	walDir string   // checkpoint manifest location
@@ -623,17 +635,19 @@ const (
 	opIndex
 	opVecIndex // declaration-class like opIndex: rides IndexDecl frames
 	opFTS      // full-text declaration-class: rides IndexDecl frames too (FTS plan)
+	opUnique   // unique-constraint declaration-class: rides IndexDecl frames too
 )
 
 // pendOp is one recorded write, kept in original order until flush.
 type pendOp struct {
-	kind     opKind
-	node     NodeUpsert
-	edge     EdgeUpsert
-	edel     EdgeDelete
-	ndel     string
-	idx      string                // opIndex/opFTS: declared property key
-	vecDecls []wal.VectorIndexDecl // opVecIndex: full declaration list
+	kind        opKind
+	node        NodeUpsert
+	edge        EdgeUpsert
+	edel        EdgeDelete
+	ndel        string
+	idx         string                 // opIndex/opFTS: declared property key
+	vecDecls    []wal.VectorIndexDecl  // opVecIndex: full declaration list
+	uniqueDecls []wal.UniqueConstraint // opUnique: full declaration list
 }
 
 // New returns an empty graph. The initial generation is an empty merged
@@ -1226,6 +1240,15 @@ func (g *Graph) AddNode(key, label string, props map[string]any) (NodeID, error)
 	if err := g.checkWriter(); err != nil {
 		return 0, err
 	}
+	// Unique-constraint gate (spec 2026-10-30 §2.3): the check runs at ENTRY,
+	// before recordNode and before the ID ratchet advances, so a rejected
+	// write leaves WAL frames, pendOps, the builder, the registry, the ratchet
+	// and the vector intake untouched. The pre-image fetch must precede every
+	// mutation of the node's records (the builder overwrites them below).
+	pre := g.uniquePreState(key)
+	if err := g.uniqueCheckAdd(key, label, props); err != nil {
+		return 0, err
+	}
 	if err := g.recordNode(key, label, props); err != nil {
 		return 0, err
 	}
@@ -1245,6 +1268,7 @@ func (g *Graph) AddNode(key, label string, props map[string]any) (NodeID, error)
 		return 0, err // unreachable for a fresh builder; surfaced anyway
 	}
 	g.vecIntakeNode(key, props)
+	g.uniqueSwap(pre, key, label, props)
 	g.finishOp(0)
 	return NodeID(id), nil
 }
@@ -1382,6 +1406,12 @@ func (g *Graph) DeleteNode(key string) (int, error) {
 	if !g.nodeLive(key) {
 		return 0, ErrNodeNotFound
 	}
+	// Fetch the node's pre-image BEFORE any mutation: once the builder's
+	// tombstone lands, the record is only reachable through the (stale until
+	// publish) mirror. The release itself runs only after the write steps
+	// succeeded, next to vecIntakeDelete — an error path leaves the registry
+	// exactly as it was.
+	pre := g.uniquePreState(key)
 	if err := g.recordNodeDelete(key); err != nil {
 		return 0, err
 	}
@@ -1396,6 +1426,9 @@ func (g *Graph) DeleteNode(key string) (int, error) {
 	}
 	g.bLiveNodes[key] = false
 	g.vecIntakeDelete(key)
+	if pre.live {
+		g.uniqueRelease(pre.label, pre.props, key)
+	}
 	for _, k := range hookKeys {
 		// mark the hook's published parallels killed (one per emitted copy) so
 		// later same-batch upserts draw fresh IDs (ratchet discipline) and
@@ -1405,6 +1438,327 @@ func (g *Graph) DeleteNode(key string) (int, error) {
 	}
 	g.finishOp(0)
 	return n, nil
+}
+
+// --- unique constraints (spec 2026-10-30) -------------------------------------
+
+// uniqueDup is one duplicate ownership pair surfaced by a DeclareUnique
+// validation scan: value is already owned by key (among others).
+type uniqueDup struct{ value, key string }
+
+// uniqueDeclError is the declaration-time validation failure (spec §2.2):
+// declaring over live data where two nodes already share a (label, prop)
+// string value. It unwraps to ErrUniqueViolation — the same class as
+// write-time rejections — and lists up to ten duplicate (value, key) pairs
+// sorted by value then key, so every raft replica reports byte-identical
+// text from any map iteration order.
+type uniqueDeclError struct {
+	c     UniqueConstraint
+	pairs []uniqueDup
+}
+
+func (e *uniqueDeclError) Error() string {
+	parts := make([]string, len(e.pairs))
+	for i, p := range e.pairs {
+		parts[i] = strconv.Quote(p.value) + " owned by " + strconv.Quote(p.key)
+	}
+	return "vectra: DeclareUnique(" + e.c.Label + "." + e.c.Prop + "): duplicate values: " +
+		strings.Join(parts, ", ")
+}
+
+func (e *uniqueDeclError) Unwrap() error { return ErrUniqueViolation }
+
+// DeclareUnique registers a property-value uniqueness constraint over one
+// (label, prop) pair: afterwards a write that would leave two live nodes of
+// the label sharing the same string value for the prop is rejected at the
+// write-method entry with zero side effects for that operation (spec §2.1).
+// The (label, prop) pair is the constraint's identity — there are no
+// constraint names, and the two nodes-mutating root entries (AddNode,
+// DeleteNode) are the only enforcement points: every other surface —
+// SetNodeProps, Cypher writes, WAL replay — funnels into AddNode.
+//
+// Declaration validates the FULL live state first (the Neo4j rule, §2.2):
+// any string value the (label, prop) pair already duplicates fails the
+// declaration with an error matching ErrUniqueViolation listing up to ten
+// (value, key) pairs sorted by value then key; the constraint is then NOT
+// registered. A duplicate declaration fails with ErrConstraintExists; both
+// rejections happen before any side effect.
+//
+// Rejected inside Batch (the CreateVectorIndex precedent, §2.1): the
+// validation scan needs the full live view and replay applies declaration
+// frames between changesets, never inside one. Non-string prop values never
+// participate (documented v1 divergence from Neo4j, §2.5). The declaration
+// is WAL-logged log-first as a full-list IndexDecl frame — drops are
+// absences, replay replaces the whole set.
+//
+// Single-writer discipline: like every write method, call from the graph's
+// writer goroutine. The scan is O(live nodes) once per declaration (the
+// same class as a full-text build at Seal, §8).
+func (g *Graph) DeclareUnique(label, prop string) error {
+	if g.closed.Load() {
+		return ErrClosed
+	}
+	if err := g.checkWriter(); err != nil {
+		return err
+	}
+	if g.batching {
+		// The validation scan must see this batch's own writes, which are
+		// pre-publication, and replay applies declaration frames BETWEEN
+		// changesets, never inside one — reject instead of diverging (the
+		// CreateVectorIndex precedent, vectra_vector.go).
+		return errors.New("vectra: DeclareUnique inside Batch is not supported")
+	}
+	g.flushPend() // publish the open window so the scan sees all live state
+	c := UniqueConstraint{Label: label, Prop: prop}
+	if _, ok := g.uniqueIdx[c]; ok {
+		return ErrConstraintExists
+	}
+	g.uniqueEnsureFresh()
+	vals, dups := g.uniqueScanConstraint(c)
+	if len(dups) > 0 {
+		return &uniqueDeclError{c: c, pairs: dups}
+	}
+	if g.uniqueIdx == nil {
+		g.uniqueIdx = map[UniqueConstraint]map[string]string{}
+	}
+	g.uniqueIdx[c] = vals
+	g.recordUniqueDecls()
+	return nil
+}
+
+// DropUnique removes the constraint: enforcement stops immediately and its
+// value map is discarded (the value lifetimes it tracked end with it —
+// nodes that held duplicate values before the declaration remain untouched).
+// The WAL frame re-declares the surviving list; replay drops by absence.
+// Dropping an unknown constraint fails with ErrConstraintNotFound before
+// any side effect; declarations never run inside Batch (see DeclareUnique).
+func (g *Graph) DropUnique(label, prop string) error {
+	if g.closed.Load() {
+		return ErrClosed
+	}
+	if err := g.checkWriter(); err != nil {
+		return err
+	}
+	if g.batching {
+		return errors.New("vectra: DropUnique inside Batch is not supported")
+	}
+	g.flushPend()
+	c := UniqueConstraint{Label: label, Prop: prop}
+	if _, ok := g.uniqueIdx[c]; !ok {
+		return ErrConstraintNotFound
+	}
+	delete(g.uniqueIdx, c)
+	g.recordUniqueDecls()
+	return nil
+}
+
+// UniqueConstraints returns the declared constraints as a sorted copy
+// (label, then prop); mutating the result never touches the registry.
+// Flushes the caller's absorption window first like every read entry. The
+// registry is writer-private state: call from the writer goroutine or with
+// writes quiesced.
+func (g *Graph) UniqueConstraints() []UniqueConstraint {
+	g.flushPend()
+	out := make([]UniqueConstraint, 0, len(g.uniqueIdx))
+	for c := range g.uniqueIdx {
+		out = append(out, c)
+	}
+	slices.SortFunc(out, func(a, b UniqueConstraint) int {
+		if c := cmp.Compare(a.Label, b.Label); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Prop, b.Prop)
+	})
+	return out
+}
+
+// uniqueScanConstraint builds one constraint's value map from the writer's
+// live state — the published mirror, which callers make complete by
+// flushing the open window first (= published ∪ builder-visible, §2.2) —
+// and collects the duplicate (value, key) pairs it finds, sorted by value
+// then key and capped at ten (deterministic across raft replicas).
+func (g *Graph) uniqueScanConstraint(c UniqueConstraint) (vals map[string]string, dups []uniqueDup) {
+	vals = make(map[string]string)
+	owners := map[string][]string{} // value -> owning keys (len > 1 = duplicate)
+	for key, ref := range g.nodes {
+		if !ref.live || ref.label != c.Label {
+			continue
+		}
+		v, ok := ref.props[c.Prop].(string)
+		if !ok {
+			continue // non-string values are invisible (§2.5)
+		}
+		vals[v] = key
+		owners[v] = append(owners[v], key)
+	}
+	for v, keys := range owners {
+		if len(keys) > 1 {
+			slices.Sort(keys)
+			for _, k := range keys {
+				dups = append(dups, uniqueDup{value: v, key: k})
+			}
+		}
+	}
+	slices.SortFunc(dups, func(a, b uniqueDup) int {
+		if c := cmp.Compare(a.value, b.value); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.key, b.key)
+	})
+	if len(dups) > 10 {
+		dups = dups[:10]
+	}
+	return vals, dups
+}
+
+// uniquePre is the pre-image of one node for the registry's release step.
+type uniquePre struct {
+	label string
+	props map[string]any
+	live  bool
+}
+
+// uniquePreState fetches a node's current (label, props) as the writer sees
+// it — BUILDER FIRST, then the published mirror. The mirror (g.nodes)
+// reconciles only at publishLayer, so a key written in the open window
+// lives only in the builder; reading the mirror alone would leak the key's
+// registered values forever (the §2.3 asymmetry: the Cypher facade reads
+// the published generation, the release reads builder-first). A key deleted
+// this window has no live pre-image (its values were released at delete
+// time). The zero-constraint fast path makes this a no-op — one len check,
+// no allocation — on unconstrained graphs.
+func (g *Graph) uniquePreState(key string) uniquePre {
+	if len(g.uniqueIdx) == 0 {
+		return uniquePre{}
+	}
+	g.uniqueEnsureFresh()
+	if g.builder != nil {
+		if rec, ok := g.builder.LookupNode(key); ok {
+			return uniquePre{label: rec.Label, props: rec.Props, live: true}
+		}
+		if g.builder.NodeTombstoned(key) {
+			return uniquePre{} // deleted this window: nothing live to release
+		}
+	}
+	if ref, ok := g.nodes[key]; ok && ref.live {
+		return uniquePre{label: ref.label, props: ref.props, live: true}
+	}
+	return uniquePre{}
+}
+
+// uniqueCheckAdd validates one AddNode against the registry (§2.3): the
+// write is rejected when any constraint matching the node's NEW label has
+// its prospective string value owned by a DIFFERENT live key — the key's
+// own current ownership counts as released (override/revive re-assign their
+// own values freely). Non-string values and non-matching labels are
+// invisible. Callers run this before recordNode, the ID ratchet and the
+// builder, making rejection zero-side-effect by construction.
+func (g *Graph) uniqueCheckAdd(key, label string, props map[string]any) error {
+	if len(g.uniqueIdx) == 0 {
+		return nil
+	}
+	for c := range g.uniqueIdx {
+		if c.Label != label {
+			continue
+		}
+		v, ok := props[c.Prop].(string)
+		if !ok {
+			continue
+		}
+		if owner, taken := g.uniqueIdx[c][v]; taken && owner != key {
+			return &UniqueViolationError{
+				Label: c.Label, Prop: c.Prop, Value: v,
+				ExistingKey: owner, AttemptedKey: key,
+			}
+		}
+	}
+	return nil
+}
+
+// uniqueSwap applies one ACCEPTED AddNode to the registry (§3.2): release
+// the key's previously-owned values (the pre-image fetched at entry,
+// builder-first), then register the new label/props' string values. Runs
+// after the write's WAL and builder steps succeeded, keeping the registry
+// in lockstep with live state; the single writer makes check→swap atomic.
+func (g *Graph) uniqueSwap(pre uniquePre, key, label string, props map[string]any) {
+	if len(g.uniqueIdx) == 0 {
+		return
+	}
+	if pre.live {
+		g.uniqueRelease(pre.label, pre.props, key)
+	}
+	for c := range g.uniqueIdx {
+		if c.Label != label {
+			continue
+		}
+		if v, ok := props[c.Prop].(string); ok {
+			g.uniqueIdx[c][v] = key
+		}
+	}
+}
+
+// uniqueRelease drops every value the (label, props) pre-image owns in the
+// registry, guarded to entries the key itself owns: idempotent, and a stale
+// pre-image can never steal another key's registration.
+func (g *Graph) uniqueRelease(label string, props map[string]any, key string) {
+	for c := range g.uniqueIdx {
+		if c.Label != label {
+			continue
+		}
+		v, ok := props[c.Prop].(string)
+		if !ok {
+			continue
+		}
+		if owner, taken := g.uniqueIdx[c][v]; taken && owner == key {
+			delete(g.uniqueIdx[c], v)
+		}
+	}
+}
+
+// uniqueEnsureFresh rebuilds the registry when the stale flag is set (§3.3).
+// The flag is marked only at the self-healing boundaries — Batch panic
+// recovery and the rebase-repair sites, wired in a later task; normal
+// publish/fold/seal paths deliberately never mark it (incremental
+// maintenance over stable keys keeps the registry correct across layer
+// changes). No-op unless stale.
+func (g *Graph) uniqueEnsureFresh() {
+	if g.uniqueStale && len(g.uniqueIdx) > 0 {
+		g.uniqueRebuild()
+	}
+}
+
+// uniqueRebuild is the self-healing rebuild entrypoint (§3.3, used by the
+// stale flag and later tasks' recovery wiring): every constraint's value
+// map is rebuilt from the writer's current live state — the open absorption
+// window publishes first, so the mirror scan sees all of it (published ∪
+// builder-visible). Mid-Batch the stale flag can never be set (Batch panic
+// recovery drops the builder only after g.batching clears; rebase repair
+// runs at merge boundaries outside Batch), so the flush never cuts an open
+// batch. Live state that genuinely duplicates a value keeps an arbitrary
+// single owner — the registry's at-most-one-owner invariant holds; the
+// duplicate data itself is a caller problem that DeclareUnique surfaces.
+func (g *Graph) uniqueRebuild() {
+	g.uniqueStale = false
+	if len(g.uniqueIdx) == 0 {
+		return
+	}
+	g.flushPend()
+	for c := range g.uniqueIdx {
+		g.uniqueIdx[c] = make(map[string]string, g.nodeTotal)
+	}
+	for key, ref := range g.nodes {
+		if !ref.live {
+			continue
+		}
+		for c := range g.uniqueIdx {
+			if c.Label != ref.label {
+				continue
+			}
+			if v, ok := ref.props[c.Prop].(string); ok {
+				g.uniqueIdx[c][v] = key
+			}
+		}
+	}
 }
 
 // --- WAL op recorder ---------------------------------------------------------
@@ -1486,6 +1840,25 @@ func (g *Graph) recordFTSDecl(key string) error {
 	return g.maybeFlush()
 }
 
+// recordUniqueDecls logs the full current unique-constraint declaration list
+// as one opUnique pendOp at the current op position (log-first; flushPending
+// coalesces it with adjacent declaration ops into the IndexDecl run,
+// last-in-run wins). The slice is ALWAYS built non-nil — including the empty
+// list after the last constraint drops — so a drop-all declaration survives
+// the wire as an explicit empty rather than a null frame (the recordVecDecls
+// rule, spec 2026-10-30 §4.1).
+func (g *Graph) recordUniqueDecls() {
+	if g.wal == nil {
+		return
+	}
+	decls := make([]wal.UniqueConstraint, 0, len(g.uniqueIdx))
+	for c := range g.uniqueIdx {
+		decls = append(decls, wal.UniqueConstraint{Label: c.Label, Prop: c.Prop})
+	}
+	g.pendOps = append(g.pendOps, pendOp{kind: opUnique, uniqueDecls: decls})
+	_ = g.maybeFlush()
+}
+
 // maybeFlush flushes unless a Batch boundary is holding the buffer.
 func (g *Graph) maybeFlush() error {
 	if g.batching {
@@ -1495,10 +1868,10 @@ func (g *Graph) maybeFlush() error {
 }
 
 // flushPending emits the buffered ops as one frame per kind-ordered run;
-// consecutive index declarations (typed, vector and full-text alike)
-// coalesce into one IndexDecl frame at their position in the op order. On
-// error the unflushed ops stay buffered so a retry (e.g. a retried Close)
-// does not silently drop them.
+// consecutive index declarations (typed, vector, full-text and unique-
+// constraint alike) coalesce into one IndexDecl frame at their position in
+// the op order. On error the unflushed ops stay buffered so a retry (e.g. a
+// retried Close) does not silently drop them.
 func (g *Graph) flushPending() error {
 	if g.wal == nil {
 		g.pendOps = nil
@@ -1506,23 +1879,26 @@ func (g *Graph) flushPending() error {
 	}
 	i := 0
 	for i < len(g.pendOps) {
-		if g.pendOps[i].kind == opIndex || g.pendOps[i].kind == opVecIndex || g.pendOps[i].kind == opFTS {
+		if g.pendOps[i].kind == opIndex || g.pendOps[i].kind == opVecIndex || g.pendOps[i].kind == opFTS || g.pendOps[i].kind == opUnique {
 			j := i
 			keys := make([]string, 0, 4)
 			var ftsKeys []string
 			var vecs []wal.VectorIndexDecl
-			for j < len(g.pendOps) && (g.pendOps[j].kind == opIndex || g.pendOps[j].kind == opVecIndex || g.pendOps[j].kind == opFTS) {
+			var ucs []wal.UniqueConstraint
+			for j < len(g.pendOps) && (g.pendOps[j].kind == opIndex || g.pendOps[j].kind == opVecIndex || g.pendOps[j].kind == opFTS || g.pendOps[j].kind == opUnique) {
 				switch g.pendOps[j].kind {
 				case opIndex:
 					keys = append(keys, g.pendOps[j].idx)
 				case opFTS:
 					ftsKeys = append(ftsKeys, g.pendOps[j].idx)
+				case opUnique:
+					ucs = g.pendOps[j].uniqueDecls
 				default:
 					vecs = g.pendOps[j].vecDecls
 				}
 				j++
 			}
-			if _, err := g.wal.AppendIndex(IndexDecl{Keys: keys, VectorIndexes: vecs, FullTextKeys: ftsKeys}); err != nil {
+			if _, err := g.wal.AppendIndex(IndexDecl{Keys: keys, VectorIndexes: vecs, FullTextKeys: ftsKeys, UniqueConstraints: ucs}); err != nil {
 				g.pendOps = append([]pendOp(nil), g.pendOps[i:]...)
 				return err
 			}
@@ -1530,7 +1906,7 @@ func (g *Graph) flushPending() error {
 			continue
 		}
 		j := i + 1
-		for j < len(g.pendOps) && g.pendOps[j].kind != opIndex && g.pendOps[j].kind != opVecIndex && g.pendOps[j].kind != opFTS &&
+		for j < len(g.pendOps) && g.pendOps[j].kind != opIndex && g.pendOps[j].kind != opVecIndex && g.pendOps[j].kind != opFTS && g.pendOps[j].kind != opUnique &&
 			g.pendOps[j].kind >= g.pendOps[j-1].kind {
 			j++
 		}

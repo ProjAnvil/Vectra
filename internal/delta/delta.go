@@ -371,6 +371,30 @@ func (b *Builder) HasNode(key string) bool {
 	return ok && !b.nodes[i].deleted
 }
 
+// LookupNode reports the builder's current live record for key — written,
+// revived or materialized this window. A key deleted this window reports
+// false like an absent one; callers distinguishing deleted from untouched
+// use NodeTombstoned. Read-only: the root's unique-constraint release step
+// fetches a node's pre-image here, builder-first, because the published
+// mirror reconciles only at publish (unique-constraints spec 2026-10-30
+// §2.3).
+func (b *Builder) LookupNode(key string) (NodeRec, bool) {
+	i, ok := b.byKey[key]
+	if !ok || b.nodes[i].deleted {
+		return NodeRec{}, false
+	}
+	return b.nodes[i].rec, true
+}
+
+// NodeTombstoned reports whether key carries a pending node delete in this
+// builder — set by DeleteNode (including its overlay form for keys never
+// written here), cleared again by a revive. The root's pre-state fetch uses
+// it to stop falling through to the stale published mirror for keys this
+// window already deleted.
+func (b *Builder) NodeTombstoned(key string) bool {
+	return b.nodeTomb[key]
+}
+
 // EdgeSlots reports the live in-builder parallels of k: how many and the
 // slot index of the most recent one (the fold target). Dead slots are not
 // counted — deletes and folds drop them from the index.
