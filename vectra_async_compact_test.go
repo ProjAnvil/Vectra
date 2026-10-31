@@ -269,7 +269,7 @@ func TestAsyncCompactCrashStates(t *testing.T) {
 		// the pinned view + forest at the pin LSN, NO manifest, no WAL
 		// mutation.
 		v := g.view.Load()
-		if err := g.saveViewFile(v, g.snapshotFile(pin)); err != nil {
+		if err := g.saveViewFile(v, g.snapshotFile(pin), g.uniqueStoreDecls()); err != nil {
 			t.Fatal(err)
 		}
 		if err := g.writeVecForest(pin); err != nil {
@@ -280,7 +280,7 @@ func TestAsyncCompactCrashStates(t *testing.T) {
 	t.Run("C-manifest-no-drop", func(t *testing.T) {
 		dir, g, pin := build(t)
 		snap := filepath.Base(g.snapshotFile(pin))
-		if err := g.saveViewFile(g.view.Load(), g.snapshotFile(pin)); err != nil {
+		if err := g.saveViewFile(g.view.Load(), g.snapshotFile(pin), g.uniqueStoreDecls()); err != nil {
 			t.Fatal(err)
 		}
 		if err := g.writeVecForest(pin); err != nil {

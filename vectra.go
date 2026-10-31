@@ -1554,9 +1554,11 @@ func (g *Graph) DropUnique(label, prop string) error {
 
 // UniqueConstraints returns the declared constraints as a sorted copy
 // (label, then prop); mutating the result never touches the registry.
-// Flushes the caller's absorption window first like every read entry. The
-// registry is writer-private state: call from the writer goroutine or with
-// writes quiesced.
+// Flushes the caller's absorption window first like every read entry. No
+// freshness rebuild runs here: the §3.3 rebuilds rebuild each constraint's
+// VALUE map only and never add or remove a constraint, so the key set this
+// listing serves is always exact. The registry is writer-private state:
+// call from the writer goroutine or with writes quiesced.
 func (g *Graph) UniqueConstraints() []UniqueConstraint {
 	g.flushPend()
 	out := make([]UniqueConstraint, 0, len(g.uniqueIdx))
@@ -1761,6 +1763,42 @@ func (g *Graph) uniqueRebuild() {
 	}
 }
 
+// applyUniqueDecls reconciles the registry to a FULL declaration list with
+// REPLACE semantics (spec §3.4, the applyVecDecls rule): constraints absent
+// from the list drop — a non-nil list including the empty one replaces the
+// whole set, so replayed drops are never resurrected. This is the trust-path
+// counterpart of DeclareUnique: no duplicate validation (the data was valid
+// when persisted; a genuinely duplicated live value keeps an arbitrary
+// single owner exactly like a rebuild), and replay applies frames in their
+// original op order, so a constraint the registry already tracks keeps its
+// incrementally-maintained value map — only new constraints scan live
+// state. WAL replay runs with recording detached (g.wal nil) and
+// loadGraphForest runs pre-attachment, so recordUniqueDecls no-ops on both
+// call paths.
+func (g *Graph) applyUniqueDecls(list []wal.UniqueConstraint) {
+	want := make(map[UniqueConstraint]struct{}, len(list))
+	for _, uc := range list {
+		want[UniqueConstraint{Label: uc.Label, Prop: uc.Prop}] = struct{}{}
+	}
+	for c := range g.uniqueIdx {
+		if _, ok := want[c]; !ok {
+			delete(g.uniqueIdx, c)
+		}
+	}
+	g.flushPend() // the scan below must see the whole live state (§2.2's union)
+	for c := range want {
+		if _, ok := g.uniqueIdx[c]; ok {
+			continue
+		}
+		vals, _ := g.uniqueScanConstraint(c)
+		if g.uniqueIdx == nil {
+			g.uniqueIdx = map[UniqueConstraint]map[string]string{}
+		}
+		g.uniqueIdx[c] = vals
+	}
+	g.recordUniqueDecls()
+}
+
 // --- WAL op recorder ---------------------------------------------------------
 //
 // When a WAL is attached, each successful write method records one pendOp
@@ -1855,6 +1893,15 @@ func (g *Graph) recordUniqueDecls() {
 	for c := range g.uniqueIdx {
 		decls = append(decls, wal.UniqueConstraint{Label: c.Label, Prop: c.Prop})
 	}
+	// Sorted emission: map iteration order is not byte-stable, and the
+	// frame bytes must be deterministic across sessions and raft replicas
+	// (Task 2 review carry-over; UniqueConstraints sorts the same way).
+	slices.SortFunc(decls, func(a, b wal.UniqueConstraint) int {
+		if c := cmp.Compare(a.Label, b.Label); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Prop, b.Prop)
+	})
 	g.pendOps = append(g.pendOps, pendOp{kind: opUnique, uniqueDecls: decls})
 	_ = g.maybeFlush()
 }
@@ -2022,6 +2069,11 @@ func (g *Graph) Batch(fn func(*Graph)) error {
 			g.builder = nil
 			g.bNodeIDs, g.bEdgeIDs = nil, nil
 			g.bLiveNodes, g.bKilled, g.bIndex, g.bFTS = nil, nil, nil, nil
+			// The unique-constraint registry saw the dropped window's
+			// writes: mark it stale (spec §3.3) — strictly AFTER
+			// g.batching cleared above, so the rebuild's flush can never
+			// cut an open batch (the ordering the Task 2 review pinned).
+			g.uniqueStale = true
 		}
 	}()
 	fn(g)
@@ -2229,7 +2281,8 @@ func Open(path string, opts Options) (*Graph, error) {
 	// Replay with recording detached (g.wal still nil): replaying must not
 	// amplify frames. Torn tails stop at the last complete frame. IndexDecl
 	// frames rebuild their declarations through IndexProperty/IndexFullText
-	// (a no-op record while g.wal is nil).
+	// and the applyVecDecls/applyUniqueDecls REPLACE branches (all no-op
+	// records while g.wal is nil).
 	if _, err := w.Replay(func(fr wal.Frame) error {
 		g.replayLSN = fr.LSN // forest-coverage gate (see vecIntakeNode)
 		if fr.Changeset != nil {
@@ -2246,6 +2299,13 @@ func Open(path string, opts Options) (*Graph, error) {
 			// non-nil slice - including empty - is a vector declaration
 			// frame: empty means drop-all.
 			g.applyVecDecls(fr.VectorIndexes)
+		}
+		if fr.UniqueConstraints != nil {
+			// Same IndexDecl rule: nil = pre-feature frame, the registry
+			// stands; non-nil INCLUDING empty replaces the whole
+			// declaration set — merge-style replay would resurrect dropped
+			// constraints (§3.4).
+			g.applyUniqueDecls(fr.UniqueConstraints)
 		}
 		return nil
 	}); err != nil {
@@ -2770,6 +2830,14 @@ func (g *Graph) forceMerge() error {
 	// publishLayer must not fire the governor (this IS the full fold).
 	g.merging = true
 	defer func() { g.merging = false }()
+	// §3.3 stale-mark gate: this fold re-derives the writer-private mirrors
+	// because a rebase renumbered under them (RepairAfterRebase and every
+	// other post-rebase forceMerge caller — the mirror-rebuild sites). The
+	// unique-constraint registry is key-stable and stays correct across
+	// folds, but the self-healing ruling still rebuilds it after a mirror
+	// rebuild — never mid-Batch (the rebuild's flush must not cut an open
+	// window) and never for ordinary publish/fold/seal paths.
+	rebaseRepair := g.rebaseHappened.Load()
 	// unconditional: a mid-batch Seal flushes the pending batch, and even
 	// with the builder already closed (window cut by an earlier read) the
 	// endpoint registry must be dropped — the merge below renumbers IDs, and
@@ -2812,7 +2880,10 @@ func (g *Graph) forceMerge() error {
 		g.labels[labels[er.LabelID]] = true
 	}
 	g.rebaseHappened.Store(false) // mirrors now match the published view
-	g.pendingFold.Store(nil)      // any fold in hand-over targeted the old stack
+	if rebaseRepair && !g.batching {
+		g.uniqueStale = true // the §3.3 mirror-rebuild mark (see the gate above)
+	}
+	g.pendingFold.Store(nil) // any fold in hand-over targeted the old stack
 	g.view.Store(&genView{
 		base: snap, baseKeys: baseKeys, layers: nil,
 		lsn: v.lsn, nodes: g.nodeTotal, edges: g.edgeTotal,
@@ -3059,6 +3130,7 @@ func (g *Graph) compactCheckpoint(lsn uint64) error {
 type compactFlight struct {
 	lsn  uint64
 	view *genView
+	ucs  []store.UniqueConstraint // declaration snapshot pinned with the view (writer-private registry)
 	err  error
 	done chan struct{}
 }
@@ -3085,7 +3157,7 @@ func (g *Graph) TryAsyncCompact() bool {
 	// mode the batch's g.Batch end already published; in direct mode this
 	// is what brings sub-pendMaxOps builder contents into the view.
 	g.flushPend()
-	fl := &compactFlight{lsn: g.wal.LastLSN(), view: g.view.Load(), done: make(chan struct{})}
+	fl := &compactFlight{lsn: g.wal.LastLSN(), view: g.view.Load(), ucs: g.uniqueStoreDecls(), done: make(chan struct{})}
 	g.compactFlight = fl
 	go g.runCompactFlight(fl)
 	return true
@@ -3103,7 +3175,7 @@ func (g *Graph) runCompactFlight(fl *compactFlight) {
 			return
 		}
 	}
-	if err := g.saveViewFile(fl.view, g.snapshotFile(fl.lsn)); err != nil {
+	if err := g.saveViewFile(fl.view, g.snapshotFile(fl.lsn), fl.ucs); err != nil {
 		fl.err = err
 		return
 	}
@@ -3229,13 +3301,38 @@ func (g *Graph) lightCheckpoint(man wal.Manifest) error {
 // The entry materializes the caller's absorption window first.
 func (g *Graph) Save(w io.Writer) error {
 	g.flushPend()
-	return g.saveView(w, g.view.Load())
+	return g.saveView(w, g.view.Load(), g.uniqueStoreDecls())
+}
+
+// uniqueStoreDecls snapshots the declaration list for persistence (the
+// saveView encode side, spec §3.5): sorted label-then-prop for
+// byte-stable snapshots, nil when unconstrained so the zero-constraint
+// store path allocates nothing. Writer-side only — the registry is
+// writer-private state (the async-compact flight pins this BEFORE its
+// goroutine starts).
+func (g *Graph) uniqueStoreDecls() []store.UniqueConstraint {
+	if len(g.uniqueIdx) == 0 {
+		return nil
+	}
+	out := make([]store.UniqueConstraint, 0, len(g.uniqueIdx))
+	for c := range g.uniqueIdx {
+		out = append(out, store.UniqueConstraint{Label: c.Label, Prop: c.Prop})
+	}
+	slices.SortFunc(out, func(a, b store.UniqueConstraint) int {
+		if c := cmp.Compare(a.Label, b.Label); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Prop, b.Prop)
+	})
+	return out
 }
 
 // saveView serializes one (pinned) generation - Save's body without the
-// pend flush. Safe from any goroutine: the view is immutable and the
-// registry load is atomic.
-func (g *Graph) saveView(w io.Writer, v *genView) error {
+// pend flush. ucs is the unique-constraint declaration snapshot; callers on
+// the writer goroutine pass g.uniqueStoreDecls(), the async-compact flight
+// passes the copy pinned at launch (safe from any goroutine: the view and
+// the declaration list are immutable, and the registry load is atomic).
+func (g *Graph) saveView(w io.Writer, v *genView, ucs []store.UniqueConstraint) error {
 	nodes, edges, labels, indexKeys, ftsKeys := v.unionRecords()
 	sn := make([]store.Node, len(nodes))
 	for i, n := range nodes {
@@ -3255,24 +3352,26 @@ func (g *Graph) saveView(w io.Writer, v *genView) error {
 	for _, vi := range reg {
 		decls = append(decls, vecDeclToStore(vi.decl))
 	}
-	return store.Encode(w, store.Data{Nodes: sn, Edges: se, IndexKeys: indexKeys, VectorDecls: decls, FTSKeys: ftsKeys})
+	return store.Encode(w, store.Data{Nodes: sn, Edges: se, IndexKeys: indexKeys, VectorDecls: decls, FTSKeys: ftsKeys, UniqueConstraints: ucs})
 }
 
 // SaveFile saves to a path: temp file + fsync + atomic rename, avoiding
 // half-written files.
 func (g *Graph) SaveFile(path string) error {
-	return g.saveViewFile(g.view.Load(), path)
+	return g.saveViewFile(g.view.Load(), path, g.uniqueStoreDecls())
 }
 
 // saveViewFile is SaveFile over a pinned view (the async compact flight's
-// writer-side export: no pend flush, no CURRENT-view load).
-func (g *Graph) saveViewFile(v *genView, path string) error {
+// writer-side export: no pend flush, no CURRENT-view load). ucs is the
+// declaration snapshot pinned alongside the view at flight launch — the
+// flight goroutine must not read the writer-private registry.
+func (g *Graph) saveViewFile(v *genView, path string, ucs []store.UniqueConstraint) error {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	if err := g.saveView(f, v); err != nil {
+	if err := g.saveView(f, v, ucs); err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return err
@@ -3381,6 +3480,19 @@ func loadGraphForest(r io.Reader, img *vecForestImage) (*Graph, error) {
 		}
 		g.applyVecDecls(list)
 		g.vecSkipBackfill = false
+	}
+	if len(data.UniqueConstraints) > 0 {
+		// Post-construction registration, the applyVecDecls discipline: the
+		// declarations ride the decoded store section (v8), not
+		// graphFromEngine. Trust path (§3.4): full build, validation
+		// skipped — the data was valid when persisted. loadGraphForest is
+		// the decode funnel for Load/LoadFile/ImportSnapshot and Open's
+		// snapshot path alike, so raft Restore carries constraints too.
+		ucs := make([]wal.UniqueConstraint, 0, len(data.UniqueConstraints))
+		for _, uc := range data.UniqueConstraints {
+			ucs = append(ucs, wal.UniqueConstraint{Label: uc.Label, Prop: uc.Prop})
+		}
+		g.applyUniqueDecls(ucs)
 	}
 	if img != nil {
 		if g.mountVecForest(img) {
@@ -3654,6 +3766,24 @@ func (g *Graph) Clone() *Graph {
 		// source's publish. Isolation is the head pointer itself: later
 		// source publishes swap the source's head, never the clone's.
 		c.setVecRegistry(mounted)
+	}
+	if len(g.uniqueIdx) > 0 {
+		// The unique-constraint registry rides along deep-copied (spec §3.5,
+		// the setVecRegistry bug class): the clone's base IS the source's
+		// live union, so an exact registry transfers exactly — and stays
+		// isolated, the clone's registrations never leak back. A
+		// stale-marked source rebuilds first, so the copy carries ground
+		// truth, never the dropped window's phantoms.
+		g.uniqueEnsureFresh()
+		idx := make(map[UniqueConstraint]map[string]string, len(g.uniqueIdx))
+		for uc, vals := range g.uniqueIdx {
+			m := make(map[string]string, len(vals))
+			for v, k := range vals {
+				m[v] = k
+			}
+			idx[uc] = m
+		}
+		c.uniqueIdx = idx
 	}
 	return c
 }
