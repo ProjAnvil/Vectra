@@ -1660,40 +1660,51 @@ func (g *Graph) uniquePreState(key string) uniquePre {
 // own current ownership counts as released (override/revive re-assign their
 // own values freely). Non-string values and non-matching labels are
 // invisible. Callers run this before recordNode, the ID ratchet and the
-// builder, making rejection zero-side-effect by construction. Constraints
-// are checked in sorted order (label, then prop — the listing/save
-// emission order): accept/reject is deterministic either way, but a write
-// violating several constraints at once must report the same FIRST
-// violation everywhere, and map iteration order is not replica-stable.
+// builder, making rejection zero-side-effect by construction. The scan is
+// single-pass and allocation-free (happy path): every constraint is visited
+// — no early return, since a partial map walk would make the reported
+// violation depend on iteration order — and the ORDER-MINIMAL violated
+// constraint under the label-then-prop order (the listing/save emission
+// order) is kept, so a write violating several constraints at once reports
+// the same FIRST violation everywhere despite map randomness. Violations
+// are the cold path, so the full walk is free where it matters; only the
+// returned error allocates.
 func (g *Graph) uniqueCheckAdd(key, label string, props map[string]any) error {
 	if len(g.uniqueIdx) == 0 {
 		return nil
 	}
-	cs := make([]UniqueConstraint, 0, len(g.uniqueIdx))
+	var (
+		found     bool
+		best      UniqueConstraint
+		bestVal   string
+		bestOwner string
+	)
 	for c := range g.uniqueIdx {
-		if c.Label == label {
-			cs = append(cs, c)
+		if c.Label != label {
+			continue
 		}
-	}
-	slices.SortFunc(cs, func(a, b UniqueConstraint) int {
-		if c := cmp.Compare(a.Label, b.Label); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.Prop, b.Prop)
-	})
-	for _, c := range cs {
 		v, ok := props[c.Prop].(string)
 		if !ok {
 			continue
 		}
-		if owner, taken := g.uniqueIdx[c][v]; taken && owner != key {
-			return &UniqueViolationError{
-				Label: c.Label, Prop: c.Prop, Value: v,
-				ExistingKey: owner, AttemptedKey: key,
-			}
+		owner, taken := g.uniqueIdx[c][v]
+		if !taken || owner == key {
+			continue
+		}
+		// Every candidate shares the write's label, so the prop alone
+		// breaks ties under the label-then-prop order; registry keys are
+		// unique (label, prop) pairs, so the minimum is exact.
+		if !found || c.Prop < best.Prop {
+			found, best, bestVal, bestOwner = true, c, v, owner
 		}
 	}
-	return nil
+	if !found {
+		return nil
+	}
+	return &UniqueViolationError{
+		Label: best.Label, Prop: best.Prop, Value: bestVal,
+		ExistingKey: bestOwner, AttemptedKey: key,
+	}
 }
 
 // uniqueSwap applies one ACCEPTED AddNode to the registry (§3.2): release

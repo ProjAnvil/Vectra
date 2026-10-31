@@ -467,6 +467,77 @@ func TestUniqueNonStringInvisible(t *testing.T) {
 	}
 }
 
+// TestUniqueConstrainedAddAllocParity pins the zero-allocation violation
+// scan: a happy-path AddNode on a graph WITH declared constraints must
+// allocate exactly as much as the same write on a structurally identical
+// unconstrained graph. The pre-fix scan built and sorted a candidate slice
+// sized by the WHOLE registry on every constrained write — one heap
+// allocation per write once two or more constraints exist (a single-entry
+// slice stays on the stack), while the check gate itself must be free like
+// the zero-constraint fast path. The registry therefore carries 8
+// constraints (past the stack-allocation bound) with one matching the
+// written label. Both graphs pre-add the same node population (every shared
+// structure — builder maps, node tables, the constraint's value map — sits
+// past the same growth thresholds) and each measured run writes a fresh key
+// with a fresh constrained value. The measured window lands the value map at
+// 357 entries, below its next growth threshold with margin, so the registry
+// inserts uniqueSwap performs allocate nothing and the two counts must land
+// on the SAME number.
+func TestUniqueConstrainedAddAllocParity(t *testing.T) {
+	if raceEnabled {
+		t.Skip("alloc counts differ under -race")
+	}
+	const (
+		pre         = 256
+		constraints = 8
+	)
+	build := func(constrained bool) *Graph {
+		g := New()
+		if constrained {
+			// One live constraint on the written label; the rest sit on
+			// labels no write ever touches, so the registry's SIZE (what the
+			// candidate slice was sized by) is pinned without changing the
+			// write's own registration work.
+			if err := g.DeclareUnique("Svc", "email"); err != nil {
+				t.Fatal(err)
+			}
+			for i := 1; i < constraints; i++ {
+				if err := g.DeclareUnique("Aux"+itoa(i), "email"); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		for i := 0; i < pre; i++ {
+			key := "seed" + itoa(i)
+			if _, err := g.AddNode(key, "Svc", map[string]any{"email": key + "@x"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return g
+	}
+	measure := func(g *Graph) float64 {
+		n := 0
+		return testing.AllocsPerRun(100, func() {
+			key := "run" + itoa(n)
+			n++
+			if _, err := g.AddNode(key, "Svc", map[string]any{"email": key + "@x"}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	plain, cons := build(false), build(true)
+	nPlain, nCons := measure(plain), measure(cons)
+	t.Logf("happy-path AddNode allocs: unconstrained %.2f, constrained (%d constraints) %.2f", nPlain, constraints, nCons)
+	// Absolute equality: the invariant under test is that the constrained
+	// scan adds ZERO allocations, not any particular absolute count. If a
+	// future toolchain's map-growth tuning ever flakes this (an amortized
+	// registry-insert bucket), relax to a ±1 delta — the pre-fix regression
+	// this pin catches was exactly +1.00.
+	if nCons != nPlain {
+		t.Fatalf("constrained AddNode allocs = %.2f vs unconstrained %.2f: the violation scan must be allocation-free", nCons, nPlain)
+	}
+}
+
 func TestUniqueDropStopsEnforcement(t *testing.T) {
 	g := New()
 	g.DeclareUnique("Svc", "email")

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/projanvil/vectra/internal/wal"
@@ -55,7 +56,7 @@ func TestUniqueRestartRoundTrip(t *testing.T) {
 	if _, err := g2.AddNode("n3", "Svc", map[string]any{"email": "b@x"}); err != nil {
 		t.Fatalf("reopened legal write: %v", err)
 	}
-	if err := g2.VerifyUniqueInvariantForTest(); err != nil {
+	if err := g2.VerifyUniqueInvariantForTest(UniqueConstraint{Label: "Svc", Prop: "email"}); err != nil {
 		t.Fatalf("reopened registry drifted: %v", err)
 	}
 
@@ -152,7 +153,8 @@ func TestUniqueReplayReplaceSemantics(t *testing.T) {
 	if err := g.DeclareUnique("Svc", "email"); !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("declare over replay-made duplicates: %v, want ErrUniqueViolation", err)
 	}
-	// A mid-chain snapshot of the registry is pinned by the invariant helper.
+	// A mid-chain snapshot of the registry is pinned by the invariant helper
+	// (REPLACE-with-none dropped every constraint by this point).
 	if err := g.VerifyUniqueInvariantForTest(); err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +185,7 @@ func TestUniqueReplayNilFrameSkips(t *testing.T) {
 	if _, err := g.AddNode("k3", "Svc", map[string]any{"email": "a@x"}); !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("post-nil-frame enforcement: %v, want ErrUniqueViolation", err)
 	}
-	if err := g.VerifyUniqueInvariantForTest(); err != nil {
+	if err := g.VerifyUniqueInvariantForTest(UniqueConstraint{Label: "Svc", Prop: "email"}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -206,7 +208,7 @@ func TestUniqueCloneCarriesConstraints(t *testing.T) {
 	if _, err := c.AddNode("n2", "Svc", map[string]any{"email": "a@x"}); !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("clone enforcement: %v, want ErrUniqueViolation", err)
 	}
-	if err := c.VerifyUniqueInvariantForTest(); err != nil {
+	if err := c.VerifyUniqueInvariantForTest(UniqueConstraint{Label: "Svc", Prop: "email"}); err != nil {
 		t.Fatalf("clone registry drifted: %v", err)
 	}
 	if _, err := c.AddNode("n2", "Svc", map[string]any{"email": "b@x"}); err != nil {
@@ -268,7 +270,7 @@ func TestUniqueStoreRoundTrip(t *testing.T) {
 	if _, err := g2.AddNode("n2", "Alpha", map[string]any{"a": "a@x"}); !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("LoadFile enforcement: %v, want ErrUniqueViolation", err)
 	}
-	if err := g2.VerifyUniqueInvariantForTest(); err != nil {
+	if err := g2.VerifyUniqueInvariantForTest(want...); err != nil {
 		t.Fatal(err)
 	}
 
@@ -345,7 +347,7 @@ func TestUniqueBatchPanicStaleRebuild(t *testing.T) {
 	if g.uniqueStale {
 		t.Fatal("the rebuild must clear the stale flag")
 	}
-	if err := g.VerifyUniqueInvariantForTest(); err != nil {
+	if err := g.VerifyUniqueInvariantForTest(UniqueConstraint{Label: "Svc", Prop: "email"}); err != nil {
 		t.Fatal(err)
 	}
 	// Enforcement is exact afterwards: the rebuilt registry tracks "fresh".
@@ -390,7 +392,7 @@ func TestUniqueRepairAfterRebaseStaleRebuild(t *testing.T) {
 	if g.uniqueStale {
 		t.Fatal("the rebuild must clear the stale flag")
 	}
-	if err := g.VerifyUniqueInvariantForTest(); err != nil {
+	if err := g.VerifyUniqueInvariantForTest(UniqueConstraint{Label: "Svc", Prop: "email"}); err != nil {
 		t.Fatal(err)
 	}
 	// Without a rebase the repair is a no-op — and never marks.
@@ -432,7 +434,7 @@ func TestUniqueFoldDuringWritesInvariant(t *testing.T) {
 				t.Fatalf("iter %d dup attempt: %v, want ErrUniqueViolation", i, err)
 			}
 		}
-		if err := g.VerifyUniqueInvariantForTest(); err != nil {
+		if err := g.VerifyUniqueInvariantForTest(UniqueConstraint{Label: "Person", Prop: "email"}); err != nil {
 			t.Fatalf("iter %d: %v", i, err)
 		}
 	}
@@ -444,12 +446,53 @@ func TestUniqueFoldDuringWritesInvariant(t *testing.T) {
 	if g.uniqueStale {
 		t.Fatal("a normal seal must not mark the registry stale")
 	}
-	if err := g.VerifyUniqueInvariantForTest(); err != nil {
+	if err := g.VerifyUniqueInvariantForTest(UniqueConstraint{Label: "Person", Prop: "email"}); err != nil {
 		t.Fatal(err)
 	}
 	// Post-fold enforcement is exact.
 	if _, err := g.AddNode("t2", "Person", map[string]any{"email": "anchor@x"}); !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("post-fold enforcement: %v, want ErrUniqueViolation", err)
+	}
+}
+
+// --- the invariant helper pins the KEY SET, not just the values ---------------------
+
+// TestUniqueVerifyInvariantPinsKeySet pins the closed blind spot of
+// VerifyUniqueInvariantForTest: the expected constraint set is now an
+// argument (zero args = no constraints), so a registry that wrongly DROPPED
+// or wrongly KEPT a constraint key fails by name instead of the helper
+// verifying whatever set it happens to hold.
+func TestUniqueVerifyInvariantPinsKeySet(t *testing.T) {
+	g := New()
+	for _, c := range [][2]string{{"Svc", "email"}, {"Svc", "ref"}} {
+		if err := g.DeclareUnique(c[0], c[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := g.AddNode("n1", "Svc", map[string]any{"email": "a@x", "ref": "r1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.DropUnique("Svc", "ref"); err != nil {
+		t.Fatal(err)
+	}
+	email := UniqueConstraint{Label: "Svc", Prop: "email"}
+	ref := UniqueConstraint{Label: "Svc", Prop: "ref"}
+
+	// The remaining set verifies clean.
+	if err := g.VerifyUniqueInvariantForTest(email); err != nil {
+		t.Fatalf("remaining set: %v", err)
+	}
+	// Asking for the dropped one reports it MISSING by name — the old
+	// zero-arg helper derived its expected set from the registry itself and
+	// could never see a dropped key.
+	err := g.VerifyUniqueInvariantForTest(email, ref)
+	if err == nil || !strings.Contains(err.Error(), "missing (Svc.ref)") {
+		t.Fatalf("dropped constraint: %v, want a missing-constraint error naming (Svc.ref)", err)
+	}
+	// A zero-arg call on a constrained graph reports the EXTRA by name.
+	err = g.VerifyUniqueInvariantForTest()
+	if err == nil || !strings.Contains(err.Error(), "extra (Svc.email)") {
+		t.Fatalf("zero-arg call on a constrained graph: %v, want an extra-constraint error naming (Svc.email)", err)
 	}
 }
 
