@@ -1,8 +1,10 @@
 package cypher
 
 import (
+	"bytes"
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"strings"
 
@@ -847,8 +849,34 @@ func sameRow(a, b row) bool {
 // valsEq is scalar value identity: encodeVal equality, so int 1 and
 // float64 1 are the same value and node/edge scalars compare by ID — the
 // same identity dedupKey's map path and aggregation group keys use.
+// Scalars compare typed with no allocations (sameRow's pairwise dedup
+// runs it once per compared pair on the view path); numbers keep the
+// exact encodeVal semantics — numVal-normalized IEEE BITS, so -0.0 and
+// +0.0 stay distinct and same-payload NaNs fold — and only the exotic
+// tails (lists, maps, structs) fall back to equality-by-encoding.
 func valsEq(a, b any) bool {
-	return string(encodeVal(nil, a)) == string(encodeVal(nil, b))
+	switch x := a.(type) {
+	case nil:
+		return b == nil
+	case bool:
+		y, ok := b.(bool)
+		return ok && x == y
+	case string:
+		y, ok := b.(string)
+		return ok && x == y
+	case NodeVal:
+		y, ok := b.(NodeVal)
+		return ok && x.ID == y.ID
+	case EdgeVal:
+		y, ok := b.(EdgeVal)
+		return ok && x.ID == y.ID
+	}
+	fa, aNum := numVal(a)
+	if !aNum {
+		return bytes.Equal(encodeVal(nil, a), encodeVal(nil, b))
+	}
+	fb, bNum := numVal(b)
+	return bNum && math.Float64bits(fa) == math.Float64bits(fb)
 }
 
 // runPath evaluates one path pattern against the incoming rows. base nil

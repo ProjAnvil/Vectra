@@ -78,3 +78,43 @@ func TestTypedIndexSkipsNonIndexableValues(t *testing.T) {
 		t.Fatalf("bool bucket empty: %v %v", ids, ok)
 	}
 }
+
+// TestLookupIndexBinarySearchEquivalence pins the sort.Search form of
+// LookupIndex (audit F-10a) against a linear scan over the same bucket:
+// every present value (including duplicate runs), every boundary between
+// and around them, and the empty-bucket edge must return exactly the
+// linear-scan result set, in the same ascending order.
+func TestLookupIndexBinarySearchEquivalence(t *testing.T) {
+	vals := []string{"a", "b", "b", "c", "e", "e", "e", "z"}
+	props := make([]map[string]any, len(vals))
+	for i, v := range vals {
+		props[i] = map[string]any{"k": v}
+	}
+	s := sealIdx(t, []string{"k"}, props)
+	entries := s.indexes["k"].strs
+	linear := func(value string) []uint32 {
+		var out []uint32
+		for _, e := range entries {
+			if e.val == value {
+				out = append(out, e.id)
+			}
+		}
+		return out
+	}
+	probes := []string{"", "a", "b", "c", "d", "e", "f", "y", "z", "{", "aa", "ab"}
+	for _, p := range probes {
+		got, ok := s.LookupIndex("k", p)
+		if !ok {
+			t.Fatalf("probe %q: registered key must return ok=true", p)
+		}
+		want := linear(p)
+		if len(got) != len(want) {
+			t.Fatalf("probe %q: got %v, linear scan %v", p, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("probe %q: got %v, linear scan %v", p, got, want)
+			}
+		}
+	}
+}

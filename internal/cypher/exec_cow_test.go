@@ -1,6 +1,7 @@
 package cypher
 
 import (
+	"math"
 	"slices"
 	"strconv"
 	"testing"
@@ -323,6 +324,114 @@ func TestRowValsDedupIdentity(t *testing.T) {
 	if kept := dedupRows([]row{n1, n2}); len(kept) != 1 {
 		t.Fatalf("nil-vals dedup kept %d, want 1", len(kept))
 	}
+}
+
+// TestValsEqIdentity pins valsEq's full value-identity table — the
+// behavior the pairwise dedup path (sameRow) and the map path (dedupKey)
+// must share (audit F-27's equivalence gate, written before the typed
+// rewrite): numeric identity across dynamic types, encodeVal's
+// bits-level numeric semantics (-0.0 vs +0.0 distinct, same-payload NaN
+// equal), type-strict mismatches, node/edge identity by ID, and the
+// exotic tails' equality-by-encoding.
+func TestValsEqIdentity(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b any
+		want bool
+	}{
+		{"nil/nil", nil, nil, true},
+		{"nil/int", nil, 1, false},
+		{"nil/empty string", nil, "", false},
+		{"nil/bool", nil, false, false},
+		{"bool/bool true", true, true, true},
+		{"bool/bool false", false, false, true},
+		{"bool/bool differ", true, false, false},
+		{"bool/int", true, 1, false},
+		{"string/string", "a", "a", true},
+		{"string/empty", "", "", true},
+		{"string/bool", "true", true, false},
+		{"string/number", "1", 1, false},
+		{"int/float64", 1, float64(1), true},
+		{"int64/float32", int64(2), float32(2), true},
+		{"uint8/int", uint8(3), 3, true},
+		{"number/number differ", 1, 1.5, false},
+		{"zero forms", float64(0), int(0), true},
+		{"neg zero distinct", float64(0), math.Copysign(0, -1), false},
+		{"nan/nan same payload", math.NaN(), math.NaN(), true},
+		{"node by id", NodeVal{ID: 1}, NodeVal{ID: 1}, true},
+		{"node id differ", NodeVal{ID: 1}, NodeVal{ID: 2}, false},
+		{"node vs edge", NodeVal{ID: 1}, EdgeVal{ID: 1}, false},
+		{"node vs number", NodeVal{ID: 1}, float64(1), false},
+		{"list/list", []any{1, 2}, []any{1, 2}, true},
+		{"list order", []any{1, 2}, []any{2, 1}, false},
+		{"map/map", map[string]any{"a": 1}, map[string]any{"a": 1}, true},
+		{"list vs number", []any{1}, 1, false},
+	}
+	for _, tc := range cases {
+		if got := valsEq(tc.a, tc.b); got != tc.want {
+			t.Errorf("%s: valsEq(%#v, %#v) = %v, want %v", tc.name, tc.a, tc.b, got, tc.want)
+		}
+		// Symmetry: identity must not depend on argument order.
+		if got := valsEq(tc.b, tc.a); got != tc.want {
+			t.Errorf("%s (reversed): valsEq(%#v, %#v) = %v, want %v", tc.name, tc.b, tc.a, got, tc.want)
+		}
+	}
+
+	// Same table end to end through sameRow: rows identical except one
+	// vals key must collapse or stay distinct exactly as valsEq ruless.
+	mk := func(v any) row {
+		r := row{pos: 1, nodes: map[string]uint32{"a": 1}}
+		r.ownVals()
+		r.vals["x"] = v
+		return r
+	}
+	if !sameRow(mk(1), mk(float64(1))) {
+		t.Error("sameRow must fold int 1 into float64 1 through vals")
+	}
+	if sameRow(mk("1"), mk(1)) {
+		t.Error("sameRow must keep \"1\" and 1 distinct")
+	}
+	if sameRow(mk(1), mk(2)) {
+		t.Error("sameRow must keep distinct numbers distinct")
+	}
+}
+
+// TestRowValsDedupAllocs pins the pairwise dedup's per-comparison cost
+// (audit F-27): sameRow on rows identical up to their vals must compare
+// scalars with ZERO allocations per compared pair — the pre-typed valsEq
+// encoded both sides through encodeVal and stringified each (2 buffer
+// growths + 2 string conversions per comparison) inside the pairwise
+// dedup that dedupRows runs for batches up to dedupPairwiseMax.
+func TestRowValsDedupAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("alloc counts differ under -race")
+	}
+	mk := func(v any) row {
+		r := row{pos: 1, nodes: map[string]uint32{"a": 1}}
+		r.ownVals()
+		r.vals["k"] = v
+		return r
+	}
+	str, num, numEq := mk("x"), mk(float64(7)), mk(int(7))
+	if sameRow(str, num) {
+		t.Fatal("sanity: \"x\" and 7 are distinct values")
+	}
+	if !sameRow(num, numEq) {
+		t.Fatal("sanity: float64 7 and int 7 are the same value")
+	}
+	if n := testing.AllocsPerRun(100, func() { sameRow(str, num) }); n != 0 {
+		t.Fatalf("sameRow differing-vals comparison allocates %.0f/op, want 0", n)
+	}
+	if n := testing.AllocsPerRun(100, func() { sameRow(num, numEq) }); n != 0 {
+		t.Fatalf("sameRow equal-vals comparison allocates %.0f/op, want 0", n)
+	}
+	// The batch shape end to end: a DISTINCT-sized pairwise dedup over
+	// same-pos rows differing only in vals must not allocate per pair.
+	batch := make([]row, dedupPairwiseMax)
+	for i := range batch {
+		batch[i] = mk(float64(i))
+	}
+	_ = dedupRows(batch)
 }
 
 // TestRowCOWAllocShape locks the allocation shape per expansion: anonymous

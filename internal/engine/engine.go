@@ -272,15 +272,7 @@ func (s *Snapshot) LookupIndex(key, value string) ([]uint32, bool) {
 		return nil, false
 	}
 	entries := pi.strs
-	lo, hi := 0, len(entries)
-	for lo < hi {
-		mid := int(uint(lo+hi) >> 1)
-		if entries[mid].val < value {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
+	lo := sort.Search(len(entries), func(i int) bool { return entries[i].val >= value })
 	var out []uint32
 	for i := lo; i < len(entries) && entries[i].val == value; i++ {
 		out = append(out, entries[i].id)
@@ -335,6 +327,13 @@ func (s *Snapshot) LookupBool(key string, value bool) ([]uint32, bool) {
 }
 
 // LabelID resolves a label name to its ID (false when never interned).
+// Deliberately a linear scan over the label dictionary (audit F-10b):
+// callers run it once per label name at query SETUP (labelMaskOf on the
+// labeled BFS/NeighborsOf/Cypher anchor paths), not per row, and the
+// registry is the Seal-time label dictionary (tens of entries typically)
+// — a name->id map would grow every Snapshot by a map and Seal by a build
+// pass to save a handful of string compares per labeled query, and a
+// lazily-built one would allocate on the read path itself.
 func (s *Snapshot) LabelID(name string) (uint32, bool) {
 	for id, l := range s.labels {
 		if l == name {

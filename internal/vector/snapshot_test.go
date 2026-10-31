@@ -3,6 +3,8 @@ package vector
 import (
 	"fmt"
 	"math/rand"
+	"reflect"
+	"slices"
 	"sort"
 	"sync"
 	"testing"
@@ -317,4 +319,116 @@ func normHits(hs []VectorHit) []VectorHit {
 		return hs[i].Key < hs[j].Key
 	})
 	return hs
+}
+
+// assertSameForest compares two States' segment forests structurally:
+// tier shape, per-segment seq/keys/ids/vectors/levels/links/entry, plus
+// the seq allocator and overlay length. Same seed + same insertion order
+// build identical HNSW graphs, so links are compared too — the strongest
+// form available.
+func assertSameForest(t *testing.T, step int, a, b *State) {
+	t.Helper()
+	if a.overlayLen != b.overlayLen {
+		t.Fatalf("step %d: overlayLen %d vs %d", step, a.overlayLen, b.overlayLen)
+	}
+	if a.seq != b.seq {
+		t.Fatalf("step %d: seq allocator ended at %d vs %d", step, a.seq, b.seq)
+	}
+	if len(a.tiers) != len(b.tiers) {
+		t.Fatalf("step %d: tier count %d vs %d", step, len(a.tiers), len(b.tiers))
+	}
+	for ti := range a.tiers {
+		if len(a.tiers[ti]) != len(b.tiers[ti]) {
+			t.Fatalf("step %d: tier %d holds %d vs %d segments", step, ti, len(a.tiers[ti]), len(b.tiers[ti]))
+		}
+		for si := range a.tiers[ti] {
+			sa, sb := a.tiers[ti][si], b.tiers[ti][si]
+			if sa.seq != sb.seq {
+				t.Fatalf("step %d: tier %d seg %d: seq %d vs %d", step, ti, si, sa.seq, sb.seq)
+			}
+			if !slices.Equal(sa.keys, sb.keys) {
+				t.Fatalf("step %d: tier %d seg %d: key arrays differ", step, ti, si)
+			}
+			ha, hb := sa.h, sb.h
+			if !slices.Equal(ha.ids, hb.ids) || !slices.Equal(ha.level, hb.level) || ha.entry != hb.entry {
+				t.Fatalf("step %d: tier %d seg %d: graph shape differs", step, ti, si)
+			}
+			for i := range ha.vecs {
+				if !slices.Equal(ha.vecs[i], hb.vecs[i]) {
+					t.Fatalf("step %d: tier %d seg %d: vector %d differs", step, ti, si, i)
+				}
+			}
+			if !reflect.DeepEqual(ha.links, hb.links) {
+				t.Fatalf("step %d: tier %d seg %d: link lists differ", step, ti, si)
+			}
+		}
+	}
+}
+
+// TestPackDriversDifferential (audit F-25): drive BOTH pack drivers over
+// the SAME chunk-granular input stream — the synchronous Pack draining
+// exactly one full chunk per call vs the folder lane's
+// BeginPack/Build/CommitPack — and compare the resulting segment FORESTS
+// structurally after every step. Identical inputs through one shared
+// merge core must pack to identical outputs. Unlike
+// TestTwoPhasePackParity (which feeds the paths different granularities —
+// whole-overlay drain vs per-chunk — and compares query results), this
+// pins the structural contract: cascade shape, merge newest-wins dedup,
+// dead filtering, compaction rebuilds, and seq stamping. Re-Adds of older
+// keys are folded INTO each chunk (a slot swap, keeping every round
+// exactly packSize entries) because a post-chunk Add makes the contracts
+// genuinely differ: sync Pack drains the whole overlay, the folder lane
+// takes only the full head chunk.
+func TestPackDriversDifferential(t *testing.T) {
+	const dim = 16
+	const chunks = 5 // chunks 0-3 fill tier 0 and cascade at the 4th; chunk 5 lands on the emptied tier 0
+	rng := rand.New(rand.NewSource(81))
+	vecs := make([][]float32, chunks*packSize)
+	for i := range vecs {
+		vecs[i] = normalizeRand(rng, dim)
+	}
+	add := func(s *State, key string, v []float32) { s.Add(key, v) }
+	sync := NewState(Cosine, dim, 16, 100, 82)
+	folder := NewState(Cosine, dim, 16, 100, 82)
+	for c := 0; c < chunks; c++ {
+		for i := 0; i < packSize; i++ {
+			key, vec := fmt.Sprintf("k%d", c*packSize+i), vecs[c*packSize+i]
+			if c > 0 && i == 999 {
+				// Slot swap: this slot re-adds a previous chunk's key (a
+				// delete victim from round c-1) with a fresh vector —
+				// revive + shadow update, resolved by seq recency at the
+				// next merge — while keeping the chunk exactly packSize
+				// entries so both drivers pack identical input.
+				key = fmt.Sprintf("k%d", (c-1)*packSize+5)
+				vec = vecs[(c*packSize+i+1234)%len(vecs)]
+			}
+			add(sync, key, vec)
+			add(folder, key, vec)
+		}
+		if c > 0 {
+			// Delete a not-yet-packed key (dead at pack time) ...
+			doomed := fmt.Sprintf("k%d", c*packSize+13)
+			if !sync.Delete(doomed) || !folder.Delete(doomed) {
+				t.Fatalf("round %d: delete of a pending key failed", c)
+			}
+			// ... and 700 keys of the previous chunk's segment (>34% dead
+			// — over the compaction line). Odd offsets keep the re-added
+			// key (offset 5) and prior doomed keys (13) out of the sweep.
+			for i := 0; i < 700; i++ {
+				key := fmt.Sprintf("k%d", (c-1)*packSize+2*i)
+				sync.Delete(key)
+				folder.Delete(key)
+			}
+		}
+		sync.Pack(false) // exactly one full chunk pending
+		p := folder.BeginPack()
+		if p == nil {
+			t.Fatalf("round %d: no full chunk pending on the folder state (overlay=%d)", c, folder.OverlayLen())
+		}
+		p.Build(Cosine, 16, 100, 82)
+		if !folder.CommitPack(p) {
+			t.Fatalf("round %d: commit rejected on a quiescent state", c)
+		}
+		assertSameForest(t, c, sync, folder)
+	}
 }

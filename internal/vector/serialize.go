@@ -10,7 +10,8 @@ import (
 )
 
 // Forest serialization (spec 2026-10-21 §2.2). Segments are immutable once
-// built - every rebuild path (Pack, mergeSegments, compact, PackPlan.Build)
+// built - every rebuild path (Pack and PackPlan.Build through packChunk,
+// mergeParts, cascade, compactTiers)
 // constructs a fresh segment - so the graphs persist as-built and load never
 // rebuilds them. rng state and build scratch stay behind: a decoded HNSW
 // gets a fresh rng it can only reach through an insert that no existing

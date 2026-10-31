@@ -1,8 +1,9 @@
 package vector
 
 import (
+	"cmp"
 	"math"
-	"sort"
+	"slices"
 )
 
 // packSize is the overlay chunk size and the L0 pack target (spec §4.2).
@@ -14,6 +15,12 @@ const packSize = 2048
 // it upward. 4-way merging keeps write amplification at ~2.97x for 100k
 // (vs 5.59x pairwise, 2026-10-19-vector-build-optimization.md).
 const tierFactor = 4
+
+// compactThreshold is the dead-ratio line at which the compaction pass
+// rebuilds a segment without its tombstoned vectors (spec §4.2). One named
+// constant for BOTH pack drivers (audit F-25 — the sync and folder-lane
+// copies had drifted to const-vs-literal here).
+const compactThreshold = 0.3
 
 // deadBits is the vid-space dead set as a chunked bitmap (spec D6): vid
 // >> 16 selects a [1024]uint64 chunk (65536 vids per chunk). Writer-side
@@ -295,8 +302,9 @@ func (v vecView) search(q []float32, k, ef int, r *Reader) []VectorHit {
 // scores - both are valid memberships inside a tie group that k cuts.
 // Mutates hits. No container/heap: ~25 lines, zero new deps.
 func selectTopK(hits []VectorHit, k int) []VectorHit {
+	byScore := func(a, b VectorHit) int { return cmp.Compare(a.Score, b.Score) }
 	if len(hits) <= k {
-		sort.Slice(hits, func(i, j int) bool { return hits[i].Score < hits[j].Score })
+		slices.SortFunc(hits, byScore)
 		return hits
 	}
 	h := hits[:k]
@@ -309,7 +317,7 @@ func selectTopK(hits []VectorHit, k int) []VectorHit {
 			siftDownMax(h, 0)
 		}
 	}
-	sort.Slice(h, func(i, j int) bool { return h[i].Score < h[j].Score })
+	slices.SortFunc(h, byScore)
 	return h
 }
 
@@ -335,7 +343,10 @@ func siftDownMax(h []VectorHit, i int) {
 
 // Pack builds an L0 segment from the overlay once it reached packSize
 // (or force), cascades in-tier merges upward, then compacts dead-heavy
-// segments (spec §4.2/§5.2).
+// segments (spec §4.2/§5.2). The synchronous whole-overlay drain; the
+// folder lane runs the same shared core through PackPlan (audit F-25) —
+// PackDriversDifferential pins the two drivers to identical output for
+// identical chunk-granular input.
 func (s *State) Pack(force bool) {
 	if s.overlayLen == 0 {
 		return
@@ -343,11 +354,43 @@ func (s *State) Pack(force bool) {
 	if !force && s.overlayLen < packSize {
 		return
 	}
-	// Dedup by vid, newest entry wins, first-occurrence order kept
-	// (deterministic builds).
+	alloc := &segAlloc{metric: s.metric, m: s.m, efc: s.efc, seed: s.seed, seq: s.seq}
+	seg := packChunk(s.overlay, &s.dead, alloc)
+	// Drop instead of truncating: a [:0] slice keeps stale entry pointers
+	// alive in the backing array (heap bitmap scans the whole object),
+	// pinning dead vectors and inflating steady-state memory.
+	s.overlay = nil
+	s.overlayLen = 0
+	s.tiers = cascade(s.tiers, seg, &s.dead, alloc)
+	compactTiers(s.tiers, &s.dead, alloc)
+	s.seq = alloc.seq
+}
+
+// segAlloc mints the segments one pack run builds: each carries the next
+// seq (segment recency is the update-order rule, spec §4.2) and an
+// HNSW seeded by seq so identical inputs build identical graphs. Both
+// pack drivers allocate through it, so seq assignment stays identical
+// across the sync and folder-lane paths.
+type segAlloc struct {
+	metric Metric
+	m, efc int
+	seed   int64
+	seq    uint64
+}
+
+func (a *segAlloc) new() *segment {
+	sg := &segment{seq: a.seq, h: NewHNSW(a.metric, a.m, a.efc, a.seed+int64(a.seq))}
+	a.seq++
+	return sg
+}
+
+// packChunk builds one L0 segment from overlay chunks: vid-dedup with the
+// NEWEST entry winning and first-occurrence order kept (deterministic
+// builds), dead vids dropped at insert.
+func packChunk(chunks [][]entry, dead *deadBits, alloc *segAlloc) *segment {
 	pos := map[uint32]int{}
 	var list []entry
-	for _, ch := range s.overlay {
+	for _, ch := range chunks {
 		for _, e := range ch {
 			if i, ok := pos[e.vid]; ok {
 				list[i] = e
@@ -357,80 +400,84 @@ func (s *State) Pack(force bool) {
 			list = append(list, e)
 		}
 	}
-	seg := &segment{seq: s.seq, h: NewHNSW(s.metric, s.m, s.efc, s.seed+int64(s.seq)), keys: make([]string, 0, len(list))}
-	s.seq++
+	sg := alloc.new()
+	sg.keys = make([]string, 0, len(list))
 	for _, e := range list {
-		if !s.dead.has(e.vid) {
-			seg.h.insertPrepared(e.vid, e.vec) // overlay vecs are stored-form
-			seg.keys = append(seg.keys, e.key)
+		if !dead.has(e.vid) {
+			sg.h.insertPrepared(e.vid, e.vec) // overlay vecs are stored-form
+			sg.keys = append(sg.keys, e.key)
 		}
 	}
-	// Drop instead of truncating: a [:0] slice keeps stale entry pointers
-	// alive in the backing array (heap bitmap scans the whole object),
-	// pinning dead vectors and inflating steady-state memory.
-	s.overlay = nil
-	s.overlayLen = 0
-	carry := seg
-	for i := 0; carry != nil; i++ {
-		for i >= len(s.tiers) {
-			s.tiers = append(s.tiers, nil)
-		}
-		s.tiers[i] = append(s.tiers[i], carry)
-		if len(s.tiers[i]) < tierFactor {
-			break
-		}
-		parts := s.tiers[i]
-		s.tiers[i] = nil // nil, not [:0]: stale segment pointers pin dead graphs
-		carry = s.mergeSegments(parts...)
-	}
-	s.compact()
+	return sg
 }
 
-// mergeSegments rebuilds one segment from the live vectors of the given
-// segments (4-way fan-in per tier). Same vid in several inputs resolves to
-// the newest segment's vector: inputs are visited latest-built first, and
-// seq recency is the update-order rule (spec §4.2).
-func (s *State) mergeSegments(segs ...*segment) *segment {
+// mergeParts rebuilds one segment from the live vectors of the given
+// segments (tierFactor-way fan-in per tier). Same vid in several inputs
+// resolves to the newest segment's vector: inputs are visited
+// latest-built first, and seq recency is the update-order rule (spec
+// §4.2).
+func mergeParts(parts []*segment, dead *deadBits, alloc *segAlloc) *segment {
+	sg := alloc.new()
 	seen := map[uint32]bool{}
-	merged := &segment{seq: s.seq, h: NewHNSW(s.metric, s.m, s.efc, s.seed+int64(s.seq))}
-	s.seq++
-	for j := len(segs) - 1; j >= 0; j-- { // tiers append oldest-first: reverse = newest-first
-		ids, vecs := segs[j].h.All()
-		keys := segs[j].keys
+	for j := len(parts) - 1; j >= 0; j-- { // tiers append oldest-first: reverse = newest-first
+		ids, vecs := parts[j].h.All()
+		keys := parts[j].keys
 		for i, id := range ids {
-			if seen[id] || s.dead.has(id) {
+			if seen[id] || dead.has(id) {
 				continue
 			}
 			seen[id] = true
-			merged.h.insertPrepared(id, vecs[i]) // All() vecs are stored-form; source graph dies here
-			merged.keys = append(merged.keys, keys[i])
+			sg.h.insertPrepared(id, vecs[i]) // All() vecs are stored-form; source graph dies here
+			sg.keys = append(sg.keys, keys[i])
 		}
 	}
-	return merged
+	return sg
 }
 
-// compact rebuilds any segment whose dead ratio exceeds 30% (spec §4.2).
-func (s *State) compact() {
-	const threshold = 0.3
-	for _, tier := range s.tiers {
+// cascade places the incoming segment at tier 0 and promotes any tier that
+// fills to tierFactor segments: its parts merge into one segment landing
+// at the next tier up, repeating until a tier stays below the fan-in.
+// Returns the (possibly grown) tiers slice. Merged-from tiers are nilled,
+// not truncated — stale segment pointers pin dead graphs.
+func cascade(tiers [][]*segment, incoming *segment, dead *deadBits, alloc *segAlloc) [][]*segment {
+	carry := incoming
+	for i := 0; carry != nil; i++ {
+		for i >= len(tiers) {
+			tiers = append(tiers, nil)
+		}
+		tiers[i] = append(tiers[i], carry)
+		if len(tiers[i]) < tierFactor {
+			break
+		}
+		parts := tiers[i]
+		tiers[i] = nil
+		carry = mergeParts(parts, dead, alloc)
+	}
+	return tiers
+}
+
+// compactTiers rebuilds, in place, any segment whose dead ratio exceeds
+// compactThreshold (spec §4.2); segments with no dead vectors skip the
+// ratio pass entirely (the common no-deletes state).
+func compactTiers(tiers [][]*segment, dead *deadBits, alloc *segAlloc) {
+	for _, tier := range tiers {
 		for i, seg := range tier {
 			ids, vecs := seg.h.All()
 			if len(ids) == 0 {
 				continue
 			}
-			dead := 0
+			deadN := 0
 			for _, id := range ids {
-				if s.dead.has(id) {
-					dead++
+				if dead.has(id) {
+					deadN++
 				}
 			}
-			if dead == 0 || float64(dead)/float64(len(ids)) <= threshold {
+			if deadN == 0 || float64(deadN)/float64(len(ids)) <= compactThreshold {
 				continue
 			}
-			fresh := &segment{seq: s.seq, h: NewHNSW(s.metric, s.m, s.efc, s.seed+int64(s.seq))}
-			s.seq++
+			fresh := alloc.new()
 			for j, id := range ids {
-				if !s.dead.has(id) {
+				if !dead.has(id) {
 					fresh.h.insertPrepared(id, vecs[j]) // stored-form; old graph dropped below
 					fresh.keys = append(fresh.keys, seg.keys[j])
 				}
@@ -512,102 +559,16 @@ func (s *State) BeginPack() *PackPlan {
 }
 
 // Build constructs the L0 segment, the 4-way cascade, and the dead
-// compaction over the captured inputs - all lock-free. HNSW building is
+// compaction over the captured inputs - all lock-free, through the same
+// shared core the synchronous Pack uses (audit F-25). HNSW building is
 // the entire cost; nothing here touches the State.
 func (p *PackPlan) Build(metric Metric, m, efc int, seed int64) {
 	dead := deadBits{chunks: p.dead}
-	newSeg := func() *segment {
-		sg := &segment{seq: p.seq, h: NewHNSW(metric, m, efc, seed+int64(p.seq))}
-		p.seq++
-		return sg
-	}
-	packSeg := func(entries []entry) *segment {
-		pos := map[uint32]int{}
-		list := make([]entry, 0, len(entries))
-		for _, e := range entries {
-			if i, ok := pos[e.vid]; ok {
-				list[i] = e
-				continue
-			}
-			pos[e.vid] = len(list)
-			list = append(list, e)
-		}
-		sg := newSeg()
-		for _, e := range list {
-			if !dead.has(e.vid) {
-				sg.h.insertPrepared(e.vid, e.vec)
-				sg.keys = append(sg.keys, e.key)
-			}
-		}
-		return sg
-	}
-	mergeSeg := func(parts []*segment) *segment {
-		sg := newSeg()
-		seen := map[uint32]bool{}
-		for j := len(parts) - 1; j >= 0; j-- { // tiers append oldest-first
-			ids, vecs := parts[j].h.All()
-			for i, id := range ids {
-				if seen[id] || dead.has(id) {
-					continue
-				}
-				seen[id] = true
-				sg.h.insertPrepared(id, vecs[i])
-				sg.keys = append(sg.keys, parts[j].keys[i])
-			}
-		}
-		return sg
-	}
-
-	tiers := p.tiers
-	if len(tiers) == 0 {
-		tiers = append(tiers, nil)
-	}
-	tiers[0] = append(tiers[0], packSeg(p.chunk))
-	i := 0
-	for {
-		for i >= len(tiers) {
-			tiers = append(tiers, nil)
-		}
-		if len(tiers[i]) < tierFactor {
-			break
-		}
-		carry := mergeSeg(tiers[i])
-		tiers[i] = nil
-		i++
-		for i >= len(tiers) { // the promoted segment lands at i
-			tiers = append(tiers, nil)
-		}
-		tiers[i] = append(tiers[i], carry)
-	}
-	// Dead compaction over the copy (30% line, spec 4.2).
-	for ti, tier := range tiers {
-		for si, seg := range tier {
-			ids, _ := seg.h.All()
-			if len(ids) == 0 {
-				continue
-			}
-			deadc := 0
-			for _, id := range ids {
-				if dead.has(id) {
-					deadc++
-				}
-			}
-			if deadc == 0 || float64(deadc)/float64(len(ids)) <= 0.3 {
-				continue
-			}
-			fresh := newSeg()
-			ids2, vecs := seg.h.All()
-			for j, id := range ids2 {
-				if !dead.has(id) {
-					fresh.h.insertPrepared(id, vecs[j])
-					fresh.keys = append(fresh.keys, seg.keys[j])
-				}
-			}
-			tiers[ti][si] = fresh
-		}
-	}
+	alloc := &segAlloc{metric: metric, m: m, efc: efc, seed: seed, seq: p.seq}
+	tiers := cascade(p.tiers, packChunk([][]entry{p.chunk}, &dead, alloc), &dead, alloc)
+	compactTiers(tiers, &dead, alloc)
 	p.newTiers = tiers
-	p.seqEnd = p.seq
+	p.seqEnd = alloc.seq
 }
 
 // CommitPack swaps the built plan in. Under the State lock; false when

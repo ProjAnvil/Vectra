@@ -1,9 +1,10 @@
 package vector
 
 import (
+	"cmp"
 	"math"
 	"math/rand"
-	"sort"
+	"slices"
 )
 
 // Hit is one nearest-neighbor result from an HNSW search. Score uses the
@@ -79,10 +80,7 @@ func (h *HNSW) Len() int { return len(h.ids) }
 // All returns every (id, stored-vector) pair. Tier merges and compaction
 // rebuilds use it; the slices are fresh copies.
 func (h *HNSW) All() ([]uint32, [][]float32) {
-	ids := append([]uint32(nil), h.ids...)
-	vs := make([][]float32, len(h.vecs))
-	copy(vs, h.vecs)
-	return ids, vs
+	return slices.Clone(h.ids), slices.Clone(h.vecs)
 }
 
 func (h *HNSW) randomLevel() int {
@@ -106,7 +104,7 @@ func (h *HNSW) Insert(id uint32, v []float32) {
 
 // insertPrepared inserts v WITHOUT copying: the caller certifies v already
 // matches the metric's stored form (unit length for Cosine) and gives up
-// ownership. Internal rebuild paths (State.Pack, mergeSegments, compact)
+// ownership. Internal rebuild paths (packChunk, mergeParts, compactTiers)
 // feed vectors that State.Add or All() already normalized/copied — the
 // defensive second copy in Insert was pure churn (0.14GB per 10k build).
 // All()-sourced vectors alias the dying source graph; that graph becomes
@@ -221,7 +219,7 @@ func (h *HNSW) selectNeighbors(maxLinks int, cands []cand, base []float32) []uin
 // capped at maxLinks) fall back to pdqsort to avoid quadratic blowup.
 func sortCandsAsc(cs []cand) {
 	if len(cs) > 64 {
-		sort.Slice(cs, func(i, j int) bool { return cs[i].d < cs[j].d })
+		slices.SortFunc(cs, func(a, b cand) int { return cmp.Compare(a.d, b.d) })
 		return
 	}
 	for i := 1; i < len(cs); i++ {
@@ -448,7 +446,7 @@ func (h *HNSW) searchLayer(lev, ep int, q []float32, ef int, alive func(uint32) 
 			}
 		}
 	}
-	sort.Slice(results, func(i, j int) bool { return results[i].d < results[j].d })
+	slices.SortFunc(results, func(a, b cand) int { return cmp.Compare(a.d, b.d) })
 	r.cands = cands
 	r.results = results
 	return results

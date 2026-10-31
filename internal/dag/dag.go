@@ -4,7 +4,10 @@
 // face a DAG.
 package dag
 
-import "slices"
+import (
+	"cmp"
+	"slices"
+)
 
 type frame struct {
 	v  uint32
@@ -124,13 +127,13 @@ func Condense(numNodes uint32, sccOf []uint32, count uint32, adj func(uint32) []
 		}
 	}
 	slices.SortFunc(edges, func(a, b condEdge) int {
-		if a.src != b.src {
-			return int(a.src) - int(b.src)
+		if c := cmp.Compare(a.src, b.src); c != 0 {
+			return c
 		}
-		if a.dst != b.dst {
-			return int(a.dst) - int(b.dst)
+		if c := cmp.Compare(a.dst, b.dst); c != 0 {
+			return c
 		}
-		return int(a.label) - int(b.label)
+		return cmp.Compare(a.label, b.label)
 	})
 	edges = slices.CompactFunc(edges, func(a, b condEdge) bool { return a == b })
 
