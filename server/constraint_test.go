@@ -212,6 +212,9 @@ func TestConstraintReplicaDeterminism(t *testing.T) {
 
 	// Determinism probe: apply one fresh violating batch directly on each
 	// replica's FSM (same synthetic index) and compare error class + payload.
+	// The synthetic Index: 1 << 30 corrupts appliedIndex with a value the
+	// log never had, so this probe must remain the FINAL assertion on this
+	// FSM — nothing may be appended after it.
 	probe := Batch{Version: 1, Nodes: []NodeUpsert{
 		{Key: "ok2", Label: "Person", Props: map[string]any{"email": "ok2@x"}},
 		{Key: "dup2", Label: "Person", Props: map[string]any{"email": "ok2@x"}},

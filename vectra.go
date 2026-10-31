@@ -1514,6 +1514,12 @@ func (g *Graph) DeclareUnique(label, prop string) error {
 		return ErrConstraintExists
 	}
 	g.uniqueEnsureFresh()
+	// Clear the stale flag unconditionally: the rebuild above is gated on
+	// constraints existing, so a mark set while the graph was unconstrained
+	// (a Batch panic, §3.3) would linger past an empty registry — declaring
+	// here has nothing to rebuild, the scan below registers this
+	// constraint from live state.
+	g.uniqueStale = false
 	vals, dups := g.uniqueScanConstraint(c)
 	if len(dups) > 0 {
 		return &uniqueDeclError{c: c, pairs: dups}
@@ -1654,15 +1660,28 @@ func (g *Graph) uniquePreState(key string) uniquePre {
 // own current ownership counts as released (override/revive re-assign their
 // own values freely). Non-string values and non-matching labels are
 // invisible. Callers run this before recordNode, the ID ratchet and the
-// builder, making rejection zero-side-effect by construction.
+// builder, making rejection zero-side-effect by construction. Constraints
+// are checked in sorted order (label, then prop — the listing/save
+// emission order): accept/reject is deterministic either way, but a write
+// violating several constraints at once must report the same FIRST
+// violation everywhere, and map iteration order is not replica-stable.
 func (g *Graph) uniqueCheckAdd(key, label string, props map[string]any) error {
 	if len(g.uniqueIdx) == 0 {
 		return nil
 	}
+	cs := make([]UniqueConstraint, 0, len(g.uniqueIdx))
 	for c := range g.uniqueIdx {
-		if c.Label != label {
-			continue
+		if c.Label == label {
+			cs = append(cs, c)
 		}
+	}
+	slices.SortFunc(cs, func(a, b UniqueConstraint) int {
+		if c := cmp.Compare(a.Label, b.Label); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Prop, b.Prop)
+	})
+	for _, c := range cs {
 		v, ok := props[c.Prop].(string)
 		if !ok {
 			continue
@@ -3299,6 +3318,14 @@ func (g *Graph) lightCheckpoint(man wal.Manifest) error {
 // effective and pending, typed and full-text alike — are persisted too
 // (store v3/v7), so Load restores both the graph and its lookup indexes.
 // The entry materializes the caller's absorption window first.
+//
+// Goroutine safety: with unique constraints declared, the declaration
+// snapshot (uniqueStoreDecls) iterates the writer-private registry on the
+// caller's goroutine, so the encode must run on the writer goroutine or
+// with writes quiesced — Saving a live constrained graph from, say, a
+// monitoring goroutine data-races. Unconstrained graphs keep the
+// any-goroutine guarantee the pre-branch saveView doc stated (the view and
+// the vector registry ride atomics).
 func (g *Graph) Save(w io.Writer) error {
 	g.flushPend()
 	return g.saveView(w, g.view.Load(), g.uniqueStoreDecls())
@@ -3330,8 +3357,11 @@ func (g *Graph) uniqueStoreDecls() []store.UniqueConstraint {
 // saveView serializes one (pinned) generation - Save's body without the
 // pend flush. ucs is the unique-constraint declaration snapshot; callers on
 // the writer goroutine pass g.uniqueStoreDecls(), the async-compact flight
-// passes the copy pinned at launch (safe from any goroutine: the view and
-// the declaration list are immutable, and the registry load is atomic).
+// passes the copy pinned at launch. Safe from any goroutine only when ucs
+// was pinned on the writer goroutine (the flight's launch discipline): the
+// view and the declaration list are immutable and the vector-registry load
+// is atomic; with a live registry read (Save/SaveFile's path) the encode
+// inherits their writer-goroutine-or-quiesced requirement.
 func (g *Graph) saveView(w io.Writer, v *genView, ucs []store.UniqueConstraint) error {
 	nodes, edges, labels, indexKeys, ftsKeys := v.unionRecords()
 	sn := make([]store.Node, len(nodes))
@@ -3356,7 +3386,10 @@ func (g *Graph) saveView(w io.Writer, v *genView, ucs []store.UniqueConstraint) 
 }
 
 // SaveFile saves to a path: temp file + fsync + atomic rename, avoiding
-// half-written files.
+// half-written files. Goroutine safety as Save: with unique constraints
+// declared the declaration snapshot reads the writer-private registry, so
+// run on the writer goroutine or with writes quiesced; the async-compact
+// flight uses saveViewFile with a launch-pinned snapshot instead.
 func (g *Graph) SaveFile(path string) error {
 	return g.saveViewFile(g.view.Load(), path, g.uniqueStoreDecls())
 }
@@ -3364,7 +3397,8 @@ func (g *Graph) SaveFile(path string) error {
 // saveViewFile is SaveFile over a pinned view (the async compact flight's
 // writer-side export: no pend flush, no CURRENT-view load). ucs is the
 // declaration snapshot pinned alongside the view at flight launch — the
-// flight goroutine must not read the writer-private registry.
+// flight goroutine must not read the writer-private registry, which is
+// exactly what makes this safe from any goroutine (see saveView).
 func (g *Graph) saveViewFile(v *genView, path string, ucs []store.UniqueConstraint) error {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)

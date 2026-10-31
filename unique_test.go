@@ -295,6 +295,54 @@ func TestUniqueAddNodeViolationWalOff(t *testing.T) {
 	}
 }
 
+// TestUniqueMultiConstraintViolationOrder pins the deterministic
+// first-violation payload when one write violates several constraints at
+// once: the sorted-first constraint (label, then prop — the listing/save
+// emission order) is reported, not whichever one map iteration happens to
+// visit first. Accept/reject is deterministic regardless; only the error
+// payload follows iteration order, and raft replicas compare it
+// (server/constraint_test.go). The rejected write has zero side effects,
+// so the same attempt is replayed to pin the order against map randomness.
+func TestUniqueMultiConstraintViolationOrder(t *testing.T) {
+	g := New()
+	for _, c := range [][2]string{{"Svc", "email"}, {"Svc", "name"}, {"Svc", "ssn"}} {
+		if err := g.DeclareUnique(c[0], c[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Seeds unique per constraint; "dup" below collides with all three.
+	seeds := []struct{ key, email, name, ssn string }{
+		{"ownEmail", "dup@x", "u1", "u1"},
+		{"ownName", "u1@x", "dup", "u2"},
+		{"ownSsn", "u2@x", "u2", "111"},
+	}
+	for _, s := range seeds {
+		if _, err := g.AddNode(s.key, "Svc", map[string]any{
+			"email": s.email, "name": s.name, "ssn": s.ssn,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// email < name < ssn sorted: every attempt must report the email
+	// constraint, never name or ssn.
+	want := UniqueViolationError{
+		Label: "Svc", Prop: "email", Value: "dup@x",
+		ExistingKey: "ownEmail", AttemptedKey: "dup",
+	}
+	for i := 0; i < 25; i++ {
+		_, err := g.AddNode("dup", "Svc", map[string]any{
+			"email": "dup@x", "name": "dup", "ssn": "111",
+		})
+		var uv *UniqueViolationError
+		if !errors.As(err, &uv) {
+			t.Fatalf("attempt %d: violation error: %v", i, err)
+		}
+		if *uv != want {
+			t.Fatalf("attempt %d: first violation = %+v, want the sorted-first constraint: %+v", i, uv, want)
+		}
+	}
+}
+
 // --- SetNodeProps facade (covered transitively through AddNode) -----------------
 
 func TestUniqueSetNodePropsFacade(t *testing.T) {
