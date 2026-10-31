@@ -68,9 +68,12 @@ say_pass "cloned $(git log --oneline -1)"
 # --- Step 2: version-prep commit + annotated tag trio --------------------
 say_step 2 "version-prep commit (require vectra v$ver) + tags v$ver server/v$ver mcp/v$ver"
 for m in server mcp; do
-    [ "$(grep -c 'github.com/projanvil/vectra v0\.0\.0' "$m/go.mod")" -eq 1 ] \
-        || say_fail "$m/go.mod: expected exactly one 'github.com/projanvil/vectra v0.0.0' require line"
-    sed -i.bak "s|github.com/projanvil/vectra v0\.0\.0|github.com/projanvil/vectra v$ver|" "$m/go.mod"
+    # Bump from whatever version the submodules currently require — the
+    # v0.0.0 placeholder of a fresh tree or the last released tag of a
+    # prepped one (both are exactly one require line).
+    [ "$(grep -cE 'github\.com/projanvil/vectra v[0-9]+\.[0-9]+\.[0-9]+' "$m/go.mod")" -eq 1 ] \
+        || say_fail "$m/go.mod: expected exactly one 'github.com/projanvil/vectra vX.Y.Z' require line"
+    sed -i.bak -E "s|github\.com/projanvil/vectra v[0-9]+\.[0-9]+\.[0-9]+|github.com/projanvil/vectra v$ver|" "$m/go.mod"
     rm -f "$m/go.mod.bak"
     grep -q "github.com/projanvil/vectra v$ver" "$m/go.mod" \
         || say_fail "$m/go.mod: require line was not bumped to v$ver"

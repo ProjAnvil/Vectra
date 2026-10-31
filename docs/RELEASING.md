@@ -9,11 +9,12 @@ commit — the version-prep commit — carrying all three annotated tags:
 | `github.com/projanvil/vectra/server` | `server/vX.Y.Z` | raft/HTTP server + `vectra-server`, `vectra-bench`, `vectra-cli` |
 | `github.com/projanvil/vectra/mcp` | `mcp/vX.Y.Z` | MCP agent gateway (`vectra-mcp`) |
 
-`server/go.mod` and `mcp/go.mod` both carry
-`require github.com/projanvil/vectra v0.0.0` with
+`server/go.mod` and `mcp/go.mod` both carry a
+`require github.com/projanvil/vectra vX.Y.Z` line with
 `replace github.com/projanvil/vectra => ../` so in-repo (workspace) builds
-compile against the engine working tree. The release flow below turns that
-placeholder into the real version for the tagged commit — see
+compile against the engine working tree. Before the first release the line
+reads the `v0.0.0` placeholder; after any release it reads the last shipped
+version — the flow below bumps whichever is there. See
 [go get compatibility](#go-get-compatibility) for why this is not optional.
 
 Historical note: releases up to `v0.13.1` tagged only the root module; the
@@ -38,7 +39,7 @@ Replace `X.Y.Z` with the release version (e.g. `0.15.0`) throughout.
    exists to prevent:
 
    ```sh
-   sed -i.bak 's|github.com/projanvil/vectra v0\.0\.0|github.com/projanvil/vectra vX.Y.Z|' server/go.mod mcp/go.mod
+   sed -i.bak -E 's|github\.com/projanvil/vectra v[0-9]+\.[0-9]+\.[0-9]+|github.com/projanvil/vectra vX.Y.Z|' server/go.mod mcp/go.mod
    rm -f server/go.mod.bak mcp/go.mod.bak
    for m in server mcp; do
        grep -q "github.com/projanvil/vectra vX.Y.Z" "$m/go.mod" \
@@ -49,7 +50,10 @@ Replace `X.Y.Z` with the release version (e.g. `0.15.0`) throughout.
    git commit -m "chore(release): vectra vX.Y.Z"
    ```
 
-   (`sed -i.bak` plus removing the `*.bak` files works on both BSD and GNU
+   (The bump pattern rewrites ANY current version — the `v0.0.0` placeholder
+   of a fresh tree or the last released version of a prepped one — and the
+   guard asserts the end state regardless of the starting point.
+   `sed -i.bak` plus removing the `*.bak` files works on both BSD and GNU
    sed. The guard asserts the end state of both go.mod files — the bumped
    require line and the surviving `replace ../` — mirroring the checks
    `scripts/goget-smoke.sh` applies in its step 2; asserting the end state

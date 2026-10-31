@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.1] - 2026-11-01
+
+Internal quality follow-ups to the unique-constraints feature; no API or
+wire changes.
+
+### Fixed
+
+- `VerifyUniqueInvariantForTest` (test-only helper) no longer derives its
+  expected constraint set from the registry it verifies — the key-set blind
+  spot that hid a wrongly-dropped or wrongly-kept constraint is closed: the
+  helper takes the expected constraints from the caller (`want ...`,
+  zero args = expect none) and reports extra/missing by name.
+- `scripts/goget-smoke.sh` now version-bumps from whatever the submodules
+  currently require (previously it only rewrote the `v0.0.0` placeholder,
+  so it could not run against a tree that had already shipped a release).
+
+### Changed
+
+- The unique-constraint violation scan on the write path is
+  allocation-free (single pass tracking the order-minimal violated
+  constraint, replacing a per-write candidate slice build + sort; reporting
+  semantics and cross-replica determinism unchanged). A constrained
+  `AddNode` now allocates exactly as much as an unconstrained one.
+
 ## [0.14.0] - 2026-10-31
 
 The release where the write path grows into a language and the project ships
