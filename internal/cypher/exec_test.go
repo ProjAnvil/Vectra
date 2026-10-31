@@ -1,12 +1,14 @@
 package cypher
 
 import (
+	"fmt"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/projanvil/vectra/internal/csr"
 	"github.com/projanvil/vectra/internal/engine"
 )
 
@@ -94,6 +96,82 @@ func TestExecAnchorIndexedAndFallback(t *testing.T) {
 	res = run(t, `MATCH (a {nosuch: 1}) RETURN a`) // unregistered key → full-scan fallback, no hit
 	if len(res.Rows) != 0 {
 		t.Fatalf("unindexed fallback: %d rows", len(res.Rows))
+	}
+}
+
+// boolSource is a three-source stub whose LookupBool answers from its node
+// records and records its calls — the view-path (unmerged layers) leg of a
+// boolean typed-index anchor.
+type boolSource struct {
+	stubSource
+	recs  []engine.NodeRec
+	calls []string
+}
+
+func (b *boolSource) NodeInfo(id uint32) (engine.NodeRec, bool) {
+	if int(id) >= len(b.recs) {
+		return engine.NodeRec{}, false
+	}
+	return b.recs[id], true
+}
+
+func (b *boolSource) LookupBool(key string, value bool) ([]uint32, bool) {
+	b.calls = append(b.calls, fmt.Sprintf("%s=%v", key, value))
+	if key != "on" {
+		return nil, false
+	}
+	var ids []uint32
+	for i, r := range b.recs {
+		if v, ok := r.Props["on"].(bool); ok && v == value {
+			ids = append(ids, uint32(i))
+		}
+	}
+	return ids, true
+}
+
+// TestExecAnchorBoolIndexed is the boolean leg of the typed-index anchor:
+// a bool prop-map literal routes through lookupBool on both execution paths
+// (sealed snapshot and three-source view), discriminating true from false.
+func TestExecAnchorBoolIndexed(t *testing.T) {
+	nodes := []engine.NodeRec{
+		{Key: "gw", Label: "Service", Props: map[string]any{"on": true}},
+		{Key: "orders", Label: "Service", Props: map[string]any{"on": false}},
+		{Key: "db", Label: "Store"}, // no "on" prop: matches neither value
+	}
+	snap := engine.Seal(nodes, nil, []string{"Service", "Store"}, []string{"on"}, nil)
+
+	res, err := Run(snap, `MATCH (a {on: true}) RETURN a.key`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if k := keysOf(res, "a.key"); len(k) != 1 || k[0] != "gw" {
+		t.Fatalf("bool-true anchor: %v, want [gw]", k)
+	}
+	res, err = Run(snap, `MATCH (a {on: false}) RETURN a.key`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if k := keysOf(res, "a.key"); len(k) != 1 || k[0] != "orders" {
+		t.Fatalf("bool-false anchor: %v, want [orders]", k)
+	}
+	res, err = Run(snap, `MATCH (a {nosuch: true}) RETURN a.key`) // unregistered key → full-scan fallback
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(res.Rows) != 0 {
+		t.Fatalf("unindexed bool key: %d rows, want 0", len(res.Rows))
+	}
+
+	src := &boolSource{stubSource: stubSource{n: 3, rows: map[uint32][]csr.AdjRow{}}, recs: nodes}
+	res, err = RunView(src, `MATCH (a {on: false}) RETURN a.key`)
+	if err != nil {
+		t.Fatalf("RunView: %v", err)
+	}
+	if k := keysOf(res, "a.key"); len(k) != 1 || k[0] != "orders" {
+		t.Fatalf("view-path bool anchor: %v, want [orders]", k)
+	}
+	if !slices.Equal(src.calls, []string{"on=false"}) {
+		t.Fatalf("source LookupBool calls = %v, want [on=false]", src.calls)
 	}
 }
 
