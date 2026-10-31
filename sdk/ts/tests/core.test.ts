@@ -316,6 +316,7 @@ describe("cypher write summary", () => {
     assert.deepEqual(res.columns, ["n.key", "n.env"]);
     assert.deepEqual(res.rows, [{ "n.key": "cw-x", "n.env": "prod" }]);
     assert.deepEqual(Object.keys(res.summary).sort(), [
+      "constraintsCreated",
       "createdEdges",
       "createdNodes",
       "deletedEdges",

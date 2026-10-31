@@ -240,7 +240,7 @@ class TestCypherWriteSummary(ServerTestCase):
         self.assertEqual(
             set(summary.keys()),
             {"createdNodes", "createdEdges", "deletedNodes", "deletedEdges",
-             "propertiesSet", "indexesCreated"},
+             "propertiesSet", "indexesCreated", "constraintsCreated"},
         )
         self.assertEqual(summary["createdNodes"], 1)
         self.assertEqual(summary["createdEdges"], 0)

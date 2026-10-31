@@ -136,8 +136,8 @@ export interface CypherReadResult {
   count: number;
 }
 
-/** The six write counters POST /v1/cypher reports on WRITE statements
- * (CREATE/SET/DELETE/MERGE/CREATE INDEX). */
+/** The seven write counters POST /v1/cypher reports on WRITE statements
+ * (CREATE/SET/DELETE/MERGE/CREATE INDEX/CREATE CONSTRAINT). */
 export interface WriteSummary {
   createdNodes: number;
   createdEdges: number;
@@ -145,6 +145,7 @@ export interface WriteSummary {
   deletedEdges: number;
   propertiesSet: number;
   indexesCreated: number;
+  constraintsCreated: number;
 }
 
 /** POST /v1/cypher WRITE response: `{"columns", "rows", "summary"}` —
