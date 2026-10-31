@@ -238,3 +238,23 @@ func (w *writeGraph) IndexFullText(key string) error {
 	w.g.IndexFullText(key)
 	return nil
 }
+
+// DeclareUnique registers a (label, prop) uniqueness constraint, and
+// DropUnique removes one, through the root API (the Task 2 engine
+// surface). Cypher statements never run inside g.Batch, so the engine's
+// mid-Batch rejection is unreachable on this path — the Go API keeps the
+// guard. Both errors (duplicate declaration, declaration-time duplicate
+// data, unknown constraint, a write-time violation surfacing through the
+// declaration scan) propagate RAW to the statement caller: the Cypher
+// layer never wraps writer errors, so the payload stays reachable for
+// errors.Is/errors.As and the server's wire mapping (unique-constraints
+// spec §2.6).
+func (w *writeGraph) DeclareUnique(label, prop string) error {
+	return w.g.DeclareUnique(label, prop)
+}
+
+// DropUnique removes the constraint; same raw-error contract as
+// DeclareUnique.
+func (w *writeGraph) DropUnique(label, prop string) error {
+	return w.g.DropUnique(label, prop)
+}

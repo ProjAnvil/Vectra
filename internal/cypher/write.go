@@ -13,6 +13,14 @@ type WriteSummary struct {
 	CreatedNodes, CreatedEdges    int
 	DeletedNodes, DeletedEdges    int
 	PropertiesSet, IndexesCreated int
+	// ConstraintsCreated counts 0 or 1 — a constraint declaration this
+	// statement made. Unlike IndexesCreated (which counts idempotent
+	// re-declarations), a duplicate CREATE CONSTRAINT is an ERROR
+	// (unique-constraints spec §2.1), so the counter only ever moves on an
+	// actual creation — a documented divergence, do not "harmonize". A DROP
+	// CONSTRAINT statement leaves it 0 (there is no constraintsDropped).
+	// Wire/JSON name: constraintsCreated (spec §5.3).
+	ConstraintsCreated int
 }
 
 // Writer is the mutation surface the write clauses drive. Every method is
@@ -58,6 +66,15 @@ type Writer interface {
 	EdgeIDByTriple(srcKey, dstKey, label string) (uint32, bool)
 	IndexProperty(key string) error
 	IndexFullText(key string) error
+	// DeclareUnique registers a (label, prop) uniqueness constraint; the
+	// declaration validates existing data first and fails whole on
+	// duplicates. DropUnique removes the constraint; an unknown pair
+	// errors. Both reject mid-Batch at the engine. Their errors propagate
+	// RAW out of RunWrite — never wrapped in a positioned *Error — so the
+	// violation payload stays reachable for errors.Is/errors.As (and the
+	// server's 400 UNIQUE_VIOLATION face, unique-constraints spec §2.6).
+	DeclareUnique(label, prop string) error
+	DropUnique(label, prop string) error
 }
 
 // IsWrite reports whether the statement mutates (write clauses or DDL).
@@ -71,7 +88,7 @@ func IsWrite(q string) (bool, error) {
 	}
 	for _, c := range ast.Clauses {
 		switch c.(type) {
-		case *CreateClause, *SetClause, *DeleteClause, *MergeClause, *IndexClause:
+		case *CreateClause, *SetClause, *DeleteClause, *MergeClause, *IndexClause, *ConstraintClause:
 			return true, nil
 		}
 	}
@@ -677,6 +694,29 @@ func (ex *executor) indexStage(c *IndexClause) error {
 		}
 	}
 	ex.sum.IndexesCreated++
+	return nil
+}
+
+// constraintStage applies one ConstraintClause: CREATE|DROP CONSTRAINT
+// declares or removes a (label, prop) uniqueness constraint on the writer
+// — a statement-level effect (CREATE additionally scans live data to
+// validate the declaration, unique-constraints spec §2.2). A no-rows
+// statement by grammar (standalone, like IndexClause), so it applies
+// exactly once per statement, never through the per-row stage machinery.
+//
+// Writer errors propagate RAW (the indexStage convention): the violation
+// payload must survive the Cypher layer unwrapped for errors.Is/As and the
+// server's 400 UNIQUE_VIOLATION mapping (§2.6). ConstraintsCreated counts
+// 0 or 1 only — a duplicate declare is an ERROR (§2.1), unlike
+// IndexesCreated's idempotent re-declaration counting.
+func (ex *executor) constraintStage(c *ConstraintClause) error {
+	if c.Drop {
+		return ex.w.DropUnique(c.Label, c.Prop)
+	}
+	if err := ex.w.DeclareUnique(c.Label, c.Prop); err != nil {
+		return err
+	}
+	ex.sum.ConstraintsCreated++
 	return nil
 }
 

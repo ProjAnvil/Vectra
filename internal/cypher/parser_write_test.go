@@ -233,6 +233,67 @@ func TestParseIndexDDL(t *testing.T) {
 	}
 }
 
+// TestParseConstraintDDL pins the constraint DDL grammar (spec §2.1): both
+// the CREATE and DROP REQUIRE-form statements parse to one standalone
+// ConstraintClause carrying the (label, prop) identity; there is no name
+// form — the pair IS the identity.
+func TestParseConstraintDDL(t *testing.T) {
+	q, err := Parse(`CREATE CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(q.Clauses) != 1 {
+		t.Fatalf("clauses: %d", len(q.Clauses))
+	}
+	cc := q.Clauses[0].(*ConstraintClause)
+	if cc.Label != "Person" || cc.Prop != "email" || cc.Drop {
+		t.Fatalf("constraint: %+v", cc)
+	}
+
+	q, err = Parse(`DROP CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cc = q.Clauses[0].(*ConstraintClause)
+	if cc.Label != "Person" || cc.Prop != "email" || !cc.Drop {
+		t.Fatalf("drop constraint: %+v", cc)
+	}
+
+	// keywords are case-insensitive like every keyword in the grammar
+	q, err = Parse(`create constraint for (n:P) require n.p is unique`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cc := q.Clauses[0].(*ConstraintClause); cc.Label != "P" || cc.Prop != "p" || cc.Drop {
+		t.Fatalf("lowercase constraint: %+v", cc)
+	}
+}
+
+// TestConstraintClauseClassification pins BOTH classification lists (spec
+// §5.2 layer 3): isWriteClause drives the parser's RETURN-optional logic,
+// IsWrite drives the root/server routing — a ConstraintClause (either form)
+// must register as a write in both or the statement misroutes.
+func TestConstraintClauseClassification(t *testing.T) {
+	if !isWriteClause(&ConstraintClause{Label: "P", Prop: "email"}) {
+		t.Fatal("isWriteClause(&ConstraintClause{create}) = false")
+	}
+	if !isWriteClause(&ConstraintClause{Label: "P", Prop: "email", Drop: true}) {
+		t.Fatal("isWriteClause(&ConstraintClause{drop}) = false")
+	}
+	for _, q := range []string{
+		`CREATE CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE`,
+		`DROP CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE`,
+	} {
+		got, err := IsWrite(q)
+		if err != nil {
+			t.Fatalf("IsWrite(%q): %v", q, err)
+		}
+		if !got {
+			t.Fatalf("IsWrite(%q) = false, want true", q)
+		}
+	}
+}
+
 func TestParseWriteNoReturnOptional(t *testing.T) {
 	for _, src := range []string{
 		`CREATE (n:P {key:'x'})`,
@@ -240,6 +301,8 @@ func TestParseWriteNoReturnOptional(t *testing.T) {
 		`MATCH (a) DELETE a`,
 		`MERGE (n:P {key:'x'})`,
 		`CREATE FULLTEXT INDEX ON (n.body)`,
+		`CREATE CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE`,
+		`DROP CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE`,
 	} {
 		if _, err := Parse(src); err != nil {
 			t.Fatalf("Parse(%q): %v", src, err)
@@ -289,6 +352,17 @@ func TestParseWriteErrors(t *testing.T) {
 		// explicitly so the scalar arm cannot silently change message.
 		{`UNWIND [1] AS k CREATE (a)-[k:X]->(b)`, `edge variable "k" is already declared`, 1, 29},
 		{"MERGE (a), (b)", "MERGE takes exactly one pattern", 1, 10},
+		// constraint DDL: standalone rule (both forms), grammar shape
+		{"CREATE CONSTRAINT FOR (n:P) REQUIRE n.email IS UNIQUE RETURN n", "standalone statement", 1, 1},
+		{"MATCH (a) CREATE CONSTRAINT FOR (n:P) REQUIRE n.email IS UNIQUE", "CREATE CONSTRAINT is a standalone statement", 1, 11},
+		{"MATCH (a) DROP CONSTRAINT FOR (n:P) REQUIRE n.email IS UNIQUE", "DROP CONSTRAINT is a standalone statement", 1, 11},
+		{"DROP CONSTRAINT FOR (n:P) REQUIRE n.email IS UNIQUE RETURN n", "standalone statement", 1, 1},
+		{"CREATE CONSTRAINT ON (n:P) REQUIRE n.email IS UNIQUE", "expected FOR", 1, 19},
+		{"CREATE CONSTRAINT FOR n:P REQUIRE n.email IS UNIQUE", `expected "("`, 1, 23},
+		{"CREATE CONSTRAINT FOR (n) REQUIRE n.email IS UNIQUE", `expected ":"`, 1, 25},
+		{"CREATE CONSTRAINT FOR (n:P) REQUIRE m.email IS UNIQUE", `REQUIRE variable "m" must repeat the FOR variable "n"`, 1, 37},
+		{"DROP CONSTRAINT FOR (n:P)", "expected REQUIRE", 1, 26},
+		{`CREATE CONSTRAINT FOR (n:P) REQUIRE n.email IS NOT UNIQUE`, "expected UNIQUE", 1, 48},
 	}
 	for _, c := range cases {
 		_, err := Parse(c.src)

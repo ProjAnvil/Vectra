@@ -118,12 +118,15 @@ func (g *Graph) retypeResult(res *cypher.Result, v *genView) (*CypherResult, err
 }
 
 // writeClauseKeywords are the clause-head keywords a mutating statement
-// must spell (CREATE covers CREATE INDEX, DELETE covers DETACH DELETE).
+// must spell (CREATE covers CREATE INDEX and CREATE CONSTRAINT, DELETE
+// covers DETACH DELETE; "constraint" carries the DROP CONSTRAINT form,
+// whose head keyword DROP is not itself a write-clause keyword — the
+// unique-constraints spec §5.2 layer 1).
 // maybeWriteQuery reports whether any of them appears in q as a substring,
 // comparing ASCII case-insensitively with zero allocations — a deliberate
 // SUPERSET of write statements: false negatives would misroute a write
 // onto the read path, false positives cost one extra parse.
-var writeClauseKeywords = []string{"create", "merge", "set", "delete"}
+var writeClauseKeywords = []string{"create", "merge", "set", "delete", "constraint"}
 
 func maybeWriteQuery(q string) bool {
 	for _, kw := range writeClauseKeywords {

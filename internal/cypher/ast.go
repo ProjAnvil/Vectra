@@ -103,6 +103,18 @@ type IndexClause struct {
 	FullText bool
 }
 
+// ConstraintClause is the constraint DDL statement
+// "[CREATE|DROP] CONSTRAINT FOR (n:Label) REQUIRE n.prop IS UNIQUE"
+// (unique-constraints spec §2.1: REQUIRE-form only, no name form — the
+// (Label, Prop) pair is the constraint's identity). Drop distinguishes the
+// two spellings; the pattern variable is grammatically required but
+// semantically ignored, exactly like the IndexClause variable.
+type ConstraintClause struct {
+	Label string
+	Prop  string
+	Drop  bool
+}
+
 // PathPattern is one comma-separated path of the MATCH clause:
 // Nodes[i] --Edges[i]--> Nodes[i+1].
 type PathPattern struct {
@@ -243,4 +255,5 @@ func (*CreateClause) isClause() {}
 func (*SetClause) isClause()    {}
 func (*DeleteClause) isClause() {}
 func (*MergeClause) isClause()  {}
-func (*IndexClause) isClause()  {}
+func (*IndexClause) isClause()      {}
+func (*ConstraintClause) isClause() {}

@@ -80,15 +80,16 @@ func (p *parser) expectKw(word string) error {
 // may repeat up to the first write clause (CREATE patterns, MERGE pattern
 // [ON CREATE SET | ON MATCH SET], SET items, [DETACH] DELETE vars); after
 // a write clause only write clauses and the final RETURN may appear — a
-// read clause there is a positioned error. CREATE [FULLTEXT] INDEX is a
-// standalone statement (two-token lookahead; no other clause may
-// accompany it). RETURN is terminal — anything after it is an
-// unexpected-token error — and optional when the statement contains at
-// least one write clause; a pure-read statement still requires it.
+// read clause there is a positioned error. CREATE [FULLTEXT] INDEX and
+// [CREATE|DROP] CONSTRAINT are standalone statements (two-token lookahead;
+// no other clause may accompany them). RETURN is terminal — anything after
+// it is an unexpected-token error — and optional when the statement
+// contains at least one write clause; a pure-read statement still requires
+// it.
 func (p *parser) parseQuery() (*Query, error) {
 	if !p.kw("MATCH") && !p.atOptionalMatch() && !p.kw("UNWIND") &&
 		!p.kw("CREATE") && !p.kw("MERGE") && !p.kw("SET") &&
-		!p.kw("DELETE") && !p.atDetachDelete() {
+		!p.kw("DELETE") && !p.kw("DROP") && !p.atDetachDelete() {
 		return nil, p.errf("expected MATCH, got %s", describe(p.cur()))
 	}
 	q := newQuery()
@@ -116,9 +117,13 @@ func (p *parser) parseQuery() (*Query, error) {
 		case p.kw("CREATE"):
 			if p.atCreateIndex() {
 				c, err = p.parseIndexClause()
+			} else if p.atCreateConstraint() {
+				c, err = p.parseConstraintClause()
 			} else {
 				c, err = p.parseCreateClause()
 			}
+		case p.kw("DROP"):
+			c, err = p.parseConstraintClause()
 		case p.kw("MERGE"):
 			c, err = p.parseMergeClause()
 		case p.kw("SET"):
@@ -137,6 +142,13 @@ func (p *parser) parseQuery() (*Query, error) {
 		if _, ddl := c.(*IndexClause); ddl && (len(q.Clauses) > 0 || !p.at(TEOF)) {
 			return nil, &Error{start.Line, start.Col, "CREATE INDEX is a standalone statement (no other clauses may accompany it)"}
 		}
+		if cc, ddl := c.(*ConstraintClause); ddl && (len(q.Clauses) > 0 || !p.at(TEOF)) {
+			kw := "CREATE CONSTRAINT"
+			if cc.Drop {
+				kw = "DROP CONSTRAINT"
+			}
+			return nil, &Error{start.Line, start.Col, kw + " is a standalone statement (no other clauses may accompany it)"}
+		}
 		if isWriteClause(c) {
 			sawWrite = true
 		}
@@ -149,11 +161,11 @@ func (p *parser) parseQuery() (*Query, error) {
 }
 
 // isWriteClause reports whether c mutates the graph (write clauses and
-// the CREATE INDEX DDL statement); RETURN-optional and the
-// read-after-write sequencing key off this.
+// the CREATE INDEX / CREATE-DROP CONSTRAINT DDL statements); RETURN-
+// optional and the read-after-write sequencing key off this.
 func isWriteClause(c Clause) bool {
 	switch c.(type) {
-	case *CreateClause, *SetClause, *DeleteClause, *MergeClause, *IndexClause:
+	case *CreateClause, *SetClause, *DeleteClause, *MergeClause, *IndexClause, *ConstraintClause:
 		return true
 	}
 	return false
@@ -189,6 +201,18 @@ func (p *parser) atCreateIndex() bool {
 		return t2.Kind == TIdent && strings.EqualFold(t2.Text, "INDEX")
 	}
 	return false
+}
+
+// atCreateConstraint reports whether the cursor sits on the CREATE
+// CONSTRAINT DDL prefix (plain CREATE parses path patterns). The +1 index
+// is safe: toks always ends with TEOF, and a cursor on CREATE is never on
+// that final token.
+func (p *parser) atCreateConstraint() bool {
+	if !p.kw("CREATE") {
+		return false
+	}
+	t := p.toks[p.pos+1]
+	return t.Kind == TIdent && strings.EqualFold(t.Text, "CONSTRAINT")
 }
 
 // atOptionalMatch reports whether the cursor sits on the two-keyword
@@ -534,6 +558,73 @@ func (p *parser) parseIndexClause() (*IndexClause, error) {
 	}
 	ic.Prop = prop.Text
 	return ic, nil
+}
+
+// parseConstraintClause parses "[CREATE|DROP] CONSTRAINT FOR (v:Label)
+// REQUIRE v.prop IS UNIQUE" (unique-constraints spec §2.1: REQUIRE-form
+// only, no name form — the (label, prop) pair is the constraint's
+// identity, so nothing else in the grammar carries one). The pattern
+// variable is grammatically required but semantically ignored (the
+// IndexClause precedent); the REQUIRE variable must repeat it, a different
+// name is a positioned error. The leading keyword is still unconsumed;
+// parseQuery already verified the lookahead (CREATE) or the entry gate
+// (DROP).
+func (p *parser) parseConstraintClause() (*ConstraintClause, error) {
+	cc := &ConstraintClause{}
+	if p.kw("DROP") {
+		p.next() // DROP
+		cc.Drop = true
+	} else {
+		p.next() // CREATE
+	}
+	if err := p.expectKw("CONSTRAINT"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKw("FOR"); err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(TParenL, "\"(\""); err != nil {
+		return nil, err
+	}
+	v, err := p.expect(TIdent, "variable")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(TColon, "\":\""); err != nil {
+		return nil, err
+	}
+	label, err := p.expect(TIdent, "label")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(TParenR, "\")\""); err != nil {
+		return nil, err
+	}
+	if err := p.expectKw("REQUIRE"); err != nil {
+		return nil, err
+	}
+	rv, err := p.expect(TIdent, "variable")
+	if err != nil {
+		return nil, err
+	}
+	if !strings.EqualFold(rv.Text, v.Text) {
+		return nil, &Error{Line: rv.Line, Col: rv.Col, Msg: fmt.Sprintf("REQUIRE variable %q must repeat the FOR variable %q", rv.Text, v.Text)}
+	}
+	if _, err := p.expect(TDot, "\".\""); err != nil {
+		return nil, err
+	}
+	prop, err := p.expect(TIdent, "property name")
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKw("IS"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKw("UNIQUE"); err != nil {
+		return nil, err
+	}
+	cc.Label, cc.Prop = label.Text, prop.Text
+	return cc, nil
 }
 
 // parseOrderSkipLimit parses the shared ORDER BY / SKIP / LIMIT trailer

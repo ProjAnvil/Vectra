@@ -404,6 +404,8 @@ func TestCypherIsWrite(t *testing.T) {
 		{"MERGE (n:P {key:'x'}) ON CREATE SET n.created = true", true},
 		{"CREATE INDEX ON (n.env)", true},
 		{"CREATE FULLTEXT INDEX ON (n.body)", true},
+		{"CREATE CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE", true},
+		{"DROP CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE", true},
 	}
 	for _, c := range cases {
 		got, err := CypherIsWrite(c.q)

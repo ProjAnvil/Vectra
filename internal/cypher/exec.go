@@ -206,6 +206,17 @@ func runStatement(ex *executor, ast *Query) (*Result, error) {
 			if err := ex.indexStage(c); err != nil {
 				return nil, err
 			}
+		case *ConstraintClause:
+			// Same write-path gating as CREATE (routing, not semantics).
+			if ex.w == nil {
+				return nil, &Error{1, 1, "write clause outside the write path (use RunWrite)"}
+			}
+			// A no-rows statement: applied once at the statement level,
+			// never through the per-row stage machinery (see
+			// constraintStage). Writer errors pass through RAW (§2.6).
+			if err := ex.constraintStage(c); err != nil {
+				return nil, err
+			}
 		case *ReturnClause:
 			if ex.w != nil {
 				// Rebind entity bindings through the writer against the
