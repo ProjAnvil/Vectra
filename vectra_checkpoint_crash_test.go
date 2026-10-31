@@ -23,10 +23,10 @@ package vectra
 //     WAL-mode library's `path` never exists (checkpoints write watermark
 //     files next to it), so ModeOff cannot see a chained library at all:
 //     it returns a fresh empty graph, having read nothing (no silent
-//     base-only load is possible). Pointing ModeOff at a v7 snapshot FILE
-//     loads it on this binary (Decode knows v7) and hard-fails on an
-//     unknown version byte — the exact dispatch branch a v0.11.1 binary
-//     takes on the real v7 file.
+//     base-only load is possible). Pointing ModeOff at a v8 snapshot FILE
+//     loads it on this binary (Decode knows v8) and hard-fails on an
+//     unknown version byte — the exact dispatch branch a v0.12.x binary
+//     takes on the real v8 file.
 
 import (
 	"bytes"
@@ -44,8 +44,8 @@ import (
 func probeManifestBase(t *testing.T, db, step string) {
 	t.Helper()
 	man := readManifest(t, db)
-	if v := snapshotVersion(t, db, man.Snapshot); v != store.VersionV7 {
-		t.Fatalf("%s: manifest-named base %s probes v%d, want the v7 tripwire", step, man.Snapshot, v)
+	if v := snapshotVersion(t, db, man.Snapshot); v != store.VersionV8 {
+		t.Fatalf("%s: manifest-named base %s probes v%d, want the v8 tripwire", step, man.Snapshot, v)
 	}
 }
 
@@ -225,14 +225,14 @@ func TestCompactCrashWindowOrphanBaseOverChain(t *testing.T) {
 		t.Fatalf("fixture: manifest = %+v, want a live retained chain", manLive)
 	}
 
-	// Crash after SaveFile, before WriteManifest: the orphan v7 watermark is
+	// Crash after SaveFile, before WriteManifest: the orphan v8 watermark is
 	// on disk, the manifest still names the old base, and Reset never ran.
 	orphan := g2.snapshotFile(g2.wal.LastLSN())
 	if err := g2.SaveFile(orphan); err != nil {
 		t.Fatal(err)
 	}
-	if v := snapshotVersion(t, db, filepath.Base(orphan)); v != store.VersionV7 {
-		t.Fatalf("orphan watermark probes v%d, want v7", v)
+	if v := snapshotVersion(t, db, filepath.Base(orphan)); v != store.VersionV8 {
+		t.Fatalf("orphan watermark probes v%d, want v8", v)
 	}
 	manCrash := readManifest(t, db)
 	if manCrash != manLive {
@@ -337,7 +337,7 @@ func TestChainLibraryAlwaysV7Backed(t *testing.T) {
 	// Mid-session crash shape: the rotate landed, the manifest did not. The
 	// manifest bytes stay at the light checkpoint while a segment beyond its
 	// Segment exists on disk — the exposure window an old binary reopening
-	// mid-session faces. Its named base still probes v7.
+	// mid-session faces. Its named base still probes v8.
 	segsLive := listSegments(t, db+".wal")
 	if _, err := g2.AddNode("c", "Svc", nil); err != nil {
 		t.Fatal(err)
@@ -353,8 +353,8 @@ func TestChainLibraryAlwaysV7Backed(t *testing.T) {
 	}
 	probeManifestBase(t, db, "mid-session crash")
 
-	// The dispatch branch an old binary takes on the v7 header, exercised
-	// honestly in-process: this binary decodes its own v7 base, and hard-
+	// The dispatch branch an old binary takes on the v8 header, exercised
+	// honestly in-process: this binary decodes its own v8 base, and hard-
 	// fails on the same bytes with an unknown version byte.
 	man := readManifest(t, db)
 	snapPath := filepath.Join(filepath.Dir(db), man.Snapshot)
@@ -363,10 +363,10 @@ func TestChainLibraryAlwaysV7Backed(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := store.Decode(bytes.NewReader(raw)); err != nil {
-		t.Fatalf("this binary must decode its own v7 base: %v", err)
+		t.Fatalf("this binary must decode its own v8 base: %v", err)
 	}
 	forged := append([]byte(nil), raw...)
-	binary.LittleEndian.PutUint16(forged[4:6], store.VersionV7+1)
+	binary.LittleEndian.PutUint16(forged[4:6], store.VersionV8+1)
 	if _, err := store.Decode(bytes.NewReader(forged)); err == nil {
 		t.Fatal("Decode must hard-fail on an unknown snapshot version (old-binary dispatch proxy)")
 	}
@@ -465,16 +465,16 @@ func TestModeOffOpenOfChainedLibrary(t *testing.T) {
 		t.Fatalf("ModeOff open must not touch the WAL dir: %v (was %v)", chainAfter, chainBefore)
 	}
 
-	// ModeOff on the manifest-named v7 base FILE: this binary loads it (the
+	// ModeOff on the manifest-named v8 base FILE: this binary loads it (the
 	// compact boundary's content only — the chain is invisible to a file
 	// load, by LoadFile semantics), an old binary hard-fails at the byte.
 	snap := filepath.Join(dir, man.Snapshot)
-	if v := snapshotVersion(t, db, man.Snapshot); v != store.VersionV7 {
-		t.Fatalf("chained base probes v%d, want v7", v)
+	if v := snapshotVersion(t, db, man.Snapshot); v != store.VersionV8 {
+		t.Fatalf("chained base probes v%d, want v8", v)
 	}
 	mof, err := Open(snap, Options{WALMode: ModeOff})
 	if err != nil {
-		t.Fatalf("this binary must ModeOff-load its own v7 snapshot: %v", err)
+		t.Fatalf("this binary must ModeOff-load its own v8 snapshot: %v", err)
 	}
 	if n := mof.NodeCount(); n != 2 {
 		t.Fatalf("ModeOff file load = %d nodes, want the compact boundary's 2 (the chain is not part of the file)", n)
@@ -487,13 +487,13 @@ func TestModeOffOpenOfChainedLibrary(t *testing.T) {
 	}
 
 	// Old-binary dispatch proxy on the same surface: the identical branch a
-	// v0.11.1 binary takes on the real v7 file hard-fails through ModeOff.
+	// v0.12.x binary takes on the real v8 file hard-fails through ModeOff.
 	raw, err := os.ReadFile(snap)
 	if err != nil {
 		t.Fatal(err)
 	}
 	forged := append([]byte(nil), raw...)
-	binary.LittleEndian.PutUint16(forged[4:6], store.VersionV7+1)
+	binary.LittleEndian.PutUint16(forged[4:6], store.VersionV8+1)
 	forgedPath := filepath.Join(dir, "forged.db")
 	if err := os.WriteFile(forgedPath, forged, 0o644); err != nil {
 		t.Fatal(err)

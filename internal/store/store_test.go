@@ -3,6 +3,7 @@ package store_test
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"hash/crc32"
 	"slices"
@@ -340,24 +341,33 @@ func TestFTSKeysRoundtrip(t *testing.T) {
 	}
 }
 
-// restampDownlevel turns this binary's v7 Encode output into the genuine
-// bytes a ver-era encoder (v6 or v5) wrote. v7's only layout delta over v6
-// is the FTS section appended after the float32 section, so cutting exactly
-// that many trailing bytes (u32 count + u32 length per key, computable from
-// the keys that produced the buffer), re-stamping the header and re-sealing
-// the CRC yields the older format byte-for-byte. Version-byte patching
-// ALONE cannot produce these bytes: the CRC trailer covers every preceding
-// byte, and the leftover section would read as trailing garbage.
-func restampDownlevel(t *testing.T, v7 []byte, ftsKeys []string, ver uint16) []byte {
+// restampDownlevel turns this binary's v8 Encode output into the genuine
+// bytes a ver-era encoder (v6 or v5) wrote. v8's layout deltas over v6 are
+// the FTS section and the unique-constraint section appended after the
+// float32 section, so cutting exactly that many trailing bytes (u32 count +
+// u32 length per key/constraint blob, computable from the inputs that
+// produced the buffer), re-stamping the header and re-sealing the CRC
+// yields the older format byte-for-byte. Version-byte patching ALONE cannot
+// produce these bytes: the CRC trailer covers every preceding byte, and the
+// leftover sections would read as trailing garbage.
+func restampDownlevel(t *testing.T, v8 []byte, ftsKeys []string, ucs []store.UniqueConstraint, ver uint16) []byte {
 	t.Helper()
-	secLen := 4 // u32 key count
+	secLen := 4 // u32 ftsKey count
 	for _, k := range ftsKeys {
 		secLen += 4 + len(k)
 	}
-	if len(v7)-4-secLen < 10 {
-		t.Fatalf("v7 buffer too short to hold header + FTS section of %d bytes", secLen)
+	secLen += 4 // u32 unique-constraint count
+	for _, uc := range ucs {
+		blob, err := json.Marshal(uc)
+		if err != nil {
+			t.Fatalf("marshal constraint: %v", err)
+		}
+		secLen += 4 + len(blob)
 	}
-	out := append([]byte(nil), v7[:len(v7)-4-secLen]...)
+	if len(v8)-4-secLen < 10 {
+		t.Fatalf("v8 buffer too short to hold header + sections of %d bytes", secLen)
+	}
+	out := append([]byte(nil), v8[:len(v8)-4-secLen]...)
 	binary.LittleEndian.PutUint16(out[4:6], ver)
 	return binary.LittleEndian.AppendUint32(out, crc32.ChecksumIEEE(out))
 }
@@ -381,7 +391,7 @@ func TestV6StillReadableUnderV7(t *testing.T) {
 	if err := store.Encode(&buf, in); err != nil {
 		t.Fatal(err)
 	}
-	v6 := restampDownlevel(t, buf.Bytes(), in.FTSKeys, store.VersionV6)
+	v6 := restampDownlevel(t, buf.Bytes(), in.FTSKeys, nil, store.VersionV6)
 	if v, err := store.ProbeVersion(bytes.NewReader(v6)); err != nil || v != store.VersionV6 {
 		t.Fatalf("probe downgraded file = %d, %v; want %d, nil", v, err, store.VersionV6)
 	}

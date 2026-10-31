@@ -92,7 +92,54 @@ var (
 	// keep it on the writer goroutine as well (its signature predates this
 	// check and cannot carry an error).
 	ErrNotWriter = errors.New("vectra: mutation rejected: not the attached writer")
+
+	// ErrUniqueViolation is the errors.Is target for write-time unique
+	// constraint rejections: the engine returns *UniqueViolationError
+	// values (carrying the label/prop/value and both node keys) that
+	// unwrap to it — match with errors.Is for the class, errors.As for
+	// the payload (unique-constraints spec §2.3).
+	ErrUniqueViolation = errors.New("vectra: unique constraint violation")
+
+	// ErrConstraintExists / ErrConstraintNotFound guard the declaration
+	// surface: declaring the same (label, prop) pair twice, or dropping
+	// one that was never declared, fails before any side effect
+	// (unique-constraints spec §2.1).
+	ErrConstraintExists   = errors.New("vectra: unique constraint already declared")
+	ErrConstraintNotFound = errors.New("vectra: unique constraint not declared")
 )
+
+// UniqueConstraint declares property-value uniqueness over one (label,
+// prop) pair (unique-constraints spec §2.1): once declared, a write that
+// would leave two live nodes of that label sharing the same string value
+// for the prop is rejected with *UniqueViolationError. The (label, prop)
+// pair is the constraint's identity — there are no constraint names.
+type UniqueConstraint struct {
+	Label string
+	Prop  string
+}
+
+// UniqueViolationError is the write-time rejection payload: the (Label,
+// Prop) constraint already owns Value for ExistingKey, and the write that
+// produced this error carried AttemptedKey, which would have created a
+// second owner.
+type UniqueViolationError struct {
+	Label        string
+	Prop         string
+	Value        string
+	ExistingKey  string
+	AttemptedKey string
+}
+
+// Error pins the violation face shared by every surface (Go API, Cypher,
+// server wire): the constraint identity, the contended value and its
+// current owner.
+func (e *UniqueViolationError) Error() string {
+	return fmt.Sprintf("unique constraint violation: (%s.%s) value %q already owned by key %q", e.Label, e.Prop, e.Value, e.ExistingKey)
+}
+
+// Unwrap makes errors.Is(err, ErrUniqueViolation) true for every violation
+// while errors.As keeps the payload reachable.
+func (e *UniqueViolationError) Unwrap() error { return ErrUniqueViolation }
 
 type Node struct {
 	ID    NodeID         `json:"id"`

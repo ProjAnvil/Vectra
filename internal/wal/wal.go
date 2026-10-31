@@ -121,6 +121,25 @@ type IndexDecl struct {
 	// empty: both mean "this frame declares none". Old payloads decode it
 	// as nil (forward compatible) the same way as VectorIndexes.
 	FullTextKeys []string `json:"fullTextKeys"`
+	// UniqueConstraints carries unique-constraint declarations (2026-10-30
+	// unique-constraints plan, spec §4.1) in the same frame shape as the
+	// vector declarations. no omitempty — the null-vs-empty split is the
+	// contract replay dispatches on: null = this frame carries no
+	// constraint declarations (pre-feature frames decode this way), while
+	// an explicit empty array means "drop all" — replay applies REPLACE
+	// semantics to non-nil lists (nil skips, non-nil including empty
+	// replaces the whole set), so a drop-only flush must survive the wire
+	// as non-nil, exactly like the DropVectorIndex rule on VectorIndexes.
+	UniqueConstraints []UniqueConstraint `json:"uniqueConstraints"`
+}
+
+// UniqueConstraint is the wire form of a unique-constraint declaration
+// (unique-constraints spec §2.1): property-value uniqueness over one
+// (label, prop) pair — the pair is the identity, there are no constraint
+// names. Mirrors the root package's UniqueConstraint.
+type UniqueConstraint struct {
+	Label string `json:"label"`
+	Prop  string `json:"prop"`
 }
 
 // VectorIndexDecl is the wire form of a vector index declaration
@@ -666,8 +685,8 @@ func (w *WAL) Sync() error {
 // Frame is one replayed frame above the checkpoint watermark, in exactly one
 // of two families: a changeset frame sets Changeset (written as
 // frameChangeset or frameChangesetV2), an index-declaration frame sets
-// IndexKeys (frameIndexDecl) with VectorIndexes / FullTextKeys riding the
-// same payload.
+// IndexKeys (frameIndexDecl) with VectorIndexes / FullTextKeys /
+// UniqueConstraints riding the same payload.
 type Frame struct {
 	LSN       uint64
 	Changeset *Changeset // frameChangeset
@@ -678,6 +697,11 @@ type Frame struct {
 	// FullTextKeys rides frameIndexDecl payloads too (2026-10-26 FTS
 	// plan): empty on pre-FTS frames (null ≡ empty — no drop-all op).
 	FullTextKeys []string
+	// UniqueConstraints rides frameIndexDecl payloads too (2026-10-30
+	// unique-constraints plan, spec §4.1): nil on pre-feature frames;
+	// non-nil including empty = the full declaration list (a non-nil
+	// empty list is a drop-all under replay's REPLACE semantics).
+	UniqueConstraints []UniqueConstraint
 }
 
 // Replay applies every frame above the manifest's base LSN to fn, in LSN
@@ -758,6 +782,7 @@ func (w *WAL) replayLSN(fn func(lsn uint64, fr Frame) error) (uint64, error) {
 				fr.IndexKeys = d.Keys
 				fr.VectorIndexes = d.VectorIndexes
 				fr.FullTextKeys = d.FullTextKeys
+				fr.UniqueConstraints = d.UniqueConstraints
 			} else if typ == frameChangesetV2 {
 				// A CRC-intact frame whose envelope still fails to decode
 				// (bad magic, torn hint section, forged out-of-range $vec

@@ -1,11 +1,12 @@
 // Package store implements Vectra's single-file binary snapshot. Under the
 // small-graph all-in-memory assumption the disk only serves crash recovery:
 // whole-graph rewrite, rebuild CSR/SCC on load, no incremental WAL.
-// Layout (v7, little-endian):
-// "VCTR" | u16 version(7) | u32 node count | u32 edge count |
+// Layout (v8, little-endian):
+// "VCTR" | u16 version(8) | u32 node count | u32 edge count |
 // u32 vector-decl count | decl JSON string* | node{ key string, label string, props JSON }* |
 // edge{ srcKey, dstKey, label, props }* | u32 indexKey count | key string* |
 // u32 float count | float32 LE* | u32 ftsKey count | key string* |
+// u32 unique-constraint count | constraint JSON string* |
 // u32 CRC32(IEEE, covering all preceding bytes).
 // string = u32 length + bytes; props = u32 JSON length + JSON (0 = nil).
 // The vector declarations precede the nodes (spec 2026-10-21 §1.4, ruling
@@ -20,15 +21,19 @@
 // index). v7 appends the ftsKey section after the float32 section: the FTS
 // property declarations (engine bigram gram buckets, 2026-10-26 plan) ride
 // the same positional count+strings shape so a reloaded graph rebuilds them
-// at Seal time too. v6 (v7 minus the ftsKey section — a version-only bump
-// over v5), v4 (vector decls trailing, vectors in the JSON channel), v3, v2
-// (no indexKey section) and v1 (additionally no CRC trailer) remain
-// readable; dispatched by header version. Pre-v7 readers hard-fail on the
-// version byte instead of misreading the layout. v6 was the retained-WAL
-// checkpoint tripwire: its base snapshot stayed on disk while WAL segments
-// carried the increments, and a v0.11.1 binary would silently load only
-// that base — the v6 stamp made it hard-fail instead of losing the retained
-// segments; v7 extends the same line to v0.12.0-era binaries.
+// at Seal time too. v8 (2026-10-30 unique-constraints plan, spec §4.2)
+// appends the unique-constraint section after the ftsKey section — u32
+// count + one JSON blob per constraint, the vector-decl section shape — so
+// constraint declarations survive checkpoint/reload. v6 (v7 minus the ftsKey
+// section — a version-only bump over v5), v4 (vector decls trailing,
+// vectors in the JSON channel), v3, v2 (no indexKey section) and v1
+// (additionally no CRC trailer) remain readable; dispatched by header
+// version. Pre-v8 readers hard-fail on the version byte instead of
+// misreading the layout. v6 was the retained-WAL checkpoint tripwire: its
+// base snapshot stayed on disk while WAL segments carried the increments,
+// and a v0.11.1 binary would silently load only that base — the v6 stamp
+// made it hard-fail instead of losing the retained segments; v7 and v8
+// extend the same line forward one version at a time.
 package store
 
 import (
@@ -46,6 +51,7 @@ import (
 
 const (
 	magic         = "VCTR"
+	versionV8     = 8 // adds the unique-constraint section after the ftsKey section
 	versionV7     = 7 // adds the ftsKey section (FTS property declarations) after the float32 section
 	versionV6     = 6 // version-only bump over v5 (retained-WAL checkpoint tripwire; v7 appends the FTS section)
 	versionV5     = 5 // declarations-first layout + shared binary float32 section
@@ -59,11 +65,11 @@ const (
 // VersionV5 is the retired baseline of the 2026-10-21 Open-time migration
 // gate: vectra.Open then probed the recovered head's version and sealed
 // anything below v5 (spec 2026-10-21 §1.3). The live gate floor is VersionV6
-// (2026-10-22 checkpoint plan), and since the 2026-10-26 FTS plan Encode
-// stamps the current VersionV7 — v7 appends the ftsKey section on top of the
-// version-only v6 bump — so Open's v1-v5 migration seals land on the current
-// stamp; this constant now only pins the bottom of that chain (tests forge
-// "one version past the product" from it).
+// (2026-10-22 checkpoint plan), and Encode always stamps the current
+// version (v8 as of the 2026-10-30 unique-constraints plan), so Open's
+// v1-v5 migration seals land on the current stamp; this constant now only
+// pins the bottom of that chain (tests forge "one version past the product"
+// from it).
 const VersionV5 = versionV5
 
 // VersionV6 exports the v6 tripwire version (2026-10-22 checkpoint plan): a
@@ -74,12 +80,17 @@ const VersionV5 = versionV5
 // check, not the exact version: v7-and-newer bases qualify equally.
 const VersionV6 = versionV6
 
-// VersionV7 exports the current store version (2026-10-26 FTS plan): v7
-// appends the ftsKey section so FTS property declarations survive
-// checkpoint/reload, and re-arms the downgrade tripwire one version forward
-// — a v0.12.0 binary facing a hypothetical v8 hard-fails on the version
-// byte instead of misreading the layout.
+// VersionV7 exports the v7 store version (2026-10-26 FTS plan): v7 appended
+// the ftsKey section so FTS property declarations survive checkpoint/reload,
+// and re-armed the downgrade tripwire one version forward at the time.
 const VersionV7 = versionV7
+
+// VersionV8 exports the current store version (2026-10-30 unique-constraints
+// plan): v8 appends the unique-constraint section so constraint declarations
+// survive checkpoint/reload, and re-arms the downgrade tripwire one version
+// forward — a v0.12.x binary facing a v8 file hard-fails on the version byte
+// instead of silently dropping the declarations.
+const VersionV8 = versionV8
 
 // Node / Edge use string keys rather than internal NodeIDs: the snapshot is
 // decoupled from ID assignment order and rebuilt on load. props serialize to
@@ -111,20 +122,31 @@ type VectorIndexDecl struct {
 	EfConstruction int    `json:"efConstruction,omitempty"`
 }
 
+// UniqueConstraint is the store mirror of the unique-constraint declaration
+// (JSON tags match wal.UniqueConstraint; unique-constraints spec §2.1/§4.2):
+// property-value uniqueness over one (label, prop) pair — the pair is the
+// identity, there are no constraint names.
+type UniqueConstraint struct {
+	Label string `json:"label"`
+	Prop  string `json:"prop"`
+}
+
 // Data is the full decoded content of a snapshot: nodes, edges, and the
 // property-index declarations to re-register before Seal. IndexKeys is nil
 // for v1/v2 files (they never persisted any); VectorDecls is nil for
 // pre-v4 files; FTSKeys is nil for pre-v7 files (the ftsKey section does
 // not exist there — callers must treat nil as "no FTS declarations
-// persisted" and re-declare as needed). In v5+ files declared vector
+// persisted" and re-declare as needed); UniqueConstraints is nil for
+// pre-v8 files the same way. In v5+ files declared vector
 // props come back as []float32 (restored from the binary section); in
 // v4-and-older files they arrive via JSON as []any.
 type Data struct {
-	Nodes       []Node
-	Edges       []Edge
-	IndexKeys   []string
-	VectorDecls []VectorIndexDecl
-	FTSKeys     []string
+	Nodes             []Node
+	Edges             []Edge
+	IndexKeys         []string
+	VectorDecls       []VectorIndexDecl
+	FTSKeys           []string
+	UniqueConstraints []UniqueConstraint
 }
 
 // crcWriter aggregates the CRC of the written byte stream (appended as a
@@ -189,12 +211,13 @@ func writeProps(w io.Writer, props map[string]any) error {
 	return err
 }
 
-// Encode writes the whole graph to w stamped v7: the v6/v5 layout (vector
+// Encode writes the whole graph to w stamped v8: the v7/v6/v5 layout (vector
 // declarations preceding the nodes, ruling #2; declared vector props hoisted
 // out of the JSON channel into one shared trailing float32 section, ruling
-// #1) plus the ftsKey section appended after the floats, and a CRC trailer
-// covering everything. Pre-v7 readers hard-fail on the version byte instead
-// of misreading the layout (same downgrade line as v5 -> v6).
+// #1) plus the ftsKey section and the unique-constraint section appended
+// after the floats, and a CRC trailer covering everything. Pre-v8 readers
+// hard-fail on the version byte instead of misreading the layout (same
+// downgrade line as v5 -> v6 -> v7).
 func Encode(w io.Writer, d Data) error {
 	cw := &crcWriter{bw: bufio.NewWriter(w)}
 	var head [4]byte
@@ -202,7 +225,7 @@ func Encode(w io.Writer, d Data) error {
 	if _, err := cw.Write(head[:]); err != nil {
 		return err
 	}
-	if err := binary.Write(cw, binary.LittleEndian, uint16(versionV7)); err != nil {
+	if err := binary.Write(cw, binary.LittleEndian, uint16(versionV8)); err != nil {
 		return err
 	}
 	if err := putU32(cw, uint32(len(d.Nodes))); err != nil {
@@ -302,6 +325,22 @@ func Encode(w io.Writer, d Data) error {
 	}
 	for _, k := range d.FTSKeys {
 		if err := writeString(cw, k); err != nil {
+			return err
+		}
+	}
+	// v8 unique-constraint section: u32 count + one JSON blob per
+	// constraint (the vector-decl section shape), appended after the ftsKey
+	// section so constraint declarations survive checkpoint/reload
+	// (unique-constraints spec §4.2).
+	if err := putU32(cw, uint32(len(d.UniqueConstraints))); err != nil {
+		return err
+	}
+	for _, uc := range d.UniqueConstraints {
+		blob, err := json.Marshal(uc)
+		if err != nil {
+			return err
+		}
+		if err := writeString(cw, string(blob)); err != nil {
 			return err
 		}
 	}
@@ -448,7 +487,7 @@ func Decode(r io.Reader) (Data, error) {
 	ver := binary.LittleEndian.Uint16(raw[4:6])
 	body := raw
 	switch ver {
-	case versionV7, versionV6, versionV5, versionV4, versionV3, versionV2:
+	case versionV8, versionV7, versionV6, versionV5, versionV4, versionV3, versionV2:
 		body = raw[:len(raw)-4]
 		want := binary.LittleEndian.Uint32(raw[len(raw)-4:])
 		if got := crc32.ChecksumIEEE(body); got != want {
@@ -580,8 +619,34 @@ func Decode(r io.Reader) (Data, error) {
 			}
 		}
 	}
+	// v8 unique-constraint section, gated the same way: u32 count + one
+	// JSON blob per constraint (the vector-decl section shape); v7-and-older
+	// files end at the ftsKey section and decode a nil field — zero
+	// constraints, recompact-eligible to v8 (unique-constraints spec §4.2).
+	var uniqueCons []UniqueConstraint
+	if ver >= versionV8 {
+		nu, err := rd.u32()
+		if err != nil {
+			return Data{}, err
+		}
+		if int64(nu)*4 > int64(len(rd.b)-rd.i) { // same forged-count guard, 4 bytes per blob length minimum
+			return Data{}, errTruncated
+		}
+		if nu > 0 {
+			uniqueCons = make([]UniqueConstraint, nu)
+			for i := range uniqueCons {
+				blob, err := rd.str()
+				if err != nil {
+					return Data{}, err
+				}
+				if err := json.Unmarshal([]byte(blob), &uniqueCons[i]); err != nil {
+					return Data{}, err
+				}
+			}
+		}
+	}
 	if rd.i != len(rd.b) {
 		return Data{}, errors.New("store: trailing garbage")
 	}
-	return Data{Nodes: nodes, Edges: edges, IndexKeys: indexKeys, VectorDecls: vecDecls, FTSKeys: ftsKeys}, nil
+	return Data{Nodes: nodes, Edges: edges, IndexKeys: indexKeys, VectorDecls: vecDecls, FTSKeys: ftsKeys, UniqueConstraints: uniqueCons}, nil
 }

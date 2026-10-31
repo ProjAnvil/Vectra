@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -595,5 +596,75 @@ func TestIndexDeclFullTextKeysRoundtrip(t *testing.T) {
 	}
 	if len(gotFTS[1]) != 0 {
 		t.Fatalf("old-shape frame replayed FullTextKeys = %v, want empty", gotFTS[1])
+	}
+}
+
+// TestUniqueConstraintDeclRoundtrip: unique-constraint declarations ride
+// IndexDecl frames (2026-10-30 unique-constraints plan, spec §4.1) and
+// surface on Frame.UniqueConstraints. The null-vs-empty split is the wire
+// contract replay dispatches on: null = this frame carries no constraint
+// declarations (pre-feature frames decode this way), an explicit empty
+// array = "drop all" — replay applies REPLACE semantics to non-nil lists,
+// so the empty list must survive the wire as non-nil.
+func TestUniqueConstraintDeclRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(dir, ModeAlways)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decls := []UniqueConstraint{
+		{Label: "Person", Prop: "email"},
+		{Label: "Company", Prop: "vat"},
+	}
+	if _, err := w.AppendIndex(IndexDecl{UniqueConstraints: decls}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.AppendIndex(IndexDecl{UniqueConstraints: []UniqueConstraint{}}); err != nil {
+		t.Fatal(err) // drop-all flush: a non-nil empty list on the wire
+	}
+	if _, err := w.AppendIndex(IndexDecl{Keys: []string{"team"}}); err != nil {
+		t.Fatal(err) // pre-feature shape: the field rides as null, decodes nil
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w2, err := Open(dir, ModeAlways)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	var got [][]UniqueConstraint
+	if _, err := w2.Replay(func(fr Frame) error {
+		got = append(got, fr.UniqueConstraints)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("replayed %d decl frames, want 3", len(got))
+	}
+	if !slices.Equal(got[0], decls) {
+		t.Fatalf("constraints = %+v, want %+v", got[0], decls)
+	}
+	if got[1] == nil || len(got[1]) != 0 {
+		t.Fatalf("drop-all frame decoded %v (nil=%t), want non-nil empty", got[1], got[1] == nil)
+	}
+	if got[2] != nil {
+		t.Fatalf("old-shape frame decoded UniqueConstraints = %v, want nil", got[2])
+	}
+}
+
+// TestUniqueConstraintWireNames pins the JSON names of the IndexDecl field
+// and the declaration struct: encode and decode share the tags, so a
+// same-struct round-trip cannot catch a tag typo — but the names are the
+// cross-version wire contract (spec §4.1).
+func TestUniqueConstraintWireNames(t *testing.T) {
+	blob, err := json.Marshal(IndexDecl{UniqueConstraints: []UniqueConstraint{{Label: "Person", Prop: "email"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(blob, []byte(`"uniqueConstraints":[{"label":"Person","prop":"email"}]`)) {
+		t.Fatalf("wire names drifted: %s", blob)
 	}
 }

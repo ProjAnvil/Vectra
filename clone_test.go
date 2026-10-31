@@ -235,11 +235,12 @@ func TestSnapshotCRCv5Roundtrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	data := buf.Bytes()
-	// version = 7: the 2026-10-26 FTS plan bumps the stamp (and appends the
-	// ftsKey section) over the v6/v5 layout — old binaries hard-fail on the
-	// stamp instead of silently missing retained segments.
-	if data[4] != 7 || data[5] != 0 {
-		t.Errorf("version bytes = %d/%d, want 7/0", data[4], data[5])
+	// version = 8: the 2026-10-30 unique-constraints plan bumps the stamp
+	// (and appends the unique-constraint section) over the v7/v6/v5 layout —
+	// old binaries hard-fail on the stamp instead of silently missing
+	// retained segments.
+	if data[4] != 8 || data[5] != 0 {
+		t.Errorf("version bytes = %d/%d, want 8/0", data[4], data[5])
 	}
 	g2, err := vectra.Load(bytes.NewReader(data))
 	if err != nil {
