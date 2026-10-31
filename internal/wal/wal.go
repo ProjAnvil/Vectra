@@ -39,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"io/fs"
 	"math"
 	"os"
@@ -48,6 +49,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/projanvil/vectra/internal/atomicfile"
 	"github.com/projanvil/vectra/internal/vecbin"
 )
 
@@ -283,40 +285,16 @@ func ReadManifest(dir string) (Manifest, bool, error) {
 }
 
 // WriteManifest atomically writes dir/manifest.json (temp file + fsync +
-// rename + directory fsync).
+// rename + directory fsync — internal/atomicfile owns the ritual).
 func WriteManifest(dir string, m Manifest) error {
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(dir, manifestName+".tmp")
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
+	return atomicfile.Write(filepath.Join(dir, manifestName), func(w io.Writer) error {
+		_, err := w.Write(b)
 		return err
-	}
-	if _, err := f.Write(b); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, filepath.Join(dir, manifestName)); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if d, err := os.Open(dir); err == nil {
-		d.Sync()
-		d.Close()
-	}
-	return nil
+	})
 }
 
 // HasSegments reports whether dir already holds any wal-<N>.log file.

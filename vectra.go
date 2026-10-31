@@ -57,6 +57,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/projanvil/vectra/internal/atomicfile"
 	"github.com/projanvil/vectra/internal/delta"
 	"github.com/projanvil/vectra/internal/engine"
 	"github.com/projanvil/vectra/internal/store"
@@ -2446,27 +2447,15 @@ func retainLegacyArtifact(path string, ver uint16) {
 		return
 	}
 	bak := fmt.Sprintf("%s-v%d.bak", path, ver)
-	tmp := bak + ".tmp"
 	in, err := os.Open(path)
 	if err != nil {
 		return
 	}
-	out, err := os.Create(tmp)
-	if err != nil {
-		in.Close()
-		return
-	}
-	_, cpErr := io.Copy(out, in)
-	syncErr := out.Sync()
-	closeErr := out.Close()
-	in.Close()
-	if cpErr != nil || syncErr != nil || closeErr != nil {
-		os.Remove(tmp)
-		return
-	}
-	if err := os.Rename(tmp, bak); err != nil {
-		os.Remove(tmp)
-	}
+	defer in.Close()
+	_ = atomicfile.Write(bak, func(w io.Writer) error {
+		_, err := io.Copy(w, in)
+		return err
+	})
 }
 
 // Close ends a session. With a WAL attached, Close is a mandatory checkpoint
@@ -3411,36 +3400,11 @@ func (g *Graph) SaveFile(path string) error {
 // flight goroutine must not read the writer-private registry, which is
 // exactly what makes this safe from any goroutine (see saveView).
 func (g *Graph) saveViewFile(v *genView, path string, ucs []store.UniqueConstraint) error {
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	if err := g.saveView(f, v, ucs); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
-	}
-	// The rename is not durable on all filesystems until the parent
-	// directory is fsynced — checkpoint manifests point at this file.
-	// Best-effort: some filesystems reject directory fsync (EINVAL).
-	if d, err := os.Open(filepath.Dir(path)); err == nil {
-		d.Sync()
-		d.Close()
-	}
-	return nil
+	// atomicfile.Write owns the full ritual: temp file in the same dir,
+	// write, fsync, close, rename, best-effort dir fsync, temp cleanup on
+	// every failure branch. Checkpoint manifests point at this file, so the
+	// rename's durability discipline is the helper's, not the caller's.
+	return atomicfile.Write(path, func(w io.Writer) error { return g.saveView(w, v, ucs) })
 }
 
 // Load restores a graph from a snapshot and merges it into the initial base

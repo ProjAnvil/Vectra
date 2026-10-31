@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"hash/crc32"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/projanvil/vectra/internal/atomicfile"
 	"github.com/projanvil/vectra/internal/store"
 	"github.com/projanvil/vectra/internal/vecbin"
 	"github.com/projanvil/vectra/internal/vector"
@@ -819,33 +821,15 @@ func (g *Graph) writeVecForest(lsn uint64) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
+	// atomicfile.Write owns the ritual: temp + fsync + rename + best-effort
+	// directory fsync, temp cleanup on every failure branch (SaveFile's
+	// atomicity discipline, single-sourced with the checkpoint snapshots and
+	// the WAL manifest).
+	if err := atomicfile.Write(path, func(w io.Writer) error {
+		_, err := w.Write(b)
 		return err
-	}
-	if _, err := f.Write(b); err != nil {
-		f.Close()
-		os.Remove(tmp)
+	}); err != nil {
 		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
-	}
-	// Best-effort directory fsync, as in SaveFile: the rename is not durable
-	// everywhere until the parent directory is.
-	if d, err := os.Open(filepath.Dir(path)); err == nil {
-		d.Sync()
-		d.Close()
 	}
 	// The image on disk now carries every pack up to counts[i]. Advance the
 	// drift marker only when no further pack committed while the bytes were
