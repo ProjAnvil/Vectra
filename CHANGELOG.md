@@ -5,6 +5,74 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.2] - 2026-11-01
+
+Remediation of the 2026-11-01 Go code audit (40 findings; report in
+docs/research/2026-11-01-go-code-audit.md). Behavior changes are listed
+under Changed; everything else is internal quality with allocation gates
+byte-identical throughout.
+
+### Fixed
+
+- **MCP `inject_batch` no longer silently drops failed node writes.**
+  A failing node write (e.g. a unique-constraint violation) or a delete
+  of a missing key now aborts the injection with an error carrying the
+  underlying cause and disclosing that earlier items were applied —
+  aligning the node-write lane with `/v1/batch`'s first-error-stops
+  semantics (node deletes abort here too, deliberately stricter than the
+  server lane's skip-counted deletes). Edge-endpoint misses keep their
+  documented skip-counting behavior.
+- `meta.json` (node identity) is written atomically (temp + fsync +
+  rename + dir fsync), matching every other persisted artifact; a crash
+  mid-write can no longer corrupt it.
+- json.Number prop values now match on the PENDING lookup path
+  (LookupByNumber/LookupByNumberRange and Cypher numeric comparisons
+  over unsealed layers) exactly as they already did after Seal — a
+  pre-merge/post-merge parity gap, now pinned by tests.
+- The rows-path BFS family in internal/traverse (fork/EnsureDepth/
+  filledNoDepth/expandRowsSerial/expandRowsParallel and the visited
+  pool) — a live production path — was never exercised by tests; now
+  covered (package coverage 22.7% → 46.8%), along with the previously
+  untested boolean typed-index anchor (`{on:true}` prop-map lookups).
+
+### Changed
+
+- `vectra.go` (4,100 lines) split along its natural seams into
+  same-package feature files (`vectra_unique.go`, `vectra_recovery.go`,
+  `vectra_snapshot_io.go`, `vectra_mirror.go`) — a pure file move with
+  zero code-line deltas (verified by line-multiset proof) and identical
+  allocation gates.
+- The atomic-file-write ritual (temp/write/fsync/rename/dir-fsync) is
+  single-sourced in `internal/atomicfile` (five former copies); temp
+  files are now unique per writer (`os.CreateTemp`), and persisted
+  artifacts carry 0600 pre-umask (stricter than the previous 0644/0666).
+- The tiered-merge algorithm in internal/vector exists once (shared
+  core with thin synchronous and folder-lane drivers, one compaction
+  threshold); the vector `valsEq` row-dedup comparison is
+  allocation-free (typed switch mirroring the encoder's tag structure;
+  3 → 0 allocs per pair, pinned).
+- `raceEnabled` build-tag pairs consolidated into `internal/racemode`;
+  the five former copies are aliases. Cypher parser/lexer cleanups
+  (hoisted write-clause guard, keyed error literals, honest lexer
+  cur/adv naming, deduplicated key-expression/var-prop/position
+  helpers) with allocation gates byte-identical (parse path 48 allocs
+  pinned before and after).
+- Modern-Go sweep on non-hot paths: `errors.AsType`, builtin `min/max`,
+  `slices.SortFunc`+`cmp.Compare`, `slices.Clone`, `sync.OnceFunc`,
+  `strings.CutPrefix/CutSuffix`; the server's join HTTP path shares one
+  client with a per-request deadline; MCP errors carry a consistent
+  `mcp:` prefix; `ErrSealed`/`ErrNotSealed` are marked Deprecated (no
+  longer returned anywhere).
+- New cold-path sentinels (`ErrInBatch`, vector-index validation
+  errors) make ad-hoc rejections programmatically classifiable via
+  `errors.Is`.
+
+### Unchanged
+
+- Wire formats (WAL frames, store layout, vecbin) byte-identical;
+  allocation gates byte-identical (244/177/422/302/350/400 root, 48
+  parse, 0 vector-dedup); no public API removals.
+
 ## [0.14.1] - 2026-11-01
 
 Internal quality follow-ups to the unique-constraints feature; no API or
