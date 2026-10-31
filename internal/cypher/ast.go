@@ -251,9 +251,9 @@ func (*WithClause) isClause()   {}
 func (*UnwindClause) isClause() {}
 func (*ReturnClause) isClause() {}
 
-func (*CreateClause) isClause() {}
-func (*SetClause) isClause()    {}
-func (*DeleteClause) isClause() {}
-func (*MergeClause) isClause()  {}
+func (*CreateClause) isClause()     {}
+func (*SetClause) isClause()        {}
+func (*DeleteClause) isClause()     {}
+func (*MergeClause) isClause()      {}
 func (*IndexClause) isClause()      {}
 func (*ConstraintClause) isClause() {}

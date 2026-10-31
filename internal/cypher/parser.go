@@ -81,9 +81,10 @@ func (p *parser) expectKw(word string) error {
 // [ON CREATE SET | ON MATCH SET], SET items, [DETACH] DELETE vars); after
 // a write clause only write clauses and the final RETURN may appear — a
 // read clause there is a positioned error. CREATE [FULLTEXT] INDEX and
-// [CREATE|DROP] CONSTRAINT are standalone statements (two-token lookahead;
-// no other clause may accompany them). RETURN is terminal — anything after
-// it is an unexpected-token error — and optional when the statement
+// [CREATE|DROP] CONSTRAINT are standalone statements (lookahead-gated:
+// two tokens for CREATE, the DROP entry keyword plus CONSTRAINT for DROP;
+// no other clause may accompany either). RETURN is terminal — anything
+// after it is an unexpected-token error — and optional when the statement
 // contains at least one write clause; a pure-read statement still requires
 // it.
 func (p *parser) parseQuery() (*Query, error) {
