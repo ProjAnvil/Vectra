@@ -270,7 +270,14 @@ func TestQueryVectorConcurrentReaders(t *testing.T) {
 func TestVecFolderLaneConvergence(t *testing.T) {
 	g, vecs := buildVectorGraph(t, 4096, 64) // exactly two full chunks: the lane drains to zero; a partial tail would legitimately stay (D7 read-your-write)
 	defer g.Close()
-	deadline := time.Now().Add(20 * time.Second)
+	// The background pack lane's throughput drops ~30x under the race
+	// detector and further on shared CI runners; scale the drain window
+	// so slow hosts converge instead of timing out.
+	drain := 20 * time.Second
+	if vectra.RaceEnabledForTest {
+		drain = 120 * time.Second
+	}
+	deadline := time.Now().Add(drain)
 	for time.Now().Before(deadline) {
 		if g.VectorOverlayLen("mem") == 0 {
 			break

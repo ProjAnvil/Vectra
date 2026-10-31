@@ -16,6 +16,11 @@ func (g *Graph) VecForestLoadedForTest() bool { return g.vecForestLoaded }
 // injection seam.
 var RetainLegacyArtifactForTest = retainLegacyArtifact
 
+// RaceEnabledForTest exposes the race-detector build tag so external-package
+// tests can scale timing-sensitive wait windows under -race (the pack lane
+// slows many-fold; see root's race_enabled.go).
+var RaceEnabledForTest = raceEnabled
+
 // VerifyUniqueInvariantForTest compares the writer-private unique-constraint
 // registry against ground truth derived from the PUBLISHED generation (the
 // same union a rebuild, a Save or a Clone would see — deliberately not the

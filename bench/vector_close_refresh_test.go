@@ -40,7 +40,14 @@ func closeRefreshSubmit(h *writer.Handle, lo, hi int) {
 
 func closeRefreshWaitIdle(t *testing.T, g *vectra.Graph) {
 	t.Helper()
-	dl := time.Now().Add(30 * time.Second)
+	// The pack lane slows many-fold under -race and on shared CI runners;
+	// scale the convergence deadline so slow hosts converge (the same
+	// discipline as root's TestVecFolderLaneConvergence drain window).
+	wait := 30 * time.Second
+	if raceEnabled {
+		wait = 180 * time.Second
+	}
+	dl := time.Now().Add(wait)
 	for g.VectorOverlayLen("mem") >= 2048 {
 		if time.Now().After(dl) {
 			t.Fatalf("vector lane did not converge: overlay=%d", g.VectorOverlayLen("mem"))
