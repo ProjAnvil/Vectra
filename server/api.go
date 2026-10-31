@@ -171,18 +171,45 @@ func (n *Node) writeApplyErr(w http.ResponseWriter, err error) {
 // writeUniqueViolation renders the §2.6 client face for an apply error
 // carrying a unique-constraint violation: 400 with code UNIQUE_VIOLATION
 // and the violation payload as the message (constraint identity, contended
-// value, current owner). A violation is a CLIENT error, so this runs
-// AHEAD of writeApplyErr (which would land it on 500 INTERNAL) and, on the
-// Cypher lane, ahead of the CypherError branch (which would land it on 400
-// PARSE with the payload hidden). Returns false when err is not a
-// violation, so callers fall through to the generic mappings.
+// value, current owner). The match is by sentinel — errors.Is against
+// ErrUniqueViolation — not by payload type: both the write-time
+// *UniqueViolationError and the declaration-scan uniqueDeclError (CREATE
+// CONSTRAINT over legacy duplicate data, an unexported type) unwrap to
+// that sentinel, so one check covers both faces. A violation is a CLIENT
+// error, so this runs AHEAD of writeApplyErr (which would land it on 500
+// INTERNAL) and, on the Cypher lane, ahead of the CypherError branch
+// (which would land it on 400 PARSE with the payload hidden). Returns
+// false when err is not a violation, so callers fall through to the
+// generic mappings.
 func writeUniqueViolation(w http.ResponseWriter, err error) bool {
-	var uve *vectra.UniqueViolationError
-	if !errors.As(err, &uve) {
+	if !errors.Is(err, vectra.ErrUniqueViolation) {
 		return false
 	}
 	writeErr(w, http.StatusBadRequest, "UNIQUE_VIOLATION", err.Error())
 	return true
+}
+
+// writeConstraintDeclError renders the constraint-DDL declaration faces on
+// the Cypher lane — the VECTOR_INDEX_* precedent: a duplicate CREATE
+// CONSTRAINT replays deterministically on every replica and maps to 409
+// CONSTRAINT_EXISTS; a DROP CONSTRAINT for a pair never declared maps to
+// 404 CONSTRAINT_NOT_FOUND. Constraint DDL reaches the server ONLY through
+// Cypher statements (there is no constraint endpoint and Batch carries no
+// constraint op), so handleBatch/handleTxn never see these sentinels and
+// need no call site — this helper is wired into applyCypherWrite alone,
+// between the violation face and the CypherError branch (a declaration
+// error is a client error, not a parse error). Returns false when err is
+// neither sentinel, so callers fall through to the generic mappings.
+func writeConstraintDeclError(w http.ResponseWriter, err error) bool {
+	if errors.Is(err, vectra.ErrConstraintExists) {
+		writeErr(w, http.StatusConflict, "CONSTRAINT_EXISTS", "unique constraint already declared")
+		return true
+	}
+	if errors.Is(err, vectra.ErrConstraintNotFound) {
+		writeErr(w, http.StatusNotFound, "CONSTRAINT_NOT_FOUND", "unique constraint not declared")
+		return true
+	}
+	return false
 }
 
 // wireableProps rewrites JSON-decoded numeric arrays in props in place:
@@ -615,9 +642,14 @@ func (n *Node) handleCypher(w http.ResponseWriter, r *http.Request) {
 // batch write faces (writeApplyErr); a unique-constraint violation keeps
 // the 400 UNIQUE_VIOLATION client face (§2.6, checked BEFORE the CypherError
 // branch — the engine passes violations through unwrapped, but if one ever
-// arrived wrapped, the violation class must win over 400 PARSE); any other
-// statement error surfacing at FSM apply time replays deterministically on
-// every replica and keeps the read path's 400 PARSE face. The response
+// arrived wrapped, the violation class must win over 400 PARSE); a
+// constraint-DDL declaration error (duplicate CREATE / unknown DROP, plus
+// the declaration scan's duplicate-data failure when it matches
+// ErrUniqueViolation) keeps its own client face — 409 CONSTRAINT_EXISTS /
+// 404 CONSTRAINT_NOT_FOUND via writeConstraintDeclError — also ahead of the
+// CypherError branch, since these are client errors, not parse errors; any
+// other statement error surfacing at FSM apply time replays deterministically
+// on every replica and keeps the read path's 400 PARSE face. The response
 // carries columns/rows (a write's RETURN clause, empty when absent) plus
 // the summary — never the read path's count key.
 func (n *Node) applyCypherWrite(w http.ResponseWriter, r *http.Request, query string) {
@@ -627,6 +659,9 @@ func (n *Node) applyCypherWrite(w http.ResponseWriter, r *http.Request, query st
 	})
 	if err != nil {
 		if writeUniqueViolation(w, err) {
+			return
+		}
+		if writeConstraintDeclError(w, err) {
 			return
 		}
 		var ce *vectra.CypherError

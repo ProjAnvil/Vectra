@@ -3,9 +3,12 @@ package server
 // Unique-constraint enforcement across the server surfaces (spec
 // 2026-10-30 §2.4/§2.6/§4.3): the FSM's node lane aborts on the first
 // rejected upsert (no silent skip), every raft-backed write face answers a
-// violation with 400 UNIQUE_VIOLATION (never 400 PARSE, never 500), both
-// replicas of a two-node cluster reject identically, and the constraint
-// survives the GET /v1/backup restore round trip.
+// violation with 400 UNIQUE_VIOLATION (never 400 PARSE, never 500), the
+// constraint DDL's own failure modes over the Cypher lane are client errors
+// too (409 CONSTRAINT_EXISTS / 404 CONSTRAINT_NOT_FOUND / the declaration
+// scan's 400 UNIQUE_VIOLATION — never 500), both replicas of a two-node
+// cluster reject identically, and the constraint survives the GET /v1/backup
+// restore round trip.
 
 import (
 	"errors"
@@ -77,10 +80,18 @@ func TestConstraintCypherFace(t *testing.T) {
 	}
 
 	// A duplicate declare is an engine error (ErrConstraintExists), never a
-	// silent success.
+	// silent success — and a CLIENT error, never 500: the VECTOR_INDEX_EXISTS
+	// precedent face, 409 CONSTRAINT_EXISTS.
 	resp, out = postJSON(t, leader.URL()+"/v1/cypher", map[string]any{"query": constraintCreateStmt})
-	if resp.StatusCode == http.StatusOK {
-		t.Fatalf("duplicate create constraint must error, got 200 %v", out)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("duplicate create constraint: %d %v, want 409", resp.StatusCode, out)
+	}
+	e, ok := out["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("duplicate create constraint: response lacks the error object: %v", out)
+	}
+	if e["code"] != "CONSTRAINT_EXISTS" {
+		t.Fatalf("duplicate create constraint: code = %v, want CONSTRAINT_EXISTS (not INTERNAL)", e["code"])
 	}
 
 	// Seed the owned value through the batch lane, then violate via Cypher.
@@ -100,6 +111,75 @@ func TestConstraintCypherFace(t *testing.T) {
 	// The violating CREATE never landed.
 	if resp, out = getJSON(t, leader.URL()+"/v1/nodes/b"); resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("violating node b: %d %v, want 404", resp.StatusCode, out)
+	}
+}
+
+// TestConstraintDropUnknownFace: DROP CONSTRAINT for a pair never declared
+// answers 404 CONSTRAINT_NOT_FOUND over /v1/cypher — the engine sentinel
+// (ErrConstraintNotFound) replays deterministically on every replica and is
+// a client error, so it must not fall to writeApplyErr's 500 INTERNAL.
+func TestConstraintDropUnknownFace(t *testing.T) {
+	tc := newTestCluster(t, 1)
+	leader := tc.leaderWithin(10 * time.Second)
+
+	resp, out := postJSON(t, leader.URL()+"/v1/cypher", map[string]any{
+		"query": `DROP CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE`,
+	})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("drop unknown constraint: %d %v, want 404", resp.StatusCode, out)
+	}
+	e, ok := out["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("drop unknown constraint: response lacks the error object: %v", out)
+	}
+	if e["code"] != "CONSTRAINT_NOT_FOUND" {
+		t.Fatalf("drop unknown constraint: code = %v, want CONSTRAINT_NOT_FOUND (not INTERNAL)", e["code"])
+	}
+}
+
+// TestConstraintDeclScanFace: CREATE CONSTRAINT whose declaration validation
+// scan finds legacy duplicate data (two live nodes already sharing the
+// (label, prop) value, written before any constraint) answers 400
+// UNIQUE_VIOLATION naming the constraint — the declaration-time face of the
+// same client class as write-time violations. The engine raises its
+// uniqueDeclError (unwraps to ErrUniqueViolation, but NOT a
+// *UniqueViolationError), which previously slipped past the violation
+// check and landed on 500 INTERNAL.
+func TestConstraintDeclScanFace(t *testing.T) {
+	tc := newTestCluster(t, 1)
+	leader := tc.leaderWithin(10 * time.Second)
+
+	// Pre-seed the duplicate pair — constraint-free writes, both land.
+	resp, out := postJSON(t, leader.URL()+"/v1/batch", map[string]any{
+		"nodes": []map[string]any{
+			{"key": "a", "label": "Person", "props": map[string]any{"email": "dup@x"}},
+			{"key": "b", "label": "Person", "props": map[string]any{"email": "dup@x"}},
+		},
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("seed write: %d %v", resp.StatusCode, out)
+	}
+	tc.waitAllPublished(2, 0, 5*time.Second)
+
+	resp, out = postJSON(t, leader.URL()+"/v1/cypher", map[string]any{"query": constraintCreateStmt})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("declare over duplicate data: %d %v, want 400", resp.StatusCode, out)
+	}
+	e, ok := out["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("declare over duplicate data: response lacks the error object: %v", out)
+	}
+	if e["code"] != "UNIQUE_VIOLATION" {
+		t.Fatalf("declare over duplicate data: code = %v, want UNIQUE_VIOLATION (not INTERNAL)", e["code"])
+	}
+	msg, _ := e["message"].(string)
+	if !strings.Contains(msg, "Person.email") {
+		t.Fatalf("message %q lacks the constraint identity (want Person.email)", msg)
+	}
+
+	// Declaration is atomic: the constraint was NOT registered.
+	if cs := tc.nodes[0].node.Published().UniqueConstraints(); len(cs) != 0 {
+		t.Fatalf("constraint registered over duplicate data: %+v", cs)
 	}
 }
 

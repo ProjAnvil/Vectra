@@ -310,7 +310,11 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 // unique-constraint violation rides this lane as the RAW
 // *vectra.UniqueViolationError (the engine's Cypher layer passes it
 // through unwrapped), so the HTTP face can classify it 400
-// UNIQUE_VIOLATION instead of the generic apply mapping.
+// UNIQUE_VIOLATION instead of the generic apply mapping. The constraint
+// DDL's own errors ride the same raw discipline: ErrConstraintExists /
+// ErrConstraintNotFound (and the declaration scan's uniqueDeclError, which
+// unwraps to ErrUniqueViolation) reach applyCypherWrite as-is for their
+// 409/404/400 client faces.
 //
 // Known limitation (deliberate, documented): the per-key version tables
 // (nodeVer/edgeVer) are not advanced — the engine's summary carries

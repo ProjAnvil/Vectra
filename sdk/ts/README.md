@@ -135,17 +135,20 @@ await vectra.cypher("DROP CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE");
 ```
 
 Declaring validates existing data: duplicate string values already on
-the `(label, prop)` pair fail the declaration (the message lists the
-duplicate value/key pairs); only string prop values participate
-(non-string values are invisible). Afterwards any write that would
-duplicate a declared value — `batch`, `txn`, or a Cypher write —
-aborts and surfaces as `VectraError` with `status: 400` and
-`code: "UNIQUE_VIOLATION"`; the message names the constraint, the
-contended value, and both node keys. Partial application is
-first-error-stops: entries before the violating one are already
-applied, so retry the remainder with a fresh value, not the whole
-batch. On `txn` this is the 400 abort, not the `TxnConflictError` 409
-face.
+the `(label, prop)` pair fail the declaration with 400
+`UNIQUE_VIOLATION` (the message lists the duplicate value/key pairs);
+a duplicate declare answers 409 `CONSTRAINT_EXISTS`
+(`VectraConflictError`) and an unknown drop 404 `CONSTRAINT_NOT_FOUND`
+(`VectraNotFoundError`) — all client errors, never 500. Only string
+prop values participate (non-string values are invisible).
+Afterwards any write that would duplicate a declared value —
+`batch`, `txn`, or a Cypher write — aborts and surfaces as
+`VectraError` with `status: 400` and `code: "UNIQUE_VIOLATION"`;
+the message names the constraint, the contended value, and both
+node keys. Partial application is first-error-stops: entries before
+the violating one are already applied, so retry the remainder with
+a fresh value, not the whole batch. On `txn` this is the 400
+abort, not the `TxnConflictError` 409 face.
 
 ## Errors
 

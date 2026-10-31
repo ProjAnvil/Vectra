@@ -45,6 +45,13 @@ the TLS planes are exactly the 0.15.0 plain-HTTP, plain-TCP ones.
   value — the error lists up to ten duplicate value/key pairs (sorted,
   identical on every raft replica) and the constraint is not
   registered. The scan is O(live nodes) once per declaration.
+- Constraint-DDL failures over `POST /v1/cypher` are client errors
+  with dedicated wire faces (the VECTOR_INDEX_* precedent): a
+  duplicate `CREATE CONSTRAINT` answers 409 `CONSTRAINT_EXISTS`, an
+  unknown `DROP CONSTRAINT` 404 `CONSTRAINT_NOT_FOUND`, and a
+  declaration scan over legacy duplicate data 400 `UNIQUE_VIOLATION`
+  naming the `label.prop` pair — all three landed on 500 `INTERNAL`
+  before this fix.
 - Constraint declarations persist: WAL `IndexDecl` frames carry the
   full declaration list with replace-on-replay semantics (dropped
   constraints stay dropped across recovery), store snapshots stamp
