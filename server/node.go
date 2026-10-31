@@ -343,10 +343,11 @@ func (n *Node) Join(seedHTTP string) error {
 	data, _ := json.Marshal(body)
 	// Single trust domain: the join credential rides the same bearer auth
 	// as every other route (empty authToken = auth off, no header attached).
-	resp, err := httpPost(seedHTTP+"/v1/join", data, 15*time.Second, n.authToken)
+	resp, cancel, err := httpPost(seedHTTP+"/v1/join", data, 15*time.Second, n.authToken)
 	if err != nil {
 		return err
 	}
+	defer cancel() // releases the request's deadline context
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
@@ -385,9 +386,7 @@ func (n *Node) Apply(ctx context.Context, b Batch) (ApplyResult, error) {
 	}
 	timeout := 10 * time.Second
 	if dl, ok := ctx.Deadline(); ok {
-		if t := time.Until(dl); t < timeout {
-			timeout = t
-		}
+		timeout = min(timeout, time.Until(dl))
 	}
 	fut := n.r.Apply(data, timeout)
 	if err := fut.Error(); err != nil {

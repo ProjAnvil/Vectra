@@ -307,8 +307,8 @@ func TestConstraintReplicaDeterminism(t *testing.T) {
 			if !errors.Is(v, vectra.ErrUniqueViolation) {
 				t.Fatalf("node %s: error class = %v, want ErrUniqueViolation", tn.node.cfg.NodeID, v)
 			}
-			var uv *vectra.UniqueViolationError
-			if !errors.As(v, &uv) {
+			uv, ok := errors.AsType[*vectra.UniqueViolationError](v)
+			if !ok {
 				t.Fatalf("node %s: violation payload unreachable in %v", tn.node.cfg.NodeID, v)
 			}
 			payloads = append(payloads, uv)

@@ -101,25 +101,9 @@ func TestClusterLeaderFailover(t *testing.T) {
 	writeBatch(t, newLeader, 2)
 	writeBatch(t, newLeader, 3)
 
-	// Two live nodes catch up (disconnected node excluded)
-	deadline = time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		ok := true
-		for _, tn := range tc.nodes {
-			if tn == leader {
-				continue
-			}
-			p := tn.node.Published()
-			if p == nil || p.Stats().Nodes != 3 {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	// Two live nodes catch up (the disconnected old leader is excluded;
+	// the helper fails the test on timeout instead of falling through)
+	tc.waitAllPublished(3, 0, 15*time.Second, leader)
 
 	// Old leader returns → catches up via log replay (T3 scenario)
 	tc.reconnect(leader)
@@ -151,25 +135,10 @@ func TestClusterFollowerCatchupByLog(t *testing.T) {
 	for i := 2; i <= 6; i++ {
 		writeBatch(t, leader, i)
 	}
-	// The other surviving node catches up
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		ok := true
-		for _, tn := range tc.nodes {
-			if tn == follower {
-				continue
-			}
-			p := tn.node.Published()
-			if p == nil || p.Stats().Nodes != 6 {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	// The other surviving node catches up (the disconnected follower is
+	// excluded; the helper fails the test on timeout instead of falling
+	// through)
+	tc.waitAllPublished(6, 0, 15*time.Second, follower)
 
 	tc.reconnect(follower)
 	tc.waitAllPublished(6, 0, 20*time.Second)

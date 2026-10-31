@@ -374,8 +374,8 @@ func TestFSMApplyUniqueViolationAborts(t *testing.T) {
 	if !errors.Is(err, vectra.ErrUniqueViolation) {
 		t.Fatalf("abort error = %v, want the ErrUniqueViolation class", err)
 	}
-	var uv *vectra.UniqueViolationError
-	if !errors.As(err, &uv) || uv.Value != "a@x" || uv.ExistingKey != "a" || uv.AttemptedKey != "c" {
+	uv, ok := errors.AsType[*vectra.UniqueViolationError](err)
+	if !ok || uv.Value != "a@x" || uv.ExistingKey != "a" || uv.AttemptedKey != "c" {
 		t.Fatalf("violation payload = %+v, want value a@x owner a attempted c", uv)
 	}
 

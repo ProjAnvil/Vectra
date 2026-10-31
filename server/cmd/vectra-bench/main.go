@@ -712,8 +712,6 @@ func buildWorkloads(mode string, g *vectra.Graph, base string, c *http.Client, p
 
 func engineWorkloads(g *vectra.Graph, p bench.QueryParams) []workload {
 	nextStart, nextPair := rotators(p)
-	_ = nextStart
-	_ = nextPair
 	return []workload{
 		{"neighbors", func() error {
 			_, err := g.NeighborsOf(nextStart(), vectra.DirOut)

@@ -107,7 +107,7 @@ func newService(g *vectra.Graph, opts Options) *service {
 			WALDir:  opts.WALDir,
 		})
 		if err != nil {
-			svc.openErr = fmt.Errorf("wal session at %s: %w", opts.WALDir, err)
+			svc.openErr = fmt.Errorf("mcp: wal session at %s: %w", opts.WALDir, err)
 			svc.live = vectra.New()
 			return svc
 		}
@@ -132,7 +132,7 @@ func newService(g *vectra.Graph, opts Options) *service {
 		case errors.Is(err, fs.ErrNotExist):
 			// first run: no snapshot yet — start fresh, first seal creates it
 		default:
-			svc.openErr = fmt.Errorf("snapshot load %s: %w", opts.SnapshotPath, err)
+			svc.openErr = fmt.Errorf("mcp: snapshot load %s: %w", opts.SnapshotPath, err)
 			svc.live = vectra.New()
 			return svc
 		}
@@ -507,7 +507,7 @@ func (svc *service) injectBatch(_ context.Context, _ *mcp.CallToolRequest, in in
 	_ = svc.live.Batch(func(g *vectra.Graph) {
 		for i, n := range in.Nodes {
 			if _, err := g.AddNode(n.Key, n.Label, n.Props); err != nil {
-				abort = fmt.Errorf("inject_batch aborted at nodes[%d] (%s): %w"+abortDisclosure, i, n.Key, err)
+				abort = fmt.Errorf("mcp: inject_batch aborted at nodes[%d] (%s): %w"+abortDisclosure, i, n.Key, err)
 				return
 			}
 			out.NodesApplied++
@@ -539,7 +539,7 @@ func (svc *service) injectBatch(_ context.Context, _ *mcp.CallToolRequest, in in
 		for i, k := range in.DeleteNodes {
 			n, err := g.DeleteNode(k)
 			if err != nil {
-				abort = fmt.Errorf("inject_batch aborted at deleteNodes[%d] (%s): %w"+abortDisclosure, i, k, err)
+				abort = fmt.Errorf("mcp: inject_batch aborted at deleteNodes[%d] (%s): %w"+abortDisclosure, i, k, err)
 				return
 			}
 			out.NodesDeleted++
@@ -573,7 +573,7 @@ func (svc *service) seal(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) 
 	}
 	if svc.opts.SnapshotPath != "" && svc.opts.WALDir == "" {
 		if err := svc.live.SaveFile(svc.opts.SnapshotPath); err != nil {
-			return nil, statsOut{}, fmt.Errorf("snapshot save failed: %w", err)
+			return nil, statsOut{}, fmt.Errorf("mcp: snapshot save failed: %w", err)
 		}
 	}
 	st := svc.live.Stats()
@@ -615,17 +615,19 @@ func (svc *service) getNode(_ context.Context, _ *mcp.CallToolRequest, in struct
 	}
 	n, ok := v.NodeByKey(in.Key)
 	if !ok {
-		return nil, nodeOut{}, fmt.Errorf("node %q does not exist", in.Key)
+		return nil, nodeOut{}, fmt.Errorf("mcp: node %q does not exist", in.Key)
 	}
 	return nil, nodeOut{Key: n.Key, Label: n.Label, Props: n.Props}, nil
 }
 
 // errPropNotIndexed is the single raise for lookup_property's not-indexed
-// misses across the three typed lookups.
+// misses across the three typed lookups. The sentinel identity is the
+// errors.Is target; raise sites carry the mcp: layer prefix (the sentinel
+// text itself stays unprefixed — it may be matched directly by hosts).
 var errPropNotIndexed = errors.New("property is not indexed (re-seal after it appears in injected data)")
 
 func notIndexed(key string) error {
-	return fmt.Errorf("%w: %q", errPropNotIndexed, key)
+	return fmt.Errorf("mcp: %w: %q", errPropNotIndexed, key)
 }
 
 // errKeyNotFullTextIndexed is lookup_contains's raise for keys never
@@ -634,7 +636,7 @@ func notIndexed(key string) error {
 var errKeyNotFullTextIndexed = errors.New("property is not full-text indexed (declare it with index_fulltext)")
 
 func notFullTextIndexed(key string) error {
-	return fmt.Errorf("%w: %q", errKeyNotFullTextIndexed, key)
+	return fmt.Errorf("mcp: %w: %q", errKeyNotFullTextIndexed, key)
 }
 
 // parseDir maps the tool's direction argument; anything but the exact "in"
@@ -647,7 +649,7 @@ func parseDir(s string) (vectra.Direction, error) {
 	case "in":
 		return vectra.DirIn, nil
 	default:
-		return 0, fmt.Errorf("invalid direction %q (want \"in\" or \"out\")", s)
+		return 0, fmt.Errorf("mcp: invalid direction %q (want \"in\" or \"out\")", s)
 	}
 }
 
@@ -689,7 +691,7 @@ func (svc *service) bfs(_ context.Context, _ *mcp.CallToolRequest, in bfsIn) (*m
 	for _, k := range in.From {
 		n, ok := v.NodeByKey(k)
 		if !ok {
-			return nil, depthOut{}, fmt.Errorf("source node %q does not exist", k)
+			return nil, depthOut{}, fmt.Errorf("mcp: source node %q does not exist", k)
 		}
 		starts = append(starts, n.ID)
 	}
@@ -830,7 +832,7 @@ func (svc *service) lookupProperty(_ context.Context, _ *mcp.CallToolRequest, in
 		}
 		nodes = ns
 	default:
-		return nil, listOut{}, fmt.Errorf("propValue must be a string, number or boolean, got %T", in.PropValue)
+		return nil, listOut{}, fmt.Errorf("mcp: propValue must be a string, number or boolean, got %T", in.PropValue)
 	}
 	out := listOut{Total: len(nodes)}
 	for i, n := range nodes {
@@ -852,7 +854,7 @@ func (svc *service) indexFullText(_ context.Context, _ *mcp.CallToolRequest, in 
 		return nil, indexFullTextOut{}, svc.openErr
 	}
 	if in.PropKey == "" {
-		return nil, indexFullTextOut{}, errors.New("propKey must not be empty")
+		return nil, indexFullTextOut{}, errors.New("mcp: propKey must not be empty")
 	}
 	svc.mu.Lock()
 	defer svc.mu.Unlock()
@@ -870,7 +872,7 @@ func (svc *service) lookupContains(_ context.Context, _ *mcp.CallToolRequest, in
 		return nil, listOut{}, err
 	}
 	if in.Contains == "" {
-		return nil, listOut{}, errors.New("contains must not be empty")
+		return nil, listOut{}, errors.New("mcp: contains must not be empty")
 	}
 	limit := in.Limit
 	if limit <= 0 {
@@ -949,23 +951,21 @@ func (svc *service) vectorSearch(_ context.Context, _ *mcp.CallToolRequest, in v
 		return nil, vectorSearchOut{}, err
 	}
 	k := in.K
-	if k <= 0 {
+	if k <= 0 { // k <= 0 selects the default; 0 < k < the default stays as asked
 		k = vectorDefaultK
 	}
-	if k > vectorMaxK {
-		k = vectorMaxK
-	}
+	k = min(k, vectorMaxK)
 	if (len(in.Vector) == 0) == (in.SimilarTo == "") {
-		return nil, vectorSearchOut{}, errors.New("provide exactly one of query_vector or similar_to")
+		return nil, vectorSearchOut{}, errors.New("mcp: provide exactly one of query_vector or similar_to")
 	}
 	var q []float32
 	if in.SimilarTo != "" {
 		if _, ok := g.NodeByKey(in.SimilarTo); !ok {
-			return nil, vectorSearchOut{}, fmt.Errorf("node %q not found", in.SimilarTo)
+			return nil, vectorSearchOut{}, fmt.Errorf("mcp: node %q not found", in.SimilarTo)
 		}
 		fv, ok := g.VectorForNode(in.Index, in.SimilarTo)
 		if !ok {
-			return nil, vectorSearchOut{}, fmt.Errorf("node %q has no valid vector for index %q", in.SimilarTo, in.Index)
+			return nil, vectorSearchOut{}, fmt.Errorf("mcp: node %q has no valid vector for index %q", in.SimilarTo, in.Index)
 		}
 		q = fv
 	} else {

@@ -114,8 +114,8 @@ func TestCypherClientErrorEnvelope(t *testing.T) {
 	if res != nil {
 		t.Errorf("response = %+v, want nil", res)
 	}
-	var apiErr *apiError
-	if !errors.As(err, &apiErr) {
+	apiErr, ok := errors.AsType[*apiError](err)
+	if !ok {
 		t.Fatalf("err = %v (%T), want *apiError", err, err)
 	}
 	if apiErr.Error() != "PARSE: bad" {

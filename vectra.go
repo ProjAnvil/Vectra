@@ -116,6 +116,14 @@ var (
 	// (unique-constraints spec §2.1).
 	ErrConstraintExists   = errors.New("vectra: unique constraint already declared")
 	ErrConstraintNotFound = errors.New("vectra: unique constraint not declared")
+
+	// ErrInBatch is the errors.Is target for operations rejected because a
+	// Batch boundary is open: declarations (DeclareUnique/DropUnique,
+	// CreateVectorIndex) must run between changesets — a mid-batch
+	// declaration would scan a pre-publish view and miss the batch's own
+	// writes (replay applies declaration frames BETWEEN changesets, never
+	// inside one). Raise sites wrap it with the operation name.
+	ErrInBatch = errors.New("vectra: operation is not supported inside Batch")
 )
 
 // UniqueConstraint declares property-value uniqueness over one (label,
@@ -1501,7 +1509,7 @@ func (g *Graph) DeclareUnique(label, prop string) error {
 		// pre-publication, and replay applies declaration frames BETWEEN
 		// changesets, never inside one — reject instead of diverging (the
 		// CreateVectorIndex precedent, vectra_vector.go).
-		return errors.New("vectra: DeclareUnique inside Batch is not supported")
+		return fmt.Errorf("%w: DeclareUnique", ErrInBatch)
 	}
 	g.flushPend() // publish the open window so the scan sees all live state
 	c := UniqueConstraint{Label: label, Prop: prop}
@@ -1541,7 +1549,7 @@ func (g *Graph) DropUnique(label, prop string) error {
 		return err
 	}
 	if g.batching {
-		return errors.New("vectra: DropUnique inside Batch is not supported")
+		return fmt.Errorf("%w: DropUnique", ErrInBatch)
 	}
 	g.flushPend()
 	c := UniqueConstraint{Label: label, Prop: prop}

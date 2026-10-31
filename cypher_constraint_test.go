@@ -106,9 +106,8 @@ func TestCypherConstraintDuplicateAndUnknown(t *testing.T) {
 	if !errors.Is(err, ErrConstraintExists) {
 		t.Fatalf("duplicate create = %v want ErrConstraintExists", err)
 	}
-	var pos *CypherError
-	if errors.As(err, &pos) {
-		t.Fatalf("duplicate create must stay raw, got positioned %v", pos)
+	if _, ok := errors.AsType[*CypherError](err); ok {
+		t.Fatalf("duplicate create must stay raw, got positioned %v", err)
 	}
 	if cs := g.UniqueConstraints(); len(cs) != 1 {
 		t.Fatalf("duplicate create must not touch the registry: %v", cs)
@@ -118,8 +117,8 @@ func TestCypherConstraintDuplicateAndUnknown(t *testing.T) {
 	if !errors.Is(err, ErrConstraintNotFound) {
 		t.Fatalf("drop unknown = %v want ErrConstraintNotFound", err)
 	}
-	if errors.As(err, &pos) {
-		t.Fatalf("drop unknown must stay raw, got positioned %v", pos)
+	if _, ok := errors.AsType[*CypherError](err); ok {
+		t.Fatalf("drop unknown must stay raw, got positioned %v", err)
 	}
 }
 
@@ -139,9 +138,8 @@ func TestCypherConstraintDeclareOnDuplicateData(t *testing.T) {
 	if !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("declare on duplicates = %v want ErrUniqueViolation", err)
 	}
-	var pos *CypherError
-	if errors.As(err, &pos) {
-		t.Fatalf("declaration failure must stay raw, got positioned %v", pos)
+	if _, ok := errors.AsType[*CypherError](err); ok {
+		t.Fatalf("declaration failure must stay raw, got positioned %v", err)
 	}
 	for _, want := range []string{"duplicate values", `"a@x" owned by "a"`, `"a@x" owned by "b"`} {
 		if !strings.Contains(err.Error(), want) {
@@ -176,17 +174,16 @@ func TestCypherConstraintViolationPassthrough(t *testing.T) {
 	if !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("violation = %v want ErrUniqueViolation", err)
 	}
-	var uv *UniqueViolationError
-	if !errors.As(err, &uv) {
+	uv, ok := errors.AsType[*UniqueViolationError](err)
+	if !ok {
 		t.Fatalf("violation payload lost through Cypher: %v", err)
 	}
 	if uv.Label != "Person" || uv.Prop != "email" || uv.Value != "a@x" ||
 		uv.ExistingKey != "a" || uv.AttemptedKey != "b" {
 		t.Fatalf("violation payload = %+v", uv)
 	}
-	var pos *CypherError
-	if errors.As(err, &pos) {
-		t.Fatalf("violation must stay raw (a wrap would flip the server face to 400 PARSE): %v", pos)
+	if _, ok := errors.AsType[*CypherError](err); ok {
+		t.Fatalf("violation must stay raw (a wrap would flip the server face to 400 PARSE): %v", err)
 	}
 	// zero side effects: the rejected node never existed
 	if _, ok := g.NodeByKey("b"); ok {
@@ -202,7 +199,8 @@ func TestCypherConstraintViolationPassthrough(t *testing.T) {
 	if !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("bulk create violation = %v", err)
 	}
-	if !errors.As(err, &uv) || uv.ExistingKey != "seed" || uv.AttemptedKey != "dup" || uv.Value != "dup" {
+	uv, ok = errors.AsType[*UniqueViolationError](err)
+	if !ok || uv.ExistingKey != "seed" || uv.AttemptedKey != "dup" || uv.Value != "dup" {
 		t.Fatalf("bulk violation payload = %+v", uv)
 	}
 	if _, ok := g.NodeByKey("ok"); !ok {

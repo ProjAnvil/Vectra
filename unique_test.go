@@ -578,6 +578,16 @@ func TestUniqueDeclareDropMidBatchRejected(t *testing.T) {
 	if dropErr == nil || !strings.Contains(dropErr.Error(), "inside Batch") {
 		t.Fatalf("mid-Batch drop: %v", dropErr)
 	}
+	// The sentinel identity is the programmatic face (F-15): both raise
+	// sites wrap vectra.ErrInBatch with the operation name, so server/CLI
+	// classification does not string-match. One site pinned suffices —
+	// DeclareUnique and DropUnique share the raise shape.
+	if !errors.Is(declErr, ErrInBatch) {
+		t.Fatalf("mid-Batch declare does not unwrap to ErrInBatch: %v", declErr)
+	}
+	if !errors.Is(dropErr, ErrInBatch) {
+		t.Fatalf("mid-Batch drop does not unwrap to ErrInBatch: %v", dropErr)
+	}
 	if got := g.UniqueConstraints(); len(got) != 0 {
 		t.Fatalf("mid-Batch declaration leaked into the registry: %v", got)
 	}

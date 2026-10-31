@@ -28,6 +28,11 @@ func loadAuthTokens(path string) ([]string, error) {
 	}
 	content := strings.TrimPrefix(string(data), "\ufeff")
 	var tokens []string
+	// strings.Split (not SplitSeq) is deliberate — audit F-33 ruled this
+	// site keep-Split: the loop index feeds the "line %d" error below, and
+	// a SplitSeq loop would need a manual counter (with the classic
+	// skip-continue reset bug shape) that reads worse than the indexed
+	// form. Startup-cold path; the slice is garbage immediately after.
 	for i, line := range strings.Split(content, "\n") {
 		line = strings.Trim(line, " \t\r")
 		if line == "" {

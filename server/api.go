@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/raft"
@@ -19,24 +20,41 @@ import (
 	"github.com/projanvil/vectra"
 )
 
+// postClient is the shared HTTP client for outbound POSTs (the join path).
+// The old per-call &http.Client{Timeout: t} already pooled connections (a
+// nil Transport means the process-wide http.DefaultTransport), so reuse was
+// never the problem; the win is one fewer Client allocation per call and
+// the per-call timeout expressed where it belongs — on the request context
+// (http.NewRequestWithContext), since client.Timeout is a whole-client
+// budget. Same redirects, same total-request deadline, as before.
+var postClient = &http.Client{}
+
 // httpPost posts body as JSON. The Authorization header is attached only
 // when bearer is non-empty, so auth-off deployments keep today's wire
-// behavior byte-for-byte.
-func httpPost(url string, body []byte, timeout time.Duration, bearer string) (*http.Response, error) {
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+// behavior byte-for-byte. The returned CancelFunc releases the request's
+// deadline context and must be called after the response body is closed
+// (defer it before resp.Body.Close so it runs after). Contract note:
+// timeout <= 0 produces an already-expired context (the request fails
+// immediately) — the old client form treated 0 as NO timeout; dead today,
+// Join (15s) is the only caller, but a future zero-timeout caller must
+// pass a real budget or special-case it here.
+func httpPost(url string, body []byte, timeout time.Duration, bearer string) (*http.Response, context.CancelFunc, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		cancel()
+		return nil, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
-	client := &http.Client{Timeout: timeout}
-	resp, err := client.Do(req)
+	resp, err := postClient.Do(req)
 	if err != nil {
-		return nil, err
+		cancel()
+		return nil, nil, err
 	}
-	return resp, nil
+	return resp, cancel, nil
 }
 
 // API error model: {"error":{"code":"...","message":"..."}}.
@@ -96,25 +114,34 @@ func (n *Node) Handler() http.Handler {
 	return mux
 }
 
-// expvarOnce is a process-level singleton: with multiple nodes in one process
-// (e.g. a test cluster), only the first node's vitra_* metrics are visible.
-// No impact on single-node production deployments.
-var expvarOnce sync.Once
+// expvarRegistrant is the first node to register expvars in this process.
+// The CompareAndSwap in registerExpvar latches it once; registerExpvarOnce
+// then publishes exactly that node's counters (a process-level singleton:
+// with multiple nodes in one process, e.g. a test cluster, only the first
+// node's vectra_* metrics are visible — no impact on single-node
+// production deployments). OnceFunc cannot carry the node as an argument,
+// so the CAS is the first-caller-wins latch and the once names the
+// publish-exactly-once intent.
+var expvarRegistrant atomic.Pointer[Node]
+
+var registerExpvarOnce = sync.OnceFunc(func() {
+	n := expvarRegistrant.Load()
+	m := n.fsm.metrics
+	expvar.Publish("vectra_applied_batches", expvar.Func(func() any { return m.AppliedBatches.Load() }))
+	expvar.Publish("vectra_applied_nodes", expvar.Func(func() any { return m.AppliedNodes.Load() }))
+	expvar.Publish("vectra_applied_edges", expvar.Func(func() any { return m.AppliedEdges.Load() }))
+	expvar.Publish("vectra_skipped_edges", expvar.Func(func() any { return m.SkippedEdges.Load() }))
+	expvar.Publish("vectra_deleted_edges", expvar.Func(func() any { return m.DeletedEdges.Load() }))
+	expvar.Publish("vectra_deleted_nodes", expvar.Func(func() any { return m.DeletedNodes.Load() }))
+	expvar.Publish("vectra_seals", expvar.Func(func() any { return m.Seals.Load() }))
+	expvar.Publish("vectra_restores", expvar.Func(func() any { return m.Restores.Load() }))
+	expvar.Publish("vectra_queries", expvar.Func(func() any { return n.queryCount.Load() }))
+	expvar.Publish("vectra_leader_changes", expvar.Func(func() any { return m.LeaderChanges.Load() }))
+})
 
 func (n *Node) registerExpvar() {
-	expvarOnce.Do(func() {
-		m := n.fsm.metrics
-		expvar.Publish("vectra_applied_batches", expvar.Func(func() any { return m.AppliedBatches.Load() }))
-		expvar.Publish("vectra_applied_nodes", expvar.Func(func() any { return m.AppliedNodes.Load() }))
-		expvar.Publish("vectra_applied_edges", expvar.Func(func() any { return m.AppliedEdges.Load() }))
-		expvar.Publish("vectra_skipped_edges", expvar.Func(func() any { return m.SkippedEdges.Load() }))
-		expvar.Publish("vectra_deleted_edges", expvar.Func(func() any { return m.DeletedEdges.Load() }))
-		expvar.Publish("vectra_deleted_nodes", expvar.Func(func() any { return m.DeletedNodes.Load() }))
-		expvar.Publish("vectra_seals", expvar.Func(func() any { return m.Seals.Load() }))
-		expvar.Publish("vectra_restores", expvar.Func(func() any { return m.Restores.Load() }))
-		expvar.Publish("vectra_queries", expvar.Func(func() any { return n.queryCount.Load() }))
-		expvar.Publish("vectra_leader_changes", expvar.Func(func() any { return m.LeaderChanges.Load() }))
-	})
+	expvarRegistrant.CompareAndSwap(nil, n)
+	registerExpvarOnce()
 }
 
 // gateReady is the readiness gate for query endpoints: 503 NOT_READY before the first publish.
@@ -607,8 +634,7 @@ func (n *Node) handleCypher(w http.ResponseWriter, r *http.Request) {
 	isWrite, err := vectra.CypherIsWrite(req.Query)
 	if err != nil {
 		// Same face the read path gives unparseable statements.
-		var ce *vectra.CypherError
-		if errors.As(err, &ce) {
+		if _, ok := errors.AsType[*vectra.CypherError](err); ok {
 			writeErr(w, http.StatusBadRequest, "PARSE", err.Error())
 			return
 		}
@@ -626,8 +652,7 @@ func (n *Node) handleCypher(w http.ResponseWriter, r *http.Request) {
 	n.queryCount.Add(1)
 	res, err := g.Cypher(req.Query)
 	if err != nil {
-		var ce *vectra.CypherError
-		if errors.As(err, &ce) {
+		if _, ok := errors.AsType[*vectra.CypherError](err); ok {
 			writeErr(w, http.StatusBadRequest, "PARSE", err.Error())
 			return
 		}
@@ -664,8 +689,7 @@ func (n *Node) applyCypherWrite(w http.ResponseWriter, r *http.Request, query st
 		if writeConstraintDeclError(w, err) {
 			return
 		}
-		var ce *vectra.CypherError
-		if errors.As(err, &ce) {
+		if _, ok := errors.AsType[*vectra.CypherError](err); ok {
 			writeErr(w, http.StatusBadRequest, "PARSE", err.Error())
 			return
 		}
@@ -821,12 +845,10 @@ func (n *Node) handleVectorSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	n.queryCount.Add(1)
 	k := req.K
-	if k <= 0 {
+	if k <= 0 { // k <= 0 selects the default; 0 < k < the default stays as asked
 		k = defaultVectorK
 	}
-	if k > maxVectorK {
-		k = maxVectorK
-	}
+	k = min(k, maxVectorK)
 	// Resolve the declaration first so the unknown-index face (404) wins
 	// over similar_to / dim errors in either query mode.
 	dim, found := 0, false

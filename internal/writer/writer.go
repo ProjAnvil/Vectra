@@ -414,13 +414,10 @@ func (h *Handle) afterBatch() {
 // mergeEdgeThreshold is the volume-proportional fold trigger: the unmerged
 // stack must carry edges comparable to the merged base before a background
 // fold is worth its O(base) cost. MergeEdges is the floor, so small graphs
-// still fold at the configured quantum.
+// still fold at the configured quantum. (Post-write trigger arithmetic —
+// a plain comparison, no allocation-gated path.)
 func (h *Handle) mergeEdgeThreshold() int {
-	t := h.cfg.MergeEdges
-	if base := h.g.BaseEdgeCount(); base > t {
-		t = base
-	}
-	return t
+	return max(h.cfg.MergeEdges, h.g.BaseEdgeCount())
 }
 
 // volumeCheckpoint implements spec §4's "WAL ≥4MB since last checkpoint"

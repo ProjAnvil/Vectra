@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"io/fs"
@@ -214,6 +215,16 @@ func (vi *vecIndex) size() int {
 var (
 	ErrVectorIndexExists   = errors.New("vectra: vector index name already declared")
 	ErrVectorIndexNotFound = errors.New("vectra: vector index not found")
+
+	// ErrVectorIndexNamePropRequired / ErrVectorIndexDimRange /
+	// ErrVectorIndexMetric are CreateVectorIndex's declaration-validation
+	// sentinels (the same set the server's POST /v1/vector/indexes handler
+	// pre-validates with its own 400 face): errors.Is-able classes, not
+	// per-call strings. Message text is unchanged from the ad-hoc
+	// errors.New era.
+	ErrVectorIndexNamePropRequired = errors.New("vectra: vector index name and prop are required")
+	ErrVectorIndexDimRange         = errors.New("vectra: vector index dim must be 1..4096")
+	ErrVectorIndexMetric           = errors.New("vectra: vector index metric must be cosine, l2, or dot")
 )
 
 // CreateVectorIndex declares and builds a vector index (spec §9.1).
@@ -233,17 +244,17 @@ func (g *Graph) CreateVectorIndex(d VectorIndexDecl) error {
 		// Mid-batch backfill would scan a pre-publish view and miss this
 		// batch's own nodes (replay applies decl frames BETWEEN changesets,
 		// never inside one) - reject instead of diverging (audit 2026-10-20).
-		return errors.New("vectra: CreateVectorIndex inside Batch is not supported")
+		return fmt.Errorf("%w: CreateVectorIndex", ErrInBatch)
 	}
 	if d.Name == "" || d.Prop == "" {
-		return errors.New("vectra: vector index name and prop are required")
+		return ErrVectorIndexNamePropRequired
 	}
 	if d.Dim < 1 || d.Dim > 4096 {
-		return errors.New("vectra: vector index dim must be 1..4096")
+		return ErrVectorIndexDimRange
 	}
 	metric, ok := vecMetric(d.Metric)
 	if !ok {
-		return errors.New("vectra: vector index metric must be cosine, l2, or dot")
+		return ErrVectorIndexMetric
 	}
 	g.flushPend()
 	for _, vi := range g.vecReg() {
@@ -573,9 +584,7 @@ func (g *Graph) QueryVector(index string, vec []float32, o QueryVectorOptions) (
 	fetch := k
 	if o.Label != "" {
 		fetch = 3 * k // oversample for the post-filter (spec 13-1)
-		if ef < fetch {
-			ef = fetch
-		}
+		ef = max(ef, fetch)
 	}
 	hits := snap.Search(vec, fetch, ef, r)
 	out := make([]VectorHit, 0, k)

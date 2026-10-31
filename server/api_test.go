@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -127,12 +128,21 @@ func (tc *testCluster) leaderWithin(within time.Duration) *testNode {
 	return nil
 }
 
-func (tc *testCluster) waitAllPublished(nodes, edges int, within time.Duration) {
+// waitAllPublished polls until every node EXCEPT the optional exclude list
+// has published a snapshot with exactly nodes/edges records, failing the
+// test on timeout (a silent fall-through would mask the failure and let
+// the test pass or fail far from the cause — audit F-30). exclude is the
+// chaos tests' disconnected node: its transport is down, so it cannot
+// publish until reconnect.
+func (tc *testCluster) waitAllPublished(nodes, edges int, within time.Duration, exclude ...*testNode) {
 	tc.t.Helper()
 	deadline := time.Now().Add(within)
 	for time.Now().Before(deadline) {
 		ok := true
 		for _, tn := range tc.nodes {
+			if slices.Contains(exclude, tn) {
+				continue
+			}
 			p := tn.node.Published()
 			if p == nil {
 				ok = false
