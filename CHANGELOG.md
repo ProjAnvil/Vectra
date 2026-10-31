@@ -5,16 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.16.0] - Unreleased
+## [0.14.0] - 2026-10-31
 
-Transport security and disaster recovery for the server: HTTPS with
-optional client-cert mTLS on the HTTP API, X.509 mutual TLS for raft
-node-to-node traffic, and a leader-served `GET /v1/backup` streaming
-a restore-ready tar.gz of the raft snapshot. This release also adds
-property-value **unique constraints** (Neo4j-community semantics) on
-every write path — the one deliberate change to an existing endpoint's
-error surface is flagged under Changed below. With no TLS flags set,
-the TLS planes are exactly the 0.15.0 plain-HTTP, plain-TCP ones.
+The release where the write path grows into a language and the project ships
+as a product. Cypher gains CREATE / SET / DELETE / DETACH DELETE / MERGE (with
+ON CREATE SET / ON MATCH SET) and `CREATE [FULLTEXT] INDEX` DDL — read
+statements keep the v0.13 pipeline byte-for-byte — and property-value
+**unique constraints** (Neo4j-community semantics) enforce on every write
+path. The server gains transport security and disaster recovery: HTTPS with
+optional client-cert mTLS, X.509 mutual TLS for raft node-to-node traffic,
+and a leader-served `GET /v1/backup` streaming a restore-ready tar.gz of the
+raft snapshot. The first official Python (`vectra-graph`) and TypeScript
+(`@projanvil/vectra`) SDKs cover the full REST surface, and the repo gains
+`vectra-cli` (a Cypher REPL), a Docker image, CI over all three modules and
+both SDKs, runnable examples, and a release guide with a tag-strategy smoke
+test. The one deliberate change to an existing endpoint's error surface —
+`/v1/batch` and `/v1/txn` failing on constraint violations — is flagged
+under Changed below; with no TLS flags set the TLS planes are exactly the
+previous plain-HTTP, plain-TCP ones.
 
 ### Added
 
@@ -87,40 +95,6 @@ the TLS planes are exactly the 0.15.0 plain-HTTP, plain-TCP ones.
   empty raft log = fresh term) — disaster recovery / new clusters
   only, not fan-out.
 
-### Changed
-
-- **`/v1/batch` and `/v1/txn` now fail on a unique-constraint
-  violation — a lane that previously could not fail on a node write.**
-  The FSM's node lane used to silently skip a failing node upsert (the
-  apply counter only incremented `if err == nil`); with constraints,
-  that silent skip would answer 200 with the node missing. The apply
-  now aborts on the first violation — deterministically on every
-  replica (constraint state is log-derived; the vector
-  shape-validation abort precedent) — and the request answers
-  **400 `UNIQUE_VIOLATION`** with the violation payload (constraint,
-  contended value, both keys) as the message. `/v1/cypher` gives a
-  violating write statement the same 400 face (never 400 `PARSE`,
-  never 500). Partial application is unchanged `Batch` semantics:
-  entries before the violating one are applied, the violating entry
-  has zero side effects, entries after it do not execute — no
-  rollback.
-- Store snapshots stamp **v8** (v7 layout + a trailing
-  unique-constraint section; a v7 file is v8 minus that section).
-  Pre-v8 readers — every v0.15.x binary — hard-fail on the version
-  byte: libraries checkpointed by 0.16.0 cannot be downgraded past
-  0.15.x (same discipline as v5/v6/v7). v7-and-older files load
-  unchanged (zero constraints, recompact-eligible to v8).
-
-## [0.15.0] - Unreleased
-
-Release engineering and operability: a Cypher REPL for talking to a
-running server, a Docker image for running one, CI over all three
-modules and both SDKs, runnable examples, and a release guide with a
-tag-strategy smoke test. Engine and server semantics are unchanged
-from 0.14.0 — this arc adds no behavior to the engine, the server, or
-the MCP servers.
-
-### Added
 
 - `vectra-cli` (`server/cmd/vectra-cli`) — a thin client of the
   server's `POST /v1/cypher` endpoint: a readline-style REPL with
@@ -171,22 +145,33 @@ the MCP servers.
 
 ### Changed
 
+- **`/v1/batch` and `/v1/txn` now fail on a unique-constraint
+  violation — a lane that previously could not fail on a node write.**
+  The FSM's node lane used to silently skip a failing node upsert (the
+  apply counter only incremented `if err == nil`); with constraints,
+  that silent skip would answer 200 with the node missing. The apply
+  now aborts on the first violation — deterministically on every
+  replica (constraint state is log-derived; the vector
+  shape-validation abort precedent) — and the request answers
+  **400 `UNIQUE_VIOLATION`** with the violation payload (constraint,
+  contended value, both keys) as the message. `/v1/cypher` gives a
+  violating write statement the same 400 face (never 400 `PARSE`,
+  never 500). Partial application is unchanged `Batch` semantics:
+  entries before the violating one are applied, the violating entry
+  has zero side effects, entries after it do not execute — no
+  rollback.
+- Store snapshots stamp **v8** (v7 layout + a trailing
+  unique-constraint section; a v7 file is v8 minus that section).
+  Pre-v8 readers — every v0.13.x binary — hard-fail on the version
+  byte: libraries checkpointed by 0.14.0 cannot be downgraded to
+  v0.13.x or earlier (same discipline as v5/v6/v7). v7-and-older
+  files load unchanged (zero constraints, recompact-eligible to v8).
 - `make build` now also emits `bin/vectra-cli` (previously
   vectra-server, vectra-bench, and vectra-mcp).
 - New Make targets: `make race` (root module under the race
   detector), `make allocs` (the root Cypher allocation gate, single
-  run), and `make goget-smoke [VERSION=0.15.0]` (the tag-strategy
+  run), and `make goget-smoke [VERSION=x.y.z]` (the tag-strategy
   smoke above).
-
-## [0.14.0] - Unreleased
-
-The Cypher write path: the subset grows from a read pipeline into a statement
-language — CREATE / SET / DELETE / DETACH DELETE / MERGE (with ON CREATE SET /
-ON MATCH SET) and `CREATE [FULLTEXT] INDEX` DDL execute against the embedded
-engine, replicate through raft on the server, and report their mutations as
-counter summaries. Read statements keep the v0.13 pipeline byte-for-byte.
-
-### Added
 
 - Cypher write clauses. A statement is an optional read prefix (MATCH / WITH /
   UNWIND) feeding per-row write clauses left to right, plus an optional
