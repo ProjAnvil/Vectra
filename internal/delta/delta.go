@@ -26,7 +26,8 @@
 //     (base-resident endpoints must be pre-validated by the writer), and
 //     DeleteNode takes a baseEdges hook for base incident edges.
 //
-// The package is core: no dependencies outside the standard library, no
+// The package is core: no dependencies outside the standard library beyond
+// the internal/propval leaf (the shared property helpers, audit F-18), no
 // goroutines, channels, or locks (v0.7 decisions D4/D5, acceptance A8).
 package delta
 
@@ -34,6 +35,8 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic" // atomic.Pointer only — the lazy Layer edge-ID index (A8 allows atomics)
+
+	"github.com/projanvil/vectra/internal/propval"
 )
 
 // EdgeKey is the logical identity of an edge: the (src, dst, label) triple
@@ -266,19 +269,6 @@ func (b *Builder) ensureEdgeIdx() {
 	}
 }
 
-// copyProps is vectra.go's copyProps verbatim: nil stays nil, non-nil maps
-// are copied shallow — nil and empty are distinct-but-equivalent.
-func copyProps(props map[string]any) map[string]any {
-	if props == nil {
-		return nil
-	}
-	m := make(map[string]any, len(props))
-	for k, v := range props {
-		m[k] = v
-	}
-	return m
-}
-
 // internLabel records a label string in first-seen order (idempotent).
 func (b *Builder) internLabel(name string) {
 	if b.labelSeen[name] {
@@ -298,7 +288,7 @@ func (b *Builder) nodeLive(key string) bool {
 // (vectra.appendEdge): append the record and register it under its key
 // (index maintenance is skipped while the lazy index is unbuilt).
 func (b *Builder) appendEdge(srcKey, dstKey, label string, props map[string]any) {
-	b.edges = append(b.edges, EdgeRec{SrcKey: srcKey, DstKey: dstKey, Label: label, Props: copyProps(props)})
+	b.edges = append(b.edges, EdgeRec{SrcKey: srcKey, DstKey: dstKey, Label: label, Props: propval.Copy(props)})
 	b.edgeDead = append(b.edgeDead, false)
 	if b.edgeIdxBuilt {
 		k := EdgeKey{SrcKey: srcKey, DstKey: dstKey, Label: label}
@@ -322,11 +312,11 @@ func (b *Builder) UpsertNode(key, label string, props map[string]any) error {
 			b.deadN--
 			delete(b.nodeTomb, key)
 		}
-		b.nodes[i].rec = NodeRec{Key: key, Label: label, Props: copyProps(props)}
+		b.nodes[i].rec = NodeRec{Key: key, Label: label, Props: propval.Copy(props)}
 		return nil
 	}
 	b.byKey[key] = len(b.nodes)
-	b.nodes = append(b.nodes, nodeState{rec: NodeRec{Key: key, Label: label, Props: copyProps(props)}})
+	b.nodes = append(b.nodes, nodeState{rec: NodeRec{Key: key, Label: label, Props: propval.Copy(props)}})
 	return nil
 }
 
@@ -448,7 +438,7 @@ func (b *Builder) upsertEdgeFold(srcKey, dstKey, label string, props map[string]
 			b.deadE++
 		}
 		keep := ids[len(ids)-1]
-		b.edges[keep].Props = copyProps(props) // wholesale replacement
+		b.edges[keep].Props = propval.Copy(props) // wholesale replacement
 		b.edgeIdx[k] = []int{keep}
 	}
 	b.edgeTomb[k] = true

@@ -18,10 +18,7 @@ func unwindSnap(t *testing.T) *engine.Snapshot {
 		{Key: "two", Label: "SVC", Props: map[string]any{"tags": []any{"c"}}},
 		{Key: "none", Label: "SVC"},
 	}
-	s, err := engine.Seal(nodes, nil, nil, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := engine.Seal(nodes, nil, nil, nil, nil)
 	return s
 }
 

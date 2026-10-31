@@ -24,10 +24,7 @@ func TestSealFTSDuplicateGramCompaction(t *testing.T) {
 		{Key: "a", Props: map[string]any{"name": "aaa"}},  // aa x2 -> once
 		{Key: "b", Props: map[string]any{"name": "abab"}}, // ab x2, ba x2 -> once each
 	}
-	s, err := Seal(nodes, nil, nil, nil, []string{"name"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := Seal(nodes, nil, nil, nil, []string{"name"})
 	want := []gramEntry{
 		{gram: "aa", id: 0},
 		{gram: "ab", id: 1},
@@ -62,10 +59,7 @@ func TestSealFTSNonASCIIBuildPath(t *testing.T) {
 			{Key: "zh", Props: map[string]any{"name": "图数据库"}}, // 图数 数据 据库
 			{Key: "skip", Props: map[string]any{"name": 9}},    // non-string: no grams
 		}
-		s, err := Seal(nodes, nil, nil, nil, []string{"name"})
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := Seal(nodes, nil, nil, nil, []string{"name"})
 		// Byte order: 图数 (E5..) < 据库 (E6 8D..) < 数据 (E6 95..) — the
 		// natural reading order differs from the sort order here; every
 		// posting at id 0 (the int-valued node contributes nothing).
@@ -86,10 +80,7 @@ func TestSealFTSNonASCIIBuildPath(t *testing.T) {
 		if got := Bigrams(bad); !slices.Equal(got, []string{"\uFFFD\uFFFD", "\uFFFDa", "ab"}) {
 			t.Fatalf("Bigrams(%q) = %q; needle side drifted", bad, got)
 		}
-		s, err := Seal([]NodeRec{{Key: "bad", Props: map[string]any{"name": bad}}}, nil, nil, nil, []string{"name"})
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := Seal([]NodeRec{{Key: "bad", Props: map[string]any{"name": bad}}}, nil, nil, nil, []string{"name"})
 		var want []gramEntry
 		for _, g := range Bigrams(bad) {
 			want = append(want, gramEntry{gram: g, id: 0})

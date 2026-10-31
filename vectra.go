@@ -60,6 +60,7 @@ import (
 	"github.com/projanvil/vectra/internal/atomicfile"
 	"github.com/projanvil/vectra/internal/delta"
 	"github.com/projanvil/vectra/internal/engine"
+	"github.com/projanvil/vectra/internal/propval"
 	"github.com/projanvil/vectra/internal/store"
 	"github.com/projanvil/vectra/internal/wal"
 )
@@ -73,9 +74,17 @@ type NodeID uint32
 type EdgeID uint32
 
 var (
-	// ErrSealed / ErrNotSealed are v0.6 sentinels kept for one release:
-	// v0.7 dissolves the sealed gates (spec §6) and never returns them.
-	ErrSealed       = errors.New("vectra: graph sealed, mutation rejected")
+	// ErrSealed is a v0.6 sentinel: v0.7 dissolved the sealed gates and no
+	// code path has returned it since. Kept for source compatibility only.
+	//
+	// Deprecated: nothing returns ErrSealed; it will be removed in a future
+	// minor release.
+	ErrSealed = errors.New("vectra: graph sealed, mutation rejected")
+	// ErrNotSealed is ErrSealed's query-side twin, equally unreturned since
+	// v0.7 dissolved the sealed gates. Kept for source compatibility only.
+	//
+	// Deprecated: nothing returns ErrNotSealed; it will be removed in a
+	// future minor release.
 	ErrNotSealed    = errors.New("vectra: graph not sealed, query rejected")
 	ErrNodeNotFound = errors.New("vectra: node key not found")
 	// ErrClosed is returned by write methods after Close. Queries remain
@@ -676,23 +685,8 @@ func New() *Graph {
 		autoSealEdges:     defaultAutoSealEdges,
 		foldWake:          make(chan struct{}, 1),
 	}
-	snap, err := engine.Seal(nil, nil, nil, nil, nil)
-	if err != nil {
-		panic(fmt.Errorf("vectra: sealing an empty base: %w", err))
-	}
-	g.view.Store(&genView{base: snap, baseKeys: map[string]NodeID{}})
+	g.view.Store(&genView{base: engine.Seal(nil, nil, nil, nil, nil), baseKeys: map[string]NodeID{}})
 	return g
-}
-
-func copyProps(props map[string]any) map[string]any {
-	if props == nil {
-		return nil
-	}
-	m := make(map[string]any, len(props))
-	for k, v := range props {
-		m[k] = v
-	}
-	return m
 }
 
 // SetAutoCompact tunes the direct-mode layer-stack governor (see
@@ -1860,7 +1854,7 @@ func (g *Graph) recordNode(key, label string, props map[string]any) error {
 	if g.wal == nil {
 		return nil
 	}
-	g.pendOps = append(g.pendOps, pendOp{kind: opNode, node: NodeUpsert{Key: key, Label: label, Props: copyProps(props)}})
+	g.pendOps = append(g.pendOps, pendOp{kind: opNode, node: NodeUpsert{Key: key, Label: label, Props: propval.Copy(props)}})
 	return g.maybeFlush()
 }
 
@@ -1870,7 +1864,7 @@ func (g *Graph) recordEdge(srcKey, dstKey, label string, props map[string]any, a
 	}
 	g.pendOps = append(g.pendOps, pendOp{kind: opEdge, edge: EdgeUpsert{
 		SrcKey: srcKey, DstKey: dstKey, Label: label,
-		Props: copyProps(props), AllowParallel: allowParallel,
+		Props: propval.Copy(props), AllowParallel: allowParallel,
 	}})
 	return g.maybeFlush()
 }
@@ -2868,10 +2862,7 @@ func (g *Graph) forceMerge() error {
 		return nil
 	}
 	nodes, edges, labels, indexKeys, ftsKeys := g.unionRecords()
-	snap, err := engine.Seal(nodes, edges, labels, indexKeys, ftsKeys)
-	if err != nil {
-		return err
-	}
+	snap := engine.Seal(nodes, edges, labels, indexKeys, ftsKeys)
 	baseKeys := make(map[string]NodeID, len(nodes))
 	g.nodes = make(map[string]nodeRef, len(nodes))
 	for i, n := range nodes {
@@ -3412,11 +3403,7 @@ func (g *Graph) saveViewFile(v *genView, path string, ucs []store.UniqueConstrai
 // Index declarations persisted by the snapshot (store v3) are rebuilt, so
 // LookupByProperty works immediately (v1/v2 files carry none).
 func Load(r io.Reader) (*Graph, error) {
-	g, err := loadGraph(r)
-	if err != nil {
-		return nil, err
-	}
-	return g, nil
+	return loadGraph(r)
 }
 
 func loadGraph(r io.Reader) (*Graph, error) {
@@ -3472,10 +3459,7 @@ func loadGraphForest(r io.Reader, img *vecForestImage) (*Graph, error) {
 			Src: s, Dst: d, LabelID: intern(e.Label), Props: e.Props,
 		})
 	}
-	g, err := graphFromEngine(nodes, edges, labels, data.IndexKeys, data.FTSKeys)
-	if err != nil {
-		return nil, err
-	}
+	g := graphFromEngine(nodes, edges, labels, data.IndexKeys, data.FTSKeys)
 	if len(data.VectorDecls) > 0 {
 		list := make([]wal.VectorIndexDecl, 0, len(data.VectorDecls))
 		for _, d := range data.VectorDecls {
@@ -3523,11 +3507,8 @@ func loadGraphForest(r io.Reader, img *vecForestImage) (*Graph, error) {
 // graphFromEngine builds a Graph whose initial generation is the merged base
 // of the given records (writer mirrors and ratchets seeded from the base).
 // ftsKeys seeds the base's FTS gram buckets (the FTS plan's load path).
-func graphFromEngine(nodes []engine.NodeRec, edges []engine.EdgeRec, labels []string, indexKeys []string, ftsKeys []string) (*Graph, error) {
-	snap, err := engine.Seal(nodes, edges, labels, indexKeys, ftsKeys)
-	if err != nil {
-		return nil, err
-	}
+func graphFromEngine(nodes []engine.NodeRec, edges []engine.EdgeRec, labels []string, indexKeys []string, ftsKeys []string) *Graph {
+	snap := engine.Seal(nodes, edges, labels, indexKeys, ftsKeys)
 	g := New()
 	baseKeys := make(map[string]NodeID, len(nodes))
 	g.nodes = make(map[string]nodeRef, len(nodes))
@@ -3555,7 +3536,7 @@ func graphFromEngine(nodes []engine.NodeRec, edges []engine.EdgeRec, labels []st
 		base: snap, baseKeys: baseKeys,
 		nodes: g.nodeTotal, edges: g.edgeTotal,
 	})
-	return g, nil
+	return g
 }
 
 // LoadFile restores a graph from a path.
@@ -3596,7 +3577,10 @@ func (g *Graph) IndexProperty(key string) *Graph {
 		return g
 	}
 	g.assertWriter()
-	if g.indexDeclared(key) {
+	if g.keyDeclared(key,
+		func(s *engine.Snapshot, key string) bool { _, ok := s.LookupIndex(key, ""); return ok },
+		func(l *delta.Layer, key string) bool { return slices.Contains(l.IndexKeys(), key) },
+		g.bIndex) {
 		return g
 	}
 	_ = g.recordIndexDecl(key)
@@ -3628,7 +3612,10 @@ func (g *Graph) IndexFullText(key string) *Graph {
 	if key == "" {
 		return g
 	}
-	if g.ftsDeclared(key) {
+	if g.keyDeclared(key,
+		func(s *engine.Snapshot, key string) bool { return slices.Contains(s.FTSKeys(), key) },
+		func(l *delta.Layer, key string) bool { return slices.Contains(l.FTSKeys(), key) },
+		g.bFTS) {
 		return g
 	}
 	_ = g.recordFTSDecl(key)
@@ -3639,38 +3626,55 @@ func (g *Graph) IndexFullText(key string) *Graph {
 	return g
 }
 
-// indexDeclared reports whether key is already an effective (base) or
-// pending (layer/batch) index declaration.
-func (g *Graph) indexDeclared(key string) bool {
+// keyDeclared reports whether key already has a declaration of one kind —
+// effective (base) or pending (unmerged layer, open batch) — probing only
+// that kind's accessors, so a typed declaration of the same key never
+// suppresses an FTS declare (and vice versa). indexDeclared/ftsDeclared's
+// twin bodies collapsed here (audit F-17): the kinds differ only in which
+// accessor they probe, never in the view/batch discipline.
+func (g *Graph) keyDeclared(key string, inBase func(*engine.Snapshot, string) bool, inLayer func(*delta.Layer, string) bool, batch []string) bool {
 	v := g.view.Load()
-	if _, ok := v.base.LookupIndex(key, ""); ok {
+	if inBase(v.base, key) {
 		return true
 	}
 	for _, l := range v.layers {
-		for _, k := range l.IndexKeys() {
-			if k == key {
-				return true
-			}
-		}
-	}
-	return slices.Contains(g.bIndex, key)
-}
-
-// ftsDeclared is indexDeclared's kind-aware sibling (FTS plan): it probes
-// only the full-text declarations — base FTS keys, unmerged layers and the
-// open batch — so a typed declaration of the same key never suppresses an
-// FTS declare (and vice versa).
-func (g *Graph) ftsDeclared(key string) bool {
-	v := g.view.Load()
-	if slices.Contains(v.base.FTSKeys(), key) {
-		return true
-	}
-	for _, l := range v.layers {
-		if slices.Contains(l.FTSKeys(), key) {
+		if inLayer(l, key) {
 			return true
 		}
 	}
-	return slices.Contains(g.bFTS, key)
+	return slices.Contains(batch, key)
+}
+
+// declaredKeys enumerates one kind's index declarations: the merged base's
+// keys plus pending declarations from unmerged layers, deduplicated and
+// sorted (nil when none). IndexedPropertyKeys/FullTextIndexedKeys's twin
+// bodies collapsed here (audit F-17): the kinds differ only in which key
+// sets they probe. It answers from the published generation only — a
+// declaration made inside a running Batch becomes visible at its boundary
+// like every other batch write — which keeps it lock-free. The entry
+// materializes the caller's absorption window first (a declaration
+// absorbed mid-window is included).
+func (g *Graph) declaredKeys(baseKeys func(*engine.Snapshot) []string, layerKeys func(*delta.Layer) []string) []string {
+	g.flushPend()
+	v := g.view.Load()
+	seen := make(map[string]bool)
+	var out []string
+	add := func(k string) {
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	for _, k := range baseKeys(v.base) {
+		add(k)
+	}
+	for _, l := range v.layers {
+		for _, k := range layerKeys(l) {
+			add(k)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // IndexedPropertyKeys returns the typed property-index declarations: the
@@ -3685,26 +3689,7 @@ func (g *Graph) ftsDeclared(key string) bool {
 // accessor (FullTextIndexedKeys): enumerating them here would make snapshot
 // consumers auto-declare typed indexes over FTS keys (unrequested memory).
 func (g *Graph) IndexedPropertyKeys() []string {
-	g.flushPend()
-	v := g.view.Load()
-	seen := make(map[string]bool)
-	var out []string
-	add := func(k string) {
-		if !seen[k] {
-			seen[k] = true
-			out = append(out, k)
-		}
-	}
-	for _, k := range v.base.IndexedKeys() {
-		add(k)
-	}
-	for _, l := range v.layers {
-		for _, k := range l.IndexKeys() {
-			add(k)
-		}
-	}
-	slices.Sort(out)
-	return out
+	return g.declaredKeys((*engine.Snapshot).IndexedKeys, (*delta.Layer).IndexKeys)
 }
 
 // FullTextIndexedKeys is IndexedPropertyKeys's full-text sibling: the FTS
@@ -3715,26 +3700,7 @@ func (g *Graph) IndexedPropertyKeys() []string {
 // that wants to preserve full-text configuration re-declares these keys
 // through IndexFullText.
 func (g *Graph) FullTextIndexedKeys() []string {
-	g.flushPend()
-	v := g.view.Load()
-	seen := make(map[string]bool)
-	var out []string
-	add := func(k string) {
-		if !seen[k] {
-			seen[k] = true
-			out = append(out, k)
-		}
-	}
-	for _, k := range v.base.FTSKeys() {
-		add(k)
-	}
-	for _, l := range v.layers {
-		for _, k := range l.FTSKeys() {
-			add(k)
-		}
-	}
-	slices.Sort(out)
-	return out
+	return g.declaredKeys((*engine.Snapshot).FTSKeys, (*delta.Layer).FTSKeys)
 }
 
 // Clone deep-copies into a graph that can keep taking writes: the union
@@ -3751,10 +3717,7 @@ func (g *Graph) FullTextIndexedKeys() []string {
 func (g *Graph) Clone() *Graph {
 	g.flushPend()
 	nodes, edges, labels, indexKeys, ftsKeys := g.unionRecords()
-	c, err := graphFromEngine(nodes, edges, labels, indexKeys, ftsKeys)
-	if err != nil { // engine.Seal of valid records cannot fail; fail loud over corrupt state
-		panic(fmt.Errorf("vectra: clone merge: %w", err))
-	}
+	c := graphFromEngine(nodes, edges, labels, indexKeys, ftsKeys)
 	if reg := g.vecReg(); len(reg) > 0 {
 		mounted := make([]*vecIndex, len(reg))
 		for i, vi := range reg {
@@ -3821,7 +3784,7 @@ func (g *Graph) LookupByNumber(key string, v float64) ([]Node, bool) {
 		func(gv *genView) ([]uint32, bool) { return gv.base.LookupNumber(key, v) },
 		typedPendingIn(key),
 		func(props map[string]any) bool {
-			f, ok := toFloat64(props[key])
+			f, ok := propval.ToFloat(props[key])
 			return ok && f == v
 		})
 }
@@ -3834,7 +3797,7 @@ func (g *Graph) LookupByNumberRange(key string, min, max *float64) ([]Node, bool
 		func(gv *genView) ([]uint32, bool) { return gv.base.LookupNumberRange(key, min, max) },
 		typedPendingIn(key),
 		func(props map[string]any) bool {
-			f, ok := toFloat64(props[key])
+			f, ok := propval.ToFloat(props[key])
 			if !ok {
 				return false
 			}
@@ -4013,37 +3976,6 @@ func lookupNodesOf(v *genView, key string, baseIndex func(*genView) ([]uint32, b
 	}
 	slices.SortFunc(out, func(a, b Node) int { return cmp.Compare(a.ID, b.ID) })
 	return out, true
-}
-
-// toFloat64 normalizes any numeric Go value (engine.toFloat's contract).
-func toFloat64(v any) (float64, bool) {
-	switch n := v.(type) {
-	case int:
-		return float64(n), true
-	case int8:
-		return float64(n), true
-	case int16:
-		return float64(n), true
-	case int32:
-		return float64(n), true
-	case int64:
-		return float64(n), true
-	case uint:
-		return float64(n), true
-	case uint8:
-		return float64(n), true
-	case uint16:
-		return float64(n), true
-	case uint32:
-		return float64(n), true
-	case uint64:
-		return float64(n), true
-	case float32:
-		return float64(n), true
-	case float64:
-		return n, true
-	}
-	return 0, false
 }
 
 // ExportSnapshot serializes the current logical view (base ∪ layers union —

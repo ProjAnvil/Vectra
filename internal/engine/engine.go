@@ -10,13 +10,13 @@ package engine
 
 import (
 	"cmp"
-	"encoding/json"
 	"maps"
 	"slices"
 	"sort"
 
 	"github.com/projanvil/vectra/internal/csr"
 	"github.com/projanvil/vectra/internal/dag"
+	"github.com/projanvil/vectra/internal/propval"
 )
 
 // NodeRec / EdgeRec are the graph's raw records. ID is the slice index;
@@ -55,48 +55,14 @@ type boolEntry struct {
 }
 
 // propIndex is the index of one property key: three type buckets. Numbers
-// normalize to float64 (all int/uint/float widths and json.Number), so a
-// value written as int 42 matches the float64 42 a JSON round-trip produces.
-// Values of other kinds (nil, slices, maps) are not indexed.
+// normalize to float64 (all int/uint/float widths and json.Number, per
+// propval.ToFloat), so a value written as int 42 matches the float64 42 a
+// JSON round-trip produces. Values of other kinds (nil, slices, maps) are
+// not indexed.
 type propIndex struct {
 	strs  []strEntry
 	nums  []numEntry
 	bools []boolEntry
-}
-
-// toFloat normalizes any numeric Go value to float64; non-numerics return
-// ok=false.
-func toFloat(v any) (float64, bool) {
-	switch n := v.(type) {
-	case int:
-		return float64(n), true
-	case int8:
-		return float64(n), true
-	case int16:
-		return float64(n), true
-	case int32:
-		return float64(n), true
-	case int64:
-		return float64(n), true
-	case uint:
-		return float64(n), true
-	case uint8:
-		return float64(n), true
-	case uint16:
-		return float64(n), true
-	case uint32:
-		return float64(n), true
-	case uint64:
-		return float64(n), true
-	case float32:
-		return float64(n), true
-	case float64:
-		return n, true
-	case json.Number:
-		f, err := n.Float64()
-		return f, err == nil
-	}
-	return 0, false
 }
 
 // Snapshot is all query state after Seal.
@@ -123,8 +89,10 @@ type Snapshot struct {
 // Seal builds an immutable snapshot from raw records: forward/reverse CSR,
 // Tarjan SCC, forward/reverse condensation DAG, component member tables,
 // self-loop flags, typed property indexes, and FTS gram buckets (only the
-// case string values of ftsKeys are tokenized).
-func Seal(nodes []NodeRec, edges []EdgeRec, labels []string, indexKeys []string, ftsKeys []string) (*Snapshot, error) {
+// case string values of ftsKeys are tokenized). It cannot fail by
+// construction (the error return was vestigial — always nil — and was
+// removed; audit F-13).
+func Seal(nodes []NodeRec, edges []EdgeRec, labels []string, indexKeys []string, ftsKeys []string) *Snapshot {
 	s := &Snapshot{nodes: nodes, edges: edges, labels: labels}
 	n := uint32(len(nodes))
 	e := len(edges)
@@ -191,7 +159,7 @@ func Seal(nodes []NodeRec, edges []EdgeRec, labels []string, indexKeys []string,
 				case bool:
 					pi.bools = append(pi.bools, boolEntry{val: v, id: uint32(id)})
 				default:
-					if f, ok := toFloat(nr.Props[key]); ok {
+					if f, ok := propval.ToFloat(nr.Props[key]); ok {
 						pi.nums = append(pi.nums, numEntry{val: f, id: uint32(id)})
 					}
 				}
@@ -235,7 +203,7 @@ func Seal(nodes []NodeRec, edges []EdgeRec, labels []string, indexKeys []string,
 			s.fts[key] = buildFTS(nodes, key)
 		}
 	}
-	return s, nil
+	return s
 }
 
 // ---- read-only accessors (the full dependency surface of traverse and the root facade) ----

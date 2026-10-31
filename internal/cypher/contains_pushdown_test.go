@@ -29,10 +29,7 @@ func containsSnap(t *testing.T, fts bool) *engine.Snapshot {
 	if fts {
 		ftsKeys = []string{"name"}
 	}
-	s, err := engine.Seal(nodes, nil, nil, nil, ftsKeys)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := engine.Seal(nodes, nil, nil, nil, ftsKeys)
 	return s
 }
 

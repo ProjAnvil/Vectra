@@ -11,10 +11,7 @@ func sealIdx(t *testing.T, keys []string, props []map[string]any) *Snapshot {
 	for i, p := range props {
 		nodes[i] = NodeRec{Key: string(rune('a' + i)), Label: "L", Props: p}
 	}
-	s, err := Seal(nodes, nil, []string{"L"}, keys, nil) // []string{"L"} = the edge label registry (what LabelID resolves against)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := Seal(nodes, nil, []string{"L"}, keys, nil) // []string{"L"} = the edge label registry (what LabelID resolves against)
 	return s
 }
 

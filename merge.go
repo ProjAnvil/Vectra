@@ -103,12 +103,8 @@ func (g *Graph) BaseEdgeCount() int {
 func (c *MergeCapture) Seal() (*MergeResult, error) {
 	pin := &genView{base: c.base, layers: c.layers}
 	nodes, edges, labels, indexKeys, ftsKeys := pin.unionRecords()
-	snap, err := engine.Seal(nodes, edges, labels, indexKeys, ftsKeys)
-	if err != nil {
-		return nil, err
-	}
 	r := &MergeResult{
-		snap:      snap,
+		snap:      engine.Seal(nodes, edges, labels, indexKeys, ftsKeys),
 		baseKeys:  make(map[string]NodeID, len(nodes)),
 		liveNodes: make(map[string]bool, len(nodes)),
 		liveEdges: make(map[delta.EdgeKey]int, len(edges)),

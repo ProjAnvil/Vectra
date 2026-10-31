@@ -15,6 +15,7 @@ import (
 	"github.com/projanvil/vectra/internal/csr"
 	"github.com/projanvil/vectra/internal/delta"
 	"github.com/projanvil/vectra/internal/engine"
+	"github.com/projanvil/vectra/internal/propval"
 	tr "github.com/projanvil/vectra/internal/traverse"
 )
 
@@ -273,7 +274,7 @@ func (s cypherSource) LookupNumber(key string, value float64) ([]uint32, bool) {
 		func(v *genView) ([]uint32, bool) { return v.base.LookupNumber(key, value) },
 		typedPendingIn(key),
 		func(props map[string]any) bool {
-			f, ok := toFloat64(props[key])
+			f, ok := propval.ToFloat(props[key])
 			return ok && f == value
 		})
 	return nodesToIDs(ns), ok

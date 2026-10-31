@@ -32,10 +32,7 @@ func withSnap(t *testing.T) *engine.Snapshot {
 		{Src: 1, Dst: 2, LabelID: 0},
 		{Src: 1, Dst: 3, LabelID: 0},
 	}
-	s, err := engine.Seal(nodes, edges, []string{"CALLS"}, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := engine.Seal(nodes, edges, []string{"CALLS"}, nil, nil)
 	return s
 }
 

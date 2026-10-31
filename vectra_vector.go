@@ -15,6 +15,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -316,7 +317,7 @@ func (g *Graph) vecReg() []*vecIndex {
 
 // vecRegistryCopy snapshots the registry for writer-side mutation.
 func (g *Graph) vecRegistryCopy() []*vecIndex {
-	return append([]*vecIndex(nil), g.vecReg()...)
+	return slices.Clone(g.vecReg())
 }
 
 func (g *Graph) setVecRegistry(reg []*vecIndex) { g.vecIdx.Store(&reg) }
@@ -738,6 +739,12 @@ func vecForestPath(dbPath string) string {
 	return strings.TrimSuffix(dbPath, filepath.Ext(dbPath)) + vecForestExt
 }
 
+// vecForestPutU32/U64 append little-endian wire integers to the VCVF buffer
+// (audit F-22: deliberately NOT shared with internal/store's putU32 — that
+// family writes through io.Writer with per-call errors, this one writes a
+// *bytes.Buffer that cannot fail; a common home would trade the difference
+// for dead error propagation. The LE convention itself is single-sourced by
+// encoding/binary.LittleEndian, which both families use.)
 func vecForestPutU32(w *bytes.Buffer, v uint32) {
 	var b [4]byte
 	binary.LittleEndian.PutUint32(b[:], v)

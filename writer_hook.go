@@ -4,9 +4,6 @@ package vectra
 
 import (
 	"fmt"
-	"runtime"
-	"strconv"
-	"strings"
 )
 
 // Wrapper-mode writer discipline (spec §2.3 R7), debug implementation.
@@ -50,25 +47,4 @@ func (g *Graph) assertWriter() {
 	if err := g.checkWriter(); err != nil {
 		panic(fmt.Errorf("%w — this method rewrites writer-private state; run it on the writer goroutine (or with writes quiescent)", err))
 	}
-}
-
-// goroutineToken parses this goroutine's id from runtime.Stack's header
-// line ("goroutine 17 [running]:"). A parse failure returns 0, which the
-// claim check reads as "unclaimed" — fail-open, matching release builds.
-// Theoretical boundary: 0 is also the pendWindow owner value stored when
-// the opener's parse failed, so a second mis-parsed token could in
-// principle match it and let a foreign goroutine trip cutLayer —
-// unreachable in practice, because runtime.Stack's header-line format
-// is a guaranteed stable contract.
-func goroutineToken() uint64 {
-	var buf [64]byte
-	n := runtime.Stack(buf[:], false)
-	s := strings.TrimSpace(string(buf[:n]))
-	s = strings.TrimPrefix(s, "goroutine ")
-	id, _, _ := strings.Cut(s, " ")
-	v, err := strconv.ParseUint(id, 10, 64)
-	if err != nil {
-		return 0
-	}
-	return v
 }

@@ -37,10 +37,7 @@ func execSnap(t *testing.T) *engine.Snapshot {
 		{Src: 1, Dst: 2, LabelID: CALLS, Props: map[string]any{"weight": 1}}, // parallel edge 2
 		{Src: 2, Dst: 1, LabelID: CALLS},
 	}
-	s, err := engine.Seal(nodes, edges, []string{"CALLS", "USES"}, []string{"type", "env", "w"}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := engine.Seal(nodes, edges, []string{"CALLS", "USES"}, []string{"type", "env", "w"}, nil)
 	return s
 }
 

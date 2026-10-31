@@ -28,7 +28,7 @@ func (s *fakeSource) Empty() bool             { return false }
 
 func testView(t *testing.T) *View {
 	t.Helper()
-	base, err := Seal(
+	base := Seal(
 		[]NodeRec{{Key: "a"}, {Key: "b"}, {Key: "c"}, {Key: "d"}},
 		[]EdgeRec{
 			{Src: 0, Dst: 1, LabelID: 0},
@@ -39,9 +39,6 @@ func testView(t *testing.T) *View {
 		nil,
 		nil,
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
 	src := &fakeSource{
 		labels: []string{"wrote"},
 		out: map[uint32][]csr.AdjRow{

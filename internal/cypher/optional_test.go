@@ -26,10 +26,7 @@ func optSnap(t *testing.T) *engine.Snapshot {
 		{Key: "g2", Label: "Ghost", Props: map[string]any{"name": "g2"}},
 	}
 	edges := []engine.EdgeRec{{Src: 0, Dst: 1, LabelID: 0}}
-	s, err := engine.Seal(nodes, edges, []string{"KNOWS"}, []string{"name"}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := engine.Seal(nodes, edges, []string{"KNOWS"}, []string{"name"}, nil)
 	return s
 }
 

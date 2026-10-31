@@ -14,10 +14,7 @@ func TestStarWithOrderBySupported(t *testing.T) {
 		{Key: "a", Label: "N", Props: map[string]any{"k": "a"}},
 		{Key: "b", Label: "N", Props: map[string]any{"k": "b"}},
 	}
-	snap, err := engine.Seal(nodes, nil, nil, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	snap := engine.Seal(nodes, nil, nil, nil, nil)
 	res, err := Run(snap, `MATCH (n:N) RETURN * ORDER BY n.k`)
 	if err != nil {
 		t.Fatalf("RETURN * with ORDER BY must parse and run: %v", err)

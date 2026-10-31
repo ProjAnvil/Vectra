@@ -58,10 +58,7 @@ func TestSealFTSBuild(t *testing.T) {
 		{Key: "d", Props: map[string]any{"name": "bcb"}}, // grams bc, cb
 		{Key: "e", Props: map[string]any{"other": "zz"}}, // other key: ignored
 	}
-	s, err := Seal(nodes, nil, nil, nil, []string{"name"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := Seal(nodes, nil, nil, nil, []string{"name"})
 	if keys := s.FTSKeys(); !slices.Equal(keys, []string{"name"}) {
 		t.Fatalf("FTSKeys() = %q, want [name]", keys)
 	}
@@ -78,10 +75,7 @@ func TestSealFTSBuild(t *testing.T) {
 	}
 
 	// No ftsKeys => no FTS state at all.
-	bare, err := Seal(nodes, nil, nil, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	bare := Seal(nodes, nil, nil, nil, nil)
 	if keys := bare.FTSKeys(); keys != nil {
 		t.Fatalf("FTSKeys() with no declarations = %q, want nil", keys)
 	}
@@ -96,10 +90,7 @@ func TestLookupFTS(t *testing.T) {
 		{Key: "b", Props: map[string]any{"name": "zz tail"}},
 		{Key: "c", Props: map[string]any{"name": 7}}, // declared key, non-string
 	}
-	s, err := Seal(nodes, nil, nil, nil, []string{"name", "ghost"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := Seal(nodes, nil, nil, nil, []string{"name", "ghost"})
 	if keys := s.FTSKeys(); !slices.Equal(keys, []string{"ghost", "name"}) {
 		t.Fatalf("FTSKeys() = %q, want [ghost name]", keys)
 	}

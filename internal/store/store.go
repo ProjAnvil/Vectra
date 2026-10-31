@@ -173,6 +173,9 @@ func (c *crcWriter) finish() error {
 	return c.bw.Flush()
 }
 
+// putU32 writes one u32 wire integer, little-endian (audit F-22: the
+// root package's vecForestPutU32/U64 twin writes a *bytes.Buffer that cannot
+// fail — deliberately not shared; see the note there).
 func putU32(w io.Writer, v uint32) error {
 	var b [4]byte
 	binary.LittleEndian.PutUint32(b[:], v)
