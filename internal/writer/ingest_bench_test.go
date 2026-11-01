@@ -12,11 +12,11 @@ package writer_test
 //     measures the recording/encoding path rather than disk sync latency.
 //   - CheckpointBytes: -1 disables in-loop volume checkpoints — the ingest
 //     path is the measurement target, checkpoint pauses are not.
-//   - changesets are pre-built before the timer: the timed loop only
-//     Submits, so changeset construction noise stays out of B/op. When
-//     b.N exceeds the pool (default -benchtime=1s runs), the pool cycles
-//     and the extra iterations become upserts — same record+flush work,
-//     bounded memory. Run with -benchtime=1000x for a pure-append pass.
+//   - changesets are pre-built before the timer into a pool sized to b.N:
+//     the timed loop only Submits (construction noise stays out of B/op)
+//     and every iteration is a fresh-key append — pure ingest under any
+//     -benchtime. The pool's memory scales with b.N (the cost of skipping
+//     construction inside the loop).
 //   - no vector index: this is the PLAIN node/edge batch whose pendOp
 //     amplification the audit flagged (~all five payloads embedded per op).
 
@@ -99,5 +99,6 @@ func benchWrapperIngest(b *testing.B, csSize int) {
 	}
 }
 
+// csSize is the per-kind count: ops per Submit = 2*csSize (nodes + edges).
 func BenchmarkWrapperIngest512(b *testing.B) { benchWrapperIngest(b, 256) }
 func BenchmarkWrapperIngest4K(b *testing.B)  { benchWrapperIngest(b, 2048) }

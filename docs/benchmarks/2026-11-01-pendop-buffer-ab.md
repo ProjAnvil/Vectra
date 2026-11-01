@@ -18,7 +18,9 @@ benchmark) before adopting any layout change; the measurement can veto.
     (internal/writer/ingest_bench_test.go): full `Handle.Submit` round-trip
     against a WAL-attached graph (`ModeInterval`, volume checkpoints
     disabled), one pre-built plain changeset (nodes then edges, no vectors)
-    per iteration; `-benchtime=1000x` = pure append ingest.
+    per iteration; the pre-built pool is sized to b.N, so every iteration
+    is a fresh-key append — pure ingest under any -benchtime (the recorded
+    runs used -benchtime=1000x on both sides of the A/B).
   - `BenchmarkPendOpBufferFootprint` (pendop_bench_test.go): peak
     recording-buffer bytes per recorded op, measured inside one `g.Batch`
     of 4096 node upserts + 2048 edge upserts (2:1 mix), computed

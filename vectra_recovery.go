@@ -50,7 +50,11 @@ type pendEntry struct {
 // (the old 240 B/op pendOp — 5x the 48 B/op a 2:1 node:edge mix needs,
 // see docs/benchmarks/2026-11-01-pendop-buffer-ab.md). The order log is
 // the single source of original-op-order truth flushPending replays; the
-// per-kind indices are dense within their own slice only.
+// per-kind indices are dense within their own slice only. Write-side
+// invariant: every recorder appends the order entry and its payload as one
+// statement pair — order entry first, its idx bound to the payload's dense
+// index — so an order entry must never exist without its payload (and vice
+// versa); rewind and flushPending rely on that pairing.
 type pendBuf struct {
 	order    []pendEntry // one entry per recorded op, in op order
 	nodes    []NodeUpsert
@@ -119,6 +123,8 @@ func (p *pendBuf) rewind(i int) {
 		case opUnique:
 			np.order = append(np.order, pendEntry{kind: opUnique, idx: uint32(len(np.ucDecls))})
 			np.ucDecls = append(np.ucDecls, p.ucDecls[e.idx])
+		default:
+			panic(fmt.Sprintf("vectra: unhandled pend kind %d in rewind", e.kind))
 		}
 	}
 	*p = np
