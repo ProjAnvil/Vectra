@@ -437,7 +437,7 @@ func (g *Graph) applyUniqueDecls(list []wal.UniqueConstraint) {
 }
 
 // recordUniqueDecls logs the full current unique-constraint declaration list
-// as one opUnique pendOp at the current op position (log-first; flushPending
+// as one opUnique pend entry at the current op position (log-first; flushPending
 // coalesces it with adjacent declaration ops into the IndexDecl run,
 // last-in-run wins). The slice is ALWAYS built non-nil — including the empty
 // list after the last constraint drops — so a drop-all declaration survives
@@ -460,7 +460,9 @@ func (g *Graph) recordUniqueDecls() {
 		}
 		return cmp.Compare(a.Prop, b.Prop)
 	})
-	g.pendOps = append(g.pendOps, pendOp{kind: opUnique, uniqueDecls: decls})
+	p := &g.pendOps
+	p.order = append(p.order, pendEntry{kind: opUnique, idx: uint32(len(p.ucDecls))})
+	p.ucDecls = append(p.ucDecls, decls)
 	_ = g.maybeFlush()
 }
 

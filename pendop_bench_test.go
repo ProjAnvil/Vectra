@@ -22,14 +22,23 @@ import (
 	"path/filepath"
 	"testing"
 	"unsafe"
+
+	"github.com/projanvil/vectra/internal/wal"
 )
 
 // pendBufBytes returns the live bytes held by the WAL recording buffer at
-// its current fill level, per the formula above. This file's baseline
-// version measures the single pendOp slice; the layout change keeps the
-// same function contract (peak bytes of the whole recording buffer).
+// its current fill level, per the formula above. Covers the per-kind
+// payload-slice layout (the baseline single-slice form measured
+// len(pendOps) * unsafe.Sizeof(pendOp) — same formula, one slice).
 func pendBufBytes(g *Graph) uint64 {
-	return uint64(len(g.pendOps)) * uint64(unsafe.Sizeof(pendOp{}))
+	p := &g.pendOps
+	return uint64(len(p.order))*uint64(unsafe.Sizeof(pendEntry{})) +
+		uint64(len(p.nodes))*uint64(unsafe.Sizeof(NodeUpsert{})) +
+		uint64(len(p.edges))*uint64(unsafe.Sizeof(EdgeUpsert{})) +
+		uint64(len(p.edgeDels))*uint64(unsafe.Sizeof(EdgeDelete{})) +
+		uint64(len(p.strs))*uint64(unsafe.Sizeof("")) +
+		uint64(len(p.vecDecls))*uint64(unsafe.Sizeof([]wal.VectorIndexDecl(nil))) +
+		uint64(len(p.ucDecls))*uint64(unsafe.Sizeof([]wal.UniqueConstraint(nil)))
 }
 
 // BenchmarkPendOpBufferFootprint records one plain ingest batch (4096 node
@@ -66,7 +75,7 @@ func BenchmarkPendOpBufferFootprint(b *testing.B) {
 					b.Fatal(err)
 				}
 			}
-			ops = len(g.pendOps)
+			ops = len(g.pendOps.order)
 			buf = pendBufBytes(g)
 		}); err != nil {
 			b.Fatal(err)
@@ -83,7 +92,7 @@ func BenchmarkPendOpBufferFootprint(b *testing.B) {
 // BenchmarkPendOpSizes prints the struct widths behind the buffer numbers
 // so a reviewer can re-derive them without a debugger.
 func BenchmarkPendOpSizes(b *testing.B) {
-	b.ReportMetric(float64(unsafe.Sizeof(pendOp{})), "pendOp-B")
+	b.ReportMetric(float64(unsafe.Sizeof(pendEntry{})), "pendEntry-B")
 	b.ReportMetric(float64(unsafe.Sizeof(NodeUpsert{})), "NodeUpsert-B")
 	b.ReportMetric(float64(unsafe.Sizeof(EdgeUpsert{})), "EdgeUpsert-B")
 	b.ReportMetric(float64(unsafe.Sizeof(EdgeDelete{})), "EdgeDelete-B")

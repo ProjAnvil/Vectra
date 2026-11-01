@@ -376,7 +376,7 @@ type Graph struct {
 	compactFlight     *compactFlight
 	compactFlightHook func() error
 	dbPath            string      // session path; checkpoints write <dbPath minus ext>-<lsn>.db next to it
-	pendOps           []pendOp    // recorded-but-unflushed ops (inside Batch, or single writes mid-record)
+	pendOps           pendBuf     // recorded-but-unflushed ops: order log + per-kind payloads (audit F-11)
 	batching          bool        // inside Batch: records accumulate instead of flushing
 	closed            atomic.Bool // after Close: writes fail with ErrClosed, queries legal
 
@@ -824,7 +824,7 @@ func (g *Graph) AddNode(key, label string, props map[string]any) (NodeID, error)
 	}
 	// Unique-constraint gate (spec 2026-10-30 §2.3): the check runs at ENTRY,
 	// before recordNode and before the ID ratchet advances, so a rejected
-	// write leaves WAL frames, pendOps, the builder, the registry, the ratchet
+	// write leaves WAL frames, the pend buffer, the builder, the registry, the ratchet
 	// and the vector intake untouched. The pre-image fetch must precede every
 	// mutation of the node's records (the builder overwrites them below).
 	pre := g.uniquePreState(key)
@@ -1054,7 +1054,7 @@ func (g *Graph) Batch(fn func(*Graph)) error {
 		g.batching = false
 		if g.builder != nil {
 			// Panic path: drop the un-published layer (the buffered ops stay
-			// in pendOps for the next flush, T2 discipline).
+			// in the pend buffer for the next flush, T2 discipline).
 			g.builder = nil
 			g.bNodeIDs, g.bEdgeIDs = nil, nil
 			g.bLiveNodes, g.bKilled, g.bIndex, g.bFTS = nil, nil, nil, nil
@@ -1100,7 +1100,7 @@ func (g *Graph) Batch(fn func(*Graph)) error {
 //
 // Append/fsync failure discipline (see the op-recorder comment): if a frame
 // Append ever returned an error, the caller must retry the flush (Batch/
-// Close) or abandon the graph — buffered ops stay in pendOps and are
+// Close) or abandon the graph — buffered ops stay in the pend buffer and are
 // re-attempted by the next flush, because a frame whose fsync reported
 // failure may still be on disk.
 //

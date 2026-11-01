@@ -501,7 +501,7 @@ func (svc *service) injectBatch(_ context.Context, _ *mcp.CallToolRequest, in in
 	// lenient deterministic-skip discipline: an edge whose endpoints do not
 	// exist is skipped and counted, never fatal. The boundary's own flush
 	// error keeps the same lenient surface — the ops already hit memory and
-	// stay buffered in pendOps for the next successful flush (see Batch's
+	// stay buffered in the pend buffer for the next successful flush (see Batch's
 	// direct-mode limitation note).
 	var abort error
 	_ = svc.live.Batch(func(g *vectra.Graph) {

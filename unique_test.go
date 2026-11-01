@@ -226,7 +226,7 @@ func TestUniqueAddNodeViolationZeroSideEffects(t *testing.T) {
 	}
 
 	lsn := g.wal.LastLSN()
-	pend := len(g.pendOps)
+	pend := len(g.pendOps.order)
 	ratchet := g.nextNode
 	reg := snapshotUnique(g)
 
@@ -242,8 +242,8 @@ func TestUniqueAddNodeViolationZeroSideEffects(t *testing.T) {
 	if g.wal.LastLSN() != lsn {
 		t.Fatalf("rejected write advanced the WAL: %d -> %d", lsn, g.wal.LastLSN())
 	}
-	if len(g.pendOps) != pend {
-		t.Fatalf("rejected write left pendOps: %d -> %d", pend, len(g.pendOps))
+	if len(g.pendOps.order) != pend {
+		t.Fatalf("rejected write left pendOps: %d -> %d", pend, len(g.pendOps.order))
 	}
 	if g.nextNode != ratchet {
 		t.Fatalf("rejected write advanced the ID ratchet: %d -> %d", ratchet, g.nextNode)

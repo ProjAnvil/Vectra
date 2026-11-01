@@ -372,7 +372,9 @@ func (g *Graph) recordVecDecls() {
 	for _, vi := range reg {
 		decls = append(decls, vi.decl.toWal())
 	}
-	g.pendOps = append(g.pendOps, pendOp{kind: opVecIndex, vecDecls: decls})
+	p := &g.pendOps
+	p.order = append(p.order, pendEntry{kind: opVecIndex, idx: uint32(len(p.vecDecls))})
+	p.vecDecls = append(p.vecDecls, decls)
 	_ = g.maybeFlush()
 }
 

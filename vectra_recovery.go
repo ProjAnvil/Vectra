@@ -1,4 +1,4 @@
-// WAL session machinery: pendOp recorder + flusher, Open recovery + migration
+// WAL session machinery: pend buffer recorder + flusher, Open recovery + migration
 // gate, tiered checkpoints, and the async compact flight.
 
 package vectra
@@ -18,7 +18,7 @@ import (
 	"github.com/projanvil/vectra/internal/wal"
 )
 
-// opKind orders pendOp entries exactly like the Changeset apply order:
+// opKind orders pend buffer entries exactly like the Changeset apply order:
 // node upserts → edge upserts → edge deletes → node deletes. opIndex is
 // outside that order: it never enters a Changeset — flushPending emits each
 // run of index declarations as its own IndexDecl frame, preserving op order.
@@ -35,21 +35,104 @@ const (
 	opUnique   // unique-constraint declaration-class: rides IndexDecl frames too
 )
 
-// pendOp is one recorded write, kept in original order until flush.
-type pendOp struct {
-	kind        opKind
-	node        NodeUpsert
-	edge        EdgeUpsert
-	edel        EdgeDelete
-	ndel        string
-	idx         string                 // opIndex/opFTS: declared property key
-	vecDecls    []wal.VectorIndexDecl  // opVecIndex: full declaration list
-	uniqueDecls []wal.UniqueConstraint // opUnique: full declaration list
+// pendEntry is one line of the pend order log: the op's kind plus the
+// index of its payload in the matching per-kind slice of pendBuf. idx is
+// uint32 — a single unflushed buffer holds at most 4G ops of one kind,
+// far beyond any real batch (>160 GB of payloads alone).
+type pendEntry struct {
+	kind opKind
+	idx  uint32
+}
+
+// pendBuf is the recorded-write buffer (audit F-11): a compact order log
+// plus one payload slice per kind, so an op costs its payload plus a
+// 2-word log entry instead of a struct embedding every kind's payload
+// (the old 240 B/op pendOp — 5x the 48 B/op a 2:1 node:edge mix needs,
+// see docs/benchmarks/2026-11-01-pendop-buffer-ab.md). The order log is
+// the single source of original-op-order truth flushPending replays; the
+// per-kind indices are dense within their own slice only.
+type pendBuf struct {
+	order    []pendEntry // one entry per recorded op, in op order
+	nodes    []NodeUpsert
+	edges    []EdgeUpsert
+	edgeDels []EdgeDelete
+	strs     []string                 // opNodeDelete / opIndex / opFTS: the single string payload
+	vecDecls [][]wal.VectorIndexDecl  // opVecIndex: full declaration list, one per op
+	ucDecls  [][]wal.UniqueConstraint // opUnique: full declaration list, one per op
+}
+
+// pendRetainCap bounds the backing arrays reset() keeps between batches:
+// ordinary batches (thousands of ops) reuse their arrays, so batch flushes
+// stop paying append-amortized growth allocations, while a one-off giant
+// batch releases its arrays instead of pinning them forever.
+const pendRetainCap = 1 << 16 // entries per slice
+
+// pendTrunc empties s for reuse: zeroed first so no payload reference
+// (key string, Props map) outlives the flush, then re-based to len 0.
+func pendTrunc[T any](s []T) []T {
+	if cap(s) > pendRetainCap {
+		return nil
+	}
+	clear(s)
+	return s[:0]
+}
+
+// reset empties the buffer after a successful flush, retaining the backing
+// arrays (bounded by pendRetainCap).
+func (p *pendBuf) reset() {
+	p.order = pendTrunc(p.order)
+	p.nodes = pendTrunc(p.nodes)
+	p.edges = pendTrunc(p.edges)
+	p.edgeDels = pendTrunc(p.edgeDels)
+	p.strs = pendTrunc(p.strs)
+	p.vecDecls = pendTrunc(p.vecDecls)
+	p.ucDecls = pendTrunc(p.ucDecls)
+}
+
+// rewind drops the flushed prefix [0:i) after a failed Append and re-bases
+// the payload slices onto the surviving order-log entries, so the next
+// flush re-attempts exactly the unflushed ops, in the original order.
+// Fresh slices (no capacity retention): the error path is rare, and the
+// retry buffer must never alias the arrays the caller may still inspect.
+func (p *pendBuf) rewind(i int) {
+	if i == 0 {
+		return
+	}
+	np := pendBuf{}
+	for _, e := range p.order[i:] {
+		switch e.kind {
+		case opNode:
+			np.order = append(np.order, pendEntry{kind: opNode, idx: uint32(len(np.nodes))})
+			np.nodes = append(np.nodes, p.nodes[e.idx])
+		case opEdge:
+			np.order = append(np.order, pendEntry{kind: opEdge, idx: uint32(len(np.edges))})
+			np.edges = append(np.edges, p.edges[e.idx])
+		case opEdgeDelete:
+			np.order = append(np.order, pendEntry{kind: opEdgeDelete, idx: uint32(len(np.edgeDels))})
+			np.edgeDels = append(np.edgeDels, p.edgeDels[e.idx])
+		case opNodeDelete, opIndex, opFTS:
+			np.order = append(np.order, pendEntry{kind: e.kind, idx: uint32(len(np.strs))})
+			np.strs = append(np.strs, p.strs[e.idx])
+		case opVecIndex:
+			np.order = append(np.order, pendEntry{kind: opVecIndex, idx: uint32(len(np.vecDecls))})
+			np.vecDecls = append(np.vecDecls, p.vecDecls[e.idx])
+		case opUnique:
+			np.order = append(np.order, pendEntry{kind: opUnique, idx: uint32(len(np.ucDecls))})
+			np.ucDecls = append(np.ucDecls, p.ucDecls[e.idx])
+		}
+	}
+	*p = np
+}
+
+// isDeclKind reports whether k is one of the declaration-class kinds that
+// ride IndexDecl frames (typed keys, vector, full-text, unique).
+func isDeclKind(k opKind) bool {
+	return k == opIndex || k == opVecIndex || k == opFTS || k == opUnique
 }
 
 // --- WAL op recorder ---------------------------------------------------------
 //
-// When a WAL is attached, each successful write method records one pendOp
+// When a WAL is attached, each successful write method records one pend entry
 // BEFORE mutating memory (log-first for single writes). Outside Batch the op
 // flushes immediately as its own frame — one fsync per write in ModeAlways,
 // the documented cost of unbatched direct-mode writes — and the layer
@@ -69,7 +152,7 @@ type pendOp struct {
 // that returns a WAL error must be retried or the graph abandoned — never
 // silently continued. A failed Append may still have put the frame on disk
 // (a write/fsync can fail after partial success), and any ops it did not
-// persist stay buffered in pendOps, so the next flush (Batch boundary, or
+// persist stay buffered in the pend buffer, so the next flush (Batch boundary, or
 // Close) re-attempts exactly those; continuing to write without a
 // successful flush risks losing the earlier ops.
 
@@ -77,7 +160,9 @@ func (g *Graph) recordNode(key, label string, props map[string]any) error {
 	if g.wal == nil {
 		return nil
 	}
-	g.pendOps = append(g.pendOps, pendOp{kind: opNode, node: NodeUpsert{Key: key, Label: label, Props: propval.Copy(props)}})
+	p := &g.pendOps
+	p.order = append(p.order, pendEntry{kind: opNode, idx: uint32(len(p.nodes))})
+	p.nodes = append(p.nodes, NodeUpsert{Key: key, Label: label, Props: propval.Copy(props)})
 	return g.maybeFlush()
 }
 
@@ -85,10 +170,12 @@ func (g *Graph) recordEdge(srcKey, dstKey, label string, props map[string]any, a
 	if g.wal == nil {
 		return nil
 	}
-	g.pendOps = append(g.pendOps, pendOp{kind: opEdge, edge: EdgeUpsert{
+	p := &g.pendOps
+	p.order = append(p.order, pendEntry{kind: opEdge, idx: uint32(len(p.edges))})
+	p.edges = append(p.edges, EdgeUpsert{
 		SrcKey: srcKey, DstKey: dstKey, Label: label,
 		Props: propval.Copy(props), AllowParallel: allowParallel,
-	}})
+	})
 	return g.maybeFlush()
 }
 
@@ -96,7 +183,9 @@ func (g *Graph) recordEdgeDelete(srcKey, dstKey, label string) error {
 	if g.wal == nil {
 		return nil
 	}
-	g.pendOps = append(g.pendOps, pendOp{kind: opEdgeDelete, edel: EdgeDelete{SrcKey: srcKey, DstKey: dstKey, Label: label}})
+	p := &g.pendOps
+	p.order = append(p.order, pendEntry{kind: opEdgeDelete, idx: uint32(len(p.edgeDels))})
+	p.edgeDels = append(p.edgeDels, EdgeDelete{SrcKey: srcKey, DstKey: dstKey, Label: label})
 	return g.maybeFlush()
 }
 
@@ -104,7 +193,9 @@ func (g *Graph) recordNodeDelete(key string) error {
 	if g.wal == nil {
 		return nil
 	}
-	g.pendOps = append(g.pendOps, pendOp{kind: opNodeDelete, ndel: key})
+	p := &g.pendOps
+	p.order = append(p.order, pendEntry{kind: opNodeDelete, idx: uint32(len(p.strs))})
+	p.strs = append(p.strs, key)
 	return g.maybeFlush()
 }
 
@@ -112,17 +203,21 @@ func (g *Graph) recordIndexDecl(key string) error {
 	if g.wal == nil {
 		return nil
 	}
-	g.pendOps = append(g.pendOps, pendOp{kind: opIndex, idx: key})
+	p := &g.pendOps
+	p.order = append(p.order, pendEntry{kind: opIndex, idx: uint32(len(p.strs))})
+	p.strs = append(p.strs, key)
 	return g.maybeFlush()
 }
 
 // recordFTSDecl is recordIndexDecl for the full-text kind (FTS plan): an
-// opFTS pendOp coalesced into the same IndexDecl frame run at flush.
+// opFTS pend entry coalesced into the same IndexDecl frame run at flush.
 func (g *Graph) recordFTSDecl(key string) error {
 	if g.wal == nil {
 		return nil
 	}
-	g.pendOps = append(g.pendOps, pendOp{kind: opFTS, idx: key})
+	p := &g.pendOps
+	p.order = append(p.order, pendEntry{kind: opFTS, idx: uint32(len(p.strs))})
+	p.strs = append(p.strs, key)
 	return g.maybeFlush()
 }
 
@@ -141,53 +236,53 @@ func (g *Graph) maybeFlush() error {
 // retried Close) does not silently drop them.
 func (g *Graph) flushPending() error {
 	if g.wal == nil {
-		g.pendOps = nil
+		g.pendOps = pendBuf{}
 		return nil
 	}
+	p := &g.pendOps
 	i := 0
-	for i < len(g.pendOps) {
-		if g.pendOps[i].kind == opIndex || g.pendOps[i].kind == opVecIndex || g.pendOps[i].kind == opFTS || g.pendOps[i].kind == opUnique {
+	for i < len(p.order) {
+		if isDeclKind(p.order[i].kind) {
 			j := i
 			keys := make([]string, 0, 4)
 			var ftsKeys []string
 			var vecs []wal.VectorIndexDecl
 			var ucs []wal.UniqueConstraint
-			for j < len(g.pendOps) && (g.pendOps[j].kind == opIndex || g.pendOps[j].kind == opVecIndex || g.pendOps[j].kind == opFTS || g.pendOps[j].kind == opUnique) {
-				switch g.pendOps[j].kind {
+			for j < len(p.order) && isDeclKind(p.order[j].kind) {
+				switch p.order[j].kind {
 				case opIndex:
-					keys = append(keys, g.pendOps[j].idx)
+					keys = append(keys, p.strs[p.order[j].idx])
 				case opFTS:
-					ftsKeys = append(ftsKeys, g.pendOps[j].idx)
+					ftsKeys = append(ftsKeys, p.strs[p.order[j].idx])
 				case opUnique:
-					ucs = g.pendOps[j].uniqueDecls
+					ucs = p.ucDecls[p.order[j].idx]
 				default:
-					vecs = g.pendOps[j].vecDecls
+					vecs = p.vecDecls[p.order[j].idx]
 				}
 				j++
 			}
 			if _, err := g.wal.AppendIndex(IndexDecl{Keys: keys, VectorIndexes: vecs, FullTextKeys: ftsKeys, UniqueConstraints: ucs}); err != nil {
-				g.pendOps = append([]pendOp(nil), g.pendOps[i:]...)
+				p.rewind(i)
 				return err
 			}
 			i = j
 			continue
 		}
 		j := i + 1
-		for j < len(g.pendOps) && g.pendOps[j].kind != opIndex && g.pendOps[j].kind != opVecIndex && g.pendOps[j].kind != opFTS && g.pendOps[j].kind != opUnique &&
-			g.pendOps[j].kind >= g.pendOps[j-1].kind {
+		for j < len(p.order) && !isDeclKind(p.order[j].kind) && p.order[j].kind >= p.order[j-1].kind {
 			j++
 		}
 		cs := Changeset{Version: changesetVersion}
-		for _, op := range g.pendOps[i:j] {
-			switch op.kind {
+		for _, e := range p.order[i:j] {
+			switch e.kind {
 			case opNode:
-				cs.Nodes = append(cs.Nodes, op.node)
+				cs.Nodes = append(cs.Nodes, p.nodes[e.idx])
 			case opEdge:
-				cs.Edges = append(cs.Edges, op.edge)
+				cs.Edges = append(cs.Edges, p.edges[e.idx])
 			case opEdgeDelete:
-				cs.EdgeDeletes = append(cs.EdgeDeletes, op.edel)
+				cs.EdgeDeletes = append(cs.EdgeDeletes, p.edgeDels[e.idx])
 			case opNodeDelete:
-				cs.NodeDeletes = append(cs.NodeDeletes, op.ndel)
+				cs.NodeDeletes = append(cs.NodeDeletes, p.strs[e.idx])
 			}
 		}
 		// Frame selection (spec 2026-10-21 §1.2): declared vector props ride
@@ -196,12 +291,12 @@ func (g *Graph) flushPending() error {
 		// logging call — declarations can change between batches and a cached
 		// map would go stale.
 		if _, err := g.wal.AppendHoisted(cs, g.vecPropDecls()); err != nil {
-			g.pendOps = append([]pendOp(nil), g.pendOps[i:]...)
+			p.rewind(i)
 			return err
 		}
 		i = j
 	}
-	g.pendOps = nil
+	p.reset()
 	return nil
 }
 
