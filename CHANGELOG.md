@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.4] - 2026-11-01
+
+Internal-quality follow-up to the v0.14.3 audit-closure arc (review-ledger
+leftovers); no API, wire or behavior changes. Allocation gates
+byte-identical.
+
+### Fixed
+
+- `flushPending`'s changeset-build switch now panics on an unknown pend
+  kind, matching the rewind guard added in v0.14.3. This closes the last
+  silent-drop hole in the WAL frame builder: a future ninth `opKind` would
+  have failed loudly in rewind's retry path but silently skipped the op
+  during frame construction, losing it from the persisted WAL without a
+  signal. Unreachable for the eight kinds that exist today.
+
+### Changed
+
+- Coupling-surface documentation polish from the same review: the
+  debug-build `ClaimWriter` doc comment now starts with the symbol name
+  (godoc summary convention; the release twin already complied), and the
+  package-doc coupling section states that its type-level lists include
+  the method-level markings (`MergeCapture.Seal`, `VecHandle.Drain`),
+  reconciling the 21-name enumeration with the 23 per-symbol annotations.
+
 ## [0.14.3] - 2026-11-01
 
 Closure of the three findings deferred by the 2026-11-01 audit remediation
