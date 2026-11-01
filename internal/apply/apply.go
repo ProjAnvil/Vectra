@@ -34,6 +34,22 @@ const (
 	KindNodeDeletes             // wal.Changeset.NodeDeletes
 )
 
+// String names the lane (KindNodes & co.) so diagnostics — the stops() panic,
+// test failure output, caller error strings — read names, not ints.
+func (k Kind) String() string {
+	switch k {
+	case KindNodes:
+		return "KindNodes"
+	case KindEdges:
+		return "KindEdges"
+	case KindEdgeDeletes:
+		return "KindEdgeDeletes"
+	case KindNodeDeletes:
+		return "KindNodeDeletes"
+	}
+	panic(fmt.Sprintf("apply: unknown kind %d", k))
+}
+
 // Policy is the explicit error strategy of one apply: for each lane, whether
 // an engine error is FATAL (the walk stops there; later ops never run) or is
 // TOLERATED (the walk continues; the lane's observer decides how to count
@@ -73,6 +89,20 @@ func (p Policy) stops(k Kind) bool {
 		return k == KindNodes
 	case NodesAndDeletesStop:
 		return k == KindNodes || k == KindNodeDeletes
+	}
+	panic(fmt.Sprintf("apply: unknown policy %d", p))
+}
+
+// String names the policy (StopAtFirst & co.) — same role as Kind.String,
+// same panic-default discipline as stops.
+func (p Policy) String() string {
+	switch p {
+	case StopAtFirst:
+		return "StopAtFirst"
+	case NodesStopRestSkip:
+		return "NodesStopRestSkip"
+	case NodesAndDeletesStop:
+		return "NodesAndDeletesStop"
 	}
 	panic(fmt.Sprintf("apply: unknown policy %d", p))
 }

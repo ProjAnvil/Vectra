@@ -576,11 +576,15 @@ func (svc *service) injectBatch(_ context.Context, _ *mcp.CallToolRequest, in in
 		})
 		if fatal.Err != nil {
 			// NodesAndDeletesStop's fatal lanes are exactly node upserts and
-			// node deletes — the two abort shapes below.
+			// node deletes — the two abort shapes below. Any other kind here
+			// means the policy drifted; panic loudly instead of silently
+			// mislabeling the abort as a node upsert.
 			if fatal.Kind == apply.KindNodeDeletes {
 				abort = fmt.Errorf("mcp: inject_batch aborted at deleteNodes[%d] (%s): %w"+abortDisclosure, fatal.Index, fatal.Key, fatal.Err)
-			} else {
+			} else if fatal.Kind == apply.KindNodes {
 				abort = fmt.Errorf("mcp: inject_batch aborted at nodes[%d] (%s): %w"+abortDisclosure, fatal.Index, fatal.Key, fatal.Err)
+			} else {
+				panic(fmt.Sprintf("mcp: inject_batch: unexpected fatal kind %v", fatal.Kind))
 			}
 		}
 	})
