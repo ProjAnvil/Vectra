@@ -38,6 +38,21 @@
 // translation); the merged base lives in internal/engine, micro-layers in
 // internal/delta, query algorithms in internal/traverse, encode/decode in
 // internal/store.
+//
+// Wrapper-mode coupling surface — internal/writer only, not covered by API
+// stability: wrapper mode (internal/writer, the single-writer wrapper that
+// runs the background merger, async compaction, the vector folder lane and
+// the writer discipline) drives the engine through a fixed set of exported
+// symbols. Wrapper-only — direct-mode callers never touch them:
+// CaptureMerge, PublishMerge, the MergeCapture/MergeResult pair,
+// RepairAfterRebase, SealForClose, TryAsyncCompact, PollAsyncCompact,
+// WaitAsyncCompact, AsyncCompactActive, BaseEdgeCount, VecHandle,
+// VectorHandles, VectorOverlayPressure, ClaimWriter, YieldWriter. Shared
+// with direct mode — wrapper-coupled but also documented direct-mode
+// utilities or plain observability: FlushPend, LayerPressure,
+// VectorOverlayLen. All of them are engine coupling rather than supported
+// API: they are excluded from API stability and may change in any release
+// to serve the wrapper.
 package vectra
 
 import (
@@ -1531,6 +1546,9 @@ func (g *Graph) Seal() error { return g.seal(false) }
 // for internal/writer's session-end Seal (the RepairAfterRebase pattern);
 // the compact tier needs nothing extra, its own forest write advances the
 // drift markers.
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 func (g *Graph) SealForClose() error { return g.seal(true) }
 
 // seal is Seal's body; closeShape routes the light tier through the

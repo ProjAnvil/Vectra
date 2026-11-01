@@ -14,9 +14,15 @@ package vectra
 // window's read-side flush in every build: wrapper-mode readers must skip
 // it); the goroutine-token claim itself is a debug-build diagnostic. See
 // writer_hook.go.
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 func (g *Graph) ClaimWriter() { g.writerAttached.Store(true) }
 
 // YieldWriter clears the wrapper-attached flag; see writer_hook.go.
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 func (g *Graph) YieldWriter() { g.writerAttached.Store(false) }
 
 // checkWriter never rejects in release builds; see writer_hook.go.

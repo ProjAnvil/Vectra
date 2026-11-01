@@ -19,6 +19,9 @@ import (
 // It also sets writerAttached (in BOTH builds — see the release twin): the
 // absorption window's read-side flush skips wrapper-mode graphs, whose
 // readers are never the writer.
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 func (g *Graph) ClaimWriter() {
 	g.writerTok.Store(goroutineToken())
 	g.writerAttached.Store(true)
@@ -26,6 +29,9 @@ func (g *Graph) ClaimWriter() {
 
 // YieldWriter releases the writer claim: writes from any goroutine are
 // legal again (direct mode resumes, e.g. after Handle.Close).
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 func (g *Graph) YieldWriter() {
 	g.writerTok.Store(0)
 	g.writerAttached.Store(false)

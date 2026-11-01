@@ -665,13 +665,24 @@ func (g *Graph) vecOverlayPressure() bool {
 // VecHandle is the folder-lane surface of one index for the wrapper-mode
 // writer (spec D10): drain packs overlay chunks and swaps the snapshot
 // head; the return reports remaining backlog.
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 type VecHandle struct {
 	vi *vecIndex
 }
 
+// Drain packs up to maxChunks pending overlay chunks into a segment and
+// swaps the index's snapshot head; it reports whether backlog remains.
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 func (v *VecHandle) Drain(maxChunks int) bool { return v.vi.drain(maxChunks) }
 
 // VectorHandles exposes the folder-lane handles (wrapper merger use).
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 func (g *Graph) VectorHandles() []*VecHandle {
 	reg := g.vecReg()
 	out := make([]*VecHandle, 0, len(reg))
@@ -683,10 +694,17 @@ func (g *Graph) VectorHandles() []*VecHandle {
 
 // VectorOverlayPressure reports whether any index's overlay reached the
 // pack size (the wrapper's afterBatch trigger).
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 func (g *Graph) VectorOverlayPressure() bool { return g.vecOverlayPressure() }
 
 // VectorOverlayLen reports one index's pending entry count (folder-lane
 // observability for tests and operators).
+//
+// Wrapper-mode coupling surface: exported beside the wrapper's folder-lane
+// surface, but consumed in practice only as test/operator observability
+// (no non-test wrapper call site); not covered by API stability.
 func (g *Graph) VectorOverlayLen(name string) int {
 	if vi := g.vecIndexByName(name); vi != nil {
 		vi.mu.Lock()

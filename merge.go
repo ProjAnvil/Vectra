@@ -54,6 +54,9 @@ import (
 // MergeCapture is an immutable pin of one generation prefix: the base plus
 // the first n micro-layers as of capture time. Safe to hold across writer
 // activity; Seal may be retried against it.
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 type MergeCapture struct {
 	base   *engine.Snapshot
 	layers []*delta.Layer // the captured prefix, oldest first
@@ -61,6 +64,9 @@ type MergeCapture struct {
 
 // MergeResult is the sealed output of one captured prefix. Single-use: the
 // live-key sets are consumed (mutated) by PublishMerge's count fold.
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 type MergeResult struct {
 	snap      *engine.Snapshot      // the sealed new base
 	baseKeys  map[string]NodeID     // union node key -> new dense id
@@ -71,6 +77,9 @@ type MergeResult struct {
 // CaptureMerge pins the current generation prefix for a background merge.
 // Reading the layers prefix is race-free: layers are immutable once
 // published, and the writer only ever appends past the captured length.
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 func (g *Graph) CaptureMerge() *MergeCapture {
 	v := g.view.Load()
 	return &MergeCapture{base: v.base, layers: v.layers}
@@ -79,6 +88,10 @@ func (g *Graph) CaptureMerge() *MergeCapture {
 // LayerPressure reports the unmerged layer count and the cumulative edge
 // records across those layers — the two background-merge triggers of spec
 // §3.1 (layer-count and delta-volume thresholds). Safe from any goroutine.
+//
+// Wrapper-mode coupling surface: internal/writer's merge triggers (other
+// modules' tests also read it as an observability probe); not covered by
+// API stability.
 func (g *Graph) LayerPressure() (layers int, layerEdges int) {
 	v := g.view.Load()
 	for _, l := range v.layers {
@@ -91,6 +104,9 @@ func (g *Graph) LayerPressure() (layers int, layerEdges int) {
 // the volume-proportional merge threshold (internal/writer folds when the
 // unmerged stack carries max(MergeEdges, BaseEdgeCount) edges, keeping the
 // fold interval proportional to the base). Safe from any goroutine.
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 func (g *Graph) BaseEdgeCount() int {
 	return g.view.Load().base.EdgeCount()
 }
@@ -100,6 +116,9 @@ func (g *Graph) BaseEdgeCount() int {
 // on any goroutine while the writer continues. The result carries the new
 // base's key index and the union's live-key sets (input to PublishMerge's
 // count fold).
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 func (c *MergeCapture) Seal() (*MergeResult, error) {
 	pin := &genView{base: c.base, layers: c.layers}
 	nodes, edges, labels, indexKeys, ftsKeys := pin.unionRecords()
@@ -132,6 +151,9 @@ func (c *MergeCapture) Seal() (*MergeResult, error) {
 // Staleness: if a full merge superseded the capture (the current base is
 // no longer the captured base, or the stack shrank), the publish is a
 // no-op returning false — the rebase is simply dropped.
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 func (g *Graph) PublishMerge(c *MergeCapture, r *MergeResult) bool {
 	cur := g.view.Load()
 	if cur.base != c.base || len(cur.layers) < len(c.layers) {
@@ -194,6 +216,9 @@ func (g *Graph) PublishMerge(c *MergeCapture, r *MergeResult) bool {
 // Write-path method (it rewrites writer-private state): run it on the
 // writer goroutine, under the same publication mutex that serializes
 // PublishMerge — internal/writer's loop calls it before every batch.
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 func (g *Graph) RepairAfterRebase() error {
 	if !g.rebaseHappened.Load() {
 		return nil

@@ -742,6 +742,9 @@ type compactFlight struct {
 // its volume checkpoint to a later batch. The pinned view is the CURRENT
 // published generation after a pending flush: export walks it immutably
 // while the writer keeps cutting layers on top.
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 func (g *Graph) TryAsyncCompact() bool {
 	if g.wal == nil || g.compactFlight != nil {
 		return false
@@ -788,6 +791,9 @@ func (g *Graph) runCompactFlight(fl *compactFlight) {
 
 // AsyncCompactActive reports whether a flight is in progress (writer
 // thread).
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 func (g *Graph) AsyncCompactActive() bool { return g.compactFlight != nil }
 
 // PollAsyncCompact completes a finished flight on the writer thread and
@@ -803,6 +809,9 @@ func (g *Graph) AsyncCompactActive() bool { return g.compactFlight != nil }
 //     fully covered) and only the covered segments are dropped - the
 //     discipline is manifest FIRST (the reconciliation invariant makes the
 //     deleted frames unreadable), deletion after.
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 func (g *Graph) PollAsyncCompact() error {
 	fl := g.compactFlight
 	if fl == nil {
@@ -820,6 +829,9 @@ func (g *Graph) PollAsyncCompact() error {
 // completion on the writer thread. Seal/Close call it first: a checkpoint
 // landing while a flight's manifest is pending would race the flight's own
 // re-anchor.
+//
+// Wrapper-mode coupling surface: internal/writer only, not covered by API
+// stability.
 func (g *Graph) WaitAsyncCompact() error {
 	fl := g.compactFlight
 	if fl == nil {

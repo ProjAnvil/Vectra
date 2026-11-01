@@ -112,6 +112,11 @@ func (g *Graph) flushPend() {
 // mode). Useful before handing a graph to another goroutine or reading it
 // from one: unflushed absorbed writes are invisible to readers until the
 // writer flushes (its next query, boundary, or cap).
+//
+// Wrapper-mode coupling surface: internal/writer also calls this at Attach
+// (to materialize the caller's window before claiming the graph); it
+// doubles as a documented direct-mode utility and is not covered by API
+// stability.
 func (g *Graph) FlushPend() { g.flushPend() }
 
 // nodeLive answers "is key a visible node right now" for endpoint
