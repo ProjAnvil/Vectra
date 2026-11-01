@@ -290,6 +290,8 @@ func (g *Graph) flushPending() error {
 				cs.EdgeDeletes = append(cs.EdgeDeletes, p.edgeDels[e.idx])
 			case opNodeDelete:
 				cs.NodeDeletes = append(cs.NodeDeletes, p.strs[e.idx])
+			default:
+				panic(fmt.Sprintf("vectra: unhandled pend kind %d in flushPending", e.kind))
 			}
 		}
 		// Frame selection (spec 2026-10-21 §1.2): declared vector props ride

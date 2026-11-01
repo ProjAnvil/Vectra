@@ -6,8 +6,6 @@ import (
 	"fmt"
 )
 
-// Wrapper-mode writer discipline (spec §2.3 R7), debug implementation.
-//
 // ClaimWriter records the calling goroutine's token (its runtime goroutine
 // id, parsed from a runtime.Stack snapshot — the only portable source).
 // Every write-method entry then asserts the caller is either that
@@ -19,6 +17,8 @@ import (
 // It also sets writerAttached (in BOTH builds — see the release twin): the
 // absorption window's read-side flush skips wrapper-mode graphs, whose
 // readers are never the writer.
+//
+// Wrapper-mode writer discipline (spec §2.3 R7), debug implementation.
 //
 // Wrapper-mode coupling surface: internal/writer only, not covered by API
 // stability.
