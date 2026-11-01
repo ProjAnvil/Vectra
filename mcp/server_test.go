@@ -355,6 +355,14 @@ func TestInjectNodeViolationAborts(t *testing.T) {
 			t.Errorf("error text %q missing %q", errText, want)
 		}
 	}
+	// Exact abort surface (audit F-02 pin): the lane prefix names the failing
+	// slice and key; the disclosure suffix closes the message.
+	if prefix := "mcp: inject_batch aborted at nodes[1] (dup): "; !strings.HasPrefix(errText, prefix) {
+		t.Errorf("error text %q missing prefix %q", errText, prefix)
+	}
+	if suffix := "; earlier items in the batch were applied"; !strings.HasSuffix(errText, suffix) {
+		t.Errorf("error text %q missing suffix %q", errText, suffix)
+	}
 
 	// earlier items stay applied and are immediately visible
 	ok1 := call[struct {
@@ -392,6 +400,14 @@ func TestInjectDeleteMissingNodeAborts(t *testing.T) {
 			t.Errorf("error text %q missing %q", errText, want)
 		}
 	}
+	// Exact abort surface (audit F-02 pin): the delete lane's prefix differs
+	// from the node-write lane's — slice name and key identify the failing op.
+	if prefix := "mcp: inject_batch aborted at deleteNodes[1] (ghost): "; !strings.HasPrefix(errText, prefix) {
+		t.Errorf("error text %q missing prefix %q", errText, prefix)
+	}
+	if suffix := "; earlier items in the batch were applied"; !strings.HasSuffix(errText, suffix) {
+		t.Errorf("error text %q missing suffix %q", errText, suffix)
+	}
 
 	// "a" was deleted before the abort; "b" (written, not deleted) stays.
 	if text := callErr(t, cs, "get_node", map[string]any{"key": "a"}); !strings.Contains(text, "does not exist") {
@@ -421,6 +437,95 @@ func TestInjectEdgeSkipStillLenient(t *testing.T) {
 	})
 	if inj.NodesApplied != 2 || inj.EdgesApplied != 1 || inj.EdgesSkipped != 1 {
 		t.Fatalf("edge-skip counts = %+v, want 2 nodes / 1 edge / 1 skipped", inj)
+	}
+}
+
+// TestInjectEdgeDeleteMissUncounted (audit F-02 pin): the edge-DELETE lane is
+// the lenient lane with NO skip counter here — unlike the server lane (which
+// counts a failed edge delete in EdgesSkipped), a deleteEdges entry
+// referencing a nonexistent endpoint is silently dropped: never fatal, no
+// counter moves, and later deletes in the same call still run.
+func TestInjectEdgeDeleteMissUncounted(t *testing.T) {
+	cs := newTestSession(t)
+	call[any](t, cs, "inject_batch", map[string]any{
+		"nodes": []map[string]any{{"key": "a"}, {"key": "b"}},
+		"edges": []map[string]any{{"srcKey": "a", "dstKey": "b", "label": "E"}},
+	})
+
+	inj := call[struct {
+		EdgesDeleted int `json:"edgesDeleted"`
+		EdgesSkipped int `json:"edgesSkipped"`
+	}](t, cs, "inject_batch", map[string]any{
+		"deleteEdges": []map[string]any{
+			{"srcKey": "ghost", "dstKey": "a", "label": "E"}, // endpoint miss: dropped, uncounted
+			{"srcKey": "a", "dstKey": "b", "label": "E"},     // still runs after the miss
+		},
+	})
+	if inj.EdgesDeleted != 1 || inj.EdgesSkipped != 0 {
+		t.Fatalf("edge-delete counts = %+v, want deleted=1 skipped=0 (miss dropped uncounted, not fatal)", inj)
+	}
+	st := call[struct {
+		Nodes int `json:"nodes"`
+		Edges int `json:"edges"`
+	}](t, cs, "stats", nil)
+	if st.Edges != 0 {
+		t.Fatalf("edges after delete = %d, want 0 (the valid delete ran; the miss aborted nothing)", st.Edges)
+	}
+}
+
+// TestInjectPropKeyTiming (audit F-02 pin): the propKeys side-collection's
+// timing differs by lane — node props are collected only for APPLIED nodes
+// (a violating node contributes nothing), while edge props are collected
+// UNCONDITIONALLY for every visited edge, including skipped ones. Observable
+// through seal (propKeys are auto-indexed) + lookup_property's not-indexed
+// error.
+func TestInjectPropKeyTiming(t *testing.T) {
+	cs := newConstraintSession(t) // node "a" owns (Service,name)="alpha"
+
+	// Aborts at nodes[1]: ok1 (env) applied and collected; dup (team) is the
+	// violating op — never collected; after (late) never runs — never collected.
+	callErr(t, cs, "inject_batch", map[string]any{
+		"nodes": []map[string]any{
+			{"key": "ok1", "label": "Service", "props": map[string]any{"env": "prod"}},
+			{"key": "dup", "label": "Service", "props": map[string]any{"name": "alpha", "team": "red"}},
+			{"key": "after", "label": "Service", "props": map[string]any{"late": "x"}},
+		},
+	})
+	// Succeeds: the ghost edge is SKIPPED but visited — its prop key is still
+	// collected; the ok edge's too.
+	inj := call[struct {
+		EdgesApplied int `json:"edgesApplied"`
+		EdgesSkipped int `json:"edgesSkipped"`
+	}](t, cs, "inject_batch", map[string]any{
+		"edges": []map[string]any{
+			{"srcKey": "ok1", "dstKey": "a", "label": "E", "props": map[string]any{"okProp": "1"}},
+			{"srcKey": "ghost", "dstKey": "a", "label": "E", "props": map[string]any{"skipProp": "1"}},
+		},
+	})
+	if inj.EdgesApplied != 1 || inj.EdgesSkipped != 1 {
+		t.Fatalf("edge counts = %+v, want 1 applied / 1 skipped", inj)
+	}
+	call[any](t, cs, "seal", nil)
+
+	// env: applied node — indexed and queryable.
+	env := call[struct {
+		Nodes []string `json:"nodes"`
+	}](t, cs, "lookup_property", map[string]any{"propKey": "env", "propValue": "prod"})
+	if len(env.Nodes) != 1 || env.Nodes[0] != "ok1" {
+		t.Fatalf("lookup_property(env) = %v, want [ok1]", env.Nodes)
+	}
+	// Edge prop keys — collected for BOTH the applied and the skipped edge.
+	for _, key := range []string{"okProp", "skipProp"} {
+		call[struct {
+			Nodes []string `json:"nodes"`
+		}](t, cs, "lookup_property", map[string]any{"propKey": key, "propValue": "1"})
+	}
+	// Node prop keys from the violating op and from ops past the abort were
+	// never collected — still not indexed after seal.
+	for _, key := range []string{"team", "late"} {
+		if text := callErr(t, cs, "lookup_property", map[string]any{"propKey": key, "propValue": "x"}); !strings.Contains(text, "not indexed") {
+			t.Errorf("lookup_property(%s) after seal: %q, want the not-indexed error", key, text)
+		}
 	}
 }
 

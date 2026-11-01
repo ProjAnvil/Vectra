@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -378,6 +379,12 @@ func TestFSMApplyUniqueViolationAborts(t *testing.T) {
 	if !ok || uv.Value != "a@x" || uv.ExistingKey != "a" || uv.AttemptedKey != "c" {
 		t.Fatalf("violation payload = %+v, want value a@x owner a attempted c", uv)
 	}
+	// The abort surface is this lane's own wrapping (audit F-02 pin): the
+	// node's slice index and key identify the failing op, the engine payload
+	// rides underneath via %w.
+	if prefix := "server: batch nodes[1] (c): "; !strings.HasPrefix(err.Error(), prefix) {
+		t.Fatalf("abort text %q missing prefix %q", err.Error(), prefix)
+	}
 
 	f.mu.RLock()
 	_, bOK := f.live.NodeByKey("b")
@@ -393,6 +400,22 @@ func TestFSMApplyUniqueViolationAborts(t *testing.T) {
 	}
 	if n != 2 {
 		t.Fatalf("live nodes = %d, want 2 (a + b)", n)
+	}
+
+	// Bookkeeping advanced despite the abort (the documented partial
+	// application): the partial effects are PUBLISHED (small graph — the
+	// publisher was woken on the abort path), while the batch metrics and
+	// txn counters did not move (the entry did not commit). Only the seed
+	// entry incremented AppliedBatches; the Cypher declare entry never does.
+	waitPublished(t, f, 2, 0, 2*time.Second)
+	if got := f.metrics.AppliedBatches.Load(); got != 1 {
+		t.Fatalf("AppliedBatches = %d, want 1 (aborted entry not counted)", got)
+	}
+	if got := f.metrics.TxnCommits.Load(); got != 0 {
+		t.Fatalf("TxnCommits = %d, want 0", got)
+	}
+	if got := f.metrics.DeletedNodes.Load(); got != 0 {
+		t.Fatalf("DeletedNodes = %d, want 0", got)
 	}
 
 	// Replay of the same entry aborts at the same op with the same class.

@@ -190,6 +190,68 @@ func TestUniqueReplayNilFrameSkips(t *testing.T) {
 	}
 }
 
+// TestWALReplayErrorPolicy pins applyChangeset's replay error discipline
+// (audit F-02, root lane): every changeset lane is first-error-stops, the
+// first failing OP's error surfaces from Open RAW (the engine's own text —
+// no replay/frame wrapping), and the failure is deterministic across
+// reopenings of the same bytes. Lane order is observable through the error
+// class: a frame carrying both a unique-violating node write (nodes run
+// first) and a ghost-endpoint edge (edges run second) must report the node
+// violation — the edge op behind it never ran.
+func TestWALReplayErrorPolicy(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "g.db")
+	craftWAL(t, db,
+		wal.IndexDecl{UniqueConstraints: []wal.UniqueConstraint{{Label: "Svc", Prop: "email"}}},
+		wal.Changeset{Nodes: []wal.NodeUpsert{{Key: "k1", Label: "Svc", Props: map[string]any{"email": "a@x"}}}},
+		wal.Changeset{
+			Nodes: []wal.NodeUpsert{{Key: "k2", Label: "Svc", Props: map[string]any{"email": "a@x"}}}, // violates k1's a@x
+			Edges: []wal.EdgeUpsert{{SrcKey: "k1", DstKey: "ghost", Label: "E"}},                      // would fail too — never reached
+		},
+	)
+	g, err := Open(db, Options{WALMode: ModeAlways})
+	if err == nil {
+		g.Close()
+		t.Fatal("open over a replay-violating frame: want error, got nil")
+	}
+	var uv *UniqueViolationError
+	if !errors.As(err, &uv) || !errors.Is(err, ErrUniqueViolation) {
+		t.Fatalf("replay error = %v, want the raw unique-violation class", err)
+	}
+	if uv.Value != "a@x" || uv.ExistingKey != "k1" || uv.AttemptedKey != "k2" {
+		t.Fatalf("violation payload = %+v, want value a@x owner k1 attempted k2", uv)
+	}
+	// Raw surface: the engine's own text rides out unchanged (nodes-lane
+	// stop-at-first; the ghost edge behind it is not reported).
+	if want := `unique constraint violation: (Svc.email) value "a@x" already owned by key "k1"`; err.Error() != want {
+		t.Fatalf("replay error text = %q, want the engine's raw text %q", err.Error(), want)
+	}
+
+	// Edge-lane failure surfaces the bare sentinel the same way (raw, no
+	// wrapper), and the abort is deterministic: the same bytes fail the same
+	// way on an independent library.
+	db2 := filepath.Join(t.TempDir(), "g2.db")
+	craftWAL(t, db2,
+		wal.Changeset{
+			Nodes:       []wal.NodeUpsert{{Key: "a", Label: "Svc"}},
+			Edges:       []wal.EdgeUpsert{{SrcKey: "a", DstKey: "ghost", Label: "E"}},
+			NodeDeletes: []string{"a"}, // after the failing edge: never executed
+		},
+	)
+	_, err2a := Open(db2, Options{WALMode: ModeAlways})
+	_, err2b := Open(db2, Options{WALMode: ModeAlways})
+	for _, e := range []error{err2a, err2b} {
+		if !errors.Is(e, ErrNodeNotFound) {
+			t.Fatalf("edge-lane replay error = %v, want ErrNodeNotFound", e)
+		}
+		if e.Error() != "vectra: node key not found" {
+			t.Fatalf("edge-lane replay text = %q, want the raw sentinel text", e.Error())
+		}
+	}
+	if err2a.Error() != err2b.Error() {
+		t.Fatalf("replay failure not deterministic: %q vs %q", err2a.Error(), err2b.Error())
+	}
+}
+
 // --- Clone carry (§3.5) -----------------------------------------------------------
 
 func TestUniqueCloneCarriesConstraints(t *testing.T) {

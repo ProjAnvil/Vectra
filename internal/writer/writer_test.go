@@ -260,6 +260,44 @@ func TestConcurrentSubmitAndQueries(t *testing.T) {
 	}
 }
 
+// ---- 1b. changeset error policy (audit F-02, writer lane pin) -------------------
+//
+// applyChangeset is first-error-stops with a RAW error surface: the engine
+// sentinel rides out to the submitter unwrapped (no writer: prefix), the ops
+// before the failure stay applied (partial application, the replay-parity
+// discipline), and the lanes after the failing op never run.
+
+func TestSubmitChangesetFirstErrorStops(t *testing.T) {
+	g := vectra.New()
+	if err := g.Batch(func(g *vectra.Graph) {
+		if _, err := g.AddNode("keep", "Svc", nil); err != nil {
+			t.Fatal(err)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h := writer.Attach(g, writer.Config{MaxLayers: 8, MergeEdges: 64})
+	defer h.Close()
+
+	err := h.Submit(vectra.Changeset{
+		Nodes:       []vectra.NodeUpsert{{Key: "first", Label: "Svc"}},                  // applies, stays applied
+		Edges:       []vectra.EdgeUpsert{{SrcKey: "first", DstKey: "ghost", Label: "E"}}, // fails raw
+		NodeDeletes: []string{"keep"},                                                   // after the failure: never executed
+	})
+	if !errors.Is(err, vectra.ErrNodeNotFound) {
+		t.Fatalf("Submit error = %v, want ErrNodeNotFound", err)
+	}
+	if err.Error() != "vectra: node key not found" {
+		t.Fatalf("Submit error text = %q, want the raw sentinel text (no lane wrapping)", err.Error())
+	}
+	if _, ok := g.NodeByKey("first"); !ok {
+		t.Fatal("op before the failure must stay applied (partial application)")
+	}
+	if _, ok := g.NodeByKey("keep"); !ok {
+		t.Fatal("node delete behind the failing edge must not run")
+	}
+}
+
 // ---- 2. write stall engages and releases --------------------------------------
 
 func TestWriteStallBlocksAndResolves(t *testing.T) {
