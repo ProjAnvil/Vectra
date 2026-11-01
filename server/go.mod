@@ -6,7 +6,7 @@ require (
 	github.com/hashicorp/go-metrics v0.7.0
 	github.com/hashicorp/raft v1.8.0
 	github.com/hashicorp/raft-boltdb/v2 v2.4.2
-	github.com/projanvil/vectra v0.14.3
+	github.com/projanvil/vectra v0.14.4
 	golang.org/x/term v0.47.0
 )
 
