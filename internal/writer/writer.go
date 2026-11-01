@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/projanvil/vectra"
+	"github.com/projanvil/vectra/internal/apply"
 )
 
 // Config tunes the wrapper. The zero value takes the spec defaults.
@@ -485,38 +486,16 @@ func (h *Handle) volumeCheckpoint() bool {
 	return true
 }
 
-// applyChangeset applies one submitted changeset with the write-method
-// semantics, in the Changeset apply order (nodes, edges, edge deletes,
-// node deletes — the same order WAL replay uses). The first error stops
-// that changeset; its earlier entries stay applied (matching Open's replay
-// discipline: a WAL error means retry-or-abandon, and the recorded ops
-// replay exactly the entries that succeeded).
+// applyChangeset applies one submitted changeset through the shared apply
+// walk (audit F-02) under apply.StopAtFirst, in the Changeset apply order
+// (nodes, edges, edge deletes, node deletes — the same order WAL replay
+// uses). The first error stops that changeset and surfaces RAW (the engine
+// sentinel, no writer wrapping); its earlier entries stay applied (matching
+// Open's replay discipline: a WAL error means retry-or-abandon, and the
+// recorded ops replay exactly the entries that succeeded).
 func applyChangeset(g *vectra.Graph, cs vectra.Changeset) error {
-	for _, n := range cs.Nodes {
-		if _, err := g.AddNode(n.Key, n.Label, n.Props); err != nil {
-			return err
-		}
-	}
-	for _, e := range cs.Edges {
-		var err error
-		if e.AllowParallel {
-			_, err = g.AddEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
-		} else {
-			_, err = g.UpsertEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
-		}
-		if err != nil {
-			return err
-		}
-	}
-	for _, d := range cs.EdgeDeletes {
-		if _, err := g.DeleteEdge(d.SrcKey, d.DstKey, d.Label); err != nil {
-			return err
-		}
-	}
-	for _, key := range cs.NodeDeletes {
-		if _, err := g.DeleteNode(key); err != nil {
-			return err
-		}
+	if fatal := g.ApplyChangeset(cs, apply.StopAtFirst, nil); fatal.Err != nil {
+		return fatal.Err
 	}
 	return nil
 }

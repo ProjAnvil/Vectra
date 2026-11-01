@@ -20,6 +20,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/projanvil/vectra"
+	"github.com/projanvil/vectra/internal/apply"
 )
 
 // Version is the implementation version advertised by the MCP service.
@@ -217,6 +218,34 @@ type injectIn struct {
 	Edges       []edgeIn       `json:"edges,omitempty"`
 	DeleteEdges []edgeDeleteIn `json:"deleteEdges,omitempty" jsonschema:"delete edges by (srcKey,dstKey,label)"`
 	DeleteNodes []string       `json:"deleteNodes,omitempty" jsonschema:"delete nodes (cascades incident edges)"`
+}
+
+// changeset projects the tool input into the core changeset vocabulary: the
+// shared apply walk (internal/apply, audit F-02) takes one Changeset.
+// Node-deletes share the caller's slice (the walk only reads); the typed
+// lanes convert field-by-field, order-preserving.
+func (in injectIn) changeset() vectra.Changeset {
+	var cs vectra.Changeset
+	if len(in.Nodes) > 0 {
+		cs.Nodes = make([]vectra.NodeUpsert, len(in.Nodes))
+		for i, n := range in.Nodes {
+			cs.Nodes[i] = vectra.NodeUpsert{Key: n.Key, Label: n.Label, Props: n.Props}
+		}
+	}
+	if len(in.Edges) > 0 {
+		cs.Edges = make([]vectra.EdgeUpsert, len(in.Edges))
+		for i, e := range in.Edges {
+			cs.Edges[i] = vectra.EdgeUpsert{SrcKey: e.SrcKey, DstKey: e.DstKey, Label: e.Label, Props: e.Props, AllowParallel: e.AllowParallel}
+		}
+	}
+	if len(in.DeleteEdges) > 0 {
+		cs.EdgeDeletes = make([]vectra.EdgeDelete, len(in.DeleteEdges))
+		for i, d := range in.DeleteEdges {
+			cs.EdgeDeletes[i] = vectra.EdgeDelete{SrcKey: d.SrcKey, DstKey: d.DstKey, Label: d.Label}
+		}
+	}
+	cs.NodeDeletes = in.DeleteNodes
+	return cs
 }
 
 type countsOut struct {
@@ -493,57 +522,66 @@ func (svc *service) injectBatch(_ context.Context, _ *mcp.CallToolRequest, in in
 	// unique-constraint violation, deleting a missing key) aborts the
 	// injection and fails the tool call; items before it stay applied (the
 	// boundary publishes them as one layer; no rollback). Parity note: the
-	// node-WRITE abort aligns with the server lane's /v1/batch; node
-	// deletes abort here too — deliberately stricter than the server lane,
-	// which skip-counts missing delete keys (server/fsm.go NodesSkipped) —
-	// so an MCP caller always learns a delete missed (F-02's apply-loop
-	// unification must keep this per-lane split). The edge lanes keep the
+	// node-WRITE abort aligns with the server lane's /v1/batch; node deletes
+	// abort here too — deliberately stricter than the server lane
+	// (server/fsm.go skip-counts missing delete keys as NodesSkipped) — so
+	// an MCP caller always learns a delete missed. The edge lanes keep the
 	// lenient deterministic-skip discipline: an edge whose endpoints do not
-	// exist is skipped and counted, never fatal. The boundary's own flush
-	// error keeps the same lenient surface — the ops already hit memory and
-	// stay buffered in the pend buffer for the next successful flush (see Batch's
+	// exist is skipped and counted, never fatal — and a failed edge DELETE
+	// is dropped uncounted (the one cell where this lane is more lenient
+	// than the server's skip counter). The boundary's own flush error keeps
+	// the same lenient surface — the ops already hit memory and stay
+	// buffered in the pend buffer for the next successful flush (see Batch's
 	// direct-mode limitation note).
+	//
+	// The stop set above is single-sourced with the other apply lanes by
+	// audit F-02: apply.NodesAndDeletesStop IS this policy (the server lane
+	// runs apply.NodesStopRestSkip instead — the per-lane split is carried
+	// by the policy values, not by divergent loops). The propKeys
+	// side-collection keeps its per-lane timing in the observer below:
+	// node prop keys are collected for APPLIED nodes only (a violating node
+	// contributes nothing, nodes past the abort never ran), edge prop keys
+	// for EVERY visited edge, skipped ones included.
 	var abort error
+	cs := in.changeset()
 	_ = svc.live.Batch(func(g *vectra.Graph) {
-		for i, n := range in.Nodes {
-			if _, err := g.AddNode(n.Key, n.Label, n.Props); err != nil {
-				abort = fmt.Errorf("mcp: inject_batch aborted at nodes[%d] (%s): %w"+abortDisclosure, i, n.Key, err)
-				return
+		fatal := g.ApplyChangeset(cs, apply.NodesAndDeletesStop, func(op apply.Op) {
+			switch op.Kind {
+			case apply.KindNodes:
+				if op.Err == nil {
+					out.NodesApplied++
+					for k := range cs.Nodes[op.Index].Props {
+						svc.propKeys[k] = true
+					}
+				}
+			case apply.KindEdges:
+				if op.Err == nil {
+					out.EdgesApplied++
+				} else {
+					out.EdgesSkipped++
+				}
+				for k := range cs.Edges[op.Index].Props {
+					svc.propKeys[k] = true
+				}
+			case apply.KindEdgeDeletes:
+				if op.Err == nil {
+					out.EdgesDeleted += op.N
+				}
+			case apply.KindNodeDeletes:
+				if op.Err == nil {
+					out.NodesDeleted++
+					out.EdgesDeleted += op.N
+				}
 			}
-			out.NodesApplied++
-			for k := range n.Props {
-				svc.propKeys[k] = true
-			}
-		}
-		for _, e := range in.Edges {
-			var err error
-			if e.AllowParallel {
-				_, err = g.AddEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
+		})
+		if fatal.Err != nil {
+			// NodesAndDeletesStop's fatal lanes are exactly node upserts and
+			// node deletes — the two abort shapes below.
+			if fatal.Kind == apply.KindNodeDeletes {
+				abort = fmt.Errorf("mcp: inject_batch aborted at deleteNodes[%d] (%s): %w"+abortDisclosure, fatal.Index, fatal.Key, fatal.Err)
 			} else {
-				_, err = g.UpsertEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
+				abort = fmt.Errorf("mcp: inject_batch aborted at nodes[%d] (%s): %w"+abortDisclosure, fatal.Index, fatal.Key, fatal.Err)
 			}
-			if err == nil {
-				out.EdgesApplied++
-			} else {
-				out.EdgesSkipped++
-			}
-			for k := range e.Props {
-				svc.propKeys[k] = true
-			}
-		}
-		for _, d := range in.DeleteEdges {
-			if n, err := g.DeleteEdge(d.SrcKey, d.DstKey, d.Label); err == nil {
-				out.EdgesDeleted += n
-			}
-		}
-		for i, k := range in.DeleteNodes {
-			n, err := g.DeleteNode(k)
-			if err != nil {
-				abort = fmt.Errorf("mcp: inject_batch aborted at deleteNodes[%d] (%s): %w"+abortDisclosure, i, k, err)
-				return
-			}
-			out.NodesDeleted++
-			out.EdgesDeleted += n
 		}
 	})
 	if abort != nil {

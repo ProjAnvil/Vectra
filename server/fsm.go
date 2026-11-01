@@ -17,6 +17,7 @@ import (
 	"github.com/hashicorp/raft"
 
 	"github.com/projanvil/vectra"
+	"github.com/projanvil/vectra/internal/apply"
 )
 
 // defaultSmallGraphLimit: when the live graph size is below this value, publishing
@@ -209,44 +210,47 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	// advance before the error surfaces. Edge lanes stay skip-counted:
 	// edge ops cannot violate node constraints in v1, so they keep the
 	// deterministic-skip discipline.
+	//
+	// The walk itself is the shared apply loop (audit F-02):
+	// apply.NodesStopRestSkip encodes exactly the stop set above, and the
+	// observer below accumulates this lane's counters — edge upsert errors
+	// count as skips only on ErrNodeNotFound (any other edge error is
+	// neither counted nor fatal, preserved as-is), edge-delete errors count
+	// as skips, node-delete errors count as skips with cascades folded into
+	// EdgesDeleted on success.
 	var nodeErr error
 	_ = f.live.Batch(func(g *vectra.Graph) {
-		for i, n := range b.Nodes {
-			if _, err := g.AddNode(n.Key, n.Label, n.Props); err != nil {
-				nodeErr = fmt.Errorf("server: batch nodes[%d] (%s): %w", i, n.Key, err)
-				return
+		fatal := g.ApplyChangeset(b.ChangesetOf(), apply.NodesStopRestSkip, func(op apply.Op) {
+			switch op.Kind {
+			case apply.KindNodes:
+				if op.Err == nil {
+					res.NodesApplied++
+				}
+			case apply.KindEdges:
+				if op.Err == nil {
+					res.EdgesApplied++
+				} else if errors.Is(op.Err, vectra.ErrNodeNotFound) {
+					res.EdgesSkipped++ // Authoritative validation: replay skips invalid items, no divergence
+				}
+			case apply.KindEdgeDeletes:
+				if op.Err == nil {
+					res.EdgesDeleted += op.N
+				} else {
+					res.EdgesSkipped++ // References a nonexistent node: deterministic skip, no divergence
+				}
+			case apply.KindNodeDeletes:
+				if op.Err == nil {
+					res.NodesDeleted++
+					res.EdgesDeleted += op.N
+				} else {
+					res.NodesSkipped++
+				}
 			}
-			res.NodesApplied++
-		}
-		for _, e := range b.Edges {
-			var err error
-			if e.AllowParallel {
-				_, err = g.AddEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
-			} else {
-				_, err = g.UpsertEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
-			}
-			if err == nil {
-				res.EdgesApplied++
-			} else if errors.Is(err, vectra.ErrNodeNotFound) {
-				res.EdgesSkipped++ // Authoritative validation: replay skips invalid items, no divergence
-			}
-		}
-		for _, d := range b.EdgeDeletes {
-			n, err := g.DeleteEdge(d.SrcKey, d.DstKey, d.Label)
-			if err != nil {
-				res.EdgesSkipped++ // References a nonexistent node: deterministic skip, no divergence
-				continue
-			}
-			res.EdgesDeleted += n
-		}
-		for _, key := range b.NodeDeletes {
-			cascaded, err := g.DeleteNode(key)
-			if err != nil {
-				res.NodesSkipped++
-				continue
-			}
-			res.NodesDeleted++
-			res.EdgesDeleted += cascaded
+		})
+		if fatal.Err != nil {
+			// NodesStopRestSkip's only fatal lane is node upserts, so the
+			// wrap is always the nodes[%d] shape.
+			nodeErr = fmt.Errorf("server: batch nodes[%d] (%s): %w", fatal.Index, fatal.Key, fatal.Err)
 		}
 	})
 	f.dirty = true

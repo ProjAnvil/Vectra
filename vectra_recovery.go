@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/projanvil/vectra/internal/apply"
 	"github.com/projanvil/vectra/internal/propval"
 	"github.com/projanvil/vectra/internal/store"
 	"github.com/projanvil/vectra/internal/wal"
@@ -306,46 +307,18 @@ func (g *Graph) flushPending() error {
 	return nil
 }
 
-// applyChangeset replays one frame with the write-method semantics. Used by
-// Open's recovery path (recording is detached there — replaying must not
+// replayChangeset replays one frame with the write-method semantics (the
+// shared apply walk under apply.StopAtFirst — audit F-02). Used by Open's
+// recovery path (recording is detached there — replaying must not
 // re-record). One Batch boundary per frame: recovery rebuilds one micro-layer
 // per replayed frame. Any error means the frame references state the replay
-// did not rebuild identically: surfaced, not skipped (the graph is abandoned
-// by the caller, the partially-applied layer never escapes Open).
-func (g *Graph) applyChangeset(cs Changeset) error {
+// did not rebuild identically: surfaced raw, not skipped (the graph is
+// abandoned by the caller, the partially-applied layer never escapes Open).
+func (g *Graph) replayChangeset(cs Changeset) error {
 	var firstErr error
 	err := g.Batch(func(g *Graph) {
-		fail := func(err error) bool {
-			if firstErr == nil {
-				firstErr = err
-			}
-			return true
-		}
-		for _, n := range cs.Nodes {
-			if _, err := g.AddNode(n.Key, n.Label, n.Props); err != nil && fail(err) {
-				return
-			}
-		}
-		for _, e := range cs.Edges {
-			var err error
-			if e.AllowParallel {
-				_, err = g.AddEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
-			} else {
-				_, err = g.UpsertEdge(e.SrcKey, e.DstKey, e.Label, e.Props)
-			}
-			if err != nil && fail(err) {
-				return
-			}
-		}
-		for _, d := range cs.EdgeDeletes {
-			if _, err := g.DeleteEdge(d.SrcKey, d.DstKey, d.Label); err != nil && fail(err) {
-				return
-			}
-		}
-		for _, key := range cs.NodeDeletes {
-			if _, err := g.DeleteNode(key); err != nil && fail(err) {
-				return
-			}
+		if fatal := g.ApplyChangeset(cs, apply.StopAtFirst, nil); fatal.Err != nil {
+			firstErr = fatal.Err
 		}
 	})
 	if err != nil {
@@ -474,7 +447,7 @@ func Open(path string, opts Options) (*Graph, error) {
 	//     the forest state absorbed — re-derives the identical final dead
 	//     set and live overlay;
 	//   - replay reaches State only through vecIntakeNode/vecIntakeDelete
-	//     on the writer thread (applyChangeset -> AddNode/DeleteNode), the
+	//     on the writer thread (replayChangeset -> AddNode/DeleteNode), the
 	//     same funnel that produced the forest, so normalization and
 	//     ordering match exactly.
 	// Re-application costs O(chain window), bounded by the compaction
@@ -554,7 +527,7 @@ func Open(path string, opts Options) (*Graph, error) {
 	if _, err := w.Replay(func(fr wal.Frame) error {
 		g.replayLSN = fr.LSN // forest-coverage gate (see vecIntakeNode)
 		if fr.Changeset != nil {
-			return g.applyChangeset(*fr.Changeset)
+			return g.replayChangeset(*fr.Changeset)
 		}
 		for _, k := range fr.IndexKeys {
 			g.IndexProperty(k)

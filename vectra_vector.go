@@ -416,7 +416,7 @@ func vecSeed(name string) int64 {
 // 5.1): valid vector -> Add; prop absent or invalid -> Delete (overwrite
 // to a non-vector kills the old embedding, spec 4.4; Delete of a
 // never-indexed key is a no-op). Runs on the writer thread inside
-// AddNode/applyChangeset - replay parity holds because applyChangeset
+// AddNode/replayChangeset - replay parity holds because replayChangeset
 // replays through AddNode itself.
 func (g *Graph) vecIntakeNode(key string, props map[string]any) {
 	for _, vi := range g.vecReg() {
