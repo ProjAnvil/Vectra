@@ -52,7 +52,10 @@
 // utilities or plain observability: FlushPend, LayerPressure,
 // VectorOverlayLen. All of them are engine coupling rather than supported
 // API: they are excluded from API stability and may change in any release
-// to serve the wrapper.
+// to serve the wrapper. ApplyChangeset is the same-kind sibling for the
+// apply loop: engine coupling for internal/writer, server and mcp only
+// (its parameter types live in internal/apply, unusable outside the repo),
+// excluded from API stability the same way.
 package vectra
 
 import (

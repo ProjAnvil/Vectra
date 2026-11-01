@@ -93,6 +93,10 @@ func (e applyEngine) DeleteNode(key string) (int, error) {
 // used by WAL replay (Open recovery), the writer wrapper, the server FSM
 // replay and the MCP inject_batch tool; changes to the walk's order or
 // write-method dispatch live in internal/apply.Changeset, once.
+//
+// Apply-loop coupling surface: internal/writer, server and mcp only — the
+// parameter types live in internal/apply, so this is unusable outside the
+// repo; not covered by API stability.
 func (g *Graph) ApplyChangeset(cs Changeset, p apply.Policy, observe func(apply.Op)) apply.Op {
 	return apply.Changeset(applyEngine{g}, cs, p, observe)
 }

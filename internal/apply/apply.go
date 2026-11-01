@@ -34,8 +34,8 @@ const (
 	KindNodeDeletes             // wal.Changeset.NodeDeletes
 )
 
-// String names the lane (KindNodes & co.) so diagnostics — the stops() panic,
-// test failure output, caller error strings — read names, not ints.
+// String names the lane (KindNodes & co.) so diagnostics — the MCP fatal-kind
+// guard, test failure output, caller error strings — read names, not ints.
 func (k Kind) String() string {
 	switch k {
 	case KindNodes:
