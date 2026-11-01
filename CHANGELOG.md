@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.3] - 2026-11-01
+
+Closure of the three findings deferred by the 2026-11-01 audit remediation
+(F-05 wrapper surface, F-11 pendOp memory, F-02 apply-loop convergence;
+report in docs/research/2026-11-01-go-code-audit.md). Wire formats and
+allocation gates byte-identical throughout.
+
+### Fixed
+
+- **WAL recording buffer memory amplification on batch ingest (F-11).**
+  Every recorded op embedded all five op payloads plus two declaration
+  slices (~240 B/op) regardless of kind, so large wrapper batches buffered
+  ~5x the live payload size in `pendOps`. The buffer is now per-kind
+  payload slices plus a 16 B/op order log: 240 → 64 B/op recorded
+  (amplification 5.0x → 1.33x over live payload) on the new wrapper ingest
+  benchmark, with allocs/op and ns/op both improved
+  (Ingest512: 2,836 → 2,829 allocs/op, 3.08 → 2.63 ms;
+  Ingest4K: 20,103 → 19,768 allocs/op, 67.6 → 47.7 ms). Frame order, the
+  failed-flush retry buffer and restart parity are unchanged; the measured
+  A/B record is docs/benchmarks/2026-11-01-pendop-buffer-ab.md.
+
+### Changed
+
+- **The changeset apply loop exists once instead of four times (F-02).**
+  The nodes → edges → edge deletes → node deletes walk (with the
+  AllowParallel branch) was hand-maintained in root WAL replay,
+  internal/writer, the server FSM and MCP `inject_batch` — the copy-paste
+  drift that already bit once (F-03, a missed unique-violation lane). All
+  four lanes now run one shared walk in `internal/apply` with the error
+  policy as an explicit parameter (`StopAtFirst` for replay and writer,
+  `NodesStopRestSkip` for the server, `NodesAndDeletesStop` for MCP) and
+  per-op observers that keep each lane's counters and error strings
+  byte-identical. Per-lane behavior is pinned by tests written and green
+  before the convergence and untouched by it — including the newly pinned
+  fact that MCP edge deletes on missing endpoints are silently uncounted
+  (unlike the server lane's skip counter). `Graph.ApplyChangeset` joins
+  the documented coupling surface (internal/writer, server and mcp only;
+  not covered by API stability).
+- **The wrapper-mode coupling surface is documented (F-05).** The ~24
+  exported root methods that exist solely for internal/writer, server and
+  mcp (CaptureMerge/PublishMerge, SealForClose, the async-compact quartet,
+  VecHandle and friends) now carry per-symbol annotations, one package-doc
+  section — "wrapper-mode coupling surface — internal/writer only, not
+  covered by API stability" — and a README paragraph (en+zh). These
+  symbols are explicitly outside API stability; everything else the
+  package exports is the supported surface. Docs-only; no behavior change.
+
 ## [0.14.2] - 2026-11-01
 
 Remediation of the 2026-11-01 Go code audit (40 findings; report in
